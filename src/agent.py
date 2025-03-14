@@ -1,10 +1,10 @@
-import re
 from pathlib import Path
 
 from loguru import logger
 from pydantic import BaseModel
 
 from model import invoke_llm
+from tools import error_formatting, grab_error_message
 
 result_dir = Path("tmp-result")
 
@@ -203,35 +203,6 @@ def patch2pattern(id: str, iter: int, patch_info: str, use_general=False):
     return response
 
 
-def patch2demo(id: str, iter: int, patch_info: str):
-    logger.info(f"start generating demo{iter}.")
-    patch2demo = Path("prompt/patch2demo.md").read_text()
-    patch2demo_prompt = patch2demo.replace("# {patchinfo(replace)}", patch_info)
-
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
-    path2store = prompt_history_dir / "patch2demo.md"
-    prompt_history_dir.mkdir(parents=True, exist_ok=True)
-
-    if iter == 0:
-        path2store.write_text(patch2demo_prompt)
-
-    response = invoke_llm(patch2demo_prompt)
-    pattern = r"```c\n([\s\S]*?)\n```"
-    matches = re.findall(pattern, response)
-
-    base_dir = Path(result_dir) / id
-    demo_buggy_dir = Path(base_dir) / "demos" / "buggy"
-    demo_nonbuggy_dir = Path(base_dir) / "demos" / "nonbuggy"
-    demo_buggy_filepath = demo_buggy_dir / f"demo{iter}.c"
-    demo_nonbuggy_filepath = demo_nonbuggy_dir / f"demo{iter}.c"
-
-    demo_buggy_dir.mkdir(parents=True, exist_ok=True)
-    demo_nonbuggy_dir.mkdir(parents=True, exist_ok=True)
-
-    demo_buggy_filepath.write_text(matches[0])
-    demo_nonbuggy_filepath.write_text(matches[1])
-
-
 def pattern2plan(
     id: str,
     iter: int,
@@ -287,30 +258,6 @@ def pattern2plan(
 
     response = invoke_llm(pattern2plan_prompt)
     response_store = prompt_history_dir / "response_plan.md"
-
-    response_store.write_text(response)
-    return response
-
-
-def refine_plan(id: str, iter: int, pattern: str, plan: str):
-    logger.info("start generating refine_plan prompts")
-    plan_refine = Path("prompt/plan_refine.md").read_text()
-    plan_refine_prompt = plan_refine.replace(
-        "# {bugpattern(replace)}", pattern.strip("```")
-    )
-    plan_refine_prompt = plan_refine_prompt.replace(
-        "# {originalplan(replace)}", plan.strip("```")
-    )
-
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
-    path2store = prompt_history_dir / "plan_refine.md"
-    prompt_history_dir.mkdir(parents=True, exist_ok=True)
-
-    path2store.write_text(plan_refine_prompt)
-    logger.info("finish refine_plan generation")
-    response = invoke_llm(plan_refine_prompt)
-    response_store = prompt_history_dir / "response_refinedplan.md"
-    prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
     response_store.write_text(response)
     return response
@@ -427,5 +374,32 @@ def repair_FP(
     response = invoke_llm(repair_FP_prompt, temperature=0.01)
     response_store = prompt_history_dir / f"response_repair_FP-{commit_id}.md"
 
+    response_store.write_text(response)
+    return response
+
+
+def repair_syntax(id: str, iter: int, times, checker_code, error_content):
+    logger.info("start generating repair_syntax prompts")
+    template = (prompt_template_dir / "repair.md").read_text()
+
+    error_list = grab_error_message(error_content)
+    error_list_md = error_formatting(error_list)
+    prompt = template.replace("{checkercode}", checker_code).replace(
+        "{errors}", error_list_md
+    )
+
+    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    path2store = prompt_history_dir / f"repair_syntax-{times}.md"
+    prompt_history_dir.mkdir(parents=True, exist_ok=True)
+
+    path2store.write_text(prompt)
+    logger.info("finish repair_syntax generation")
+
+    response = invoke_llm(prompt)
+    if response is None:
+        logger.error("Empty response")
+        response = "SKIP"
+
+    response_store = prompt_history_dir / f"response_repair_syntax-{times}.md"
     response_store.write_text(response)
     return response

@@ -36,17 +36,34 @@ def init_llm():
     key_config = get_key_config()
     global azure_deepseek_client, deepseek_client, nv_client, openai_client, google_client, model_config
 
-    azure_deepseek_client = ChatCompletionsClient(
-        endpoint="XXXX", credential=AzureKeyCredential(key_config["azure_key"])
-    )
-    deepseek_client = OpenAI(
-        api_key=key_config["deepseek_key"], base_url="https://api.deepseek.com/v1"
-    )
-    nv_client = OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1", api_key=key_config["nv_key"]
-    )
-    openai_client = OpenAI(api_key=key_config["openai_key"])
-    google_client = genai.Client(api_key=key_config["google_key"])
+    if "azure_key" in key_config:
+        azure_deepseek_client = ChatCompletionsClient(
+            endpoint="XXXX", credential=AzureKeyCredential(key_config["azure_key"])
+        )
+    if "deepseek_key" in key_config:
+        deepseek_client = OpenAI(
+            api_key=key_config["deepseek_key"], base_url="https://api.deepseek.com/v1"
+        )
+    if "nv_key" in key_config:
+        nv_client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1", api_key=key_config["nv_key"]
+        )
+    if "openai_key" in key_config:
+        openai_client = OpenAI(api_key=key_config["openai_key"])
+
+    if "google_key" in key_config:
+        google_client = genai.Client(api_key=key_config["google_key"])
+
+    if not any(
+        [
+            azure_deepseek_client,
+            deepseek_client,
+            nv_client,
+            openai_client,
+            google_client,
+        ]
+    ):
+        raise ValueError("No API key provided")
 
     model_config["model"] = key_config["model"]
     logger.info(f"Init LLM with model: {model_config['model']}")

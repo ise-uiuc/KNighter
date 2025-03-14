@@ -43,7 +43,7 @@ def report_objects(report_content: str, linux_path: str):
     return matches
 
 
-def grab_error_message(error_content: str, llvm_path: Path) -> list:
+def grab_error_message(error_content: str) -> list:
     pattern = r"error:.*\n\s*\d+\s*\|\s+.*\n"
     error_list = re.findall(pattern, error_content, re.MULTILINE)
 

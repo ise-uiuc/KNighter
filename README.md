@@ -59,6 +59,18 @@ model: "o3-mini"
 - "key_file": the key file for the models.
 - "model": the model for the generated checkers.
 
+You also need to set up the `llm_keys.yaml` file, which includes the key for the LLM model.
+
+```yaml
+nv_key: "XXX"
+deepseek_key: "XXX"
+azure_key: "XXX"
+openai_key: "XXX"
+google_key: "XXX"
+```
+
+You don't need to provide all the keys. If you don't have the key for a specific model, you can leave it empty.
+
 **Step3**
 
 Set up the LLVM environment.
@@ -85,4 +97,26 @@ modes = {
     "triage": (triage_report, "Triage the report"),
     "label": (label_commits, "Label commits"),
 }
+```
+
+### Example Workflow
+
+1. Generate checkers for the your target commits (e.g., stored in `commit.txt`).
+
+```sh
+# Under src
+python3 main.py gen --commit_file=commits.txt --config_file=config.yaml
+```
+
+The result dir is `/path/to/result-checkers`, which is specified in the `config.yaml`.
+
+2. Collect and refine the checkers.
+
+```sh
+# Under knighter
+python3 scripts/collect_checkers.py /path/to/result-checkers /path/to/result-valid-checkers
+```
+
+```sh
+python3 main.py refine --checker_dir=/path/to/result-valid-checkers --config_file=config.yaml
 ```
