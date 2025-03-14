@@ -1,7 +1,7 @@
-# ![Project logo](assets/icon.png) KNighter: Transforming Static Analysis with LLM-Synthesized Checkers
+# <img src="assets/icon.png" alt="Project logo" width="40"> KNighter: Transforming Static Analysis with LLM-Synthesized Checkers
 
 <p align="left">
-    <a href="https://arxiv.org/abs/2503.09002"><img src="https://img.shields.io/badge/arXiv-2310.15991-b31b1b.svg?style=for-the-badge">
+    <a href="https://arxiv.org/abs/2503.09002"><img src="https://img.shields.io/badge/arXiv-2503.09002-b31b1b.svg?style=for-the-badge">
 </p>
 
 ![Framework](assets/overview.svg)
@@ -9,6 +9,11 @@
 ## About
 
 KNighter is a checker synthesis tool that leverages the power of LLMs to generate static analysis checkers 🦉 based on historical patch commits.
+
+> [!IMPORTANT]
+> We are keeping improving the documents and supporting more features. Please stay tuned for the updates.
+
+**Contact:** [Chenyuan Yang](https://yangchenyuan.github.io/), [Zijie Zhao](https://zijie.cs.illinois.edu/), [Lingming Zhang](https://lingming.cs.illinois.edu).
 
 ## Environment Setup
 
