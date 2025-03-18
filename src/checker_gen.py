@@ -199,6 +199,9 @@ def gen_checker_worker(
             no_tf_plans.append(refined_plan)
         elif TN > 0:
             no_tp_plans.append(refined_plan)
+        elif TP == -1 and TN == -1:
+            logger.error(f"Fail to evaluate checker{i}!")
+            break
 
     # First compare the TP, then rating
     checker_id = sorted(checker_id, key=lambda x: (x[1], x[2]), reverse=True)

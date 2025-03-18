@@ -183,7 +183,7 @@ def invoke_llm(
                 return response.text
 
             answer = response.choices[0].message.content
-            if "<think>" in answer:
+            if "<think>" in answer or "</think>" in answer:
                 # Delete the content between <think> and </think> tags
-                answer = answer.split("</think>")[-1]
+                answer = answer.split("</think>")[-1].strip()
             return answer
