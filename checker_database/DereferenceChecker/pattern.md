@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Dereferencing a pointer when it is null or undefined. In particular, the checker detects cases where a pointer is either explicitly known to be null or remains undefined (i.e., it has not been properly initialized or checked) before it is dereferenced. This bug pattern covers code where a pointer value, which could be null or undefined, is used in memory accesses such as loads, stores, or field accesses without prior validation, potentially leading to runtime crashes or undefined behavior.

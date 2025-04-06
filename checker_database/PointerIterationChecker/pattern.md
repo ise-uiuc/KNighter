@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Iterating over pointer-like elements stored in unordered containers (such as std::unordered_set) can lead to non-deterministic iteration order. This pattern arises when using range-based for loops or similar constructs on unordered collections of pointers, where the order is not guaranteed. Relying on a specific iteration order in such contexts might introduce subtle bugs or inconsistent behavior.

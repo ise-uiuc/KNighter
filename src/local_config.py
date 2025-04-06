@@ -14,7 +14,7 @@ if not log_dir.exists():
     log_dir.mkdir()
 
 
-def load_config(file_path: str):
+def load_config(file_path: str = "config.yaml"):
     global inited
     if inited:
         return

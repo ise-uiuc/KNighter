@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker detects the pattern where user‐facing string literals (or strings not marked as localized) are used in API calls or UI methods that demand a localized string. In other words, strings that should be wrapped in a localization macro (and optionally include translator comments) are instead left untagged, so that they are treated as “non-localized.” This often happens when a string literal’s state is not explicitly set as localized in the program state, and then that same string is passed to UI methods that expect correctly localized content, leading to potential mismatches in user-facing text.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker looks for cases where foundation APIs are misused by passing nil where non‐nil objects are expected or by failing to verify that an API’s return value is non-nil before use. In essence, the bug pattern is: a value that must be validated (typically for non-nil) is used without the necessary null-check, leading to API misusage (such as by invoking methods on nil receivers, supplying nil for required key/value arguments in collection methods, or mismanaging memory via invalid CF calls). This pattern is common when developers assume that a method always returns a valid object or that a particular argument can be nil, potentially resulting in runtime crashes or undefined behavior.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker isn’t attempting to diagnose program errors at all – instead, it “dumps” internal traversal and call‐event information by printing directly to the standard output (llvm::outs()). This pattern of using unfiltered debug output rather than reporting diagnostics via the analyzer’s bug reporting mechanisms means that the checker is essentially leaking internal traversal state. In other words, embedding direct printing calls in analyzer callbacks (for branch conditions, function entry/exit, and call events) is the pattern here, which can lead to debugging information being exposed and can interfere with the normal diagnostic flow.

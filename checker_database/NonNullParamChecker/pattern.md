@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Passing a null pointer as an argument to a function when the corresponding parameter is required to be non-null (either by an explicit 'nonnull' attribute or because it is a reference). This pattern occurs when a function’s interface promises that a valid, non-null pointer will always be provided, but a null value is passed instead, potentially leading to undefined behavior or crashes when the pointer is dereferenced.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker flags cases where call or message expressions use uninitialized, undefined, or null function pointers or arguments. In other words, it detects when a function, method, or block is invoked using a callee or arguments that have not been properly set up (e.g. an uninitialized function pointer, a nil/undef Objective-C receiver, or uninitialized value passed as an argument), leading to potential undefined behavior or crashes.

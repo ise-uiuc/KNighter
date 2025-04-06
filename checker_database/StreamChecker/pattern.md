@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker is designed to detect incorrect handling of file stream pointers. In general, the bug pattern is operating on a stream (FILE*) without ensuring that the stream is valid—i.e., not NULL, not already closed or previously failed to open, and not in an indeterminate state due to prior I/O errors. Programs that use stream functions without verifying that the stream pointer is non-null and still in an "opened" state (and that its file position is determinate) risk undefined behavior, erroneous I/O, and resource leaks.

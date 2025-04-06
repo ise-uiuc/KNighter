@@ -593,10 +593,51 @@ def run_checker(
     return num_bugs
 
 
+def collect_reports(commit_report_dir: str, max_num_reports=100) -> tuple[dict, bool]:
+    """Collect reports from the given directory.
+    
+    Args:
+        commit_report_dir (str): The directory path containing the reports.
+        max_num_reports (int): The maximum number of reports to collect.
+    Returns:
+        tuple: A tuple containing a dictionary of file reports and a boolean indicating if there are too many reports.
+    """
+    commit_report_dir = Path(commit_report_dir)
+    file_reports = defaultdict(list)
+
+    num_html_file = len(list(commit_report_dir.glob("*.html")))
+    if num_html_file > max_num_reports:
+        logger.warning(f"Too many reports: {num_html_file}!")
+        return {}, True
+
+    for report_file in commit_report_dir.rglob("*.html"):
+        if report_file.stem == "index":
+            continue
+
+        html_content = report_file.read_text()
+        md_content = html2text(html_content)
+        md_content = remove_text_section(md_content, html_content)
+
+        # Extract filename from the title tag
+        title_pattern = re.compile(r"<title>(.+)</title>")
+        match = title_pattern.search("\n".join(html_content.splitlines()[:10]))
+        if match:
+            file_name = match.group(1)
+        else:
+            file_name = "default"
+        file_name = file_name.replace("/", "_").replace(".c", "").replace(".h", "")
+        file_reports[file_name].append((md_content, html_content))
+    return file_reports, False
+
+
 def triage_report(report_dir):
-    """Go through all the html files and triage them."""
+    """
+    Go through all the html files and triage them.
+
+    Args:
+        report_dir (str): The directory path containing the reports.
+    """
     report_dir = Path(report_dir)
-    file_name_pattern = re.compile(r"File:\| (.+)")
     commit_bug_num = {}
     for commit_dir in report_dir.iterdir():
         if not commit_dir.is_dir():
@@ -606,42 +647,31 @@ def triage_report(report_dir):
         md_report_dir = commit_dir / "kernel_reports_md"
         md_report_dir.mkdir(parents=True, exist_ok=True)
 
-        file_reports = defaultdict(list)
-        too_many_reports = False
-        for commit_report_dir in commit_dir.iterdir():
-            if not commit_report_dir.is_dir():
-                continue
-            num_html_file = len(list(commit_report_dir.glob("*.html")))
-            if num_html_file > 100:
-                logger.warning(f"Too many reports: {num_html_file}!")
-                too_many_reports = True
+        final_report_dir = None
+        for i in range(5, 0, -1):
+            temp_dir = commit_dir / f"kernel-report-{i}"
+            if temp_dir.exists() and temp_dir.is_dir():
+                print(i)
+                final_report_dir = temp_dir
                 break
+        if final_report_dir is None:
+            logger.warning("No final report found!")
+            continue
 
-            for report_file in commit_report_dir.iterdir():
-                if not report_file.is_file():
-                    continue
-                if report_file.suffix != ".html" or report_file.stem == "index":
-                    continue
-
-                html_content = report_file.read_text()
-                md_content = html2text(html_content)
-                md_content = remove_text_section(md_content, html_content)
-
-                file_name = file_name_pattern.search(md_content)
-                if file_name:
-                    file_name = file_name.group(1)
-                else:
-                    file_name = "default"
-
-                report_md = md_report_dir / (report_file.stem + ".md")
-                report_md.write_text(md_content)
-                file_reports[file_name].append((md_content, html_content))
-
+        # Collect reports
+        file_reports, too_many_reports = collect_reports(final_report_dir) 
+        print(file_reports)
         if too_many_reports:
+            logger.warning("Too many reports!")
             continue
 
         check_report_dir = commit_dir / "check_reports"
         check_report_dir.mkdir(parents=True, exist_ok=True)
+
+        is_bug_dir = commit_dir / "is_bug"
+        is_not_bug_dir = commit_dir / "is_not_bug"
+        is_bug_dir.mkdir(parents=True, exist_ok=True)
+        is_not_bug_dir.mkdir(parents=True, exist_ok=True)
 
         pattern = (commit_dir / "checker1-pattern.txt").read_text()
         patch = (commit_dir / "patch.md").read_text()
@@ -658,7 +688,7 @@ def triage_report(report_dir):
                 .replace("..", "--")
                 .strip()
             )
-            # We only consider the first report
+            # We only consider the first report for each file
             md_content = reports[0][0]
             html_content = reports[0][1]
 
@@ -676,9 +706,17 @@ def triage_report(report_dir):
 
             if "NotABug" in check_result:
                 num_not_bug += 1
+
+                (is_not_bug_dir / f"{file_name}.md").write_text(md_content)
+                (is_not_bug_dir / f"{file_name}.html").write_text(html_content)
+                (is_not_bug_dir / f"{file_name}.check").write_text(check_result)
             else:
                 num_bug += 1
                 bug_files.append(file_name)
+
+                (is_bug_dir / f"{file_name}.md").write_text(md_content)
+                (is_bug_dir / f"{file_name}.html").write_text(html_content)
+                (is_bug_dir / f"{file_name}.check").write_text(check_result)
 
         commit_bug_num[commit_dir.name] = (num_bug, num_not_bug)
         (commit_dir / "bug_files.txt").write_text("\n".join(bug_files))

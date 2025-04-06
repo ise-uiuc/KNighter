@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern occurs when a memory allocation call (such as malloc, calloc, or realloc) is cast to a pointer of one type, but the allocation size is computed using a sizeof expression for a different, incompatible type. This mismatch between the pointed-to type and the type used in the size calculation can lead to allocating the wrong amount of memory and result in potential memory errors such as buffer overflows or inefficient memory usage.

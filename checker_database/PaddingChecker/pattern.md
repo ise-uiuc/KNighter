@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker detects records (or arrays of records) where the ordering of member fields leads to excessive padding. In other words, when a structure is declared with a field order that forces the compiler to insert unnecessary alignment-induced gaps, the overall memory footprint can be significantly larger than an optimally arranged version. This pattern—suboptimal field ordering causing extra padding—is associated with inefficient data layouts that can impact performance and memory usage.

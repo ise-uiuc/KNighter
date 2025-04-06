@@ -1,0 +1,5 @@
+```
+## Bug Pattern
+
+The bug pattern is the inadvertent (or intentional) use of special “clang_analyzer_…” functions—which are meant for introspecting and debugging the analyzer’s internal state—in production code. These functions, when called, trigger the emission of diagnostic bug reports (e.g., printing symbolic values, state dumps, or evaluation outcomes) even though there is no actual “bug” in the analyzed program. In other words, code that calls these analyzer-specific debug/evaluation functions (such as clang_analyzer_eval, clang_analyzer_explain, etc.) manifests a pattern where internal analyzer assumptions or state details are exposed via built-in error nodes. This pattern is a red flag since it indicates that debug or test helper functions intended for regression or instrumentation have been left in the code and may lead to misleading diagnostics or spurious error reports.
+```

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+In a MIG callback function, if a routine deallocates an out-of-line parameter (i.e., transfers ownership by calling a known deallocation function) and then returns an error code rather than a success code, it leads to a use‐after‐free vulnerability. This is because the MIG calling convention expects that on error, the caller will clean up the parameter—so deallocating it in the callee causes double deallocation (or use‐after‐free) when the caller later tries to free the same resource.

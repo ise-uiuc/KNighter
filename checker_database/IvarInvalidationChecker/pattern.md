@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is when a class that is supposed to invalidate its “invalidatable” instance variables—based on annotations (such as "objc_instance_variable_invalidator" or its partial variant)—fails to properly reset those instance variables (e.g., by setting them to nil or by calling an appropriate invalidation method). In other words, if a class declares an invalidation method (or relies on partial invalidators) but its implementation does not comprehensively clear or invalidate every instance variable that requires it, then the object may end up with stale or dangling ivars. This pattern can lead to undefined behavior or memory management issues, as the object retains references that are meant to be invalidated.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker detects situations where an array element is accessed using an index that goes beyond the dynamically determined size of the array. In other words, if a computed index of an element (extracted as part of an ElementRegion) is found to be outside the range defined by the dynamic extent of the array, it is flagged as an out-of-bound access (i.e., a potential buffer overflow).

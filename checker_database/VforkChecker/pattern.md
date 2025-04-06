@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Detecting code running in a vfork child process that performs unsafe operations—specifically, any function calls (other than a small, predefined allowed set), memory writes (other than to the designated vfork return storage), or attempts to return normally. These operations are forbidden because vfork’s child shares the parent's memory state. Thus, the bug pattern is when the child process derived from vfork performs disallowed operations (function calls, bindings/assignments, or returns) that can lead to undefined behavior due to the shared address space.

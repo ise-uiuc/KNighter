@@ -187,3 +187,12 @@ def invoke_llm(
                 # Delete the content between <think> and </think> tags
                 answer = answer.split("</think>")[-1].strip()
             return answer
+
+
+def get_embeddings(text: str):
+    """Get embeddings for the given text."""
+    response = openai_client.embeddings.create(
+        input=text,
+        model="text-embedding-ada-002"
+    )
+    return response.data[0].embedding

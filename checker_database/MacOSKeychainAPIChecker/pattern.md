@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Memory allocated via Keychain API functions (e.g. SecKeychainItemCopyContent, SecKeychainFindGenericPassword, SecKeychainFindInternetPassword, etc.) is expected to be released with a specific corresponding deallocation function (e.g. SecKeychainItemFreeContent). The bug pattern occurs when the allocated memory is not freed using the correct deallocator—or when an incorrect, mismatched deallocation function is used (such as free or another non-corresponding API call). This improper pairing of allocation and deallocation leads to resource leaks or deallocator mismatch errors.

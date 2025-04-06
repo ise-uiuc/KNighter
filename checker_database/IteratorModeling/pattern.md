@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Modeling iterator positions via abstract symbolic offsets without ensuring consistent, bound-to-container state propagation. In other words, when iterator operations (such as copy construction, advancement via std::advance/next/prev, incremental/decremental operators, and comparisons) are handled by updating an abstract “position” (using conjured symbols and arithmetic) without adequate checks on container binding or state consistency, the resulting state may be unsound or mismatched. This pattern can lead to erroneous assumptions about iterator equivalence or validity when iterators’ positions are not properly tracked across operations.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker detects duplicate or nearly duplicate code fragments—code clones—that indicate potential copy-paste errors. In particular, it looks for groups of statements that are either exact matches or demonstrate only a very minor (often single variable) difference. This pattern suggests that code may have been copied and modified inadequately, leading to maintenance issues or logic bugs when the adaptations (such as variable renaming) are incomplete or inconsistent.

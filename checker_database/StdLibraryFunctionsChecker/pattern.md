@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Calls to well‐known library functions where one or more arguments do not meet the expected constraints—such as being within a prescribed numeric range, non‑NULL, or having adequate buffer size—which violates the function’s specification. This mismatch between the caller’s argument values and the function’s documented preconditions (as captured by summary constraints) can lead to undefined behavior or runtime errors.
