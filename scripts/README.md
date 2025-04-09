@@ -1,7 +1,37 @@
+# Scripts of KNighter
 
-## Setup LLVM
+## `collect_valid_checkers.py`: Collect Valid Checkers
+
+This script collects all valid checkers from the KNighter synthesized checkers.
+
+```sh
+python3 collect_valid_checkers.py /path/to/synthesized_checkers /path/to/output_dir
+# def find_valid_checkers(result_dir: str, output_dir: str)
+```
+
+## `count_errors.py`: Count Errors
+
+This script counts the number of errors in the synthesized checkers.
+
+```sh
+python3 count_errors.py /path/to/synthesized_checkers/log-XXX.log output_error.csv
+# def count_errors_from_file(input_file, output_file)
+```
+
+## `count_tokens.py`: Count Tokens
+
+This script counts the number of tokens in the synthesized checkers.
+
+```sh
+python count_tokens.py /path/to/result/dir
+```
+
+## `setup_llvm.py`: Setup LLVM
 
 Create the SAGenTestPlugin in your LLVM environment for "self-repair" phase.
+
+> [!NOTE]
+> This is specifically for the LLVM-18.1.8.
 
 ```sh
 # Set up LLVM environment
