@@ -38,19 +38,22 @@ def evaluate_with_history_commit(commit_id: str, patch: str, llvm_build_dir: str
     for obj in objects:
         comd = comd_prefix + f"make LLVM=1 ARCH=x86 {obj} -j32"
         logger.info("Running: " + comd)
-        res = subprocess.run(
-            comd,
-            shell=True,
-            text=True,
-            cwd=patch2md.repo.working_dir,
-            capture_output=True,
-            timeout=300,
-        )
-        output = res.stdout
+        try:
+            res = subprocess.run(
+                comd,
+                shell=True,
+                text=True,
+                cwd=patch2md.repo.working_dir,
+                capture_output=True,
+                timeout=300,
+            )
+            output = res.stdout
+        except subprocess.TimeoutExpired:
+            raise Exception(f"Compilation Timeout: {comd}")
 
         # FIXME: Debugging
-        Path(f"tmp-stdout-debug.txt").write_text(output)
-        Path(f"tmp-stderr-debuggg.txt").write_text(res.stderr)
+        # Path(f"tmp-stdout-debug.txt").write_text(output)
+        # Path(f"tmp-stderr-debuggg.txt").write_text(res.stderr)
 
         logger.info(f"Buggy: {obj} {res.returncode}")
         # logger.debug(output)
@@ -76,20 +79,24 @@ def evaluate_with_history_commit(commit_id: str, patch: str, llvm_build_dir: str
     prepare_repo(commit_id, is_before=False, olddefcmd=comd.split(" "))
     for obj in objects:
         comd = comd_prefix + f"make LLVM=1 ARCH=x86 {obj} -j32 2>&1"
-        res = subprocess.run(
-            comd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=patch2md.repo.working_dir,
-            timeout=300,
-        )
-        output = res.stdout
+        try:
+            res = subprocess.run(
+                comd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=patch2md.repo.working_dir,
+                timeout=300,
+            )
+            output = res.stdout
+        except subprocess.TimeoutExpired:
+            raise Exception(f"Compilation Timeout: {comd}")
+
         logger.info(f"Non-buggy: {obj} {res.returncode}")
 
         # FIXME: Debugging
-        Path(f"tmp-stdout-debug-n.txt").write_text(output)
-        Path(f"tmp-stderr-debug-n.txt").write_text(res.stderr)
+        # Path(f"tmp-stdout-debug-n.txt").write_text(output)
+        # Path(f"tmp-stderr-debug-n.txt").write_text(res.stderr)
 
         # logger.debug(output)
         if res.returncode == 0 and "No bugs found" in output:
