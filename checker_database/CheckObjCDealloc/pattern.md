@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is failing to correctly manage the memory for synthesized instance variables that back properties with retain or copy semantics in Objective-C. Specifically, it involves either omitting a proper -dealloc method altogether or not releasing these ivars (or improperly releasing ivars that should not be directly released, such as those for assign or weak properties). In short, the pattern is about inconsistent or incorrect release of retained resources in deallocation paths, which can lead to memory leaks or over-releases in manual reference counting environments.

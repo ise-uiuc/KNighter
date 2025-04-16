@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Untrusted (or tainted) data flows from its source into security‐sensitive sinks without being properly sanitized or validated. In other words, if data is obtained from untrusted sources (like input functions or environment variables) and is then directly used in functions that perform critical operations (e.g. as format strings, system call arguments, buffer size parameters, or in memory copy routines), the program becomes vulnerable to attacks such as format string exploits, command injection, or buffer overflows. This pattern—failing to filter or validate tainted data before it is consumed in dangerous contexts—is what the checker identifies.

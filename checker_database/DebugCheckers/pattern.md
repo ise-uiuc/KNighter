@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The pattern here is one of excessive or unconditional diagnostic output where the checker generates reports or dumps internal analyzer data (like CFGs, dominator trees, live variable info, call graphs, or even a report on every statement) regardless of an actual bug condition. This approach, which is useful for debugging, can lead to a flood of non-actionable or spurious warnings that do not represent real issues in the user's code, but instead expose internal analysis details.

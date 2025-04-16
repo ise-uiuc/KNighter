@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Returning a pointer computed via array or pointer arithmetic where the resulting offset is out-of-bounds with respect to the original object. Specifically, the checker detects when a function returns a pointer that points to an element outside the valid range (other than the allowed one-past-end iterator) of the underlying array, potentially leading to buffer overflow vulnerabilities.

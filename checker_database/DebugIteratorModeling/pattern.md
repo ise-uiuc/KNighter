@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker assumes that the provided iterator argument is valid and its internal state (like offset, container, and validity flag) can be extracted. When an iterator value is missing or its internal representation cannot be retrieved (for example, if no argument is given), the checker simply binds a default value and emits a debug message instead of enforcing proper validation. This pattern—relying on presumed valid iterator inputs and defaulting silently when they are absent—can mask underlying iterator misuse or invalid state issues in the analyzed code.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Keeping and using raw pointers that refer to a container’s internal buffer after the container has been modified or destroyed. This pattern typically occurs when the code retrieves a pointer to the internals of a standard container (e.g., via c_str(), data(), etc.) and later calls non-const operations on the container (such as append, assign, clear, erase, etc.) that may invalidate that raw pointer. Using such invalidated pointers can lead to use-after-free or undefined behavior.

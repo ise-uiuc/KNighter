@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the failure to recognize and enforce non-nullness for global constant string-like objects. In this pattern, global variables that are declared as constant (often via types like const char*, NSString* const, or typedefs such as CFStringRef) are treated as if they could be null despite their inherent non-null semantics. This may lead to analysis imprecision or spurious warnings since the actual program logic assumes such globals are always non-null, but the analyzer might not be able to infer that without an explicit assumption.

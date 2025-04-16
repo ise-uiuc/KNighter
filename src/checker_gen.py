@@ -4,6 +4,7 @@ from pathlib import Path
 
 import local_config
 from agent import patch2checker, patch2pattern, pattern2plan, plan2checker
+from checker_example import init_example
 from checker_eval import evaluate_with_history_commit
 from checker_repair import repairChecker
 from local_config import logger
@@ -18,6 +19,7 @@ def gen_checker(
     use_multi=True,
     use_general=False,
     no_utility=False,
+    sample_examples=False,
 ):
     logger.info("Using multi: " + str(use_multi))
 
@@ -31,6 +33,10 @@ def gen_checker(
     result_content = ""
     if result_file:
         result_content = Path(result_file).read_text()
+    
+    # Init example checkers if needed
+    if sample_examples:
+        init_example()
 
     log_file = result_dir / f"log-{time.time()}.log"
     result_file = log_file.with_suffix(".txt")
@@ -48,6 +54,7 @@ def gen_checker(
                 use_multi=use_multi,
                 use_general=use_general,
                 no_utility=no_utility,
+                sample_examples=sample_examples,
             )
             with open(log_file, "a") as flog:
                 flog.write(f"{commit_id} {commit_type} {checker_id}\n")
@@ -73,8 +80,8 @@ def gen_checker_worker(
     use_plan_feedback=False,
     use_general=False,
     no_utility=False,
+    sample_examples=False,
 ):
-
     checker_id = []
     LLVM_dir = global_config.get("LLVM_dir")
     checker_nums = global_config.get("checker_nums")
@@ -137,15 +144,16 @@ def gen_checker_worker(
                     no_tp_plans,
                     no_tf_plans,
                     no_utility=no_utility,
+                    sample_examples=sample_examples,
                 )
             else:
-                plan = pattern2plan(id, i, pattern, patch, no_utility=no_utility)
+                plan = pattern2plan(id, i, pattern, patch, no_utility=no_utility, sample_examples=sample_examples)
             # Refine Plan
             # refined_plan = refine_plan(id, i, pattern, plan)
             refined_plan = plan
             # Plan to Checker
             checker_code = plan2checker(
-                id, i, pattern, refined_plan, patch, no_utility=no_utility
+                id, i, pattern, refined_plan, patch, no_utility=no_utility, sample_examples=sample_examples
             )
         else:
             pattern = ""
@@ -199,6 +207,9 @@ def gen_checker_worker(
             no_tf_plans.append(refined_plan)
         elif TN > 0:
             no_tp_plans.append(refined_plan)
+        elif TP == -1 and TN == -1:
+            logger.error(f"Fail to evaluate checker{i}!")
+            break
 
     # First compare the TP, then rating
     checker_id = sorted(checker_id, key=lambda x: (x[1], x[2]), reverse=True)

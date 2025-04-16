@@ -5,9 +5,16 @@ from pydantic import BaseModel
 
 from model import invoke_llm
 from tools import error_formatting, grab_error_message
+from checker_example import choose_example
 
 result_dir = Path("tmp-result")
+prompt_template_dir = Path(__file__).parent.parent / "prompt_template"
+example_dir = prompt_template_dir / "examples"
+default_checker_examples = []
 
+UTILITY_FUNCTION = (prompt_template_dir / "knowledge" / "utility.md").read_text()
+SUGGESTIONS = (prompt_template_dir / "knowledge" / "suggestions.md").read_text()
+TEMPLATE = (prompt_template_dir / "knowledge" / "template.md").read_text()
 
 class Example(BaseModel):
     patch: str
@@ -15,33 +22,28 @@ class Example(BaseModel):
     plan: str
     checker_code: str
 
+    @staticmethod
+    def load_example_from_dir(checker_dir: str):
+        checker_dir = Path(checker_dir)
+        patch = (checker_dir / "patch.md").read_text()
+        pattern = (checker_dir / "pattern.md").read_text()
+        plan = (checker_dir / "plan.md").read_text()
+        checker_code = (checker_dir / "checker.cpp").read_text()
 
-prompt_template_dir = Path(__file__).parent.parent / "prompt_template"
+        return Example(patch=patch, pattern=pattern, plan=plan, checker_code=checker_code)
 
-CHECKER_EXAMPLES = []
-example_dir = prompt_template_dir / "examples"
+
 for checker_dir in example_dir.iterdir():
     if not checker_dir.is_dir():
         continue
-    patch = (checker_dir / "patch.md").read_text()
-    pattern = (checker_dir / "pattern.md").read_text()
-    plan = (checker_dir / "plan.md").read_text()
-    checker_code = (checker_dir / "checker.cpp").read_text()
-
-    CHECKER_EXAMPLES.append(
-        Example(patch=patch, pattern=pattern, plan=plan, checker_code=checker_code)
-    )
-
-UTILITY_FUNCTION = (prompt_template_dir / "knowledge" / "utility.md").read_text()
-SUGGESTIONS = (prompt_template_dir / "knowledge" / "suggestions.md").read_text()
-TEMPLATE = (prompt_template_dir / "knowledge" / "template.md").read_text()
+    default_checker_examples.append(Example.load_example_from_dir(checker_dir))
 
 
 def get_example_text(
-    need_patch: bool, need_pattern: bool, need_plan: bool, need_checker: bool
+    example_list, need_patch: bool=False, need_pattern: bool=False, need_plan: bool=False, need_checker: bool=False
 ):
     example_text = ""
-    for i, example in enumerate(CHECKER_EXAMPLES):
+    for i, example in enumerate(example_list):
         example_text += f"## Example {i+1}\n"
         if need_patch:
             example_text += example.patch + "\n\n"
@@ -65,15 +67,16 @@ patch2pattern_template = (
 patch2checker_template = patch2pattern_template.replace(
     "{{examples}}",
     get_example_text(
-        need_patch=True, need_pattern=False, need_plan=False, need_checker=True
+        default_checker_examples, need_patch=True, need_pattern=False, need_plan=False, need_checker=True
     ),
 )
 
+"""Patch to Pattern"""
 patch2pattern_template = (prompt_template_dir / "patch2pattern.md").read_text()
 patch2pattern_template = patch2pattern_template.replace(
     "{{examples}}",
     get_example_text(
-        need_patch=True, need_pattern=True, need_plan=False, need_checker=False
+        default_checker_examples, need_patch=True, need_pattern=True, need_plan=False, need_checker=False
     ),
 )
 
@@ -83,53 +86,32 @@ patch2pattern_general_template = (
 patch2pattern_general_template = patch2pattern_general_template.replace(
     "{{examples}}",
     get_example_text(
-        need_patch=True, need_pattern=True, need_plan=False, need_checker=False
+        default_checker_examples, need_patch=True, need_pattern=True, need_plan=False, need_checker=False
     ),
 )
 
+"""Pattern to Plan"""
 pattern2plan_template = (prompt_template_dir / "pattern2plan.md").read_text()
 pattern2plan_template = pattern2plan_template.replace(
     "{{utility_functions}}", UTILITY_FUNCTION
 )
-pattern2plan_template = pattern2plan_template.replace(
-    "{{examples}}",
-    get_example_text(
-        need_patch=False, need_pattern=True, need_plan=True, need_checker=False
-    ),
-)
 
+"""Pattern to Plan without utility functions"""
 pattern2plan_template_no_utility = (
     prompt_template_dir / "pattern2plan-no-utility.md"
 ).read_text()
-pattern2plan_template_no_utility = pattern2plan_template_no_utility.replace(
-    "{{examples}}",
-    get_example_text(
-        need_patch=False, need_pattern=True, need_plan=True, need_checker=False
-    ),
-)
 
+"""Plan to Checker"""
 plan2checker_template = (prompt_template_dir / "plan2checker.md").read_text()
 plan2checker_template = (
     plan2checker_template.replace("{{utility_functions}}", UTILITY_FUNCTION)
     .replace("{{suggestions}}", SUGGESTIONS)
     .replace("{{checker_template}}", TEMPLATE)
 )
-plan2checker_template = plan2checker_template.replace(
-    "{{examples}}",
-    get_example_text(
-        need_patch=False, need_pattern=True, need_plan=True, need_checker=True
-    ),
-)
 
 plan2checker_template_no_utility = (
     prompt_template_dir / "plan2checker-no-utility.md"
 ).read_text()
-plan2checker_template_no_utility = plan2checker_template_no_utility.replace(
-    "{{examples}}",
-    get_example_text(
-        need_patch=False, need_pattern=True, need_plan=True, need_checker=True
-    ),
-)
 plan2checker_template_no_utility = plan2checker_template_no_utility.replace(
     "{{suggestions}}", SUGGESTIONS
 ).replace("{{checker_template}}", TEMPLATE)
@@ -211,17 +193,39 @@ def pattern2plan(
     no_tp_plans=None,
     no_fp_plans=None,
     no_utility=False,
+    sample_examples=False,
 ):
+    """Generate plan based on the given pattern and patch.
+
+    Args:
+        id (str): The id of the current task.
+        iter (int): The iteration number.
+        pattern (str): The pattern of the bug.
+        patch (str): The patch of the bug.
+        no_tp_plans (list, optional): Plans that cannot detect the buggy pattern. Defaults to None.
+        no_fp_plans (list, optional): Plans that can label the non-buggy pattern correctly. Defaults to None.
+        no_utility (bool, optional): Whether to use utility functions. Defaults to False.
+        sample_examples (bool, optional): Whether to sample examples. Defaults to False.
+    """
     logger.info("start generating pattern2plan prompts")
     if no_utility:
         logger.warning("No utility functions are used in pattern2plan")
         template = pattern2plan_template_no_utility
     else:
         template = pattern2plan_template
+    
+    if sample_examples:
+        logger.warning("Sample examples for pattern2plan")
+        example_list = choose_example(pattern, "pattern")
+    else:
+        example_list = default_checker_examples
 
+    example_text = get_example_text(
+        example_list, need_patch=False, need_pattern=True, need_plan=True, need_checker=False
+    )
     pattern2plan_prompt = template.replace("{{input_pattern}}", pattern).replace(
         "{{input_patch}}", patch
-    )
+    ).replace("{{examples}}", example_text)
 
     feedback_plan_text = ""
     if no_tp_plans:
@@ -264,7 +268,7 @@ def pattern2plan(
 
 
 def plan2checker(
-    id: str, iter: int, pattern: str, refined_plan: str, patch: str, no_utility=False
+    id: str, iter: int, pattern: str, refined_plan: str, patch: str, no_utility=False, sample_examples=False
 ):
     logger.info("start generating plan2checker prompts")
     if no_utility:
@@ -272,11 +276,22 @@ def plan2checker(
         template = plan2checker_template_no_utility
     else:
         template = plan2checker_template
+    
+    if sample_examples:
+        logger.warning("Sample examples for plan2checker")
+        example_list = choose_example(refined_plan, "plan")
+    else:
+        example_list = default_checker_examples
+
+    example_text = get_example_text(
+        example_list, need_patch=False, need_pattern=True, need_plan=True, need_checker=True
+    )
 
     plan2checker_prompt = (
         template.replace("{{input_pattern}}", pattern)
         .replace("{{input_plan}}", refined_plan)
         .replace("{{input_patch}}", patch)
+        .replace("{{examples}}", example_text)
     )
 
     prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)

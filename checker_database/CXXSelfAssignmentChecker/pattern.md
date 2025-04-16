@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an assignment operator that does not explicitly handle the case where the assigned object is the same as the target (i.e. self-assignment). Without a guard against self-assignment, the operator may proceed with a full assignment of its own contents over itself, which can lead to logic errors or unintended resource handling issues. This checker models both self‐assignment and non-self‐assignment scenarios to help detect potential bugs arising from the lack of an explicit self-assignment check.

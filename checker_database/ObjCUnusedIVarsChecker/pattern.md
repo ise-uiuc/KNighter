@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern detected is the declaration of private instance variables (ivars) in an Objective-C class that are never used in any of the class’s implementation methods. In other words, the code defines ivars that are neither referenced within the class’s own methods nor marked with attributes (like Unused or IBOutlet) to indicate intentional non-use. This pattern can lead to unnecessary memory usage and maintenance overhead, suggesting that the ivars may be redundant or vestigial code.

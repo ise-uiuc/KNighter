@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker detects use of insecure or deprecated API calls and coding constructs that fail to enforce critical security requirements. In essence, it flags code patterns where functions known to be inherently unsafe (e.g. unbounded buffer operations like gets/strcpy/strcat, weak random number generators, or deprecated functions such as bcmp/bcopy/bzero) are used without proper safeguards—such as bounds checking, return value validation, or secure alternatives—thus opening the door to vulnerabilities like buffer overflows, predictable randomness, privilege escalation, and other security flaws.

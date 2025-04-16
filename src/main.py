@@ -11,6 +11,7 @@ from checker_refine import refine_checker, scan, triage_report
 from commit_label import label_commits
 from local_config import logger
 from model import init_llm
+from prepare import prepare
 
 global_config = dict()  # store information from config.json
 
@@ -48,6 +49,7 @@ def main(mode: str, *args, **kwargs):
         "scan": (scan, "Scan the kernel with valid checkers"),
         "triage": (triage_report, "Triage the report"),
         "label": (label_commits, "Label commits"),
+        "prepare": (prepare, "Prepare the data"),
     }
 
     if mode not in modes:
@@ -65,7 +67,6 @@ def main(mode: str, *args, **kwargs):
     func, description = modes[mode]
     logger.info(f"{description}")
 
-    func(*args, **kwargs)
     try:
         func(*args, **kwargs)
     except Exception as e:

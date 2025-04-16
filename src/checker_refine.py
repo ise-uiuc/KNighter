@@ -67,7 +67,8 @@ def refine_checker(checker_dir, scan=True, max_tries=1):
                     checker_code,
                     scan=scan,
                     max_tries=max_tries,
-                    timeout=3600,
+                    # timeout=3600,
+                    timeout=1800,
                 )
 
                 with open(result_log, "a") as flog:
@@ -87,7 +88,6 @@ def refine_one_checker(checker_dir, checker_code, scan=True, max_tries=3, timeou
     last_scan_id = None
     orig_scan = scan
     for i in range(max_tries):
-        # for i in range(1, max_tries): # FIXME: only try once
         logger.info(f"Refine attempt {i + 1}...")
         logger.info(f"Last scan id: {last_scan_id}")
         refine_result = refine_checker_worker(
@@ -128,13 +128,13 @@ def scan(valid_chekcer_meta_dir, arch="x86"):
             checker_code = checker_file.read_text()
             name = "SagenScan" + sub_checker.name[:12]
             checker_dir[name] = checker_code
-            print(name)
     logger.info(f"Scanning with {len(checker_dir)} checkers for {arch}...")
     scan_batch_checkers(checker_dir, arch=arch)
 
 
 def scan_batch_checkers(checker_dict, arch="x86"):
     llvm_build_dir = Path(get_config().get("LLVM_dir")) / "build"
+    jobs = get_config().get("jobs")
 
     plugin_name_str = ""
     for checker_id, checker_code in checker_dict.items():
@@ -156,11 +156,11 @@ def scan_batch_checkers(checker_dict, arch="x86"):
         )
 
         subprocess.run(
-            f"make {plugin_name_str} CFLAGS+='-Wall' -j60",
+            f"make {plugin_name_str} CFLAGS+='-Wall' -j{jobs}",
             cwd=llvm_build_dir,
             shell=True,
         )
-        subprocess.run(f"make CFLAGS+='-Wall' -j60", cwd=llvm_build_dir, shell=True)
+        subprocess.run(f"make CFLAGS+='-Wall' -j{jobs}", cwd=llvm_build_dir, shell=True)
 
     output_dir = Path(get_config().get("result_dir")) / "reports"
     commit = "master"
@@ -178,16 +178,16 @@ def scan_batch_checkers(checker_dict, arch="x86"):
         logger.warning("ARM64")
         comd = (
             comd_prefix
-            + f"make LLVM=1 ARCH={arch} CROSS_COMPILE=aarch64-linux-gnu- -j60"
+            + f"make LLVM=1 ARCH={arch} CROSS_COMPILE=aarch64-linux-gnu- -j{jobs}"
         )
     elif arch == "riscv":
         logger.warning("RISCV")
         comd = (
             comd_prefix
-            + f"make LLVM=1 ARCH={arch} CROSS_COMPILE=riscv64-unknown-linux-gnu- -j60"
+            + f"make LLVM=1 ARCH={arch} CROSS_COMPILE=riscv64-unknown-linux-gnu- -j{jobs}"
         )
     else:
-        comd = comd_prefix + f"make LLVM=1 ARCH={arch} -j60"
+        comd = comd_prefix + f"make LLVM=1 ARCH={arch} -j{jobs}"
     logger.info("Running: " + comd)
 
     process = subprocess.Popen(
@@ -266,22 +266,18 @@ def refine_checker_worker(
             refine_result.result = "Unscannable"
             return refine_result
 
-    # if run_res == -10:
-    #     return "Non-perfect"
-    # elif run_res == -1:
-    #     return "Timeout"
-    # else:
-    #     return "Perfect"
-
     # Extract reports
     if last_scan_id:
-        reports = extract_reports(
+        reports, total_report = extract_reports(
             kernel_report_dir, checker_dir / "reports", seed=attempt_id
         )
     else:
-        reports = extract_reports(kernel_report_dir, checker_dir / "reports", seed=0)
+        reports, total_report = extract_reports(
+            kernel_report_dir, checker_dir / "reports", seed=0
+        )
+    logger.info(f"Total reports: {total_report}")
 
-    if not reports:
+    if not reports or total_report <= 10:
         # In this case, the number of reports is less than 10
         logger.info("Checker is perfect!")
         refine_result.result = "Perfect"
@@ -449,6 +445,7 @@ def extract_reports(kernel_report_dir, output_dir, seed=0):
 
     Returns:
         list: A list of tuples containing the names and contents of the extracted reports.
+        int: The number of unique report directories.
     """
     kernel_report_dir = Path(kernel_report_dir)
     # Sort the report dir by time
@@ -458,7 +455,7 @@ def extract_reports(kernel_report_dir, output_dir, seed=0):
     )
     if not report_dir_list:
         logger.error("No report found!")
-        return None
+        return None, 0
     clustered_report_dir = defaultdict(list)
 
     # The latest report
@@ -471,7 +468,8 @@ def extract_reports(kernel_report_dir, output_dir, seed=0):
     num_reports = len(report_html_list)
     if num_reports <= 5:
         logger.warning("<= 5 reports!")
-        return
+        return None, num_reports
+
     max_len = min(100, num_reports)
     # Filename pattern example: `File:| drivers/video/backlight/qcom-wled.c`
     filename_pattern = re.compile(r"File:\| (.+)")
@@ -499,7 +497,7 @@ def extract_reports(kernel_report_dir, output_dir, seed=0):
     reports = []
     for key in selected_keys:
         reports.append(clustered_report_dir[key][0])
-    return reports
+    return reports, len(clustered_report_dir)
 
 
 def run_checker(
@@ -523,6 +521,7 @@ def run_checker(
         bool: True if the checker is successfully run, None otherwise.
     """
 
+    jobs = get_config().get("jobs")
     Path(checker_file_path).write_text(checker_code)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -532,8 +531,8 @@ def run_checker(
     log_filedir = os.path.join(current_dir, "build_log.log")
     log_error_filedir = os.path.join(current_dir, "build_error_log.log")
     os.system(
-        "make SAGenTestPlugin CFLAGS+='-Wall' -j60 > {} 2>{}".format(
-            log_filedir, log_error_filedir
+        "make SAGenTestPlugin CFLAGS+='-Wall' -j{} > {} 2>{}".format(
+            jobs, log_filedir, log_error_filedir
         )
     )
     os.chdir(current_dir)
@@ -548,12 +547,11 @@ def run_checker(
     commit = "master"
     comd_prefix = generate_command(llvm_build_dir, no_output=True)
     output_dir_str = str(output_dir.absolute().as_posix())
-    print(output_dir_str)
     comd_prefix += f"-o {output_dir_str} "
     olddefcmd = comd_prefix + "make LLVM=1 ARCH=x86 olddefconfig"
     prepare_repo(commit, is_before=False, olddefcmd=olddefcmd.split(" "))
 
-    comd = comd_prefix + "make LLVM=1 ARCH=x86 -j60"
+    comd = comd_prefix + f"make LLVM=1 ARCH=x86 -j{jobs}"
     if target_object:
         comd += f" {target_object}"
     logger.info("Running: " + comd)
@@ -593,10 +591,52 @@ def run_checker(
     return num_bugs
 
 
+def collect_reports(commit_report_dir: str, max_num_reports=100) -> tuple[dict, bool]:
+    """Collect reports from the given directory.
+
+    Args:
+        commit_report_dir (str): The directory path containing the reports.
+        max_num_reports (int): The maximum number of reports to collect.
+    Returns:
+        tuple: A tuple containing a dictionary of file reports and a boolean indicating if there are too many reports.
+    """
+    commit_report_dir = Path(commit_report_dir)
+    file_reports = defaultdict(list)
+
+    num_html_file = len(list(commit_report_dir.rglob("*.html")))
+    logger.info(f"Number of HTML files: {num_html_file}")
+    if num_html_file > max_num_reports:
+        logger.warning(f"Too many reports: {num_html_file}!")
+        return {}, True
+
+    for report_file in commit_report_dir.rglob("*.html"):
+        if report_file.stem == "index":
+            continue
+
+        html_content = report_file.read_text()
+        md_content = html2text(html_content)
+        md_content = remove_text_section(md_content, html_content)
+
+        # Extract filename from the title tag
+        title_pattern = re.compile(r"<title>(.+)</title>")
+        match = title_pattern.search("\n".join(html_content.splitlines()[:10]))
+        if match:
+            file_name = match.group(1)
+        else:
+            file_name = "default"
+        file_name = file_name.replace("/", "_").replace(".c", "").replace(".h", "")
+        file_reports[file_name].append((md_content, html_content))
+    return file_reports, False
+
+
 def triage_report(report_dir):
-    """Go through all the html files and triage them."""
+    """
+    Go through all the html files and triage them.
+
+    Args:
+        report_dir (str): The directory path containing the reports.
+    """
     report_dir = Path(report_dir)
-    file_name_pattern = re.compile(r"File:\| (.+)")
     commit_bug_num = {}
     for commit_dir in report_dir.iterdir():
         if not commit_dir.is_dir():
@@ -606,42 +646,29 @@ def triage_report(report_dir):
         md_report_dir = commit_dir / "kernel_reports_md"
         md_report_dir.mkdir(parents=True, exist_ok=True)
 
-        file_reports = defaultdict(list)
-        too_many_reports = False
-        for commit_report_dir in commit_dir.iterdir():
-            if not commit_report_dir.is_dir():
-                continue
-            num_html_file = len(list(commit_report_dir.glob("*.html")))
-            if num_html_file > 100:
-                logger.warning(f"Too many reports: {num_html_file}!")
-                too_many_reports = True
+        final_report_dir = None
+        for i in range(5, 0, -1):
+            temp_dir = commit_dir / f"kernel-report-{i}"
+            if temp_dir.exists() and temp_dir.is_dir():
+                final_report_dir = temp_dir
                 break
+        if final_report_dir is None:
+            logger.warning("No final report found!")
+            continue
 
-            for report_file in commit_report_dir.iterdir():
-                if not report_file.is_file():
-                    continue
-                if report_file.suffix != ".html" or report_file.stem == "index":
-                    continue
-
-                html_content = report_file.read_text()
-                md_content = html2text(html_content)
-                md_content = remove_text_section(md_content, html_content)
-
-                file_name = file_name_pattern.search(md_content)
-                if file_name:
-                    file_name = file_name.group(1)
-                else:
-                    file_name = "default"
-
-                report_md = md_report_dir / (report_file.stem + ".md")
-                report_md.write_text(md_content)
-                file_reports[file_name].append((md_content, html_content))
-
+        # Collect reports
+        file_reports, too_many_reports = collect_reports(final_report_dir)
         if too_many_reports:
+            logger.warning("Too many reports!")
             continue
 
         check_report_dir = commit_dir / "check_reports"
         check_report_dir.mkdir(parents=True, exist_ok=True)
+
+        is_bug_dir = commit_dir / "is_bug"
+        is_not_bug_dir = commit_dir / "is_not_bug"
+        is_bug_dir.mkdir(parents=True, exist_ok=True)
+        is_not_bug_dir.mkdir(parents=True, exist_ok=True)
 
         pattern = (commit_dir / "checker1-pattern.txt").read_text()
         patch = (commit_dir / "patch.md").read_text()
@@ -658,7 +685,7 @@ def triage_report(report_dir):
                 .replace("..", "--")
                 .strip()
             )
-            # We only consider the first report
+            # We only consider the first report for each file
             md_content = reports[0][0]
             html_content = reports[0][1]
 
@@ -676,9 +703,17 @@ def triage_report(report_dir):
 
             if "NotABug" in check_result:
                 num_not_bug += 1
+
+                (is_not_bug_dir / f"{file_name}.md").write_text(md_content)
+                (is_not_bug_dir / f"{file_name}.html").write_text(html_content)
+                (is_not_bug_dir / f"{file_name}.check").write_text(check_result)
             else:
                 num_bug += 1
                 bug_files.append(file_name)
+
+                (is_bug_dir / f"{file_name}.md").write_text(md_content)
+                (is_bug_dir / f"{file_name}.html").write_text(html_content)
+                (is_bug_dir / f"{file_name}.check").write_text(check_result)
 
         commit_bug_num[commit_dir.name] = (num_bug, num_not_bug)
         (commit_dir / "bug_files.txt").write_text("\n".join(bug_files))

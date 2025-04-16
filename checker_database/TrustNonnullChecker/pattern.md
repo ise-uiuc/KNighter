@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Assuming that pointers are always non-null based solely on annotations or the API’s expected behavior instead of verifying them. That is, the checker creates assumptions—by adding non-null constraints and symbolic implications based on _Nonnull annotations and Objective-C subscript conventions—so that functions (or methods) declared in system headers or associated with standard APIs are always trusted to return non-null values. This pattern can mask actual null pointer returns by relying entirely on header annotations and implicit state transitions rather than explicit runtime checks.

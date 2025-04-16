@@ -17,6 +17,10 @@ def find_valid_checkers(result_dir: str, output_dir: str):
             commit_id = (commit_dir / "commit_id.txt").read_text().strip()
         except FileNotFoundError:
             commit_id = commit_dir.name.split("-")[-1]
+        
+        if (output_dir / commit_id).exists():
+            print(f"Already processed {commit_id}, skipping.")
+            continue
 
         ranking_file = commit_dir / "ranking.txt"
         if not ranking_file.exists():

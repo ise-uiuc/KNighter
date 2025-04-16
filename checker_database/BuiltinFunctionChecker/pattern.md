@@ -1,0 +1,5 @@
+```
+## Bug Pattern
+
+The checker models the semantics of various compiler builtin functions, and the core pattern is when a builtin is used to impose assumptions or compute values (e.g. memory extents or constant expressions) but its arguments might be undefined or non-deterministic. In particular, if a builtin (like __builtin_assume) is given an undefined or unsatisfiable condition, it can force the program state to “sink” (i.e. prune a viable execution path), or if a memory allocation builtin (like __builtin_alloca) is invoked with an undefined size, the resulting dynamic extent may be modeled incorrectly. This general pattern – relying on builtins to drive control flow or state updates without guaranteeing that their input values are well-defined – can lead to mis-propagation of assumptions and state, eventually causing incorrect analyses or missed bugs in programs that use such builtins.
+```

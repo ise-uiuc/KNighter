@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Improper use of Unix/POSIX API functions via incorrect or mismatched arguments. This includes cases where flags (such as O_CREAT) imply additional arguments (like file mode) that are missing or of the wrong type, passing too many arguments, using transient storage (e.g., stack memory) for functions expecting long-lived control objects (such as in pthread_once), and performing allocations with a size of zero (via malloc, calloc, alloca, etc.). These misuse patterns can lead to runtime errors, undefined behavior, or portability issues.

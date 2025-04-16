@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using a transient, non-static memory region (such as a local, stack, block, or instance variable) as the predicate for a one-time initialization function (e.g., dispatch_once or dispatch_once_f). This pattern is problematic because the predicate is expected to have a static storage duration; using temporary memory can lead to unsafe behavior if that memory is not reliably persistent.

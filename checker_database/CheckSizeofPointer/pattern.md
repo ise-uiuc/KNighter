@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the unintended use of sizeof() on a pointer variable. In these cases, developers invoke sizeof() with an expression whose type is a pointer rather than the type of the object pointed to. This typically happens when sizeof() is applied directly to a pointer (for example, sizeof(p)) instead of dereferencing it (for example, sizeof(*p)). This can lead to an incorrect size being computed, which might be much smaller (or different) than the actual object size expected, potentially causing logic errors, memory allocation issues, or other runtime errors.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Improper management of va_list lifetime – using a va_list value that has not been properly initialized or has been reinitialized without proper cleanup. This manifests as either accessing a va_list (via va_arg or passing it to functions that use it) before a corresponding va_start/va_copy call has been made, calling va_end on a va_list that hasn’t been initialized, or overwriting an already initialized va_list (for example via an improper va_copy or a repeated va_start) leading to potential leaks.

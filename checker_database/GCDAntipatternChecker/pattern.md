@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using asynchronous synchronization objects (such as dispatch semaphores or groups) to force synchronous behavior. Specifically, the pattern is: a semaphore or dispatch group is created (often initialized to indicate “not ready” state), an asynchronous callback is set up that signals the semaphore or leaves the group, and then the main thread or caller immediately waits on that same semaphore or group. This forces synchronous waiting on an otherwise asynchronous operation, leading to potential performance problems like thread blocking and priority inversion.

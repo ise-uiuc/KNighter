@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Improper handling of iterator positions through unchecked arithmetic and assumptions. In other words, if iterator objects (or types masquerading as iterators) are advanced, compared, or manipulated by performing arithmetic on their underlying symbolic offset without enforcing proper bounds and validity constraints, then the resulting iterator state may be invalid. This can lead to operations on iterators that are out‐of-range or otherwise unsound. The pattern is common when generic container operations (like insert, erase, or advancing an iterator) use types that either do not fully satisfy the iterator interface requirements or do not check that their computed positions remain valid with respect to the container’s actual bounds.

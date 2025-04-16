@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is indexing into an array without ensuring the index is within the valid bounds. In this case, the checker tracks the size of a CFArray (collected during its creation or through a count function) and then checks that any index used in CFArrayGetValueAtIndex falls within the legal range [0, size-1]. This pattern of using an out-of-bound index when accessing a container (or array) can lead to undefined behavior due to memory accesses outside the allocated region.

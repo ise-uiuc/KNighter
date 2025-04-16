@@ -1,0 +1,3 @@
+## Bug Pattern
+
+When operations modify the contents or structure of a container (for example, via clear, push_back, pop_back, insert, erase, or assignment), any previously obtained iterator positions may become invalid. If the program continues to use these stale iterators without properly revalidating or updating them to reflect the container’s new state, it can lead to undefined behavior. This pattern occurs when modifications to a container are not matched with corresponding updates to all dependent iterator values, resulting in potential iterator misuse.

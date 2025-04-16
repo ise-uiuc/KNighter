@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is using an uninitialized or null object as the mutex in a synchronized block (i.e., in an @synchronized statement). When the expression used as the lock is either undefined or evaluates to nil, no actual synchronization occurs. This often stems from failing to verify that the mutex is valid (non-null) before using it for synchronization, which can lead to race conditions and unsynchronized access.

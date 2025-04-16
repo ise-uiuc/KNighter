@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The checker looks for functions or methods that accept an "error out" parameter (like NSError** or CFErrorRef*) but are declared with a void return type. This pattern is problematic because it violates coding conventions (e.g., those recommended by Apple) that require such functions to return a status (non-void) to indicate whether the error out parameter was set. Without a proper return value, callers cannot reliably determine if an error occurred, which can lead to misuse or unexpected null dereferences when the error parameter is later accessed.

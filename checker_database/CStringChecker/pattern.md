@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Improper use of C string functions arising from insufficient validation of buffer properties. In particular, the bug pattern occurs when string API calls (e.g., memcpy, strcpy, strncpy, sprintf, etc.) are used without ensuring that the pointer arguments are non-null, that the buffers are large enough (and their bounds correctly computed to avoid overflows or addition overflow), and that the buffers are properly null‐terminated. It also includes failure to check for overlapping buffers, which can lead to unintended memory corruption. This combination of assumptions about buffer sizes, termination, and non-overlap is the core flaw that can result in memory errors and undefined behavior.

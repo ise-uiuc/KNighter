@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using iterators that do not stem from the same underlying container when the API requires them to be paired. That is, the code detects cases where iterator(s) from one container are compared, used in insertion, erasure, or passed as arguments expecting a matching iterator pair from the same container. This pattern—mixing iterators of different containers—leads to undefined behavior or logic errors because container operations assume that all provided iterators are from the same container.

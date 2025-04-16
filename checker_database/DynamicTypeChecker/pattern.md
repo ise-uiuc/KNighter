@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Casting a pointer where the object's dynamically determined type does not match its static type—specifically, an implicit bitcast between Objective-C object pointer types is performed without verifying that the dynamic type is compatible with the static type. This unchecked conversion can lead to type errors, as the actual object type (tracked dynamically) may be entirely unrelated to the expected static type.

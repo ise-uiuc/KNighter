@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern involves miscomputing the length argument passed to C string functions (like strncat, strlcpy, and strlcat). In these calls, the length parameter is calculated incorrectly—often by using expressions such as sizeof(destination), sizeof(destination)-1, or sizeof(destination)-strlen(destination)—which fail to properly account for the available buffer space (e.g., not leaving room for the terminating null character or misrepresenting the actual size). This incorrect size computation can lead to buffer overflows or memory corruption.
