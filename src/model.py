@@ -6,7 +6,7 @@ from azure.core.credentials import AzureKeyCredential
 from google import genai
 from openai import OpenAI
 
-from local_config import get_key_config, logger
+from global_config import logger, global_config
 
 azure_deepseek_client = None
 deepseek_client = None
@@ -33,7 +33,7 @@ encoding = tiktoken.encoding_for_model("gpt-4o")
 
 
 def init_llm():
-    key_config = get_key_config()
+    key_config = global_config.get_key_config()
     global azure_deepseek_client, deepseek_client, nv_client, openai_client, google_client, model_config
 
     if "azure_key" in key_config:
@@ -84,8 +84,6 @@ def invoke_llm(
     """Invoke the LLM model with the given prompt."""
     model = model_config["model"]
 
-    # if model == "gpt-4o" and model_config["model"] in ["o1", "o3-mini", "o1-mini", "o1-preview"]:
-    #     model = "o1-mini"
     if model == "gpt-4o" and model_config["model"] in [
         "google",
         "nv-deepseek",
@@ -94,7 +92,6 @@ def invoke_llm(
         "local-deepseek",
     ]:
         model = model_config["model"]
-        # model = "local-deepseek"
 
     logger.info(f"start LLM process: {model}")
     num_tokens = num_tokens_from_string(prompt)

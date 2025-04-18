@@ -2,15 +2,12 @@ import os
 import time
 from pathlib import Path
 
-import local_config
 from agent import patch2checker, patch2pattern, pattern2plan, plan2checker
 from checker_example import init_example
 from checker_eval import evaluate_with_history_commit
-from checker_repair import repairChecker
-from local_config import logger
+from checker_repair import repair_checker
+from global_config import logger, global_config
 from tools import extract_checker_code
-
-global_config = dict()
 
 
 def gen_checker(
@@ -22,9 +19,6 @@ def gen_checker(
     sample_examples=False,
 ):
     logger.info("Using multi: " + str(use_multi))
-
-    global global_config
-    global_config = local_config.get_config()
 
     content = Path(commit_file).read_text()
     result_dir = Path(global_config.get("result_dir"))
@@ -83,10 +77,7 @@ def gen_checker_worker(
     sample_examples=False,
 ):
     checker_id = []
-    LLVM_dir = global_config.get("LLVM_dir")
     checker_nums = global_config.get("checker_nums")
-    if commit_id:
-        global_config["commit_id"] = commit_id
 
     id = f"test-{commit_type}-{commit_id}"
     # id = id_maker()
@@ -94,9 +85,6 @@ def gen_checker_worker(
     # Build directory
     build_directory(id)
 
-    # Generate patch info
-    # > From commit_id to patch var
-    # > From a given patchfile to patch var
     try:
         from patch2md import load_patch
     except (ImportError, FileNotFoundError) as e:
@@ -128,8 +116,8 @@ def gen_checker_worker(
     no_tf_plans = []  # Plans cannot detect the non-buggy code
     # Generate checkers
     for i in range(len(checker_id), checker_nums):
-        intermeidate_dir = Path(result_dir) / id / f"intermediate-{i}"
-        intermeidate_dir.mkdir(parents=True, exist_ok=True)
+        intermediate_dir = Path(result_dir) / id / f"intermediate-{i}"
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
 
         if use_multi:
             # Patch to Pattern
@@ -148,8 +136,6 @@ def gen_checker_worker(
                 )
             else:
                 plan = pattern2plan(id, i, pattern, patch, no_utility=no_utility, sample_examples=sample_examples)
-            # Refine Plan
-            # refined_plan = refine_plan(id, i, pattern, plan)
             refined_plan = plan
             # Plan to Checker
             checker_code = plan2checker(
@@ -161,25 +147,19 @@ def gen_checker_worker(
             refined_plan = ""
             checker_code = patch2checker(id, i, patch)
 
-        (intermeidate_dir / "pattern.txt").write_text(pattern)
-        (intermeidate_dir / "plan.txt").write_text(plan)
-        (intermeidate_dir / "refined_plan.txt").write_text(refined_plan)
+        (intermediate_dir / "pattern.txt").write_text(pattern)
+        (intermediate_dir / "plan.txt").write_text(plan)
+        (intermediate_dir / "refined_plan.txt").write_text(refined_plan)
         checker_code = extract_checker_code(checker_code)
-        (intermeidate_dir / "checker-0.txt").write_text(checker_code)
+        (intermediate_dir / "checker-0.txt").write_text(checker_code)
 
         # Repair Checker
-        checker_file_path = os.path.join(
-            LLVM_dir,
-            "clang/lib/Analysis/plugins/SAGenTestHandling/SAGenTestChecker.cpp",
-        )
-        llvm_build_dir = os.path.join(LLVM_dir, "build")
-        ret, checker = repairChecker(
+        ret, checker = repair_checker(
             id=id,
             idx=i,
-            checker_file_path=checker_file_path,
-            llvm_build_dir=llvm_build_dir,
             max_idx=4,
-            intermeidate_dir=intermeidate_dir,
+            intermediate_dir=intermediate_dir,
+            checker_code=checker_code,
         )
 
         if not ret:
@@ -196,7 +176,13 @@ def gen_checker_worker(
         with open(checker_dir, "w") as fchecker:
             fchecker.write(checker)
 
-        TP, TN = evaluate_with_history_commit(commit_id, patch, llvm_build_dir)
+        TP, TN = global_config.backend().validate_checker(
+            checker,
+            commit_id,
+            patch,
+            global_config.target(),
+            skip_build_checker=True, # Just built the checker
+        )
 
         checker_id.append((i, TP, TN))
         logger.info(f"Checker{i} TP: {TP} TN: {TN}")
@@ -227,11 +213,7 @@ def build_directory(id: str):
     basedir.mkdir(parents=True, exist_ok=True)
     build_log_dir = basedir / "build_logs"
     repair_log_dir = basedir / "repair_logs"
-    demo_buggy_dir = basedir / "demos" / "buggy"
-    demo_nonbuggy_dir = basedir / "demos" / "nonbuggy"
     prompt_history_dir = basedir / "prompt_history"
     build_log_dir.mkdir(parents=True, exist_ok=True)
     repair_log_dir.mkdir(parents=True, exist_ok=True)
-    demo_buggy_dir.mkdir(parents=True, exist_ok=True)
-    demo_nonbuggy_dir.mkdir(parents=True, exist_ok=True)
     prompt_history_dir.mkdir(parents=True, exist_ok=True)

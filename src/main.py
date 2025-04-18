@@ -4,31 +4,25 @@ import fire
 import git
 
 import agent
-import local_config as local_config
 import patch2md as patch2md
 from checker_gen import gen_checker
 from checker_refine import refine_checker, scan, triage_report
 from commit_label import label_commits
-from local_config import logger
+from global_config import global_config, logger
 from model import init_llm
-from prepare import prepare
-
-global_config = dict()  # store information from config.json
 
 
 def init_config(config_file: str):
     """Initialize the configuration file."""
-    local_config.load_config(config_file)
-    global global_config
-    global_config = local_config.get_config()
+    global_config.setup(config_file)
 
     result_dir = global_config.get("result_dir")
     agent.result_dir = Path(result_dir)
-    patch2md.repo = git.Repo(global_config.get("linux_dir"))
 
     logger.debug("Config file: " + config_file)
     logger.debug("Result dir: " + result_dir)
-    logger.debug("Linux dir: " + patch2md.repo.working_dir)
+    logger.debug("Analysis backend: " + str(global_config.get("backend")))
+    logger.debug("Target: " + str(global_config.get("target")))
 
 
 def main(mode: str, *args, **kwargs):
@@ -49,7 +43,6 @@ def main(mode: str, *args, **kwargs):
         "scan": (scan, "Scan the kernel with valid checkers"),
         "triage": (triage_report, "Triage the report"),
         "label": (label_commits, "Label commits"),
-        "prepare": (prepare, "Prepare the data"),
     }
 
     if mode not in modes:

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import patch2md
 from kernel_commands import generate_command
-from local_config import logger
+from global_config import logger
 from patch2md import prepare_repo
 from tools import get_num_bugs, target_objects
 

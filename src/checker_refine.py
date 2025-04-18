@@ -11,9 +11,9 @@ import patch2md
 from agent import check_report, repair_FP
 from checker_data import RefinementResult
 from checker_eval import evaluate_with_history_commit
-from checker_repair import repairChecker
+from checker_repair import repair_checker
 from kernel_commands import generate_command
-from local_config import get_config, logger
+from global_config import global_config, logger
 from patch2md import prepare_repo
 from tools import (
     extract_checker_code,
@@ -133,12 +133,12 @@ def scan(valid_chekcer_meta_dir, arch="x86"):
 
 
 def scan_batch_checkers(checker_dict, arch="x86"):
-    llvm_build_dir = Path(get_config().get("LLVM_dir")) / "build"
-    jobs = get_config().get("jobs")
+    llvm_build_dir = Path(global_config.get("LLVM_dir")) / "build"
+    jobs = global_config.get("jobs")
 
     plugin_name_str = ""
     for checker_id, checker_code in checker_dict.items():
-        plugin_dir = Path(get_config().get("LLVM_dir")) / "clang/lib/Analysis/plugins"
+        plugin_dir = Path(global_config.get("LLVM_dir")) / "clang/lib/Analysis/plugins"
         subprocess.run(["python3", "create_plugin.py", checker_id], cwd=plugin_dir)
         checker_file_path = (
             plugin_dir / f"{checker_id}Handling" / f"{checker_id}Checker.cpp"
@@ -162,7 +162,7 @@ def scan_batch_checkers(checker_dict, arch="x86"):
         )
         subprocess.run(f"make CFLAGS+='-Wall' -j{jobs}", cwd=llvm_build_dir, shell=True)
 
-    output_dir = Path(get_config().get("result_dir")) / "reports"
+    output_dir = Path(global_config.get("result_dir")) / "reports"
     commit = "master"
     comd_prefix = generate_command(
         llvm_build_dir, no_output=True, plugin_names=list(checker_dict.keys())
@@ -206,9 +206,9 @@ def scan_batch_checkers(checker_dict, arch="x86"):
 def refine_checker_worker(
     checker_dir, checker_code, scan=True, attempt_id=0, timeout=900, last_scan_id=None
 ):
-    llvm_build_dir = Path(get_config().get("LLVM_dir")) / "build"
+    llvm_build_dir = Path(global_config.get("LLVM_dir")) / "build"
     checker_build_file = (
-        Path(get_config().get("LLVM_dir"))
+        Path(global_config.get("LLVM_dir"))
         / "clang/lib/Analysis/plugins/SAGenTestHandling/SAGenTestChecker.cpp"
     )
     refine_result = RefinementResult(
@@ -285,7 +285,7 @@ def refine_checker_worker(
     logger.info(f"Extracted {len(reports)} reports!")
     refine_result.num_reports = len(reports)
 
-    linux_dir = get_config().get("linux_dir")
+    linux_dir = global_config.get("linux_dir")
     linux_absolute_path = Path(linux_dir).absolute().as_posix()
 
     report_objs = []
@@ -521,7 +521,7 @@ def run_checker(
         bool: True if the checker is successfully run, None otherwise.
     """
 
-    jobs = get_config().get("jobs")
+    jobs = global_config.get("jobs")
     Path(checker_file_path).write_text(checker_code)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
