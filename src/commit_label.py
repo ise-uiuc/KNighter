@@ -4,8 +4,7 @@ import threading
 from pathlib import Path
 
 from agent import label_commit
-from global_config import logger, global_config
-from patch2md import load_patch
+from global_config import global_config, logger
 
 load_patch_lock = threading.Lock()
 
@@ -30,7 +29,7 @@ def label_commits(commit_file="commits", num_workers=5):
         else:
             try:
                 with load_patch_lock:
-                    patch = load_patch(0, commit_id)
+                    patch = global_config.target.get_patch(commit_id)
                 prompt_history_dir.mkdir(parents=True, exist_ok=True)
                 patch_file.write_text(patch)
             except Exception as e:

@@ -7,21 +7,12 @@ from pathlib import Path
 
 from html2text import html2text
 
-import patch2md
 from agent import check_report, repair_FP
 from checker_data import RefinementResult
-from checker_eval import evaluate_with_history_commit
 from checker_repair import repair_checker
-from kernel_commands import generate_command
 from global_config import global_config, logger
-from patch2md import prepare_repo
-from tools import (
-    extract_checker_code,
-    get_num_bugs,
-    monitor_build_output,
-    remove_text_section,
-    report_objects,
-)
+from kernel_commands import generate_command
+from tools import extract_checker_code, monitor_build_output, remove_text_section
 
 
 def refine_checker(checker_dir, scan=True, max_tries=1):
@@ -40,22 +31,6 @@ def refine_checker(checker_dir, scan=True, max_tries=1):
                 if sub_checker.name in current_result:
                     logger.info(f"Skip {sub_checker.name}!")
                     continue
-
-                # DEBUG: only care about `Refined` checkers
-                # checker_status = f"{sub_checker.name},Refined,"
-                # if checker_status not in current_result:
-                #     logger.info(f"Skip {sub_checker.name} since it is not refined")
-                #     continue
-                # checker_file = None
-                # for i in range(5, 0, -1):
-                #     correct_checker_file = sub_checker / f"checker1-correct-repair{i}.cpp"
-                #     if correct_checker_file.exists():
-                #         logger.debug(f"Checker: {correct_checker_file}")
-                #         checker_file = correct_checker_file
-                #         break
-                # if checker_file is None:
-                #     logger.info(f"Fail to find correct checker in {sub_checker}!")
-                #     continue
 
                 checker_file = sub_checker / "checker1.cpp"
                 if not checker_file.exists():
@@ -172,7 +147,9 @@ def scan_batch_checkers(checker_dict, arch="x86"):
     comd_prefix += f"-o {output_dir_str} "
     olddefcmd = comd_prefix + f"make LLVM=1 ARCH={arch} olddefconfig"
 
-    prepare_repo(commit, is_before=False, olddefcmd=olddefcmd.split(" "))
+    global_config.target().checkout_commit(
+        commit, is_before=False, olddefcmd=olddefcmd.split(" "), arch=arch
+    )
 
     if arch == "arm64":
         logger.warning("ARM64")
@@ -195,7 +172,7 @@ def scan_batch_checkers(checker_dict, arch="x86"):
         comd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=patch2md.repo.working_dir,
+        cwd=global_config.target.repo.working_dir,
         shell=True,
         bufsize=1,
     )
@@ -204,13 +181,17 @@ def scan_batch_checkers(checker_dict, arch="x86"):
 
 
 def refine_checker_worker(
-    checker_dir, checker_code, scan=True, attempt_id=0, timeout=900, last_scan_id=None
+    checker_dir,
+    checker_code,
+    scan=True,
+    attempt_id=0,
+    timeout=900,
+    last_scan_id=None,
+    scan_commit="master",
 ):
-    llvm_build_dir = Path(global_config.get("LLVM_dir")) / "build"
-    checker_build_file = (
-        Path(global_config.get("LLVM_dir"))
-        / "clang/lib/Analysis/plugins/SAGenTestHandling/SAGenTestChecker.cpp"
-    )
+    analysis_backend = global_config.backend
+    target = global_config.target
+
     refine_result = RefinementResult(
         refined=False,
         checker_code="",
@@ -226,13 +207,9 @@ def refine_checker_worker(
     patch = (checker_dir / "patch.md").read_text()
     commit_id = (checker_dir.name.split("-"))[-1]
 
-    checker_build_file.write_text(checker_code)
-    correct, checker_code = repairChecker(
+    correct, checker_code = repair_checker(
         checker_dir.name,
         "repair",
-        checker_build_file,
-        llvm_build_dir,
-        max_idx=4,
         checker_code=checker_code,
     )
     if not correct:
@@ -241,27 +218,21 @@ def refine_checker_worker(
         return refine_result
     logger.info("Compile original code successfully!")
 
-    # newTP, newTN = evaluate_with_history_commit(
-    #     commit_id, patch, llvm_build_dir
-    # )
-    # print(newTP, newTN)
-    # return
-
     if last_scan_id is not None:
         kernel_report_dir = checker_dir / f"kernel-report-{last_scan_id}"
     else:
         kernel_report_dir = checker_dir / f"kernel-report-{attempt_id}"
 
     if scan:
-        # Run the checker to scan the kernel
-        run_res = run_checker(
+        # Run the checker to scan the kernel on the scan commit
+        run_res = analysis_backend.run_checker(
             checker_code,
-            checker_build_file,
-            llvm_build_dir,
-            kernel_report_dir,
+            commit_id=scan_commit,
+            target=target,
             timeout=timeout,
+            output_dir=kernel_report_dir,
         )
-        if run_res is None:
+        if run_res == -999:
             logger.error("Fail to run the checker!")
             refine_result.result = "Unscannable"
             return refine_result
@@ -285,15 +256,12 @@ def refine_checker_worker(
     logger.info(f"Extracted {len(reports)} reports!")
     refine_result.num_reports = len(reports)
 
-    linux_dir = global_config.get("linux_dir")
-    linux_absolute_path = Path(linux_dir).absolute().as_posix()
-
     report_objs = []
     error_objs = []
     num_FP = 0
     fp_reports = []
     for report_id, report_content in reports:
-        objects = report_objects(report_content, linux_absolute_path)
+        objects = analysis_backend.get_objects_from_report(report_content, target)
         check_res = check_report(
             checker_dir.name,
             attempt_id,
@@ -352,12 +320,9 @@ def refine_checker_worker(
             )
 
             # Compile the repaired checker
-            correct, repaired_code = repairChecker(
+            correct, repaired_code = repair_checker(
                 checker_dir.name,
                 f"{idx}-repair",
-                checker_build_file,
-                llvm_build_dir,
-                max_idx=4,
                 checker_code=repaired_checker_code,
             )
             if not correct:
@@ -373,12 +338,12 @@ def refine_checker_worker(
                 # Run the checker to scan the obj
                 obj_str = obj.replace("/", "-").replace(".o", "")
                 kernel_report_dir = checker_dir / f"kernel_report_{obj_str}"
-                run_res = run_checker(
+                run_res = analysis_backend.run_checker(
                     repaired_code,
-                    checker_build_file,
-                    llvm_build_dir,
-                    kernel_report_dir,
-                    target_object=obj,
+                    commit_id=commit_id,
+                    target=target,
+                    kernel_report_dir=kernel_report_dir,
+                    object_to_analyze=obj,
                 )
                 if run_res is None:
                     logger.error("Fail to run the checker!")
@@ -394,10 +359,15 @@ def refine_checker_worker(
             if should_continue:
                 continue
 
-            # Run the checker
-            newTP, newTN = evaluate_with_history_commit(
-                commit_id, patch, llvm_build_dir
+            # Validate the repaired checker on the original commit
+            newTP, newTN = analysis_backend.validate_checker(
+                repaired_code,
+                commit_id,
+                patch,
+                target=target,
+                skip_build_checker=True,
             )
+
             if not (newTP > 0 and newTN > 0):
                 logger.error(f"Fail to repair checker{idx}!")
                 continue
@@ -418,14 +388,15 @@ def refine_checker_worker(
             for obj in error_objs:
                 obj_str = obj.replace("/", "-").replace(".o", "")
                 kernel_report_dir = checker_dir / f"kernel_report_{obj_str}"
-                run_res = run_checker(
+                run_res = analysis_backend.run_checker(
                     checker_code,
-                    checker_build_file,
-                    llvm_build_dir,
-                    kernel_report_dir,
-                    target_object=obj,
+                    commit_id=commit_id,
+                    target=target,
+                    object_to_analyze=obj,
+                    output_dir=kernel_report_dir,
                 )
-                if run_res is None:
+
+                if run_res == -999:
                     logger.error("Fail to run the checker!")
                     continue
                 elif run_res == 0:
@@ -498,97 +469,6 @@ def extract_reports(kernel_report_dir, output_dir, seed=0):
     for key in selected_keys:
         reports.append(clustered_report_dir[key][0])
     return reports, len(clustered_report_dir)
-
-
-def run_checker(
-    checker_code,
-    checker_file_path,
-    llvm_build_dir,
-    output_dir: str,
-    target_object=None,
-    timeout=900,
-):
-    """
-    Runs the checker by compiling the checker code and building the kernel.
-
-    Args:
-        checker_code (str): The code of the checker.
-        checker_file_path (str): The file path to write the checker code.
-        llvm_build_dir (str): The directory path of the LLVM build.
-        output_dir (str): The directory path to store the output.
-
-    Returns:
-        bool: True if the checker is successfully run, None otherwise.
-    """
-
-    jobs = global_config.get("jobs")
-    Path(checker_file_path).write_text(checker_code)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    current_dir = os.getcwd()
-    os.chdir(llvm_build_dir)
-    log_filedir = os.path.join(current_dir, "build_log.log")
-    log_error_filedir = os.path.join(current_dir, "build_error_log.log")
-    os.system(
-        "make SAGenTestPlugin CFLAGS+='-Wall' -j{} > {} 2>{}".format(
-            jobs, log_filedir, log_error_filedir
-        )
-    )
-    os.chdir(current_dir)
-
-    with open(log_error_filedir, "r") as flogerror:
-        error_content = flogerror.read()
-    if error_content:
-        logger.error("Fail to compile the checker!")
-        return None
-
-    # commit = "ed30a4a51bb196781c8058073ea720133a65596f"
-    commit = "master"
-    comd_prefix = generate_command(llvm_build_dir, no_output=True)
-    output_dir_str = str(output_dir.absolute().as_posix())
-    comd_prefix += f"-o {output_dir_str} "
-    olddefcmd = comd_prefix + "make LLVM=1 ARCH=x86 olddefconfig"
-    prepare_repo(commit, is_before=False, olddefcmd=olddefcmd.split(" "))
-
-    comd = comd_prefix + f"make LLVM=1 ARCH=x86 -j{jobs}"
-    if target_object:
-        comd += f" {target_object}"
-    logger.info("Running: " + comd)
-
-    process = subprocess.Popen(
-        # comd.split(" "),
-        comd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=patch2md.repo.working_dir,
-        shell=True,
-        bufsize=1,
-    )
-    output, completed = monitor_build_output(process, 100, timeout=timeout)
-    Path("tmp-output").write_text(output)
-
-    num_bugs = 0
-    if completed == "Complete":
-        return_code = process.wait()
-        if return_code != 0:
-            logger.error("Fail to build the kernel with checker!")
-            logger.error("Return code: " + str(return_code))
-            (output_dir / "scan_error.log").write_text(output)
-            return None
-
-        if "No bugs found" not in output:
-            num_bugs = get_num_bugs(output)
-            logger.success(f"{num_bugs} bugs found!")
-
-    elif completed == "Timeout":
-        logger.warning("Timeout!")
-        num_bugs = -1
-    else:
-        num_bugs = -10
-        logger.warning("Too many bugs found!")
-
-    return num_bugs
 
 
 def collect_reports(commit_report_dir: str, max_num_reports=100) -> tuple[dict, bool]:

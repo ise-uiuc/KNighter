@@ -12,6 +12,7 @@ from queue import Queue
 
 from bs4 import BeautifulSoup
 from loguru import logger
+from kparser.kfunction import KernelFunction
 
 
 def id_maker() -> str:
@@ -316,3 +317,36 @@ def get_num_bugs(content: str) -> int:
         print("Error: Couldn't extract number of bugs from output.")
         num_bugs = 0
     return num_bugs
+
+
+def get_changed_lines_in_diff(diff):
+    lines = []
+    for line in diff.split("\n"):
+        if line.startswith("@@"):
+            match = re.search(r"@@ -(\d*),.* @@.*", line)
+            if match:
+                lines.append(match.group(1))
+    return lines
+
+
+def get_function_codes(commit):
+    codes = set()
+    diffs = commit.diff(commit.hexsha + "^", create_patch=True)
+    for diff in diffs:
+        if diff.a_path.endswith(".c") or diff.a_path.endswith(".h"):
+            file_content_before = commit.repo.git.show(
+                f"{commit.hexsha}^:{diff.a_path}"
+            )
+            changed_lines = get_changed_lines_in_diff(diff.diff.decode("utf-8"))
+
+            temp_file = Path("__temp.c")
+            temp_file.write_text(file_content_before)
+            functions = KernelFunction.from_file(temp_file)
+            if temp_file.exists():
+                temp_file.unlink()
+            for func in functions:
+                for line in changed_lines:
+                    start_line, end_line = func.get_line_numbers()
+                    if start_line <= int(line) <= end_line:
+                        codes.add((diff.a_path, func.name, func.code))
+    return codes

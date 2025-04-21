@@ -4,7 +4,6 @@ import fire
 import git
 
 import agent
-import patch2md as patch2md
 from checker_gen import gen_checker
 from checker_refine import refine_checker, scan, triage_report
 from commit_label import label_commits
