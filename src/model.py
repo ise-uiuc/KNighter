@@ -6,7 +6,7 @@ from azure.core.credentials import AzureKeyCredential
 from google import genai
 from openai import OpenAI
 
-from global_config import logger, global_config
+from global_config import global_config, logger
 
 azure_deepseek_client = None
 deepseek_client = None
@@ -189,7 +189,6 @@ def invoke_llm(
 def get_embeddings(text: str):
     """Get embeddings for the given text."""
     response = openai_client.embeddings.create(
-        input=text,
-        model="text-embedding-ada-002"
+        input=text, model="text-embedding-ada-002"
     )
     return response.data[0].embedding

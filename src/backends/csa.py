@@ -1,12 +1,13 @@
-import subprocess as sp
 import re
-from loguru import logger
+import subprocess as sp
 from pathlib import Path
+
+from loguru import logger
 
 from backends.factory import AnalysisBackendFactory
 from targets.factory import TargetFactory
 from targets.linux import Linux
-from tools import target_objects, monitor_build_output
+from tools import monitor_build_output, target_objects
 
 
 class ClangBackend(AnalysisBackendFactory):

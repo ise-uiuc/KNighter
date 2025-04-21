@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from agent import repair_syntax
-from global_config import logger, global_config
+from global_config import global_config, logger
 from tools import extract_checker_code
 
 # Define constants for clarity
@@ -12,17 +12,31 @@ MAX_REPAIR_ATTEMPTS = 4
 def repair_checker(
     id: str,
     idx: int,
+    checker_code: str,
     max_idx: int = MAX_REPAIR_ATTEMPTS,
     intermediate_dir: Optional[Path] = None,
-    checker_code: Optional[str] = None,
-) -> Tuple[bool, Optional[str]]:
-    """ """
-    base_dir = Path(global_config.get("result_dir", "result")) / id
+) -> Tuple[bool, Optional[str], list]:
+    """
+    Repair the checker code using a language model.
+
+    Args:
+        id (str): The ID of the checker.
+        idx (int): The index of the checker.
+        checker_code (str): Initial checker code.
+        max_idx (int): The maximum number of repair attempts.
+        intermediate_dir (Optional[Path]): Directory for intermediate files.
+    Returns:
+        Tuple[bool, Optional[str], list]: A tuple containing:
+            - success (bool): Whether the repair was successful.
+            - repaired_code (Optional[str]): The repaired checker code.
+            - repair_log_list (list): List of repair logs.
+    """
+
+    base_dir = Path(global_config.result_dir) / id
 
     # Setup directories
     prompt_history_dir = base_dir / "prompt_history" / str(idx)
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
-    response_checker_path = prompt_history_dir / "response_checker.md"
 
     if intermediate_dir is None:
         intermediate_dir = base_dir / f"intermediate-{idx}"
@@ -37,7 +51,7 @@ def repair_checker(
         # Allow max_idx attempts + 1 initial try
         logger.info(f"Compilation attempt {attempt}/{max_idx + 1}")
 
-        return_code, stderr_content = global_config.backend().build_checker(
+        return_code, stderr_content = global_config.backend.build_checker(
             current_checker_code,
             log_dir,
             attempt=attempt,
@@ -82,7 +96,7 @@ def repair_checker(
         except Exception as e:
             logger.error(f"Error during LLM repair call for attempt {attempt}: {e}")
             # Decide whether to retry or fail
-            return False, None  # Fail if LLM call fails
+            return False, None
     # Should not be reached if loop logic is correct, but as a safeguard:
     logger.error("Exited repair loop unexpectedly.")
     return False, None

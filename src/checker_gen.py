@@ -1,4 +1,3 @@
-import os
 import time
 from pathlib import Path
 
@@ -6,7 +5,7 @@ from agent import patch2checker, patch2pattern, pattern2plan, plan2checker
 from checker_data import CheckerData
 from checker_example import init_example
 from checker_repair import repair_checker
-from global_config import logger, global_config
+from global_config import global_config, logger
 from tools import extract_checker_code
 
 
@@ -78,15 +77,18 @@ def gen_checker_worker(
 ):
     """Generate checkers for one commit."""
 
+    analysis_backend = global_config.backend
+    target = global_config.target
+
     checker_id = []
     checker_nums = global_config.get("checker_nums")
 
     id = f"test-{commit_type}-{commit_id}"
-    result_dir = Path(global_config.get("result_dir"))
+    result_dir = Path(global_config.result_dir)
     # Prepare the directory
     build_directory(id)
 
-    patch = global_config.target().get_patch(commit_id)
+    patch = target.get_patch(commit_id)
 
     (result_dir / id).mkdir(parents=True, exist_ok=True)
     (result_dir / id / "commit_id.txt").write_text(commit_id)
@@ -103,6 +105,8 @@ def gen_checker_worker(
 
     # Generate checkers
     for i in range(len(checker_id), checker_nums):
+        checker_data = CheckerData(commit_id, commit_type, result_dir, i)
+
         intermediate_dir = result_dir / id / f"intermediate-{i}"
         intermediate_dir.mkdir(parents=True, exist_ok=True)
 
@@ -146,22 +150,15 @@ def gen_checker_worker(
             checker_code = patch2checker(id, i, patch)
 
         checker_code = extract_checker_code(checker_code)
-        checker_data = CheckerData(
-            commit_id=commit_id,
-            commit_type=commit_type,
-            pattern=pattern,
-            plan=plan,
-            checker_code=checker_code,
-            initial_checker_code=checker_code,
-        )
 
+        # Update the checker data
         (intermediate_dir / "pattern.txt").write_text(pattern)
         (intermediate_dir / "plan.txt").write_text(plan)
         (intermediate_dir / "refined_plan.txt").write_text(refined_plan)
         (intermediate_dir / "checker-0.cpp").write_text(checker_code)
 
         # Repair Checker
-        ret, checker, repair_log_list = repair_checker(
+        ret, checker = repair_checker(
             id=id,
             idx=i,
             max_idx=4,
@@ -172,23 +169,18 @@ def gen_checker_worker(
         if not ret:
             logger.error(f"fail to generate checker{i}")
             checker_id.append((i, -10, -10))
-            checker_data.syntax_repair_log = repair_log_list
             continue
 
         # Store the checker
-        checkers_dir = f"{result_dir}/{id}/checkers"
-        if not os.path.exists(checkers_dir):
-            os.makedirs(checkers_dir)
+        checkers_dir = result_dir / id / "checkers"
+        checkers_dir.mkdir(parents=True, exist_ok=True)
+        (checkers_dir / f"checker{i}.cpp").write_text(checker)
 
-        checker_dir = os.path.join(checkers_dir, f"checker{i}.cpp")
-        with open(checker_dir, "w") as fchecker:
-            fchecker.write(checker)
-
-        TP, TN = global_config.backend().validate_checker(
+        TP, TN = analysis_backend.validate_checker(
             checker,
             commit_id,
             patch,
-            global_config.target(),
+            target,
             skip_build_checker=True,  # Just built the checker
         )
 

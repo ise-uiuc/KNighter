@@ -1,6 +1,7 @@
 import os
-import git
 from abc import ABC, abstractmethod
+
+import git
 
 from patch2md import get_function_codes
 

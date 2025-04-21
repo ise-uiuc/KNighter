@@ -1,7 +1,8 @@
 import re
 import subprocess as sp
-from loguru import logger
 from pathlib import Path
+
+from loguru import logger
 
 from targets.factory import TargetFactory
 

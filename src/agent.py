@@ -3,11 +3,11 @@ from pathlib import Path
 from loguru import logger
 from pydantic import BaseModel
 
+from checker_example import choose_example
+from global_config import global_config
 from model import invoke_llm
 from tools import error_formatting, grab_error_message
-from checker_example import choose_example
 
-result_dir = Path("tmp-result")
 prompt_template_dir = Path(__file__).parent.parent / "prompt_template"
 example_dir = prompt_template_dir / "examples"
 default_checker_examples = []
@@ -15,6 +15,7 @@ default_checker_examples = []
 UTILITY_FUNCTION = (prompt_template_dir / "knowledge" / "utility.md").read_text()
 SUGGESTIONS = (prompt_template_dir / "knowledge" / "suggestions.md").read_text()
 TEMPLATE = (prompt_template_dir / "knowledge" / "template.md").read_text()
+
 
 class Example(BaseModel):
     patch: str
@@ -30,7 +31,9 @@ class Example(BaseModel):
         plan = (checker_dir / "plan.md").read_text()
         checker_code = (checker_dir / "checker.cpp").read_text()
 
-        return Example(patch=patch, pattern=pattern, plan=plan, checker_code=checker_code)
+        return Example(
+            patch=patch, pattern=pattern, plan=plan, checker_code=checker_code
+        )
 
 
 for checker_dir in example_dir.iterdir():
@@ -40,7 +43,11 @@ for checker_dir in example_dir.iterdir():
 
 
 def get_example_text(
-    example_list, need_patch: bool=False, need_pattern: bool=False, need_plan: bool=False, need_checker: bool=False
+    example_list,
+    need_patch: bool = False,
+    need_pattern: bool = False,
+    need_plan: bool = False,
+    need_checker: bool = False,
 ):
     example_text = ""
     for i, example in enumerate(example_list):
@@ -67,7 +74,11 @@ patch2pattern_template = (
 patch2checker_template = patch2pattern_template.replace(
     "{{examples}}",
     get_example_text(
-        default_checker_examples, need_patch=True, need_pattern=False, need_plan=False, need_checker=True
+        default_checker_examples,
+        need_patch=True,
+        need_pattern=False,
+        need_plan=False,
+        need_checker=True,
     ),
 )
 
@@ -76,7 +87,11 @@ patch2pattern_template = (prompt_template_dir / "patch2pattern.md").read_text()
 patch2pattern_template = patch2pattern_template.replace(
     "{{examples}}",
     get_example_text(
-        default_checker_examples, need_patch=True, need_pattern=True, need_plan=False, need_checker=False
+        default_checker_examples,
+        need_patch=True,
+        need_pattern=True,
+        need_plan=False,
+        need_checker=False,
     ),
 )
 
@@ -86,7 +101,11 @@ patch2pattern_general_template = (
 patch2pattern_general_template = patch2pattern_general_template.replace(
     "{{examples}}",
     get_example_text(
-        default_checker_examples, need_patch=True, need_pattern=True, need_plan=False, need_checker=False
+        default_checker_examples,
+        need_patch=True,
+        need_pattern=True,
+        need_plan=False,
+        need_checker=False,
     ),
 )
 
@@ -123,7 +142,9 @@ def label_commit(id: str, iter: int, commit_id, patch: str):
     logger.info("start generating label_commit prompts")
     label_commit_prompt = label_commit_template.replace("{{input_patch}}", patch)
 
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    prompt_history_dir = (
+        Path(global_config.result_dir) / id / "prompt_history" / str(iter)
+    )
     path2store = prompt_history_dir / f"label_commit-{commit_id}.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -148,7 +169,9 @@ def patch2checker(id: str, iter: int, patch: str):
     logger.info("start generating patch2checker prompts")
     patch2checker_prompt = patch2checker_template.replace("{{input_patch}}", patch)
 
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    prompt_history_dir = (
+        Path(global_config.result_dir) / id / "prompt_history" / str(iter)
+    )
     path2store = prompt_history_dir / "patch2checker.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -171,7 +194,9 @@ def patch2pattern(id: str, iter: int, patch_info: str, use_general=False):
 
     patch2pattern_prompt = template.replace("{{input_patch}}", patch_info)
 
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    prompt_history_dir = (
+        Path(global_config.result_dir) / id / "prompt_history" / str(iter)
+    )
     path2store = prompt_history_dir / "patch2pattern.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -213,7 +238,7 @@ def pattern2plan(
         template = pattern2plan_template_no_utility
     else:
         template = pattern2plan_template
-    
+
     if sample_examples:
         logger.warning("Sample examples for pattern2plan")
         example_list = choose_example(pattern, "pattern")
@@ -221,11 +246,17 @@ def pattern2plan(
         example_list = default_checker_examples
 
     example_text = get_example_text(
-        example_list, need_patch=False, need_pattern=True, need_plan=True, need_checker=False
+        example_list,
+        need_patch=False,
+        need_pattern=True,
+        need_plan=True,
+        need_checker=False,
     )
-    pattern2plan_prompt = template.replace("{{input_pattern}}", pattern).replace(
-        "{{input_patch}}", patch
-    ).replace("{{examples}}", example_text)
+    pattern2plan_prompt = (
+        template.replace("{{input_pattern}}", pattern)
+        .replace("{{input_patch}}", patch)
+        .replace("{{examples}}", example_text)
+    )
 
     feedback_plan_text = ""
     if no_tp_plans:
@@ -253,7 +284,9 @@ def pattern2plan(
         "{{failed_plan_examples}}", feedback_plan_text
     )
 
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    prompt_history_dir = (
+        Path(global_config.result_dir) / id / "prompt_history" / str(iter)
+    )
     path2store = prompt_history_dir / "pattern2plan.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -268,7 +301,13 @@ def pattern2plan(
 
 
 def plan2checker(
-    id: str, iter: int, pattern: str, refined_plan: str, patch: str, no_utility=False, sample_examples=False
+    id: str,
+    iter: int,
+    pattern: str,
+    refined_plan: str,
+    patch: str,
+    no_utility=False,
+    sample_examples=False,
 ):
     logger.info("start generating plan2checker prompts")
     if no_utility:
@@ -276,7 +315,7 @@ def plan2checker(
         template = plan2checker_template_no_utility
     else:
         template = plan2checker_template
-    
+
     if sample_examples:
         logger.warning("Sample examples for plan2checker")
         example_list = choose_example(refined_plan, "plan")
@@ -284,7 +323,11 @@ def plan2checker(
         example_list = default_checker_examples
 
     example_text = get_example_text(
-        example_list, need_patch=False, need_pattern=True, need_plan=True, need_checker=True
+        example_list,
+        need_patch=False,
+        need_pattern=True,
+        need_plan=True,
+        need_checker=True,
     )
 
     plan2checker_prompt = (
@@ -294,7 +337,9 @@ def plan2checker(
         .replace("{{examples}}", example_text)
     )
 
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    prompt_history_dir = (
+        Path(global_config.result_dir) / id / "prompt_history" / str(iter)
+    )
     path2store = prompt_history_dir / "plan2checker.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -318,7 +363,9 @@ def check_report(id: str, iter: int, report_id, report_md, pattern: str, patch: 
     )
     check_report_prompt = check_report_prompt.replace("{{input_patch}}", patch)
 
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    prompt_history_dir = (
+        Path(global_config.result_dir) / id / "prompt_history" / str(iter)
+    )
     path2store = prompt_history_dir / f"check_report-{report_id}.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -340,7 +387,9 @@ def check_report(id: str, iter: int, report_id, report_md, pattern: str, patch: 
 
 def reduce_report(id: str, iter: int, report_id, report_md):
     logger.info("start generating reduce_report prompts")
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    prompt_history_dir = (
+        Path(global_config.result_dir) / id / "prompt_history" / str(iter)
+    )
     response_store = prompt_history_dir / f"response_reduce_report-{report_id}.md"
     if response_store.exists():
         logger.info("reduce_report already exists")
@@ -379,7 +428,9 @@ def repair_FP(
         "{{utility_functions}}", UTILITY_FUNCTION
     )
 
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    prompt_history_dir = (
+        Path(global_config.result_dir) / id / "prompt_history" / str(iter)
+    )
     path2store = prompt_history_dir / f"repair_FP-{commit_id}.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
@@ -403,7 +454,9 @@ def repair_syntax(id: str, iter: int, times, checker_code, error_content):
         "{errors}", error_list_md
     )
 
-    prompt_history_dir = Path(result_dir) / id / "prompt_history" / str(iter)
+    prompt_history_dir = (
+        Path(global_config.result_dir) / id / "prompt_history" / str(iter)
+    )
     path2store = prompt_history_dir / f"repair_syntax-{times}.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
