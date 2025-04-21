@@ -1,3 +1,4 @@
+import os
 import git
 from abc import ABC, abstractmethod
 
@@ -8,14 +9,18 @@ class TargetFactory(ABC):
     """
     A class representing a Git repository.
     """
+
     _target_type = "generic"
+    _build_commands = None
 
     def __init__(self, repo_path: str):
         self.repo = git.Repo(repo_path)
 
+    def __str__(self):
+        return f"Target Type: {self._target_type}, Repository Path: {self.repo.working_dir}"
 
     @abstractmethod
-    def checkout_commit(self, commit_id: str, is_before: bool, **kwargs):
+    def checkout_commit(self, commit_id: str, is_before: bool = False, **kwargs):
         """
         Checkout a specific commit in the repository.
 
@@ -26,6 +31,20 @@ class TargetFactory(ABC):
         """
         pass
 
+    @staticmethod
+    @abstractmethod
+    def get_object_name(file_name: str) -> str:
+        """
+        Get the object name from a file name.
+
+        Args:
+            file_name (str): The name of the file.
+
+        Returns:
+            str: The object name.
+        """
+        raise NotImplementedError("Subclasses must implement this method.")
+
     def get_patch(self, commit_id: str) -> str:
         """
         Get the patch for a specific commit formatted as Markdown.
@@ -34,7 +53,7 @@ class TargetFactory(ABC):
             commit_id (str): The commit ID to get the patch for.
 
         Returns:
-            str: Formatted patch as Markdown including commit message, 
+            str: Formatted patch as Markdown including commit message,
                  affected functions, and diff.
 
         Raises:
@@ -44,32 +63,42 @@ class TargetFactory(ABC):
             commit = self.repo.commit(commit_id)
         except git.exc.BadName:
             raise ValueError(f"Commit '{commit_id}' not found in repository")
-            
+
         message = commit.message.strip()
-        
+
         # Get the diff between this commit and its parent
         parent_id = commit.hexsha + "^"
         diff = commit.repo.git.diff(parent_id, commit.hexsha)
-        
+
         # Get affected function code
         func_code_set = get_function_codes(commit)
-        
+
         # Build the markdown content in parts for better readability
         sections = []
-        
+
         # Add commit description
         sections.append("## Patch Description\n\n" + message + "\n")
-        
+
         # Add buggy code section
         sections.append("## Buggy Code\n")
         for func_name, _, func_code in func_code_set:
             sections.append(f"```c\n// {func_name}\n{func_code}\n```\n")
-        
+
         # Add patch diff
         sections.append("## Bug Fix Patch\n\n```diff\n" + diff + "\n```\n")
-        
+
         # Join all sections with newlines
         return "\n".join(sections)
-    
-    def __str__(self):
-        return f"Target Type: {self._target_type}, Repository Path: {self.repo.working_dir}"
+
+    @staticmethod
+    def path_similarity(path1, path2):
+        """Calculate the similarity of two paths based on their components."""
+        components1 = path1.split(os.sep)
+        components2 = path2.split(os.sep)
+
+        # Count the common components
+        common_components = len(set(components1) & set(components2))
+        total_components = len(set(components1) | set(components2))
+
+        # Simple ratio of common components to total unique components
+        return common_components / total_components

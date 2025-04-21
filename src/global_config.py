@@ -10,8 +10,6 @@ from targets.factory import TargetFactory
 from targets.linux import Linux
 
 
-global_config = dict()
-key_config = dict()
 logger = loguru.logger
 
 class GlobalConfig:
