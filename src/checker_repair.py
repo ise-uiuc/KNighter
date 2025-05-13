@@ -11,17 +11,17 @@ MAX_REPAIR_ATTEMPTS = 4
 
 def repair_checker(
     id: str,
-    idx: int,
+    repair_name: str,
     checker_code: str,
     max_idx: int = MAX_REPAIR_ATTEMPTS,
     intermediate_dir: Optional[Path] = None,
-) -> Tuple[bool, Optional[str], list]:
+) -> Tuple[bool, Optional[str]]:
     """
     Repair the checker code using a language model.
 
     Args:
         id (str): The ID of the checker.
-        idx (int): The index of the checker.
+        repair_name (str): The name of the repair.
         checker_code (str): Initial checker code.
         max_idx (int): The maximum number of repair attempts.
         intermediate_dir (Optional[Path]): Directory for intermediate files.
@@ -29,20 +29,19 @@ def repair_checker(
         Tuple[bool, Optional[str], list]: A tuple containing:
             - success (bool): Whether the repair was successful.
             - repaired_code (Optional[str]): The repaired checker code.
-            - repair_log_list (list): List of repair logs.
     """
 
     base_dir = Path(global_config.result_dir) / id
 
     # Setup directories
-    prompt_history_dir = base_dir / "prompt_history" / str(idx)
+    prompt_history_dir = base_dir / "prompt_history" / repair_name
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
 
     if intermediate_dir is None:
-        intermediate_dir = base_dir / f"intermediate-{idx}"
+        intermediate_dir = base_dir / f"intermediate-{repair_name}"
     intermediate_dir.mkdir(parents=True, exist_ok=True)
 
-    log_dir = base_dir / "build_logs" / str(idx)
+    log_dir = base_dir / "build_logs" / repair_name
     log_dir.mkdir(parents=True, exist_ok=True)
 
     current_checker_code = checker_code
@@ -78,7 +77,7 @@ def repair_checker(
         logger.info(f"Attempting repair {attempt} using LLM...")
         try:
             llm_response = repair_syntax(
-                id, idx, attempt, current_checker_code, stderr_content
+                id, repair_name, attempt, current_checker_code, stderr_content
             )
             new_checker_code = extract_checker_code(llm_response)
 

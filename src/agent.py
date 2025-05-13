@@ -412,7 +412,7 @@ def reduce_report(id: str, iter: int, report_id, report_md):
 
 
 def repair_FP(
-    id: str, iter: int, commit_id, pattern: str, report, checker_code, analysis, patch
+    id: str, iter: int, commit_id: str, pattern: str, report, checker_code, analysis, patch
 ):
     logger.info("start generating repair_FP prompts")
     repair_FP = (prompt_template_dir / "repair_FP.md").read_text()

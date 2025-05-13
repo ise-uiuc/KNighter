@@ -14,6 +14,7 @@ logger = loguru.logger
 
 
 class GlobalConfig:
+    """Singleton class to manage global configuration settings."""
     _instance = None
 
     def __new__(cls, *args, **kwargs):
@@ -28,7 +29,9 @@ class GlobalConfig:
 
     def setup(self, config_path: str = "config.yaml", keys_path: str = "llm_keys.yaml"):
         if self._initialized:
+            logger.warning("GlobalConfig is already initialized.")
             return
+
         self._load_config(config_path)
         self._load_keys(keys_path)
         self._initialized = True
@@ -95,5 +98,14 @@ class GlobalConfig:
         """Get the result directory."""
         return Path(self.get("result_dir"))
 
+    @property
+    def scan_timeout(self) -> Optional[int]:
+        """Get the scan timeout."""
+        return self.get("scan_timeout", 600)
+    
+    @property
+    def scan_commit(self) -> Optional[str]:
+        """Get the scan commit."""
+        return self.get("scan_commit", "HEAD")
 
 global_config = GlobalConfig()

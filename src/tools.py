@@ -199,6 +199,10 @@ def monitor_build_output(process, warning_limit=100, timeout=None):
 
 
 def get_source_code(html_text):
+    """
+    Extract the relavent source code from the html report.
+    Note, this is specifically for LLVM style reports.
+    """
     start = html_text.find("relevant_lines = ") + len("relevant_lines = ")
     end = html_text.find(";", start)
     relevant_lines = json.loads(html_text[start:end])

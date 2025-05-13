@@ -1,5 +1,6 @@
 import time
 from pathlib import Path
+from typing import List
 
 from agent import patch2checker, patch2pattern, pattern2plan, plan2checker
 from checker_data import CheckerData
@@ -20,7 +21,7 @@ def gen_checker(
     logger.info("Using multi: " + str(use_multi))
 
     content = Path(commit_file).read_text()
-    result_dir = Path(global_config.get("result_dir"))
+    result_dir = Path(global_config.result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
 
     result_content = ""
@@ -81,12 +82,13 @@ def gen_checker_worker(
     target = global_config.target
 
     checker_id = []
+    checker_data_list: List[CheckerData] = []
     checker_nums = global_config.get("checker_nums")
 
-    id = f"test-{commit_type}-{commit_id}"
+    id = f"AllGen-{commit_type}-{commit_id}"
     result_dir = Path(global_config.result_dir)
     # Prepare the directory
-    build_directory(id)
+    _build_directory(id)
 
     patch = target.get_patch(commit_id)
 
@@ -105,7 +107,7 @@ def gen_checker_worker(
 
     # Generate checkers
     for i in range(len(checker_id), checker_nums):
-        checker_data = CheckerData(commit_id, commit_type, result_dir, i)
+        checker_data = CheckerData(commit_id, commit_type, result_dir, i, patch)
 
         intermediate_dir = result_dir / id / f"intermediate-{i}"
         intermediate_dir.mkdir(parents=True, exist_ok=True)
@@ -151,40 +153,52 @@ def gen_checker_worker(
 
         checker_code = extract_checker_code(checker_code)
 
-        # Update the checker data
+        # Update the checker_data
+        checker_data.pattern = pattern
+        checker_data.plan = plan
+        checker_data.initial_checker_code = checker_code
+
+        # Dump the checker data
         (intermediate_dir / "pattern.txt").write_text(pattern)
         (intermediate_dir / "plan.txt").write_text(plan)
         (intermediate_dir / "refined_plan.txt").write_text(refined_plan)
         (intermediate_dir / "checker-0.cpp").write_text(checker_code)
 
         # Repair Checker
-        ret, checker = repair_checker(
+        ret, repaired_checker_code = repair_checker(
             id=id,
-            idx=i,
+            repair_name="syntax-repair-" + str(i),
             max_idx=4,
             intermediate_dir=intermediate_dir,
             checker_code=checker_code,
         )
+        checker_data.repaired_checker_code = repaired_checker_code
 
         if not ret:
-            logger.error(f"fail to generate checker{i}")
+            logger.error(f"Fail to generate compilable checker{i}")
             checker_id.append((i, -10, -10))
+            checker_data_list.append(checker_data)
             continue
 
         # Store the checker
         checkers_dir = result_dir / id / "checkers"
         checkers_dir.mkdir(parents=True, exist_ok=True)
-        (checkers_dir / f"checker{i}.cpp").write_text(checker)
+        (checkers_dir / f"checker{i}.cpp").write_text(repaired_checker_code)
 
         TP, TN = analysis_backend.validate_checker(
-            checker,
+            repaired_checker_code,
             commit_id,
             patch,
             target,
             skip_build_checker=True,  # Just built the checker
         )
 
+        # Update the checker_data
+        checker_data.tp_score = TP
+        checker_data.tn_score = TN
+
         checker_id.append((i, TP, TN))
+        checker_data_list.append(checker_data)
         logger.info(f"Checker{i} TP: {TP} TN: {TN}")
         if TP > 0 and TN > 0:
             logger.info(f"Find a perfect checker{i}!")
@@ -192,6 +206,11 @@ def gen_checker_worker(
         elif TP == -1 and TN == -1:
             logger.error(f"Fail to evaluate checker{i}!")
             break
+
+    for checker_data in checker_data_list:
+        # Write the checker data
+        checker_data.dump()
+        checker_data.dump_dir()
 
     # First compare the TP, then TN
     checker_id = sorted(checker_id, key=lambda x: (x[1], x[2]), reverse=True)
@@ -203,13 +222,11 @@ def gen_checker_worker(
     return checker_id
 
 
-def build_directory(id: str):
+def _build_directory(id: str):
     """Build the directory structure for the result."""
-    basedir = Path(global_config.get("result_dir")) / id
+    basedir = Path(global_config.result_dir) / id
     basedir.mkdir(parents=True, exist_ok=True)
     build_log_dir = basedir / "build_logs"
-    repair_log_dir = basedir / "repair_logs"
     prompt_history_dir = basedir / "prompt_history"
     build_log_dir.mkdir(parents=True, exist_ok=True)
-    repair_log_dir.mkdir(parents=True, exist_ok=True)
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
