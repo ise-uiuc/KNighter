@@ -25,18 +25,18 @@ using namespace taint;
 {{Customize program states}} // If necessary
 
 namespace {
-/*The checker callbacks are to be decided.*/
+/* The checker callbacks are to be decided. */
 class SAGenTestChecker : public Checker<{{Callback Functions}}> {
    mutable std::unique_ptr<BugType> BT;
 
    public:
-      SAGenTestChecker() : BT(new BugType(this, "{{Bug type description}}")) {}
+      SAGenTestChecker() : BT(new BugType(this, "{{Bug Group}}", "{{Bug Type}}")) {}
 
       {{Declaration of Callback Functions}}
 
    private:
 
-      {{Declaration of Sefl-defined Functions}}
+      {{Declaration of Self-Defined Functions}}
 };
 
 {{Your Functions: functions should be complete and runable}}

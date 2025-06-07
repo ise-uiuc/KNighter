@@ -1,14 +1,24 @@
 from pathlib import Path
-from model import get_embeddings
-from pydantic import BaseModel
 
 import torch
+from pydantic import BaseModel
+
+from model import get_embeddings
 
 example_dir = Path(__file__).parent.parent / "checker_database"
 example_list = []
 
-class ExampleChecker():
-    def __init__(self, patch: str, pattern: str, plan: str, checker_code: str, pattern_embedding: torch.Tensor, plan_embedding: torch.Tensor):
+
+class ExampleChecker:
+    def __init__(
+        self,
+        patch: str,
+        pattern: str,
+        plan: str,
+        checker_code: str,
+        pattern_embedding: torch.Tensor,
+        plan_embedding: torch.Tensor,
+    ):
         self.patch = patch
         self.pattern = pattern
         self.plan = plan
@@ -52,9 +62,13 @@ def choose_example(content: str, type: str, num_samples=3):
     similarity_list = []
     for example in example_list:
         if type == "pattern":
-            similarity = torch.cosine_similarity(embeddings, example.pattern_embedding, dim=0)
+            similarity = torch.cosine_similarity(
+                embeddings, example.pattern_embedding, dim=0
+            )
         elif type == "plan":
-            similarity = torch.cosine_similarity(embeddings, example.plan_embedding, dim=0)
+            similarity = torch.cosine_similarity(
+                embeddings, example.plan_embedding, dim=0
+            )
         else:
             raise ValueError(f"Invalid type: {type}")
         similarity_list.append((similarity, example))
