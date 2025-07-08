@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an error handling path where a resource (here, the request allocated via hwrm_req_init/hwrm_req_replace) is not released on failure. In the original code, when hwrm_req_replace() fails, the function returns immediately without calling the corresponding cleanup routine (hwrm_req_drop), leading to a memory leak. This pattern—returning early in an error path without properly freeing or dropping an allocated resource—is a common issue that can result in resource leaks.

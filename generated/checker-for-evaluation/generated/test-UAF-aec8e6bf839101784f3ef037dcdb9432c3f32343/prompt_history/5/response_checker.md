@@ -1,0 +1,105 @@
+```cpp
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Decl.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/Stmt.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Basic/SourceLocation.h"
+#include "clang/Frontend/FrontendAction.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/AnalysisManager.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// No additional program-state maps are needed for this checker.
+
+namespace {
+
+// A RecursiveASTVisitor to search for an assignment that resets "bdev_file" to NULL.
+class BdevFileResetVisitor : public RecursiveASTVisitor<BdevFileResetVisitor> {
+public:
+  explicit BdevFileResetVisitor(ASTContext &Ctx)
+    : Context(Ctx), ResetFound(false) {}
+
+  bool VisitBinaryOperator(BinaryOperator *BO) {
+    // We are only interested in assignment operators.
+    if (BO->getOpcode() != BO_Assign)
+      return true;
+
+    // Check the left-hand side of the assignment.
+    Expr *LHS = BO->getLHS()->IgnoreParenCasts();
+    if (auto *ME = dyn_cast<MemberExpr>(LHS)) {
+      // Check if the member being assigned is named "bdev_file".
+      if (ME->getMemberDecl()->getNameAsString() == "bdev_file") {
+        // Now check that the right-hand side is a NULL constant.
+        Expr *RHS = BO->getRHS()->IgnoreParenCasts();
+        if (RHS->isNullPointerConstant(Context, Expr::NPC_ValueDependentIsNull))
+          ResetFound = true;
+      }
+    }
+    return true;
+  }
+
+  bool isResetFound() const { return ResetFound; }
+
+private:
+  ASTContext &Context;
+  bool ResetFound;
+};
+
+class SAGenTestChecker : public Checker<check::ASTCodeBody> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() : BT(new BugType(this, "Dangling Pointer", "Use-after-free")) {}
+
+  // Check the body of function definitions.
+  void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {
+    // Only process function declarations.
+    const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+    if (!FD)
+      return;
+    // We are only interested in the function "btrfs_close_one_device".
+    if (FD->getNameAsString() != "btrfs_close_one_device")
+      return;
+    if (!FD->hasBody())
+      return;
+
+    ASTContext &Ctx = FD->getASTContext();
+    const Stmt *Body = FD->getBody();
+
+    // Traverse the function body to search for an assignment that sets "bdev_file" to NULL.
+    BdevFileResetVisitor Visitor(Ctx);
+    Visitor.TraverseStmt(const_cast<Stmt*>(Body));
+
+    // If no such assignment is found, report a bug.
+    if (!Visitor.isResetFound()) {
+      BugReport *R = new BasicBugReport(*BT,
+        "Dangling pointer: device->bdev_file is not reset to NULL after free", FD);
+      R->addRange(FD->getSourceRange());
+      BR.emitReport(std::unique_ptr<BugReport>(R));
+    }
+  }
+};
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects use-after-free due to device->bdev_file not being reset to NULL after free", 
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+```

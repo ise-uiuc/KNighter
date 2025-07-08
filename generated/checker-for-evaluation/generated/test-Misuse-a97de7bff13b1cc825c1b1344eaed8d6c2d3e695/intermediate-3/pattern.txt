@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is failing to validate that the user-supplied length (optlen) is sufficient before copying a fixed-size structure from user space. In this case, the code originally used a memory copy function (copy_from_sockptr) without ensuring that the optlen parameter is at least as large as the expected data (such as sizeof(u32) or sizeof(sec)), which can lead to out-of-bounds memory access and potential security issues. The patch fixes this by using a function (bt_copy_from_sockptr) that takes the provided length into account and properly validates it before copying data.

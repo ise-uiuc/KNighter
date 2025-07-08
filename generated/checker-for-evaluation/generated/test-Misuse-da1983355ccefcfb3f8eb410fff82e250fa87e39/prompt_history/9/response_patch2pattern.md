@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an initialization order error when using __counted_by (or similar fortify attributes) for parameter checking in memory functions. In this patch, a structure field that conveys the size of a variable-length array (num_trips) is not set before a memcpy call. As a result, despite having allocated and zero-initialized the memory, the fortify checks incorrectly assume a zero buffer length during the memcpy. Programs using a __counted_by attribute must ensure that the count field is set before performing operations (like memcpy) that rely on it for bounds checking.

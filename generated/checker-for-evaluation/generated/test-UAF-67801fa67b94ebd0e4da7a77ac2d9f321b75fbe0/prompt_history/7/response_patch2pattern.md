@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is exposing a partially initialized object by registering it (via xa_alloc) before its complete setup, which can lead to a use-after-free vulnerability. In this case, allocating a user-space identifier for the newly created queue before the entire creation process is finished allows an attacker to prematurely trigger the queue's destruction, leaving subsequent operations referencing freed memory. The root cause is the premature global registration of an object that isn’t fully initialized, enabling a race condition where the object's lifetime isn’t properly managed.

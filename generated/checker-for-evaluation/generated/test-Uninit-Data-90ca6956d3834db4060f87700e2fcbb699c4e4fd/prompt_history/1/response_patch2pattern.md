@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Automatically cleaned-up pointer variables (marked with __free(kfree)) that are not explicitly initialized to NULL may hold garbage values. When the function exits, the cleanup mechanism calls kfree() on these uninitialized pointers, leading to improper freeing of memory (or even double free/crashes) if the pointers were never assigned a valid memory address. The root cause is failing to initialize such cleanup-annotated pointers to NULL before they might be freed.

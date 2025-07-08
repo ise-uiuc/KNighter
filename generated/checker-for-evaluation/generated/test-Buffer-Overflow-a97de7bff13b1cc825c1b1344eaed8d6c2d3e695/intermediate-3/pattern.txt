@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using fixed-size memory copy operations from user space without ensuring that the user-provided length is sufficient. In this instance, the original code uses copy_from_sockptr() to copy a fixed amount of data without validating that the optlen parameter is at least as large as the expected size, which can lead to out-of-bounds memory access. The bug pattern is essentially failing to properly validate and enforce user input size prior to copying memory from user space.

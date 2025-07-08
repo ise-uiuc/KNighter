@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Iterating over an array while using an index offset (i.e., accessing element at i+1) without adjusting the loop boundary can result in an out-of-bounds access. In this case, the loop originally iterated from 0 to MAX_PIPES*2 (all valid indices), but later accessed dc->links[i+1]—which becomes invalid when i equals MAX_PIPES*2-1. This pattern of not ensuring that the offset remains within array bounds can lead to a buffer overflow.

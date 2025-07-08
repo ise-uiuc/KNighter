@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Iterating over a range determined by one constant while accessing a parallel array that has a smaller size. In this case, the loop runs for VG_NUM_SOC_VOLTAGE_LEVELS iterations, but the array DcfClocks is only allocated for VG_NUM_DCFCLK_DPM_LEVELS elements. This mismatch leads to an out-of-bounds access when the loop index exceeds the size of DcfClocks, causing a potential buffer overflow.

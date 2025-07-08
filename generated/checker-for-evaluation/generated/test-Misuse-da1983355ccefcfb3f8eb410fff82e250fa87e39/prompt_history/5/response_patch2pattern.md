@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is using a structure field as a size/count indicator for a memory copy before the field has been properly initialized. In this case, the uninitialized num_trips field is relied upon (via __counted_by() or equivalent fortify checks) during the memcpy operation, causing the bounds check to erroneously assume a zero-sized buffer and thereby trigger a buffer overflow panic. The root cause is performing operations that depend on a value (num_trips) before it is set, which can lead to runtime errors when safety mechanisms like __fortify_report detect inconsistencies.

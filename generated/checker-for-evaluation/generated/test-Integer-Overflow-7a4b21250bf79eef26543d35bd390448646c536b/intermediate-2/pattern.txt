@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing arithmetic operations (specifically left shifts used in rounding up to the nearest power of two) on unchecked integer inputs can cause an overflow, leading to undefined behavior on 32-bit systems. In this case, calling roundup_pow_of_two() without first ensuring that the value being rounded is within a safe range allows a potential overflow in the intermediate 32-bit arithmetic, making it necessary to check the value before applying the operation.

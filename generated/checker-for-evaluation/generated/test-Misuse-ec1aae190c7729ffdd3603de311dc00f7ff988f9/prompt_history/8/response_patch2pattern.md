@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is initializing or updating the counter (i.e. the field annotated with __counted_by that defines the size of a flexible array member) after the flexible array is accessed. This incorrect ordering means that any runtime bounds-checks (as provided by CONFIG_FORTIFY_SOURCE or similar mechanisms) use an outdated or zero-length counter, potentially triggering a buffer overflow when data is copied into the flexible array. The root cause is the misplacement of the counter assignment, which should occur before any operations on the flexible array to ensure proper bounds validation.

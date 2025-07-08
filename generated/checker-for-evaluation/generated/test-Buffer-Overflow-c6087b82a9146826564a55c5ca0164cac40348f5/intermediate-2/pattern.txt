@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is copying data from user space into a fixed-size kernel buffer without constraining the number of bytes to the buffer’s capacity. In this case, using copy_from_user() with a user-supplied length (nbytes) greater than the available size of the kernel buffer can lead to a buffer overflow. The correct approach restricts the number of bytes copied (using min() with the buffer size minus one) to prevent this overflow vulnerability.

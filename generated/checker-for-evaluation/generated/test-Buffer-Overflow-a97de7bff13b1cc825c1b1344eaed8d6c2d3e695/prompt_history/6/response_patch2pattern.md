@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Failing to validate the user-supplied buffer length when copying socket option data from user space. In this pattern, the code calls a copy function (copy_from_sockptr) without ensuring that the provided length (optlen) is at least as large as the destination buffer size. This can lead to slab-out-of-bounds memory accesses when users supply an unexpectedly short length. The fix replaces the call with a version (bt_copy_from_sockptr) that checks the provided length against the expected size, thereby preventing memory overreads.

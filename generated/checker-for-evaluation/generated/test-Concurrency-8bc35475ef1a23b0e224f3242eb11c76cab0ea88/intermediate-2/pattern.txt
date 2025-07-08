@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is accessing shared work item state (work->data) before verifying that the context requires such access. In the buggy code, work->data is read unconditionally—even when the cancellation flag isn’t set—resulting in a potentially unsafe read that triggers spurious data race detection (via KCSAN). The root issue is that a memory read from a concurrently updated variable is performed without first checking a flag (from_cancel) that indicates whether the read is necessary or safe, leading to a false-positive race condition.

@@ -1,0 +1,96 @@
+```cpp
+#include "clang/AST/Expr.h"
+#include "clang/AST/Stmt.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// No additional program state is necessary for this checker.
+
+namespace {
+
+/// TRANSFER_FUNC_POINTS is the upper bound for valid array indexes.
+/// In the bug patch, accesses with index >= TRANSFER_FUNC_POINTS trigger a failure.
+/// Here, we define it as a constant.
+static const int TRANSFER_FUNC_POINTS = 1024;
+
+class SAGenTestChecker : public Checker<check::PreStmt<ArraySubscriptExpr> > {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() 
+    : BT(new BugType(this, "Array Index Out-Of-Bounds",
+         "A computed index may be out of the valid bounds of TRANSFER_FUNC_POINTS")) {}
+
+  // Callback when an ArraySubscriptExpr is encountered.
+  void checkPreStmt(const Stmt *S, CheckerContext &C) const;
+
+private:
+  // You may add helper functions if needed.
+};
+
+void SAGenTestChecker::checkPreStmt(const Stmt *S, CheckerContext &C) const {
+  const ArraySubscriptExpr *ASE = dyn_cast<ArraySubscriptExpr>(S);
+  if (!ASE)
+    return;
+
+  // Get the base expression of the array subscript.
+  const Expr *BaseExpr = ASE->getBase();
+  if (!BaseExpr)
+    return;
+
+  // Narrow the check to accesses on the "tf_pts" field.
+  // We use the utility function ExprHasName to see if the expression's source text
+  // contains "tf_pts". This will focus our checker on the intended data structure.
+  if (!ExprHasName(BaseExpr, "tf_pts", C))
+    return;
+
+  // Retrieve the index expression.
+  const Expr *IndexExpr = ASE->getIdx();
+  if (!IndexExpr)
+    return;
+
+  llvm::APSInt EvalIndex;
+  // Try to evaluate the index expression to a constant integer value.
+  if (!EvaluateExprToInt(EvalIndex, IndexExpr, C))
+    return; // Non-constant indices are not reported.
+
+  // Convert the evaluated index to an integer.
+  int64_t IndexValue = EvalIndex.getExtValue();
+
+  // Check if the index is out-of-bound compared to TRANSFER_FUNC_POINTS.
+  if (IndexValue >= TRANSFER_FUNC_POINTS) {
+    ExplodedNode *ErrNode = C.generateNonFatalErrorNode();
+    if (!ErrNode)
+      return;
+
+    auto Report = std::make_unique<PathSensitiveBugReport>(
+        *BT, "Array index may exceed TRANSFER_FUNC_POINTS", ErrNode);
+    Report->addRange(ASE->getSourceRange());
+    C.emitReport(std::move(Report));
+  }
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects array access using a computed index without proper bounds-checking against TRANSFER_FUNC_POINTS",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+```

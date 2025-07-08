@@ -1,0 +1,141 @@
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/AST/Expr.h"
+#include "clang/Basic/SourceManager.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// Customize program states:
+// Track allocated netdev pointers: the key is the MemRegion of the allocated netdev.
+// The value 'true' indicates that the netdev is still live (allocated and not freed).
+REGISTER_MAP_WITH_PROGRAMSTATE(NetdevAllocMap, const MemRegion*, bool)
+// (Optional) Map for tracking pointer aliasing.
+REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)
+
+namespace {
+
+class SAGenTestChecker : public Checker<check::PostCall, check::EndFunction, check::Bind> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() : BT(new BugType(this, "Memory Leak", "Resource Leak")) {}
+
+  // Callback invoked after function calls are processed.
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  // Callback invoked at function exit.
+  void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;
+  // Callback to track pointer aliasing.
+  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+
+private:
+  // (Optional) A helper to report memory leak bug.
+  void reportMemoryLeak(const MemRegion *MR, CheckerContext &C) const;
+};
+
+void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr)
+    return;
+  
+  const IdentifierInfo *CalleeII = Call.getCalleeIdentifier();
+  if (!CalleeII)
+    return;
+
+  // Match allocation function: alloc_etherdev
+  if (CalleeII->getName() == "alloc_etherdev") {
+    // Retrieve the allocated netdev pointer from the call expression.
+    const MemRegion *MR = getMemRegionFromExpr(OriginExpr, C);
+    if (!MR)
+      return;
+    MR = MR->getBaseRegion();
+    // Mark this netdev resource as allocated ("live" = true).
+    State = State->set<NetdevAllocMap>(MR, true);
+    C.addTransition(State);
+  }
+  // Match deallocation function: free_netdev. The pointer to be freed is the first argument.
+  else if (CalleeII->getName() == "free_netdev") {
+    SVal Arg0 = Call.getArgSVal(0);
+    if (const MemRegion *MR = Arg0.getAsRegion()) {
+      MR = MR->getBaseRegion();
+      // Mark this netdev as freed ("live" = false).
+      State = State->set<NetdevAllocMap>(MR, false);
+      C.addTransition(State);
+    }
+  }
+}
+
+void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  // Retrieve the NetdevAllocMap from the program state.
+  auto AllocMap = State->get<NetdevAllocMap>();
+
+  // Iterate over every allocated netdev region.
+  for (auto I = AllocMap.begin(), E = AllocMap.end(); I != E; ++I) {
+    // If the value is true, then the netdev is still marked as "live".
+    if (I.getData() == true) {
+      const MemRegion *MR = I.getKey();
+      // Report the potential memory leak.
+      reportMemoryLeak(MR, C);
+    }
+  }
+}
+
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  // Check if the left-hand side (the region being assigned to) is a memory region.
+  if (const MemRegion *LHSReg = Loc.getAsRegion()) {
+    LHSReg = LHSReg->getBaseRegion();
+    if (!LHSReg)
+      return;
+    // Check if the right-hand side is also a memory region.
+    if (const MemRegion *RHSReg = Val.getAsRegion()) {
+      RHSReg = RHSReg->getBaseRegion();
+      if (!RHSReg)
+        return;
+      // Update pointer aliased information.
+      State = State->set<PtrAliasMap>(LHSReg, RHSReg);
+      State = State->set<PtrAliasMap>(RHSReg, LHSReg);
+      C.addTransition(State);
+    }
+  }
+}
+
+void SAGenTestChecker::reportMemoryLeak(const MemRegion *MR, CheckerContext &C) const {
+  // Generate a non-fatal error node to report the bug. If no node is generated, return.
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  // Create a bug report with a concise message using PathSensitiveBugReport.
+  auto Report = std::make_unique<PathSensitiveBugReport>(
+      *BT, "Memory leak: allocated netdev not freed in error-handling path", N);
+  // (Optional) Adding range information if available.
+  // Since MR may not contain source range info directly, this is omitted.
+  C.emitReport(std::move(Report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker",
+      "Detects memory leaks due to missing free_netdev in error-handling paths", "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

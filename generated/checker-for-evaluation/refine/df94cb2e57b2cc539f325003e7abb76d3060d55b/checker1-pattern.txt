@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using integer types with insufficient width for arithmetic on disk sector counts, leading to integer overflow. In this case, variables representing the number of sectors (and comparisons/calculations involving them) were declared as 32-bit (unsigned) instead of a 64-bit type (u64). This mismatch can cause overflows when values exceed the 32‐bit range, and it also leads to mismatched format specifiers in logging, further compounding the issue.

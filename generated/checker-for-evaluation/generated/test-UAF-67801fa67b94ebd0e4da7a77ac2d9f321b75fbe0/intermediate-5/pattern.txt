@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an initialization ordering error where a resource is registered (via xa_alloc) and becomes visible to user-space before its reference count is fully incremented or its initialization is complete. As a result, there's a window in which a race condition can occur—a malicious user or thread could destroy the resource (triggering a free) before the creation ioctl finishes setting up the required ownership (i.e. before q->xef is set). This premature registration leads to a use-after-free vulnerability.

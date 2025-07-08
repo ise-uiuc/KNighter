@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an incorrect NULL check after memory allocation. Specifically, after allocating memory with kzalloc() for dst->thread.sve_state, the code mistakenly checks the wrong pointer (dst->thread.za_state) for a NULL value. This pattern, often due to a copy-paste mistake, can lead to dereferencing an uninitialized or NULL pointer, as the allocated memory is not verified properly.

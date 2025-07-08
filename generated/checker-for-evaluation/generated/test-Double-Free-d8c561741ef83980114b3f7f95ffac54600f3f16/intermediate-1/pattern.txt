@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an incorrect cleanup function in the error path that deallocates resources already scheduled for or later freed elsewhere, leading to a double free. In this case, the error branch mistakenly calls a cleanup function that releases the SQ’s resources (such as sq->dep_wqe, sq->wq_ctrl.buf.frags, and sq->wr_priv) a second time, rather than using the appropriate destroy function that avoids redundant deallocation.

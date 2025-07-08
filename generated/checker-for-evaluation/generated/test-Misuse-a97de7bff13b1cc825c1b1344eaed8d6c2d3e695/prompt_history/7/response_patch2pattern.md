@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the failure to validate the user-provided length when copying data from user space into kernel space in socket option handlers. Specifically, the code originally uses a fixed-size memory copy (via copy_from_sockptr) without ensuring that the length (optlen) provided by the user is at least as large as the expected data structure. This oversight can lead to out-of-bounds memory access if the user input is smaller than expected. The fix replaces the generic copy function with one (bt_copy_from_sockptr) that validates the input length against the expected size before performing the copy.

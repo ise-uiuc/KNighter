@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Assigning a size field (in this case, num_trips) after performing a memory copy operation on a buffer that is protected by fortification checks. Due to the __counted_by() annotation, the buffer’s size is determined based on an uninitialized or default value (zero when allocated via kzalloc()), which causes fortified functions like memcpy() to detect a buffer overflow. The root issue is the order of operations—using an uninitialized size value during memory copying—which leads to incorrect bounds checking and potential panics.

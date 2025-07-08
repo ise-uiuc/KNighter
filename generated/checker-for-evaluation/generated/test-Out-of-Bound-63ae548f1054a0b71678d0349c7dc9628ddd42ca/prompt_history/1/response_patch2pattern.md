@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is a missing bounds check when accessing an array. In this case, the code uses an index "i" to access elements of the transfer function points without verifying that "i" is within the valid range (i.e., less than TRANSFER_FUNC_POINTS). This can lead to a buffer overflow if "i" exceeds the allocated array size. The root issue is the failure to ensure the index is within bounds before performing the array access.

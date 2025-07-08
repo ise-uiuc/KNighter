@@ -1,0 +1,3 @@
+## Bug Pattern
+
+A race condition occurs when a shared data structure used for completion notification (reset_data) is freed concurrently in two different execution paths. The code originally frees the structure in both the work handler and in the scheduling function without first checking if the completion has already been signaled. This lack of proper synchronization (i.e., not checking completion_done() before freeing) can lead to a use-after-free error when one thread accesses the structure after it’s been freed by another thread.

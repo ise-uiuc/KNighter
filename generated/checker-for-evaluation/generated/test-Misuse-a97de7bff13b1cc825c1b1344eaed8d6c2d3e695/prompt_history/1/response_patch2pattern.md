@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern here is using legacy user space copy functions (like copy_from_sockptr) without validating that the provided user input length (optlen) is sufficient for the expected kernel buffer. This results in unbounded or slab-out-of-bounds accesses when the user supplies an optlen smaller than the size of the data to be copied (e.g., u32 or a structure). The root cause is the lack of proper user input length validation before copying, which can lead to memory corruption or overreads.

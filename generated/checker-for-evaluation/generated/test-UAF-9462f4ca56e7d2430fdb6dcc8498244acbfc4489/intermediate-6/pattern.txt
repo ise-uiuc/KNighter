@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is a race condition due to unsynchronized access to shared memory queues. In this case, the tx_ctrl_list (and similarly tx_data_list) is manipulated by multiple threads without adequate locking, leading to a situation where one thread frees an element while another might still be accessing it. This concurrent modification without proper synchronization results in a use-after-free vulnerability.

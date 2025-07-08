@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is a missing cleanup in an error handling path where allocated memory is not freed. In this case, if rvu_rep_devlink_port_register() fails, the code does not free the netdev allocated via alloc_etherdev(), resulting in a memory leak. The root cause is the omission of the free_netdev() call on the erroneous iteration, which leaves the allocated memory unfreed and can accumulate over repeated failures.

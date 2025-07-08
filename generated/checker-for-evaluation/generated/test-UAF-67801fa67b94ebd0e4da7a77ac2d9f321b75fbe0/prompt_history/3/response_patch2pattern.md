@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is exposing a user-space accessible identifier (ID) for an object before the object’s lifetime is fully secured (i.e., before all necessary initialization and reference counting have been completed). In this case, the xa_alloc call—which makes the new queue available to user space—is performed before the internal reference (xe_file_get) is taken, allowing a malicious user to potentially free or destroy the object (triggering a use-after-free) before the create ioctl finishes completing its work.

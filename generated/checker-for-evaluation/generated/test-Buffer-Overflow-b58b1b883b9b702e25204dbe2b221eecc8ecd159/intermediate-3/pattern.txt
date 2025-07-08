@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is performing arithmetic subtraction on an iterated count (iov_iter_count) without ensuring that the value being subtracted does not exceed the current count, which can lead to underflow. In this instance, subtracting the rounded-up size from iter->count may result in an underflow if the computed shorten value is greater than or equal to iter->count. The proper fix involves validating that the subtraction is safe (or adjusting the value to 0) before performing the operation.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using a fixed-size copying operation (copy_from_sockptr) without validating that the supplied user buffer length (optlen) is at least as large as the expected amount of data. This unchecked copy can lead to out-of-bounds memory accesses if a user provides a buffer smaller than expected, resulting in potential slab corruption. The fix replaces the naive copy with a helper function that checks the user-provided length before copying.

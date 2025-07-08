@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is failing to perform proper resource cleanup on error paths. In this patch, when a function (hwrm_req_replace) returns an error, the allocated or held request resource is not released (i.e., hwrm_req_drop() is not called) before returning. This omission can result in a memory leak. The pattern here involves not ensuring that all allocated or acquired resources are consistently freed in error handling cases, particularly when using early returns.

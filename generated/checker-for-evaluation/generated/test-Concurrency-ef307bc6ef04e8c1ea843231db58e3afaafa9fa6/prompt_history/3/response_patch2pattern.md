@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern involves an atomicity violation due to modifying a shared pointer (urb->hcpriv) without holding the appropriate lock for the entire critical section. In this case, the code clears the pointer (setting it to NULL) outside of the locked region, which can lead to a race condition where another concurrent function checks that the pointer is non-NULL and then dereferences it, only to encounter a NULL value. This check-then-use scenario without proper synchronization exposes the code to potential NULL pointer dereference errors.

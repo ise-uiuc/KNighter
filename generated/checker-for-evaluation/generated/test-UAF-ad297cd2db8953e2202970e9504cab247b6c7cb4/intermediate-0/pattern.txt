@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Dereferencing driver private data after the associated netdev has been freed. In this case, the UAF bug arises because the netdev is deallocated (via free_netdev()) while its private data (accessed through netdev_priv) is still being used later in the cleanup process. This pattern of freeing a container structure before completely finishing its cleanup routines can lead to use-after-free vulnerabilities due to subsequent accesses to its private data.

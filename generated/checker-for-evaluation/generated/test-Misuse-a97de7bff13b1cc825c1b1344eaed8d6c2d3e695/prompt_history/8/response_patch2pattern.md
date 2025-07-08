@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the failure to validate the length of user-supplied data when copying it from a userspace pointer. The original code uses a fixed-size copy (using copy_from_sockptr) without checking whether the provided optlen is large enough, which can lead to copying more data than actually available. This mis-validation can result in slab-out-of-bounds accesses, potentially corrupting memory or causing kernel crashes.

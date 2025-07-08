@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is updating the counter field for a flexible-array member after accessing the array. In this case, the counter (datalen) that defines the bounds of the flexible array member (data) is updated only after memcpy() copies data into the array. Since runtime bounds-checking (via CONFIG_FORTIFY_SOURCE and CONFIG_UBSAN_BOUNDS) relies on the counter being set correctly before any access, delaying the update leads to a potential buffer overflow detection when the bounds of data are evaluated with an initial zero or outdated counter value.

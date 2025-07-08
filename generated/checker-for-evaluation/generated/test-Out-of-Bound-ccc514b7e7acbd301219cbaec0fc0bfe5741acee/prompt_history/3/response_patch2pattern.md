@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Iterating over an array based on one constant (VG_NUM_SOC_VOLTAGE_LEVELS, which is 8) while simultaneously using that loop index to access a second array (clock_table->DcfClocks) that has a smaller fixed size (VG_NUM_DCFCLK_DPM_LEVELS, which is 7). This mismatch in assumed array sizes can lead to buffer overflow due to accessing an element beyond the allocated range of the second array.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using a helper function (roundup_pow_of_two) that performs left-shifts without safeguarding against integer overflow on 32-bit systems. This pattern occurs when the function is fed an unchecked value (attr->max_entries) that may be too large, causing undefined behavior during the shift operation. The bug arises because overflow might not reliably result in a zero return value, so the implicit overflow check fails. The fix requires explicitly checking that attr->max_entries is below a safe threshold (in this case, 1UL << 31) prior to calling roundup_pow_of_two, thereby preventing undefined behavior.

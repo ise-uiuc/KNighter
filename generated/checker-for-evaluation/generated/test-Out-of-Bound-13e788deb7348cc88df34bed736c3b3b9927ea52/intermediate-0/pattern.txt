@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an off-by-one error in array index validation. The code mistakenly uses a '>' comparison instead of '>=' when checking whether an index is within bounds. This allows an index equal to the maximum valid index (since arrays are 0-indexed) to pass the check, potentially leading to an out-of-bounds access. This pattern frequently occurs in scenarios where user-supplied or derived indices are validated using an incorrect boundary condition.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is a misordering of initialization and memory operations where the structure’s size field (or trip count) that is used by __counted_by()/fortify checks to determine the valid buffer size is initialized after a memcpy into the buffer. This order causes the checks to see an uninitialized (zero) size, triggering a false-positive buffer overflow detection even though the data being copied is valid.

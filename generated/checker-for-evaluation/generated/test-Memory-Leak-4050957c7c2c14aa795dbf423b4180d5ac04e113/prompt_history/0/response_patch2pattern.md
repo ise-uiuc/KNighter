@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Incorrect iteration in the error cleanup loop where the loop’s termination condition fails to include the first (0th) element. In this pattern, when rolling back partially initialized resources (here, clocks), the loop uses a condition like "while (--i > 0)" which skips cleanup for index 0, potentially leaving the first resource enabled. The proper approach is to use a condition that includes index 0 (e.g., "while (--i >= 0)").

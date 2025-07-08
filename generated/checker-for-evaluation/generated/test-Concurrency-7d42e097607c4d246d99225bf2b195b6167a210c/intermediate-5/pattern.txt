@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern here is a race condition in the lifecycle management of a shared memory structure—specifically, the reset_data container used in asynchronous work and completion signaling. The code originally did not verify if the caller had already timed out (using completion_done) before deciding whether to signal completion or free the structure. As a result, the reset_data structure could be freed concurrently in two different contexts (the worker and the scheduling function), leading to use-after-free and potential double free issues.

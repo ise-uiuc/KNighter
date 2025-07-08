@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the unsafe multiplication of variables of different types without proper type sanitization, which can lead to an unintentional integer overflow. In this case, arithmetic operations directly use operands (such as a dma_addr_t and inexpensive integers) whose differing types and sizes can cause overflow errors. The fix involves separating the multiplication into distinct steps by using an intermediate integer variable for the multiplier, ensuring that the arithmetic does not inadvertently overflow the intended variable type.

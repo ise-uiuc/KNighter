@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is allocating a memory buffer with kmalloc that is later used to transfer data to user space without initializing it (i.e., without zeroing it out). This results in the possibility of uninitialized memory being copied to user space, potentially leaking sensitive kernel data. The root issue is the failure to use an allocation function that clears the allocated memory, such as kzalloc, leading to a kernel information leak.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the unchecked use of a power-of-two rounding function (roundup_pow_of_two()) on an input that can be too large for the underlying arithmetic on 32-bit architectures. The bug occurs because the function performs a left shift on a 32-bit unsigned long without first validating that the input (attr->max_entries) is within a safe range. On 32-bit systems, this can cause an integer overflow or undefined behavior due to the left-shift operation. The solution is to add an explicit check (e.g., ensuring attr->max_entries does not exceed 1UL << 31) before calling roundup_pow_of_two() to prevent the overflow.

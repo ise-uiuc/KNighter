@@ -1,0 +1,3 @@
+## Bug Pattern
+
+A race condition caused by freeing a shared notification structure (reset_data) in two independent code paths. The structure—which contains a completion object for synchronizing reset operations—is freed without properly checking whether the completion has already been signaled (using completion_done). This leads to a situation where one thread may free the structure while another is still relying on it, resulting in a use-after-free error.

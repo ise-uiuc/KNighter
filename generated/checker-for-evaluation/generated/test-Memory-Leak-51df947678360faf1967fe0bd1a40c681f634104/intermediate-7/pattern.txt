@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is a resource leak due to the failure to free an allocated object on an error path. In this case, a net_device is allocated with alloc_etherdev(), and if a subsequent initialization function (rvu_rep_devlink_port_register) fails, the allocated memory is not freed before exiting—leading to a memory leak. This pattern occurs when error paths do not properly clean up resources (here, the netdev) allocated earlier in the function.

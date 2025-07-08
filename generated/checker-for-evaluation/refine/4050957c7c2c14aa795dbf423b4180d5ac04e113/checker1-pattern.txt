@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an off-by-one error in the error cleanup loop. Specifically, when an error occurs during the iteration to enable a set of resources, the cleanup loop incorrectly starts with i decremented until i > 0, which causes the first element (at index 0) to be skipped from cleanup. This error pattern of using an improper boundary condition can leave resources not properly disabled, leading to resource leaks or inconsistent state.

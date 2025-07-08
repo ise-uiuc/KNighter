@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the use of an uninitialized local variable ("ret") that is later used as a return value. Not initializing "ret" in functions can lead to unpredictable behavior, since its value could be indeterminate if none of the error or success paths explicitly set it. This might result in erroneous error codes being returned, leading to incorrect handling of the function's result.

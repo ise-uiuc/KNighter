@@ -1,0 +1,3 @@
+## Bug Pattern
+
+A race condition arising from improper management of a shared data structure used for completion notification. The pattern occurs when a structure (containing both a work_struct and a completion) is freed by one code path (e.g., due to a timeout in the scheduling function) while another path (the worker function) later attempts to use it to signal completion. The root cause is not verifying if the completion has already been processed (using completion_done()) before either signaling or freeing the structure, leading to a use-after-free bug.

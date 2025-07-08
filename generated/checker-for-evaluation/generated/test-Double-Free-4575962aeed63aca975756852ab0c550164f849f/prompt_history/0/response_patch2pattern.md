@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the mix-up between device-managed memory allocation and manual deallocation. Here, using devm_kcalloc() allocates memory that is automatically freed by the device management infrastructure. However, in case of errors the code explicitly frees that memory as well (via pinctrl_utils_free_map()), leading to a double free. The pattern is using devm_ allocation functions while also manually calling free functions on the same pointer, which results in the memory being freed twice.

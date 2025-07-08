@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Multiplying two values stored in a 32-bit unsigned type without first promoting them to 64-bit can lead to integer overflow. In this case, the product of mall_size_per_umc and adev->gmc.num_umc is calculated using 32-bit arithmetic even though the result is later stored in a 64-bit variable. The correct approach is to cast at least one operand to a 64-bit type before performing the multiplication to ensure that the arithmetic is carried out with the appropriate precision and to prevent overflow.

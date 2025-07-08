@@ -1,0 +1,112 @@
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+
+// Additional include for ASTContext and Lexer support if needed.
+#include "clang/AST/ASTContext.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+//
+// No custom program state is needed for this checker.
+//
+
+namespace {
+
+class SAGenTestChecker : public Checker<check::PreCall> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() 
+    : BT(new BugType(this, "Unchecked user input length in copy_from_sockptr")) {}
+
+  // This callback is invoked before a function call is evaluated.
+  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+
+private:
+  // Helper function to report the bug.
+  void reportUncheckedLength(const CallEvent &Call, CheckerContext &C) const;
+};
+
+void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+  // First, check that the callee identifier exists.
+  const IdentifierInfo *CalleeII = Call.getCalleeIdentifier();
+  if (!CalleeII)
+    return;
+
+  // Only proceed if the callee is "copy_from_sockptr".
+  if (!CalleeII->getName().equals("copy_from_sockptr"))
+    return;
+
+  // Retrieve the origin expression of the call.
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr)
+    return;
+
+  // Locate the enclosing function declaration using the location context.
+  const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());
+  if (!FD)
+    return;
+
+  // Check if we are inside one of the target socket option handler functions.
+  StringRef FuncName = FD->getNameAsString();
+  if (!(FuncName.equals("rfcomm_sock_setsockopt") ||
+        FuncName.equals("rfcomm_sock_setsockopt_old")))
+    return;
+
+  // Optionally, check the third argument (expected size) if available.
+  // We expect that the copy size is passed as the third argument.
+  if (Call.getNumArgs() < 3)
+    return;
+
+  const Expr *SizeExpr = Call.getArgExpr(2);
+  llvm::APSInt SizeValue;
+  // Only report if we can evaluate the size as an integer constant.
+  if (!EvaluateExprToInt(SizeValue, SizeExpr, C))
+    return;
+
+  // At this point, we have a call to copy_from_sockptr inside a socket option handler
+  // with a constant size argument. This is suspicious because the user-provided length
+  // is not validated against the expected size.
+  reportUncheckedLength(Call, C);
+}
+
+void SAGenTestChecker::reportUncheckedLength(const CallEvent &Call, CheckerContext &C) const {
+  // Generate a non-fatal error node.
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+
+  // Create a bug report with a short, clear message.
+  auto Report = std::make_unique<PathSensitiveBugReport>(
+      *BT, "Unchecked user-provided length in copy_from_sockptr; potential out-of-bounds copy", N);
+  // Optionally, add the source range of the call for better diagnostics.
+  Report->addRange(Call.getSourceRange());
+  C.emitReport(std::move(Report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects unchecked user-provided length in copy_from_sockptr in socket option handlers",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is a mismatched null-check after a memory allocation. In this patch, memory is allocated into one variable (dst->thread.sve_state via kzalloc) but the code erroneously checks a different variable (dst->thread.za_state) for a NULL value. This mistake causes the function to overlook potential allocation failures for sve_state, leading to undefined behavior or a crash due to the usage of an uninitialized pointer.

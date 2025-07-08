@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using manual multiplication of allocation size (e.g., sizeof(element) * count) with kzalloc without checking for integer overflow. This can allow an integer overflow to occur during size calculation, resulting in an undersized buffer allocation and potential buffer overflow or memory corruption when the allocated memory is used. Replacing this with a safe allocator like kcalloc, which performs the multiplication in a way that detects overflow, mitigates this risk.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is manually computing the buffer size by multiplying the size of an element with a user-supplied count without performing an overflow check. This open-coded multiplication (i.e. sizeof(element) * count) can lead to an integer overflow when the count is excessively large, resulting in an underestimation of the required size and potentially causing buffer overflows during the copy_from_user() operation. Using the array_size() helper introduces an internal overflow check, ensuring the calculation is safe.

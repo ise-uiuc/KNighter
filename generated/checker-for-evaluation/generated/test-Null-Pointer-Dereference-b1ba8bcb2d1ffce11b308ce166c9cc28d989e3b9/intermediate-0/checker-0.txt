@@ -1,0 +1,222 @@
+#include "clang/AST/Expr.h"
+#include "clang/AST/Stmt.h"
+#include "clang/Basic/LangOptions.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// Customize program states:
+// Map to record a pointer from devm_gpiod_get_array_optional and whether it has been NULL-checked.
+// false means unchecked; true means checked.
+REGISTER_MAP_WITH_PROGRAMSTATE(OptionalResourceMap, const MemRegion *, bool)
+// Program state map to track pointer aliasing.
+REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion *, const MemRegion *)
+
+namespace {
+
+/// Helper function to mark an optional resource pointer (and its aliases)
+/// as having been checked for NULL.
+ProgramStateRef markOptionalResourceChecked(ProgramStateRef State, const MemRegion *MR) {
+  if (!MR)
+    return State;
+  
+  // Mark the resource as checked.
+  State = State->set<OptionalResourceMap>(MR, true);
+  
+  // Propagate the checked flag to any alias.
+  const MemRegion *Alias = State->get<PtrAliasMap>(MR);
+  if (Alias) {
+    State = State->set<OptionalResourceMap>(Alias, true);
+  }
+  return State;
+}
+
+/// The checker class definition.
+class SAGenTestChecker 
+  : public Checker< check::PostCall, 
+                    check::Bind, 
+                    check::BranchCondition,
+                    check::Location > {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() : BT(new BugType(this, "Unchecked Optional Resource Dereference")) {}
+
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;
+  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;
+  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;
+
+private:
+  void reportUncheckedOptionalDereference(const MemRegion *MR, const Stmt *S, CheckerContext &C) const;
+};
+
+/// checkPostCall: Track allocation call to devm_gpiod_get_array_optional.
+void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  // Use the origin expression and check if the function name matches.
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr)
+    return;
+  // Use the utility function for a more robust name-check.
+  if (!ExprHasName(OriginExpr, "devm_gpiod_get_array_optional", C))
+    return;
+
+  // Get the memory region of the returned optional resource.
+  const MemRegion *MR = getMemRegionFromExpr(OriginExpr, C);
+  if (!MR)
+    return;
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+  
+  // Record in OptionalResourceMap with initial value false (unchecked).
+  ProgramStateRef State = C.getState();
+  State = State->set<OptionalResourceMap>(MR, false);
+  C.addTransition(State);
+}
+
+/// checkBind: Track assignments that could propagate aliasing.
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+
+  // Get the left-hand side region.
+  if (const MemRegion *LHS = Loc.getAsRegion()) {
+    LHS = LHS->getBaseRegion();
+    if (!LHS)
+      return;
+    // See if the right-hand side is a region.
+    if (const MemRegion *RHS = Val.getAsRegion()) {
+      RHS = RHS->getBaseRegion();
+      if (!RHS)
+        return;
+      // If the right-hand side was an optional resource, record the alias.
+      if (State->get<OptionalResourceMap>(RHS)) {
+        State = State->set<PtrAliasMap>(LHS, RHS);
+      }
+    }
+  }
+  C.addTransition(State);
+}
+
+/// checkBranchCondition: Update state when the optional resource pointer is checked.
+void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  if (!Condition)
+    return;
+  
+  // Consider only expressions.
+  const Expr *CondE = dyn_cast<Expr>(Condition);
+  if (!CondE) {
+    C.addTransition(State);
+    return;
+  }
+  
+  // Remove parentheses and casts.
+  CondE = CondE->IgnoreParenCasts();
+
+  // Look for conditions of form: if (ptr), if (!ptr),
+  // or binary operators comparing pointer with NULL.
+  if (const UnaryOperator *UO = dyn_cast<UnaryOperator>(CondE)) {
+    if (UO->getOpcode() == UO_LNot) {
+      const Expr *SubE = UO->getSubExpr()->IgnoreParenCasts();
+      SVal SubVal = C.getState()->getSVal(SubE, C.getLocationContext());
+      if (const MemRegion *MR = SubVal.getAsRegion()) {
+        if (State->get<OptionalResourceMap>(MR))
+          State = markOptionalResourceChecked(State, MR);
+      }
+    }
+  } else if (const BinaryOperator *BO = dyn_cast<BinaryOperator>(CondE)) {
+    BinaryOperator::Opcode Op = BO->getOpcode();
+    if (Op == BO_EQ || Op == BO_NE) {
+      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();
+      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();
+      bool LHSIsNull = LHS->isNullPointerConstant(C.getASTContext(), Expr::NPC_ValueDependentIsNull);
+      bool RHSIsNull = RHS->isNullPointerConstant(C.getASTContext(), Expr::NPC_ValueDependentIsNull);
+      const Expr *PtrExpr = nullptr;
+      if (LHSIsNull && !RHSIsNull)
+        PtrExpr = RHS;
+      else if (RHSIsNull && !LHSIsNull)
+        PtrExpr = LHS;
+      
+      if (PtrExpr) {
+        SVal PtrVal = C.getState()->getSVal(PtrExpr, C.getLocationContext());
+        if (const MemRegion *MR = PtrVal.getAsRegion()) {
+          if (State->get<OptionalResourceMap>(MR))
+            State = markOptionalResourceChecked(State, MR);
+        }
+      }
+    }
+  } else {
+    // For a condition of the form: if (ptr)
+    SVal Val = C.getState()->getSVal(CondE, C.getLocationContext());
+    if (const MemRegion *MR = Val.getAsRegion()) {
+      if (State->get<OptionalResourceMap>(MR))
+        State = markOptionalResourceChecked(State, MR);
+    }
+  }
+  C.addTransition(State);
+}
+
+/// checkLocation: When a memory location is loaded (dereferenced), check that the optional
+/// resource pointer has been NULL-checked.
+void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+  if (!IsLoad)
+    return;
+  
+  ProgramStateRef State = C.getState();
+  const MemRegion *MR = Loc.getAsRegion();
+  if (!MR)
+    return;
+  
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+  
+  // Look up the pointer in our OptionalResourceMap.
+  const bool *Checked = State->get<OptionalResourceMap>(MR);
+  if (Checked && *Checked == false) {
+    reportUncheckedOptionalDereference(MR, S, C);
+  }
+}
+
+/// reportUncheckedOptionalDereference: Generate a diagnostic if an optional resource
+/// is dereferenced before a NULL-check.
+void SAGenTestChecker::reportUncheckedOptionalDereference(const MemRegion *MR, const Stmt *S, CheckerContext &C) const {
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  
+  auto Report = std::make_unique<BasicBugReport>(
+      *BT, "Optional resource not NULL-checked before dereference", N);
+  Report->addRange(S->getSourceRange());
+  C.emitReport(std::move(Report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects dereference of an optional resource (from devm_gpiod_get_array_optional) without NULL checking", 
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

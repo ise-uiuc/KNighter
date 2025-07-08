@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing arithmetic on 32-bit unsigned integers where the result is intended to be stored in a 64-bit variable, but the multiplication is executed with 32-bit arithmetic. This can cause an unintentional integer overflow before the result is assigned to the larger type. The solution is to cast one of the operands (or both) to a 64-bit type to ensure that the multiplication is computed using 64-bit arithmetic.

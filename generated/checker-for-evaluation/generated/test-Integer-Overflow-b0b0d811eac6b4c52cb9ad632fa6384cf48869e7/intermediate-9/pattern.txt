@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is performing multiplication operations between variables of different integer types (e.g., dma_addr_t and int) directly, which can lead to unintended integer overflows. Specifically, when the multiplication involves operands of differing bit widths or signedness, the implicit type promotions might not prevent overflow, causing Coverity or similar static analysis tools to flag potential overflow issues. The fix separates the multiplication into intermediate steps using an explicit integer variable for the multiplier calculation, ensuring the arithmetic is performed safely without unintended type conversion errors.

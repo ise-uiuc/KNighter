@@ -1,0 +1,187 @@
+```cpp
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Decl.h"
+#include "clang/Lex/Lexer.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// No custom program state is required.
+
+namespace {
+
+/// Visitor that traverses the function body of gsm_cleanup_mux to
+/// detect whether a guard call for tx_lock is present between the call
+/// to tty_ldisc_flush and the freeing loops (calls to kfree/kvfree).
+class GSMCleanupVisitor : public RecursiveASTVisitor<GSMCleanupVisitor> {
+public:
+  GSMCleanupVisitor(ASTContext &Ctx, CheckerContext &C)
+    : Ctx(Ctx), C(C), FlushLoc(), GuardLoc(), FirstKfreeLoc() {}
+
+  bool TraverseStmt(Stmt *S) {
+    if (!S)
+      return true;
+    RecursiveASTVisitor<GSMCleanupVisitor>::TraverseStmt(S);
+    return true;
+  }
+
+  bool VisitCallExpr(CallExpr *CE) {
+    // Get the origin expression (if available) for proper source text analysis.
+    const Expr *Origin = CE;
+    // Obtain the source text of the callee.
+    const Expr *CalleeExpr = CE->getCallee();
+    if (!CalleeExpr)
+      return true;
+    // Use our utility function to extract the source text.
+    StringRef CalleeText = Lexer::getSourceText(CharSourceRange::getTokenRange(CalleeExpr->getSourceRange()),
+                                                Ctx.getSourceManager(), Ctx.getLangOpts());
+    // Check if this is a call to tty_ldisc_flush.
+    if (CalleeText.contains("tty_ldisc_flush")) {
+      FlushLoc = CE->getBeginLoc();
+    }
+    
+    // Check for guard calls. We expect the call to be something like guard(spinlock_irqsave) and its argument to contain "tx_lock".
+    // We look for "guard" in the callee text.
+    if (CalleeText.contains("guard")) {
+      // Now, check the arguments. We scan through the argument expressions.
+      for (unsigned i = 0, e = CE->getNumArgs(); i < e; i++) {
+        const Expr *Arg = CE->getArg(i);
+        if (!Arg)
+          continue;
+        // Use the provided utility function ExprHasName() to check for "tx_lock".
+        if (ExprHasName(Arg, "tx_lock", C)) {
+          // Record the first guard call location if not already recorded.
+          if (GuardLoc.isInvalid() || Ctx.getSourceManager().isBeforeInTranslationUnit(CE->getBeginLoc(), GuardLoc))
+            GuardLoc = CE->getBeginLoc();
+        }
+      }
+    }
+    
+    // Check for calls to kfree or kvfree.
+    if (CalleeText.contains("kfree") || CalleeText.contains("kvfree")) {
+      // Record the earliest kfree call location.
+      if (FirstKfreeLoc.isInvalid() ||
+          Ctx.getSourceManager().isBeforeInTranslationUnit(CE->getBeginLoc(), FirstKfreeLoc))
+        FirstKfreeLoc = CE->getBeginLoc();
+    }
+    
+    return true;
+  }
+
+  /// Returns true if a guard call for tx_lock was found between the flush and first free.
+  bool hasProperGuard() const {
+    if (FlushLoc.isInvalid() || FirstKfreeLoc.isInvalid())
+      return false;
+    const SourceManager &SM = Ctx.getSourceManager();
+    // Check that the guard call exists and is between flush and kfree.
+    if (GuardLoc.isValid() &&
+        SM.isBeforeInTranslationUnit(FlushLoc, GuardLoc) &&
+        SM.isBeforeInTranslationUnit(GuardLoc, FirstKfreeLoc))
+      return true;
+    return false;
+  }
+
+private:
+  ASTContext &Ctx;
+  CheckerContext &C;
+  SourceLocation FlushLoc;      // Location of tty_ldisc_flush
+  SourceLocation GuardLoc;      // Location of guard(spinlock_irqsave)(tx_lock)
+  SourceLocation FirstKfreeLoc; // Earliest location of a free (kfree/kvfree)
+};
+
+class SAGenTestChecker : public Checker<check::ASTCodeBody> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() : BT(new BugType(this, "Use-after-free due to missing spin lock guard",
+                                         "Synchronization error")) {}
+
+  void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR) const;
+
+};
+
+void SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {
+  // Only inspect function definitions
+  const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+  if (!FD || !FD->hasBody())
+    return;
+  // Only target the function gsm_cleanup_mux.
+  if (FD->getNameAsString() != "gsm_cleanup_mux")
+    return;
+
+  ASTContext &Ctx = FD->getASTContext();
+  // Retrieve the function body.
+  const Stmt *Body = FD->getBody();
+  if (!Body)
+    return;
+
+  // Create a dummy CheckerContext to forward to our visitor by using a temporary context.
+  // Note: we cannot create a full CheckerContext here so we will use the BugReporter and ASTContext
+  // to get the SourceManager.
+  // Instead of using CheckerContext in the visitor for reporting, we only use it to check the
+  // presence of "tx_lock" in guard calls.
+  // We create a fake CheckerContext by using BR.getCurrentAnalysisDeclContext()->getParentMap().getParent(Body)
+  // However, for our purpose, only ASTContext and SourceManager are needed.
+  class DummyCheckerContext : public CheckerContext {
+  public:
+    DummyCheckerContext(ASTContext &Ctx) : Ctx(Ctx) { }
+    ASTContext &getASTContext() const override { return Ctx; }
+    const LangOptions &getLangOpts() const override { return Ctx.getLangOpts(); }
+    const SourceManager &getSourceManager() const override { return Ctx.getSourceManager(); }
+    // Other members are not used in our visitor.
+    ProgramStateRef getState() const override { return nullptr; }
+    void addTransition(ProgramStateRef) const override { }
+    ExplodedNode *generateNonFatalErrorNode(ProgramStateRef = nullptr, const char * = nullptr) const override { return nullptr; }
+  private:
+    ASTContext &Ctx;
+  };
+
+  DummyCheckerContext DCC(Ctx);
+  // Use our visitor to traverse the function body.
+  GSMCleanupVisitor Visitor(Ctx, DCC);
+  Visitor.TraverseStmt(const_cast<Stmt*>(Body));
+
+  // Check if we have free calls (indicating that memory is freed) and if so, ensure that
+  // the guard call is present in between.
+  if (!Visitor.hasProperGuard()) {
+    // Get the location for reporting - if possible use body start.
+    SourceLocation BugLoc = Body->getBeginLoc();
+    ExplodedNode *N = BR.getContext()->generateNonFatalErrorNode();
+    if (!N)
+      return;
+    auto Report = std::make_unique<PathSensitiveBugReport>(
+        *BT, "Use‐after‐free: Missing spin lock guard on tx_lock in gsm_cleanup_mux", N);
+    Report->addRange(CharSourceRange::getTokenRange(BugLoc, BugLoc));
+    BR.emitReport(std::move(Report));
+  }
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects use‐after‐free due to missing spin lock guard on tx_lock in gsm_cleanup_mux",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+```

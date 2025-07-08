@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Unsafe string copying into a fixed-size buffer. The code uses strcpy to copy a potentially longer string into a fixed-size array, which can lead to writing past the end of the buffer (buffer overflow). The problem is that strcpy does not check the destination's size, so if hdev->name exceeds the size of di.name, it will corrupt adjacent memory. This pattern requires bounds-checked string copy functions (like strscpy) to prevent overflows.

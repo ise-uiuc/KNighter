@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is failing to free an allocated resource during error handling before exiting a function. In this instance, after dynamically allocating a net_device via alloc_etherdev(), if an error occurs (specifically when rvu_rep_devlink_port_register() returns an error), the code proceeds to exit without freeing the allocated net_device (using free_netdev(ndev)). This pattern of not cleaning up allocated resources in error paths can lead to memory leaks and is broadly applicable when resource acquisition is not properly undone on failure.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an out-of-bounds access caused by iterating over an index range larger than the actual size of an array. In this case, the loop uses a limit based on VG_NUM_SOC_VOLTAGE_LEVELS (8) while accessing the DcfClocks array which only has VG_NUM_DCFCLK_DPM_LEVELS (7) elements. This mismatch between the loop iteration count and the array's allocated size leads to a possible buffer overflow when the index exceeds the array’s bounds.

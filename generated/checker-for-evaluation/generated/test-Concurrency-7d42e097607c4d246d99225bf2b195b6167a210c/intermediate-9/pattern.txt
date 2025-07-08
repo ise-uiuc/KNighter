@@ -1,0 +1,3 @@
+## Bug Pattern
+
+A race condition arises from concurrently freeing a shared data structure that is used for completion notification. Specifically, when a reset operation can time out and free the shared structure (reset_data) while a worker thread is still processing it, improper coordination between these two contexts leads to a use-after-free scenario. The root issue is that the reset_data structure can be freed in multiple places (in the worker and in the scheduling function) without checking if a completion has already been signaled—thus, failing to atomically verify its usage status (e.g., using completion_done()) before freeing.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an insufficient integer type for tracking and computing disk sectors, which leads to an integer overflow. In this case, fields such as the reserved sector count were declared with a type (unsigned) that is too narrow to safely hold the potentially large values encountered (beyond 32-bit limits). This causes wrap-around or miscalculation when subtracting or comparing against large sector values. The patch fixes this by switching to a wider type (u64) and using safe arithmetic helpers (min_t(u64, ...)) to prevent overflow.

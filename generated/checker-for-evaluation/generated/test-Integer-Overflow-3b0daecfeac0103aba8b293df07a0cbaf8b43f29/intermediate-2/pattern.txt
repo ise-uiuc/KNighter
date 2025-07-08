@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an allocation function (kzalloc) that multiplies two parameters (number of elements and element size) without checking for integer overflow. If the multiplication overflows, it results in allocating a buffer smaller than needed, which can lead to buffer overflows or other memory corruption when the code later writes into the allocated memory. Using kcalloc ensures that the multiplication is safely performed and that an allocation failure is returned if an overflow occurs.

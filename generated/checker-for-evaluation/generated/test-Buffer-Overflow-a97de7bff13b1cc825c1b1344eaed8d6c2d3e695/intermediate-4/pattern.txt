@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the failure to validate the user-supplied input length before copying data from user space. In this case, the code uses a simple memory-copy function (copy_from_sockptr()) with a fixed byte size without checking whether the supplied optlen parameter is at least that size. As a result, if a user provides a smaller buffer than expected, this oversight can lead to slab out-of-bounds accesses. The fix replaces the unchecked copy_from_sockptr() call with a function (bt_copy_from_sockptr()) that validates that the provided socket pointer data length is sufficient, thereby preventing potential memory overreads.

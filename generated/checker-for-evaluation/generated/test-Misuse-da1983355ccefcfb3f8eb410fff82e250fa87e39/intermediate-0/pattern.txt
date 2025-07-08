@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an order-of-initialization issue where a structure field used by buffer size checking (via __counted_by for CONFIG_FORTIFY_SOURCE) is updated only after a memcpy() call. In this case, the memory copy operation relies on the num_trips field to determine the bounds of the trips array, but since num_trips is still uninitialized (zero) at the time of memcpy(), the fortify checks detect a buffer overflow. The root of the issue is copying data into a buffer before updating the metadata (buffer size/count) that the security instrumentation uses for bounds verification.

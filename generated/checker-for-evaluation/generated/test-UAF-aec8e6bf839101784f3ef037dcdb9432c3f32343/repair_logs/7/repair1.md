@@ -1,0 +1,240 @@
+## Role
+
+You are an expert in developing and analyzing Clang Static Analyzer checkers, with decades of experience in the Clang project, particularly in the Static Analyzer plugin.
+
+## Instruction
+
+The following checker fails to compile, and your task is to resolve the compilation error based on the provided error messages.
+
+Here are some potential ways to fix the issue:
+
+1. Use the correct API: The current API may not exist, or the class has no such member. Replace it with an appropriate one.
+
+2. Use correct arguments: Ensure the arguments passed to the API have the correct types and the correct number.
+
+3. Change the variable types: Adjust the types of some variables based on the error messages.
+
+4. Be careful if you want to include a header file. Please make sure the header file exists. For instance "fatal error: clang/StaticAnalyzer/Core/PathDiagnostic.h: No such file or directory".
+
+**The version of Clang environment is Clang-18. You should consider the API compatibility.**
+
+**Please only repair the failed parts and keep the original semantics.**
+**Please return the whole checker code after fixing the compilation error.**
+
+## Suggestions
+
+1. Please only use two types of bug reports:
+  - BasicBugReport (const BugType &bt, StringRef desc, PathDiagnosticLocation l)
+  - PathSensitiveBugReport (const BugType &bt, StringRef desc, const ExplodedNode *errorNode)
+  - PathSensitiveBugReport (const BugType &bt, StringRef shortDesc, StringRef desc, const ExplodedNode *errorNode)
+
+## Example
+
+- Error Line: 48 |   Optional<DefinedOrUnknownSVal> SizeSVal; 
+
+  - Error Messages: ‘Optional’ was not declared in this scope; did you mean ‘clang::ObjCImplementationControl::Optional’? 
+
+  - Fix: Replace 'Optional<DefinedOrUnknownSVal>' with 'std::optional<DefinedOrUnknownSVal>', and include the appropriate header. 
+
+- Error Line: 113 |     const MemRegion *MR = Entry.first;
+
+    - Error Messages: unused variable ‘MR’ [-Wunused-variable]
+
+    - Fix: Remove the variable 'MR' if it is not used.
+
+## Checker
+
+```cpp
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/Lex/Lexer.h"  // for Lexer::getSourceText
+#include "clang/AST/Expr.h"
+#include "clang/AST/Decl.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// REGISTER a program state map to track the state of the device->bdev_file pointer.
+// The bool flag is true if the pointer is live (allocated) and false if it has been freed.
+REGISTER_MAP_WITH_PROGRAMSTATE(BdevFileStateMap, const MemRegion*, bool)
+
+namespace {
+
+class SAGenTestChecker :
+    public Checker<check::PostCall, check::Bind, check::BranchCondition> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() : BT(new BugType(this, "Use-After-Free of bdev_file")) {}
+
+  // Callback invoked after a function call.
+  // We intercept the call to btrfs_close_bdev to mark the bdev_file pointer as freed.
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const override;
+
+  // Callback invoked when a value is bound to a memory region.
+  // We use this to catch assignments to the bdev_file member (e.g. setting it to NULL).
+  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const override;
+
+  // Callback invoked when evaluating a branch condition.
+  // We check conditions that use device->bdev_file.
+  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const override;
+
+private:
+  // Helper function to report a use-after-free error.
+  void reportUAF(const MemRegion *MR, const Stmt *S, CheckerContext &C) const;
+};
+
+void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  // We are interested in calls to btrfs_close_bdev.
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr)
+    return;
+  if (!ExprHasName(OriginExpr, "btrfs_close_bdev", C))
+    return;
+
+  // Look into the call's AST children for a MemberExpr that access "bdev_file".
+  // This utility function finds a child expression of a specific type.
+  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(OriginExpr);
+  if (!ME || !ExprHasName(ME, "bdev_file", C))
+    return;
+
+  // Retrieve the memory region corresponding to the bdev_file field.
+  const MemRegion *MR = getMemRegionFromExpr(ME, C);
+  if (!MR)
+    return;
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+
+  ProgramStateRef State = C.getState();
+  // Mark the bdev_file pointer as freed by setting its state flag to false.
+  State = State->set<BdevFileStateMap>(MR, false);
+  C.addTransition(State);
+}
+
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {
+  // We want to intercept assignments to bdev_file.
+  // Check if the left-hand side (LHS) corresponds to a memory region that is a bdev_file.
+  const MemRegion *LHSReg = Loc.getAsRegion();
+  if (!LHSReg)
+    return;
+  LHSReg = LHSReg->getBaseRegion();
+  if (!LHSReg)
+    return;
+
+  // Examine the AST of the store expression to see if it involves the "bdev_file" member.
+  if (const BinaryOperator *BO = dyn_cast_or_null<BinaryOperator>(StoreE)) {
+    const Expr *LHS = BO->getLHS()->IgnoreParenCasts();
+    if (!LHS || !ExprHasName(LHS, "bdev_file", C))
+      return;
+  } else {
+    if (const MemberExpr *ME = dyn_cast<MemberExpr>(StoreE)) {
+      if (!ExprHasName(ME, "bdev_file", C))
+        return;
+    } else {
+      return;
+    }
+  }
+
+  // If the right-hand side is a null pointer constant, then the pointer is being set to NULL.
+  // This indicates proper handling of the freed pointer.
+  if (Val.isZeroConstant()) {
+    ProgramStateRef State = C.getState();
+    State = State->set<BdevFileStateMap>(LHSReg, false);
+    C.addTransition(State);
+  }
+}
+
+void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  const Expr *CondE = dyn_cast<Expr>(Condition);
+  if (!CondE)
+    return;
+
+  // Remove any parentheses or implicit casts.
+  const Expr *SubE = CondE->IgnoreParenCasts();
+  // We are only interested in conditions that directly use the bdev_file field.
+  const MemberExpr *ME = dyn_cast<MemberExpr>(SubE);
+  if (!ME)
+    return;
+  if (!ExprHasName(ME, "bdev_file", C))
+    return;
+
+  const MemRegion *MR = getMemRegionFromExpr(ME, C);
+  if (!MR)
+    return;
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+
+  // If the state for bdev_file exists and shows that the pointer was freed,
+  // then its use in a branch condition may lead to a use-after-free.
+  const bool *IsLive = State->get<BdevFileStateMap>(MR);
+  if (IsLive && (*IsLive == false)) {
+    reportUAF(MR, Condition, C);
+  }
+}
+
+void SAGenTestChecker::reportUAF(const MemRegion *MR, const Stmt *S, CheckerContext &C) const {
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  auto Report = std::make_unique<PathSensitiveBugReport>(
+      *BT, "UAF: use after free of bdev_file", N);
+  Report->addRange(S->getSourceRange());
+  C.emitReport(std::move(Report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects use-after-free of bdev_file due to not nullifying the pointer after free", 
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+
+```
+
+## Error Messages 
+
+- Error Line: 39 |   void checkPostCall(const CallEvent &Call, CheckerContext &C) const override;
+
+	- Error Messages: ‘void {anonymous}::SAGenTestChecker::checkPostCall(const clang::ento::CallEvent&, clang::ento::CheckerContext&) const’ marked ‘override’, but does not override
+
+- Error Line: 43 |   void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const override;
+
+	- Error Messages: ‘void {anonymous}::SAGenTestChecker::checkBind(clang::ento::SVal, clang::ento::SVal, const clang::Stmt*, clang::ento::CheckerContext&) const’ marked ‘override’, but does not override
+
+- Error Line: 47 |   void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const override;
+
+	- Error Messages: ‘void {anonymous}::SAGenTestChecker::checkBranchCondition(const clang::Stmt*, clang::ento::CheckerContext&) const’ marked ‘override’, but does not override
+
+
+
+## Formatting 
+
+Your response should be like: 
+
+```cpp
+{{whole fixed checker code here}}
+```
+
+Note, please return the **whole** checker code after fixing the compilation error.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an allocation function (like kzalloc) with a multiplication of parameters to compute the total allocation size can lead to an integer overflow. This happens when the multiplication of the element size and the number of elements exceeds the maximum value that can be represented, causing the allocated buffer to be smaller than needed. This insufficient allocation may lead to buffer overflows or memory corruption when the code writes beyond the allocated memory. Replacing such usage with a function like kcalloc, which checks for overflow during multiplication, prevents this vulnerability.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using cleanup (or automated free) attributes on pointers that are not explicitly initialized (e.g., not set to NULL) can lead to freeing uninitialized or garbage pointers on function exit. This pattern occurs when pointers with cleanup attributes (like __free(kfree)) are declared without an initial value, so if an early return is taken before these pointers are assigned a valid allocated memory or remain NULL, the cleanup mechanism may attempt to free an uninitialized pointer, causing undefined behavior.

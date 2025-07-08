@@ -1,0 +1,150 @@
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h" // for MemberExpr
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// Customize program state: This map records if a thermal zone device's "num_trips" field
+// (keyed by the base region of the structure) has been assigned.
+REGISTER_MAP_WITH_PROGRAMSTATE(TripAssignedMap, const MemRegion *, bool)
+
+namespace {
+
+class SAGenTestChecker : public Checker<check::Bind, check::PostCall> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() 
+      : BT(new BugType(this, "Initialization Order Error", 
+           "num_trips assignment occurs after memcpy, causing fortify to miscompute buffer size")) {}
+
+  // Callback for handling value bindings (e.g. assignments)
+  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;
+
+  // Callback for handling function calls
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+
+private:
+  // Helper function to report the bug.
+  void reportInitOrderError(const CallEvent &Call, const MemRegion *BaseReg, CheckerContext &C) const;
+};
+
+//
+// checkBind: Triggered when a value is bound to a memory region.
+//
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,
+                                 CheckerContext &C) const {
+  // We are interested in assignments to a member field named "num_trips".
+  if (!StoreE)
+    return;
+  
+  // Cast the Stmt to an Expr so we can call IgnoreImplicit.
+  const Expr *StoreExpr = dyn_cast<Expr>(StoreE);
+  if (!StoreExpr)
+    return;
+  
+  // Try to see if the left-hand side is a MemberExpr.
+  if (const auto *ME = dyn_cast<MemberExpr>(StoreExpr->IgnoreImplicit())) {
+    // Check if the member name is "num_trips".
+    if (const ValueDecl *MD = ME->getMemberDecl()) {
+      if (MD->getNameAsString() == "num_trips") {
+        // Retrieve the memory region corresponding to the LHS.
+        const MemRegion *MR = getMemRegionFromExpr(StoreExpr, C);
+        if (!MR)
+          return;
+        MR = MR->getBaseRegion();
+        if (!MR)
+          return;
+        // Mark in our TripAssignedMap that the num_trips field (for this structure) has been assigned.
+        ProgramStateRef State = C.getState();
+        State = State->set<TripAssignedMap>(MR, true);
+        C.addTransition(State);
+      }
+    }
+  }
+}
+
+//
+// checkPostCall: Triggered right after a function call.
+//
+void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+
+  // We target memcpy calls.
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr)
+    return;
+    
+  // Use the utility to ensure we are processing a memcpy call.
+  if (!ExprHasName(OriginExpr, "memcpy", C))
+    return;
+  
+  // Retrieve the destination argument (first argument) of memcpy.
+  const Expr *DstExpr = Call.getArgExpr(0);
+  if (!DstExpr)
+    return;
+
+  // We are interested in memcpy calls that copy into the trips field.
+  // Use ExprHasName to check if the destination expression text contains "trips".
+  if (!ExprHasName(DstExpr, "trips", C))
+    return;
+
+  // Retrieve the memory region for the destination argument.
+  const MemRegion *DstReg = getMemRegionFromExpr(DstExpr, C);
+  if (!DstReg)
+    return;
+  // Get the base region. For a field, the base region should correspond to the parent object.
+  const MemRegion *BaseReg = DstReg->getBaseRegion();
+  if (!BaseReg)
+    return;
+
+  // Lookup in TripAssignedMap whether the structure has had its num_trips assigned.
+  const bool *Assigned = State->get<TripAssignedMap>(BaseReg);
+  // If not assigned (or missing), then the memcpy is occurring before num_trips is updated.
+  if (!Assigned || !(*Assigned)) {
+    reportInitOrderError(Call, BaseReg, C);
+  }
+}
+
+//
+// reportInitOrderError: Generates a bug report for initialization order error.
+//
+void SAGenTestChecker::reportInitOrderError(const CallEvent &Call, const MemRegion *BaseReg, CheckerContext &C) const {
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+
+  // Create a bug report with a short and clear message.
+  auto report = std::make_unique<PathSensitiveBugReport>(
+      *BT, "Initialization order error: num_trips is assigned after memcpy, which may cause fortify to view the buffer size as zero", N);
+  report->addRange(Call.getSourceRange());
+  C.emitReport(std::move(report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects initialization order error where num_trips is assigned after memcpy in thermal_zone_device_register_with_trips",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

@@ -1,0 +1,97 @@
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "clang/AST/Stmt.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+namespace {
+
+class SAGenTestChecker : public Checker< check::PostCall > {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() : BT(new BugType(this, "Unsafe roundup_pow_of_two call")) {}
+
+  // Callback function to check after a function call has been evaluated.
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+
+private:
+  // No additional self-defined functions needed.
+};
+
+void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  // Retrieve the origin expression of the call.
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr)
+    return;
+
+  // Check if the call is to "roundup_pow_of_two".
+  if (!ExprHasName(OriginExpr, "roundup_pow_of_two", C))
+    return;
+
+  // Ensure that the call has exactly one argument.
+  if (Call.getNumArgs() != 1)
+    return;
+
+  // Retrieve the argument expression.
+  const Expr *ArgE = Call.getArgExpr(0);
+  if (!ArgE)
+    return;
+
+  // Filter: We are interested only if the argument source text contains "max_entries".
+  if (!ExprHasName(ArgE, "max_entries", C))
+    return;
+
+  // Now, search upward in the AST tree for an if-statement that has a proper safe guard.
+  // We look for a condition that contains "1UL << 31", indicating that the argument was checked.
+  bool safeGuardFound = false;
+  const Stmt *Current = OriginExpr;
+  while (const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Current, C)) {
+    const Expr *Cond = IfS->getCond();
+    if (Cond && ExprHasName(Cond, "1UL << 31", C)) {
+      safeGuardFound = true;
+      break;
+    }
+    // Advance the search upward.
+    Current = IfS;
+  }
+
+  // If no safe guard condition was found, report the bug.
+  if (!safeGuardFound) {
+    ExplodedNode *ErrNode = C.generateNonFatalErrorNode();
+    if (!ErrNode)
+      return;
+    auto report = std::make_unique<PathSensitiveBugReport>(
+          *BT,
+          "Unsafe call to roundup_pow_of_two: missing check for max_entries > 1UL << 31",
+          ErrNode);
+    C.emitReport(std::move(report));
+  }
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker",
+      "Detects unsafe call to roundup_pow_of_two without proper overflow check of max_entries",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

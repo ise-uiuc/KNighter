@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing unchecked subtraction on a size (the iov_iter count) can cause an unsigned integer underflow. In this case, the code rounds up a computed length to the filesystem block size and subtracts it from the total iter count without verifying that the computed subtraction ("shorten") is less than or equal to the current iter->count, which may result in an underflow when the block size is large relative to iter->count.

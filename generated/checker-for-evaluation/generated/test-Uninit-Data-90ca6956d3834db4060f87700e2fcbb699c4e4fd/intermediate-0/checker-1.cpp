@@ -1,0 +1,91 @@
+#include "clang/AST/Attr.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/Stmt.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/Decl.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/StaticAnalyzer/Core/PathDiagnostic/PathDiagnosticLocation.h" // For PathDiagnosticLocation
+
+using namespace clang;
+using namespace ento; // Removed "using namespace taint;" since no such namespace exists
+
+namespace {
+
+/// A RecursiveASTVisitor to visit variable declarations in a function body
+/// and report those pointer variables marked with a cleanup attribute but not
+/// explicitly initialized.
+class VarDeclVisitor : public RecursiveASTVisitor<VarDeclVisitor> {
+  const FunctionDecl *FD;
+  BugReporter &BR;
+  ASTContext &Ctx;
+  const BugType *BT;
+
+public:
+  VarDeclVisitor(const FunctionDecl *FD, BugReporter &BR, ASTContext &Ctx, const BugType *BT)
+      : FD(FD), BR(BR), Ctx(Ctx), BT(BT) {}
+
+  bool VisitVarDecl(VarDecl *VD) {
+    // Only consider variables of a pointer type.
+    if (!VD->getType()->isPointerType())
+      return true; // Skip non-pointer types.
+
+    // Check if the variable has a cleanup attribute.
+    // The cleanup attribute (e.g. __free) is modeled by CleanupAttr.
+    if (!VD->hasAttr<CleanupAttr>())
+      return true; // Not a cleanup pointer.
+
+    // Check if the pointer has an initializer.
+    if (VD->hasInit())
+      return true; // Already initialized.
+
+    // If we reach here, we have found a pointer with cleanup attribute that is not initialized.
+    // Create a bug report with a concise message.
+    // We now obtain a source location from the beginning of the variable declaration.
+    auto loc = PathDiagnosticLocation::createBegin(VD, BR.getSourceManager(), Ctx);
+    auto *R = new BasicBugReport(*BT, "Cleanup pointer not initialized", loc);
+    R->addRange(VD->getSourceRange());
+    BR.emitReport(R);
+    return true;
+  }
+};
+
+class SAGenTestChecker : public Checker<check::ASTDecl> {
+  // The bug type to be reported.
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker()
+      : BT(new BugType("Uninitialized Cleanup Pointer", "Custom Checker")) {}
+
+  // Callback to inspect every AST declaration.
+  void checkASTDecl(const Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {
+    // We only care about function definitions.
+    if (const FunctionDecl *FD = dyn_cast<FunctionDecl>(D)) {
+      if (!FD->hasBody())
+        return;
+
+      // Traverse the function body to look for local variable declarations.
+      VarDeclVisitor Visitor(FD, BR, FD->getASTContext(), BT.get());
+      Visitor.TraverseStmt(FD->getBody());
+    }
+  }
+};
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker",
+      "Detects cleanup pointers that are not explicitly initialized",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

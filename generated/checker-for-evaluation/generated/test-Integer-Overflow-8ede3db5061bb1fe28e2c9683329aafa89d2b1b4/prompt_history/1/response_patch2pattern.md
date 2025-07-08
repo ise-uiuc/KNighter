@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is caused by casting unsigned values (specifically, a size_t value) to int when performing overflow checks. In this case, casting controllen (an unsigned long) to int can turn large values into negative numbers. This negative conversion then bypasses the intended overflow detection because check_add_overflow considers that adding a negative number to an existing value may not overflow, even though the actual size_t arithmetic would have. Removing the unnecessary casts and using the original unsigned values ensures that overflow is correctly detected.

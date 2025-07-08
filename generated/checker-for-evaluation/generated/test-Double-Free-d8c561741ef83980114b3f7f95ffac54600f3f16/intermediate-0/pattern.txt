@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an incorrect cleanup function in the error path that frees resources twice. In this instance, when SQ creation fails, the wrong function (hws_send_ring_close_sq) was originally used, which ended up freeing parts of the SQ structure that would later be freed again—resulting in a double-free. The correct pattern is to use a single, designated cleanup routine (mlx5_core_destroy_sq wrapped in hws_send_ring_destroy_sq) to ensure all allocated resources are released exactly once.

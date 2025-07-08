@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Accessing a field of an object (in this case, subflow->request_join) after the object has been effectively freed or is in the process of being freed. The root issue is the incorrect ordering of operations: the code reads from the subflow structure after calling mptcp_close_ssk(…), which triggers the release (and potential reuse) of the memory, thereby creating a use-after-free condition.

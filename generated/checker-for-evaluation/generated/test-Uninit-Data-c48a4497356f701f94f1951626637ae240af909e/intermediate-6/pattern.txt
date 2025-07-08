@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an uninitialized pointer due to not checking the return code of a resource-loading function. In this pattern, a function (e.g., request_firmware) that may fail is called without verifying its return value. As a result, if the call fails, the pointer (here, fw) remains uninitialized yet is later dereferenced or passed to cleanup functions (like release_firmware), leading to erroneous behavior or crashes.

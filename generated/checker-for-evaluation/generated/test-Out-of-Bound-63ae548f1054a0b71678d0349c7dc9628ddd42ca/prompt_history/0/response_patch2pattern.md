@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Insufficient index bounds checking before accessing an array. In this case, the code computes an index (i) used to access elements in output_tf->tf_pts without verifying that it is less than TRANSFER_FUNC_POINTS, which can lead to an out-of-bounds memory access. This pattern occurs whenever computed indices are used to index into fixed-size arrays but lack proper runtime validation to ensure they remain within legal limits, potentially causing buffer overflows.

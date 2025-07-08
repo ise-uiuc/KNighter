@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the improper handling of uninitialized pointer values returned by a resource loading API. Instead of checking the API's return status to confirm that the pointer is valid, the code checks the pointer itself (which may not be reliably initialized) and then proceeds to call cleanup functions (like release_firmware()) on an uninitialized or invalid pointer. This mistake can lead to undefined behavior, as it allows the use of uninitialized data when firmware loading fails.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the inadequate validation of user-supplied buffer length before copying data from user space. In this case, the code uses a function (copy_from_sockptr()) to copy data from user space without ensuring that the provided length (optlen) is at least as large as the size of the expected structure or primitive type. This lack of proper length validation can lead to out-of-bounds memory accesses (as detected by KASAN) when the actual size of the user input is less than anticipated. The fix involves switching to a helper (bt_copy_from_sockptr()) that takes the user-supplied length into account to safely copy the correct amount of data, thereby preventing potential memory access violations.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the unsynchronized deallocation of shared objects, where a list of messages is freed while other concurrent threads might still be accessing it. In this case, failing to acquire an appropriate lock (in this instance, a spinlock) before freeing elements from a shared list (such as tx_ctrl_list or tx_data_list) can lead to a use‐after‐free scenario when another thread concurrently reads or traverses the list.

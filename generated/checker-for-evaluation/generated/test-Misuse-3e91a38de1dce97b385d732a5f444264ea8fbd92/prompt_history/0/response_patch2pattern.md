@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using a generic user‐space memory copying function (memdup_user) for duplicating an array without checking for possible multiplication overflow of the array size. This pattern fails to account for the arithmetic of element count times element size, which can lead to integer overflow and subsequently unsafe memory allocation or copying. The fix replaces it with memdup_array_user that safely handles array copying by validating the multiplication of the element count by its size, mitigating potential overflow vulnerabilities.

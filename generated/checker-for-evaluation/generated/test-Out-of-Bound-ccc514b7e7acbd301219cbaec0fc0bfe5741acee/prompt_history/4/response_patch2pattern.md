@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Looping over an array using a bound that exceeds the actual size of a related array, resulting in a potential buffer overflow. In this case, the iteration runs until VG_NUM_SOC_VOLTAGE_LEVELS (8) is reached, even though the DcfClocks array is only sized for VG_NUM_DCFCLK_DPM_LEVELS (7). This mismatch in loop bounds versus array size may lead to accessing memory beyond the allocated boundary.

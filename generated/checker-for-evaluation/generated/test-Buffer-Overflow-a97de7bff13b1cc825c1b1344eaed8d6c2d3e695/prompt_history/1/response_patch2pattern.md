@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the unsafe copying of user-supplied data without validating that the provided input length is sufficient. In this case, the code uses a generic copy function (copy_from_sockptr) without ensuring that the user’s optlen is greater than or equal to the expected size to be copied, which can lead to slab-out-of-bounds read issues. This pattern highlights the risk of not checking the length of user input before copying, potentially resulting in out-of-bounds memory access and corruption.

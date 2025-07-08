@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an initialization order error where a structure’s size or count field (used by fortified functions to verify buffer sizes) is updated after a memory copy, rather than before. In this case, because tz->num_trips is only set after memcpy() is executed, the __counted_by() check (inferred from the zero-initialized value from kzalloc) incorrectly determines that the destination buffer is of size zero, triggering a false-positive buffer overflow detection.

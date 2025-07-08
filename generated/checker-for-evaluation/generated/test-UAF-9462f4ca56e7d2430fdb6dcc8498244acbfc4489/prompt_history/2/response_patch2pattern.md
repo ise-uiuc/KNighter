@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is a use‐after‐free caused by insufficient synchronization when accessing shared data structures. In this patch, the memory (gsm_msg objects in tx_ctrl_list and tx_data_list) can be concurrently freed by one thread while another thread might still be accessing or iterating over the list. The root cause is the absence of proper locking (i.e., failing to acquire a spin lock) when cleaning up and flushing the transmission queues, leading to a race condition between accessing and freeing memory, and thus ultimately causing a use‐after‐free vulnerability.

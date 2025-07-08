@@ -1,0 +1,3 @@
+## Bug Pattern
+
+A race condition where the same memory object is freed in two independent paths (in the worker and in the scheduling function) without proper coordination. In this case, the reset_data structure is at risk of being freed twice—once if the scheduling function times out and again in the worker function when the completion callback is invoked—resulting in a use‐after‐free scenario. The fix introduces an explicit check (using completion_done()) before freeing the object to ensure that it is only freed once.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is updating a flexible-array member’s size indicator (counter) after the flexible array has already been accessed. Because the counter (event->datalen) is meant to inform runtime bounds checks (via __counted_by annotations and CONFIG_FORTIFY_SOURCE), failing to update it before copying data causes the bounds-checking to use an outdated (often zero) size, leading to buffer overflows and potential crashes.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an incorrect or overly broad cleanup path in error handling that frees a resource (here, the match_hl buffer) in cases where it should not be freed along with other resources. In this patch, the error branch for failure during header layout conversion mistakenly jumps to a label that frees both mt->fc and match_hl, even though mt->fc wasn’t allocated (or should not be freed) in that error path. This conflation of cleanup responsibilities creates a double free condition.

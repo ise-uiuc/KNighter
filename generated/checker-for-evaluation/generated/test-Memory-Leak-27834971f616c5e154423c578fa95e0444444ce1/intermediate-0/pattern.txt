@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is freeing sensitive, decrypted memory on an unrecoverable error. In this case, if set_memory_decrypted() fails, the code frees the decrypted memory with free_pages_exact(), which can inadvertently make the sensitive memory available to the page allocator. The pattern is “erroneously releasing (freeing) sensitive decrypted memory in error paths,” potentially exposing sensitive data if that memory is later re-used.

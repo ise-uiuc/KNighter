@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing an incorrect null check after a memory allocation by checking the wrong pointer variable. In this case, memory is allocated for dst->thread.sve_state with kzalloc(), but the code erroneously checks dst->thread.za_state for NULL, which indicates a copy-paste or oversight error. This pattern of verifying the allocated memory using an unrelated pointer can lead to unhandled NULL allocations and subsequent undefined behavior.

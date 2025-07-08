@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The root issue is declaring pointers with automatic cleanup (via __free) without initializing them. If these pointers are not set to NULL, and an early return or error path is taken before they are assigned a valid allocation, the cleanup logic may attempt to free uninitialized (or garbage) pointers. This pattern of not initializing auto-cleanup pointers to NULL results in them potentially being freed incorrectly, causing undefined behavior or crashes.

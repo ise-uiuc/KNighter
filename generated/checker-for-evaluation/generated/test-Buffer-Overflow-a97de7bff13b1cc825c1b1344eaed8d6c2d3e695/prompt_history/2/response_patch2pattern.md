@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using data-copy routines that assume a fixed amount of data can be safely copied from user-supplied buffers without first validating that the provided length (optlen) is sufficient, which can lead to out-of-bounds memory access. In this patch, the original use of copy_from_sockptr() did not confirm that the size of the user input meets the expected size, potentially allowing a slab buffer over-read. The fix replaces it with bt_copy_from_sockptr(), which explicitly checks optlen against the size required before copying the data.

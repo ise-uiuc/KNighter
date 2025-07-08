@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Looping over an index range that is larger than the size of the target array, resulting in an out-of-bounds access. In this case, the loop iterates over VG_NUM_SOC_VOLTAGE_LEVELS (8), while the DcfClocks array only has VG_NUM_DCFCLK_DPM_LEVELS (7) elements. Without checking that the index is within the valid range of DcfClocks, the code can attempt to access an element beyond its bounds, causing a buffer overflow.

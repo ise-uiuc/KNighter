@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Failing to reset or clear a pointer to a resource after it has been freed. In this patch, after closing the block device, the code does not set the pointer (device->bdev_file) to NULL, leaving a dangling pointer that may later be used to free an already freed resource (use-after-free). This pattern arises when the cleanup function releases a resource but neglects to update the pointer, leading to accidental reuse or deallocation of the stale pointer later.

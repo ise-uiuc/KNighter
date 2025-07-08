@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the use of an uninitialized structure (or structure with uninitialized padding) that is later copied to user space. In this case, a local instance of a data structure containing a hole (unused padding) is not zeroed before being filled partially with data. As a result, the uninitialized memory may contain sensitive leftover kernel data that ends up being exposed through user space operations. The proper fix is to initialize (zero out) the structure before setting its fields.

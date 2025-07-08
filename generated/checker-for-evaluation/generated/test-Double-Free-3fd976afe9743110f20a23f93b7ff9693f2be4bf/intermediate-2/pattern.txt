@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is using a device-managed memory allocation function (devm_kcalloc) for a buffer that is later freed manually by the driver's cleanup routines. This results in double freeing because the device-managed allocation automatically frees the memory on device removal while the driver code also invokes an explicit free routine (via pinconf_generic_dt_free_map calling pinctrl_utils_free_map). The root cause is mixing automatic (devm_*) allocation with manual deallocation, which can lead to double free errors.

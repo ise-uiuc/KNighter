@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the failure to check that an index used for accessing an array is within the valid bounds of the array. In this patch, the code copies data from an array of transfer function points using an index "i" that can potentially exceed the size of the array (TRANSFER_FUNC_POINTS). This lack of bounds checking may lead to buffer overflow errors as the code may read beyond the allocated memory region.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The issue is due to copying a partially initialized structure to user space. In this case, a structure with an internal hole (padding) is declared on the stack and only some of its fields are explicitly set before being copied to user space. Because the remaining fields (including padding) are uninitialized, they may contain garbage data, which can lead to a kernel info leak. Initializing the entire structure (e.g. by using memset to zero it out) ensures that no uninitialized memory is inadvertently exposed.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern here involves not executing the proper cleanup routines in an error case. Specifically, when hwrm_req_replace() fails, the code immediately returns without calling hwrm_req_drop() to release or clean up the allocated request resource. This omission leads to a memory/resource leak because the cleanup function, which is crucial to prevent such leaks, is not invoked in the error branch.

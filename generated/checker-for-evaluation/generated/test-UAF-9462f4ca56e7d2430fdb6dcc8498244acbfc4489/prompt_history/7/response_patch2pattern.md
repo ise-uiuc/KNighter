@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is a race condition caused by missing proper locking around shared dynamic data structures. In this case, the cleanup function frees structures (tx_ctrl_list and tx_data_list) that can be concurrently accessed or freed by multiple threads (e.g., via ioctl operations). The lack of a proper spin lock when flushing and freeing these queues leads to a use-after-free scenario.

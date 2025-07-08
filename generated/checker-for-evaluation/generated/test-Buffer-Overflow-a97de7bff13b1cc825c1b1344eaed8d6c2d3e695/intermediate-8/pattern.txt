@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is copying user-supplied data into kernel space without properly validating that the provided user buffer length (optlen) is sufficient for the expected data structure. This unchecked copy operation can result in accessing or writing beyond the allocated buffer (i.e., slab-out-of-bounds), potentially leading to memory corruption or exposing kernel data. In this patch, replacing copy_from_sockptr with bt_copy_from_sockptr ensures that the function verifies the length against the expected size before performing the copy.

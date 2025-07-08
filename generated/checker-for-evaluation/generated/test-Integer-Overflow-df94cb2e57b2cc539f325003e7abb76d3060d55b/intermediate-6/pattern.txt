@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an integer type (e.g. unsigned, typically 32-bit) for variables that must represent potentially large disk sector counts, causing integer overflow. This manifests in calculations and comparisons (and even format specifiers) when the actual values exceed the range of the smaller type. The fix replaces the variable type with a 64-bit type (u64) and uses associated helper macros (like min_t(u64,…)) and correct format specifiers to correctly handle large values.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is using a device-managed allocation function (devm_kcalloc) to allocate memory that is later manually freed by a callback (dt_free_map calling pinctrl_utils_free_map), which results in a double free. The root cause is mixing auto-managed memory allocation (which automatically frees memory on device removal) with manual deallocation, leading to the same memory being freed twice.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern involves publishing an object (by allocating and exposing its identifier via xa_alloc) before the object is fully initialized and its ownership reference is properly secured. By moving the xa_alloc call to the end of the function, it prevents the object (the exec queue) from being exposed (and thus accessible to potentially malicious user actions) while it is still partially set up. This premature publication of an incompletely initialized object can lead to use-after-free vulnerabilities if the object is destroyed or otherwise modified before the initialization is complete.

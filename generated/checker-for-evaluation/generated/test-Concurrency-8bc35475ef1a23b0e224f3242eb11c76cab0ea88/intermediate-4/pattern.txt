@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an unconditional read of a shared, mutable state (the work item's data via *work_data_bits) before first checking a condition (whether the work flush is coming from cancellation). This premature access may interleave with concurrent modifications and trigger spurious data race detections. In this case, the fix involves testing the condition (from_cancel) before reading shared data, thereby preventing an unnecessary and race-prone data access that can lead to false positives in tools like KCSAN.

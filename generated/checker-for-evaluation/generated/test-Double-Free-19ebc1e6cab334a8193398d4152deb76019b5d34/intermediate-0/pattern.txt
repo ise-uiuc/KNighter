@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern involves failing to reinitialize a dynamically allocated pointer (in this case, "ea") after it has been freed. Because of this, multiple error paths (or replay loops) may attempt to free the same memory again. The underlying issue is that once memory is freed in an error cleanup block, the pointer should be reset (typically to NULL) before any potential reuse; otherwise, subsequent cleanup paths might call free on an already released pointer, resulting in a double free vulnerability.

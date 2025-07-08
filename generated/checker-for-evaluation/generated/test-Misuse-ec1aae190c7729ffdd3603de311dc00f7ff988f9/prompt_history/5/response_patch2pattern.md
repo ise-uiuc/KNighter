@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is updating the size counter for a flexible array member (used in _counted_by annotations for runtime bounds checks) after accessing the flexible array. In this case, the counter (datalen) needed to be updated before any access (such as memcpy into the flexible array) so that any fortified source runtime checks can verify the correct size. Failing to update the counter early can lead to buffer overflows or triggering of bounds-check errors.

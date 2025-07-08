@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is using an improperly narrow integer type (e.g., unsigned 32-bit) for variables and parameters that represent disk sector counts. Because disk sectors and reservations can exceed the limits of a 32-bit value, arithmetic operations and formatting based on these values may overflow or misrepresent the actual amount. This type mismatch leads to incorrect disk usage calculations and can ultimately cause system panics or other erroneous behaviors.

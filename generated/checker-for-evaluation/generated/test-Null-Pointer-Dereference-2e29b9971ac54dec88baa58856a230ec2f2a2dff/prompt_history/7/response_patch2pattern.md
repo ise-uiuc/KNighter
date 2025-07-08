@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The patch fixes a mistake where the wrong pointer is checked after memory allocation. In the affected code, memory is allocated to dst->thread.sve_state using kzalloc(), but the NULL check mistakenly tests dst->thread.za_state instead of dst->thread.sve_state. This pattern of comparing the wrong pointer can lead to dereferencing a potentially NULL pointer, resulting in memory corruption or system crashes.

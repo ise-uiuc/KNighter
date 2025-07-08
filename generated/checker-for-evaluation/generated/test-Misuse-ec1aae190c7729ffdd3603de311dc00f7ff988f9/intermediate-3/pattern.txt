@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Accessing a flexible array member before its length counter is correctly set. In this case, the code copies data into the flexible array (which is annotated with __counted_by) before updating the associated length field (datalen). As a result, runtime bounds checks via CONFIG_FORTIFY_SOURCE see an incorrect size, potentially triggering buffer overflow protections. This misordering of counter initialization and data access is a common bug pattern in code handling flexible arrays with runtime bounds validation.

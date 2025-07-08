@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is initializing a structure’s size field after performing a memory copy that relies on that field for buffer size checks. In this case, the field (num_trips) that determines the valid size for the variable-length trips array is set only after memcpy() is called. Because memory allocation (via kzalloc) initially sets num_trips to zero, the fortified memcpy check (using __counted_by()) sees a destination buffer size of zero. This misordering triggers an overflow detection even though the actual allocation is sufficient. The core issue is that the metadata used for bounds checking is updated too late, leading to a misinterpretation of the buffer size during memory copying.

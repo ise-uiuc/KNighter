@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is calculating an allocation size via unchecked multiplication (i.e., sizeof(element) * count) which may lead to integer overflow. In the original code, using kzalloc with a manually computed size can result in allocating a smaller buffer than intended if the multiplication overflows. Using kcalloc mitigates this risk because it checks for multiplication overflow and ensures that the correct amount of memory is allocated.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern involves not reinitializing a pointer after it has been freed. In a function with a retry loop or multiple error-handling paths (via goto), if a pointer is freed in one error path and then later passed through the same cleanup path again without being reset (e.g., set to NULL), a double free can result. Specifically, the pointer "ea" is freed in an error path, and upon replay (retry), the pointer is not reinitialized to NULL before subsequent code execution, which leads to it being freed a second time.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+After dynamically allocating memory with kzalloc(), the code mistakenly checks the wrong pointer (dst->thread.za_state) for a NULL value instead of verifying the result of the kzalloc() call (dst->thread.sve_state). This pattern—performing an incorrect NULL check on an unrelated variable after memory allocation—can lead to a situation where a failed allocation goes undetected, potentially resulting in further errors such as dereferencing a NULL pointer.

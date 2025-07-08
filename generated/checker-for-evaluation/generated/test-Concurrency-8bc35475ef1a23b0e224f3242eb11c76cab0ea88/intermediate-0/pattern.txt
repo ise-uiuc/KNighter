@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The issue is an unconditional read of a shared, concurrently modified bit field before its value is needed. In this patch, work->data is read regardless of whether the from_cancel flag is true. This read can race with modifications in other contexts, triggering false-positive data race detections (specifically with KCSAN). The pattern is reading a shared data field unconditionally even though its inspection is only required in a specific code path, causing unnecessary concurrent access to a mutable field.

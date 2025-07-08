@@ -1,0 +1,97 @@
+#include "clang/AST/Decl.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+namespace {
+
+// This checker detects occurrences of unvalidated user-supplied buffer length
+// when calling copy_from_sockptr. In the bug pattern, the copy_from_sockptr
+// function is invoked with only three arguments, so that the length (optlen)
+// is not being properly validated. This can lead to slab-out-of-bounds accesses.
+
+class SAGenTestChecker : public Checker<check::PreCall> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() : BT(new BugType(this, "User buffer length not validated")) {}
+
+  // checkPreCall intercepts calls before they are evaluated.
+  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+
+private:
+  // A helper function to check that we are in a socket options related function.
+  // Returns true if the enclosing function's name contains "sock_setsockopt".
+  bool inSocketOptFunction(const CallEvent &Call, CheckerContext &C) const {
+    const Expr *Origin = Call.getOriginExpr();
+    if (!Origin)
+      return false;
+    // Instead of using findSpecificTypeInParents (which expects a Decl pointer),
+    // we can extract the FunctionDecl from the current location context.
+    const Decl *D = C.getLocationContext()->getDecl();
+    const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(D);
+    if (!FD)
+      return false;
+    StringRef FName = FD->getName();
+    return FName.contains("sock_setsockopt");
+  }
+};
+
+void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+  // Get the origin expression of the call.
+  const Expr *Origin = Call.getOriginExpr();
+  if (!Origin)
+    return;
+
+  // Check whether the call is to "copy_from_sockptr".
+  if (!ExprHasName(Origin, "copy_from_sockptr", C))
+    return;
+
+  // We only want to report calls that pass exactly 3 arguments,
+  // since the proper (fixed) function should supply 4 arguments.
+  if (Call.getNumArgs() != 3)
+    return;
+
+  // Optionally, check that the call is within a socket options related function.
+  // This helps reduce false positives.
+  if (!inSocketOptFunction(Call, C))
+    return;
+
+  // Report the bug: the user-supplied buffer length is not validated.
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+
+  auto Report = std::make_unique<PathSensitiveBugReport>(
+      *BT, "User buffer length not validated when copying socket option data", N);
+  Report->addRange(Call.getSourceRange());
+  C.emitReport(std::move(Report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects missing user buffer length validation in copy_from_sockptr calls",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

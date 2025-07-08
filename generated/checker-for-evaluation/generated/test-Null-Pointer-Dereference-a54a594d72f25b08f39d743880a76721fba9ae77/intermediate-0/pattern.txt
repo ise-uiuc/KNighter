@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern here is performing an incomplete/ineffective validity check on a pointer parameter that is later dereferenced. In the original code, the function checks if the pointer (or one of its critical fields) is invalid by simply logging an error but then continues to use that pointer while holding a lock—potentially dereferencing a NULL or otherwise invalid pointer. This pattern of only logging the error (without aborting the operation) leads to a null pointer dereference and undefined behavior. The fix moves the check inside the spinlock and returns early when the pointer is invalid, ensuring that no further access is made to an invalid pointer.

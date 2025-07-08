@@ -1,0 +1,3 @@
+## Bug Pattern
+
+A loop iterates using a constant that exceeds the size of one of the arrays being indexed, leading to a possible out-of-bounds access. Specifically, the loop uses VG_NUM_SOC_VOLTAGE_LEVELS (8 iterations) to index into an array (DcfClocks) that only has VG_NUM_DCFCLK_DPM_LEVELS (7 elements). This misalignment in expected sizes results in a potential buffer overflow when the loop index reaches a value that is not valid for the smaller array.

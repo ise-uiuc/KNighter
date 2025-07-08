@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is updating the counter (or length field) that bounds a flexible array member after the array is accessed. In this patch, the field annotated with __counted_by (datalen) is assigned only after the flexible-array data has already been accessed with memcpy(). This means that during the memcpy() the runtime bounds checking sees an incorrect (usually zero) length, potentially triggering a buffer overflow. The root issue is the order of operations where the metadata controlling the buffer’s size is updated too late relative to its use.

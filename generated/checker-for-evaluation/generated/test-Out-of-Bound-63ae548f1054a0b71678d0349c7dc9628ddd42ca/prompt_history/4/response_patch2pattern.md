@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Loop iterations that use an index to access an array without checking whether the index is within the valid bounds of the array. In this case, the loop used to translate the transfer function data fails to verify that the index 'i' remains lower than the maximum allowed (TRANSFER_FUNC_POINTS) before accessing the array, leading to potential buffer overflows or out-of-bounds memory accesses.

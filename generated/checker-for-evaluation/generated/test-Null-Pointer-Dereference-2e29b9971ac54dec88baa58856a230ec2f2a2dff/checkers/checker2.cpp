@@ -1,0 +1,134 @@
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/AST/Expr.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// We use a singleton key to record that a kzalloc call was made for the
+// expected field "sve_state". When this flag is true, it means that memory was
+// allocated via kzalloc and it is expected that the null-check should be performed
+// on that pointer (i.e. on "sve_state"). If a later condition checks a different
+// field (e.g. "za_state"), then we will report an error.
+static const void *SVEKey = reinterpret_cast<const void*>(1);
+
+// Register a ProgramState map to record when a kzalloc call assigned to "sve_state"
+// has been detected.
+REGISTER_MAP_WITH_PROGRAMSTATE(ExpectedSVEAlloc, const void*, bool)
+
+namespace {
+
+class SAGenTestChecker : public Checker<check::PostCall, check::BranchCondition> {
+  mutable std::unique_ptr<BugType> BT;
+public:
+  SAGenTestChecker() 
+    : BT(new BugType(this, "Incorrect Pointer Check", "Allocation Failure Check")) {}
+
+  // Callback that intercepts function calls after evaluation.
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  // Callback that examines branch conditions.
+  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;
+
+private:
+  // Helper to report the bug.
+  void reportIncorrectCheck(const Stmt *S, CheckerContext &C) const;
+};
+
+void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  // We only care about calls to kzalloc.
+  const Expr *Origin = Call.getOriginExpr();
+  if (!Origin)
+    return;
+
+  const CallExpr *CE = dyn_cast<CallExpr>(Origin);
+  if (!CE)
+    return;
+
+  // Using getCalleeIdentifier is not ideal for call chaining;
+  // use ExprHasName on the origin expression.
+  if (!ExprHasName(Origin, "kzalloc", C))
+    return;
+
+  // Try to find an assignment to a struct field.
+  // We look upward in the AST from the kzalloc call's expression to see if it is
+  // being assigned to a member and, if so, check if that member is "sve_state".
+  const MemberExpr *ME = findSpecificTypeInParents<MemberExpr>(CE, C);
+  if (!ME)
+    return;
+
+  // Get the member name.
+  const ValueDecl *VD = ME->getMemberDecl();
+  if (!VD)
+    return;
+  
+  StringRef FieldName = VD->getName();
+  // We record the allocation if the field being assigned is "sve_state".
+  if (FieldName == "sve_state") {
+    State = State->set<ExpectedSVEAlloc>(SVEKey, true);
+    C.addTransition(State);
+  }
+}
+
+void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  // We only examine conditions that come from an expression.
+  const Expr *CondE = dyn_cast<Expr>(Condition);
+  if (!CondE)
+    return;
+  
+  // Remove any implicit casts or parentheses.
+  CondE = CondE->IgnoreParenCasts();
+
+  // Check for patterns of null-check, for example "if (!ptr)" or "if (ptr == NULL)"
+  // We then use the utility function ExprHasName to detect which field is being checked.
+  // If the condition text contains "za_state" while we have previously recorded an allocation 
+  // for "sve_state", then this is a bug.
+  if (ExprHasName(CondE, "za_state", C) && !ExprHasName(CondE, "sve_state", C)) {
+    // Retrieve our recorded flag.
+    bool FoundExpected = false;
+    const bool *Flag = State->get<ExpectedSVEAlloc>(SVEKey);
+    if (Flag)
+      FoundExpected = *Flag;
+    if (FoundExpected) {
+      reportIncorrectCheck(Condition, C);
+    }
+  }
+}
+
+void SAGenTestChecker::reportIncorrectCheck(const Stmt *S, CheckerContext &C) const {
+  // Generate a non-fatal error node.
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  // Produce a bug report indicating that the allocated pointer was not correctly null-checked.
+  auto Report = std::make_unique<PathSensitiveBugReport>(
+      *BT, "Incorrect pointer check for allocation failure: allocated memory in 'sve_state' is not being checked", N);
+  Report->addRange(S->getSourceRange());
+  C.emitReport(std::move(Report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects incorrect null-check after kzalloc (checks wrong field)", "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

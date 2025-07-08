@@ -1,0 +1,3 @@
+## Bug Pattern
+
+A race condition with improper ownership transfer of a dynamically allocated data structure used for completion notification. Specifically, the code fails to adequately check (using completion_done()) whether the caller has already stopped waiting (and thus already freed the structure) before freeing the reset_data structure in the worker. This leads to a use-after-free condition where both the worker and the caller might attempt to free the same memory.

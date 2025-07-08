@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the failure to perform bounds checking on an index variable before using it to access elements of an array. In this case, the code did not verify that the variable "i" remained below the maximum number of available transfer function points (TRANSFER_FUNC_POINTS) before accessing the arrays (for red, green, and blue). This oversight can cause an out-of-bounds read, leading to potential memory corruption or crashes.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is relying on legacy user-space array copy functions (memdup_user() and vmemdup_user()) that calculate the copy size using array_size(), which may return an invalid size (like SIZE_MAX in overflow scenarios) despite assumptions that overflow is impossible. This approach lacks explicit generic overflow checks and clear intent, leading to potential miscalculations and obscure code behavior. The fix replaces these calls with the standardized wrappers (memdup_array_user() and vmemdup_array_user()), which not only provide the same functionality but also incorporate proper overflow validations.

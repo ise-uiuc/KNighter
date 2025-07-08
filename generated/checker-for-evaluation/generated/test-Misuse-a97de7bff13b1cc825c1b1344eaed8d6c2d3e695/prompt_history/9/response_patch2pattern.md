@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the use of a raw copy function (copy_from_sockptr) without first ensuring that the user-supplied length (optlen) is sufficient to cover the expected data size. This omission can lead to copying more or less than intended (resulting in slab-out-of-bounds access) when user input is malformed, thereby exposing the kernel to memory corruption issues. The fix replaces it with a helper (bt_copy_from_sockptr) that validates the provided optlen against the expected size, ensuring safe copying of user data.

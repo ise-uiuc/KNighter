@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using kzalloc() (or similar allocation functions) with a multiplication expression to calculate the total memory size can lead to an integer overflow if the product of the number of elements and the size of each element exceeds the maximum value representable by the integer type. This overflow results in allocating a smaller buffer than expected, which can cause memory corruption when the buffer is later used. Switching to kcalloc() mitigates this risk as it performs the multiplication in a checked manner to ensure that no overflow occurs.

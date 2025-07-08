@@ -1,0 +1,104 @@
+```cpp
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h"
+#include "llvm/Support/ApInt.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// No custom program state maps are needed for this checker.
+
+namespace {
+
+class SAGenTestChecker : public Checker<check::PreCall> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() 
+    : BT(new BugType(this, "Unbounded copy_from_user Length", "Security")) {}
+
+  // checkPreCall will intercept calls to copy_from_user
+  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+
+private:
+  // (Optional) Additional helper functions can be declared here if needed.
+};
+
+void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+  // Retrieve the call's originating AST expression.
+  const Expr *Origin = Call.getOriginExpr();
+  if (!Origin)
+    return;
+  
+  // Verify that this is a call to copy_from_user using source text.
+  if (!ExprHasName(Origin, "copy_from_user", C))
+    return;
+  
+  // Cast the origin expression to a CallExpr.
+  const CallExpr *CE = dyn_cast<CallExpr>(Origin);
+  if (!CE)
+    return;
+  
+  // Ensure there are at least three arguments: destination, source, and length.
+  if (CE->getNumArgs() < 3)
+    return;
+  
+  // Retrieve the destination argument (expected to be a fixed-size buffer).
+  const Expr *DestExpr = CE->getArg(0);
+  llvm::APInt BufSize(32, 0);
+  if (!getArraySizeFromExpr(BufSize, DestExpr))
+    return; // Unable to determine fixed buffer size; skip analysis.
+  
+  // Retrieve the length argument (user-provided byte count).
+  const Expr *LenExpr = CE->getArg(2);
+  if (!LenExpr)
+    return;
+  
+  // Heuristic: if the length argument's source text contains "min", assume it is bounded.
+  if (ExprHasName(LenExpr, "min", C))
+    return;
+  
+  // Optionally, try to evaluate the length expression.
+  llvm::APSInt LenVal;
+  bool Evaluated = EvaluateExprToInt(LenVal, LenExpr, C);
+  if (Evaluated && LenVal.getSExtValue() <= BufSize.getSExtValue())
+    return; // The length is a constant that fits inside the buffer.
+  
+  // At this point, we suspect that copy_from_user may copy more than the fixed buffer size.
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  
+  auto report = std::make_unique<PathSensitiveBugReport>(
+      *BT, "Unbounded copy_from_user length may lead to buffer overflow", N);
+  C.emitReport(std::move(report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects unbounded user-provided length in copy_from_user calls that may lead to buffer overflow",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+```

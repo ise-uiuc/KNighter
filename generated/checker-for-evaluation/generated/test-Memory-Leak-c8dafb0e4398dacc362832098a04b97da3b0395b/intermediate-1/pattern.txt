@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the failure to properly clean up allocated resources in the error path. In this patch, when hwrm_req_replace() fails, the error path originally returns immediately without freeing or dropping the allocated request, leading to a memory leak. The fix ensures that all allocated resources are cleaned up by adding a proper error cleanup (invoking hwrm_req_drop()) before exiting.

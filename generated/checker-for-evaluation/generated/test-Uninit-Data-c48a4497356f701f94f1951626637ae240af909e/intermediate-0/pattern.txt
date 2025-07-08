@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Failure to check the return value of a function that is responsible for initializing a pointer, leading to the use of an uninitialized pointer. In this patch, the code calls request_firmware() without capturing and verifying its return code. As a result, if firmware loading is disabled or fails, the pointer "fw" remains uninitialized but is later used (for instance, in the call to release_firmware()), possibly causing undefined behavior.

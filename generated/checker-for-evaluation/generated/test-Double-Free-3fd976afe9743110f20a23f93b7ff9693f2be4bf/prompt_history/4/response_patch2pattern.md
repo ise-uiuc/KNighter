@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the use of an auto-managed memory allocation function (devm_kcalloc) for data that is later freed manually. By allocating memory through devm_kcalloc, the system is set to automatically free the data upon device removal. However, the manual call to free the data through pinconf_generic_dt_free_map (which in turn calls pinctrl_utils_free_map) leads to the same memory being freed twice. This mismatch between the allocation method and deallocation method results in a double free error.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is a race condition caused by unsynchronized updates to a shared pointer variable. In this case, the pointer (urb->hcpriv) is set to NULL without holding the lock, which means that during concurrent executions (one thread clearing the pointer and another checking and then using it), the pointer may become NULL after passing a check but before being dereferenced. This improper ordering of pointer update and lock release leads to a potential NULL pointer dereference.

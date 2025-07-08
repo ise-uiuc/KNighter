@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Incorrectly checking the wrong pointer for allocation failure. In this case, after allocating memory for dst->thread.sve_state with kzalloc(), the code mistakenly checks dst->thread.za_state (which is unrelated to the recent allocation) for NULL. This error pattern can lead to scenarios where a failed allocation is not detected because the wrong pointer is validated, causing subsequent operations on uninitialized or NULL data.

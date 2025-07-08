@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the redundant cleanup invocation in the error path where an automatic cleanup mechanism is already in place. In this patch, the cleanup function (scmi_debugfs_common_cleanup) is called explicitly after devm_add_action_or_reset() fails, even though devm_add_action_or_reset() already ensures that the cleanup is performed. This redundancy leads to a double free of the resource dbg->name. The underlying issue is mixing manual cleanup calls with device-managed (automatic) cleanup actions, which can result in freeing memory twice.

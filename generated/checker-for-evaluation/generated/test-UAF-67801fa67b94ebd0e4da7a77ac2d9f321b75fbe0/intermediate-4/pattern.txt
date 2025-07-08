@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is publishing an object by associating it with a user‐visible ID (via xa_alloc) before all necessary object initialization is completed—in particular, before its reference count is properly increased. This premature exposure allows an attacker to predict and potentially free the object (via a destroy ioctl) while the creation ioctl is still in progress, leading to a use-after-free situation.

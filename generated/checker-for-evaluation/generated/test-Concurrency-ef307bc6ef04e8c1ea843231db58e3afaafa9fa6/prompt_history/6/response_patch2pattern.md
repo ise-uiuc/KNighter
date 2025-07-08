@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is modifying a shared pointer (urb->hcpriv) outside the protection of its associated lock. In this case, setting urb->hcpriv to NULL without holding hsotg->lock creates a race condition where another thread (or function) may check and use the pointer under the assumption it remains valid. This mismatch in lock acquisition leads to an atomicity violation that can cause a NULL pointer dereference when concurrent operations access urb->hcpriv.

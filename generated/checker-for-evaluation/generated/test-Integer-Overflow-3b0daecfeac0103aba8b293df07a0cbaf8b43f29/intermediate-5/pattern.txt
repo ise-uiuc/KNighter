@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing a multiplication (e.g., sizeof(struct type) * count) directly within the allocation call without checking for integer overflow. This pattern can result in an overflow if 'count' is very large, leading to an allocation size smaller than intended and consequently a buffer overflow or memory corruption when the allocated memory is later used. Using kcalloc avoids this risk by handling the multiplication safely.

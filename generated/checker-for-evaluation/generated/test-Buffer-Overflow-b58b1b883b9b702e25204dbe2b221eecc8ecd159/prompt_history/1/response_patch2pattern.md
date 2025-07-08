@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern here is an unchecked arithmetic subtraction that can lead to an underflow. Specifically, the code subtracts a computed "shorten" value from an unsigned count (iter->count) without ensuring that "shorten" is less than or equal to the original count. If the rounding operation causes the value to be larger than what remains, the subtraction will underflow, resulting in an erroneous or corrupted count.

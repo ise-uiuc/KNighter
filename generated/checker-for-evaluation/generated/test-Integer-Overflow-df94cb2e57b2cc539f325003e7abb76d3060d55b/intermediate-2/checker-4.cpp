@@ -1,0 +1,116 @@
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/Stmt.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "llvm/Support/raw_ostream.h"
+#include <string>
+#include <memory>
+
+using namespace clang;
+using namespace ento;
+
+namespace {
+
+// Visitor to traverse the body of bch2_trans_fs_usage_apply
+class BchUsageVisitor : public RecursiveASTVisitor<BchUsageVisitor> {
+  BugReporter &BR;
+  BugType &BT;
+  ASTContext &Context;
+public:
+  BchUsageVisitor(BugReporter &br, BugType &bt, ASTContext &ctx)
+    : BR(br), BT(bt), Context(ctx) {}
+
+  // Visit declaration statements to check the variable "disk_res_sectors"
+  bool VisitDeclStmt(DeclStmt *DS) {
+    for (Decl *D : DS->decls()) {
+      if (VarDecl *VD = dyn_cast<VarDecl>(D)) {
+        if (VD->getName() == "disk_res_sectors") {
+          // Get the type size in bits.
+          QualType QT = VD->getType();
+          // For built-in types, ASTContext::getTypeSize returns the size in bits.
+          uint64_t TypeSize = Context.getTypeSize(QT);
+          // Expecting an unsigned type with at least 64 bits.
+          if (TypeSize < 64) {
+            std::string msg =
+              "Insufficient integer width for sector count variable 'disk_res_sectors'";
+            // Report the bug using a BasicBugReport.
+            // Use the location from the VarDecl.
+            PathDiagnosticLocation Loc(VD->getLocation(), Context.getSourceManager());
+            BR.emitReport(std::make_unique<BasicBugReport>(BT, msg, Loc));
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  // Visit call expressions to check for mismatched format specifiers.
+  bool VisitCallExpr(CallExpr *CE) {
+    if (FunctionDecl *FD = CE->getDirectCallee()) {
+      if (FD->getNameAsString() == "bch2_trans_inconsistent") {
+        // Typically the format string is the second argument.
+        if (CE->getNumArgs() >= 2) {
+          const Expr *Arg = CE->getArg(1)->IgnoreImplicit();
+          if (const StringLiteral *SL = dyn_cast<StringLiteral>(Arg)) {
+            StringRef FormatStr = SL->getString();
+            // If the format string uses "%u" it is mismatched (should be %llu).
+            if (FormatStr.contains("%u")) {
+              std::string msg =
+                "Mismatched format specifier '%u' used for disk sectors; expected '%llu'";
+              // Use the beginning location of the call expression.
+              PathDiagnosticLocation Loc(CE->getBeginLoc(), Context.getSourceManager());
+              BR.emitReport(std::make_unique<BasicBugReport>(BT, msg, Loc));
+            }
+          }
+        }
+      }
+    }
+    return true;
+  }
+};
+
+class SAGenTestChecker : public Checker<> {
+  // Store the BugType for reporting bugs.
+  mutable std::unique_ptr<BugType> BT;
+public:
+  SAGenTestChecker()
+    // Previously, a pointer to the checker was passed to BugType.
+    // With the new API this conversion is not allowed, so we pass nullptr.
+    : BT(std::make_unique<BugType>(nullptr, "Insufficient Integer Width", "Integer Overflow")) {}
+
+  // This hook is invoked for every AST declaration.
+  void checkASTDecl(const Decl *D, AnalysisManager &AM, BugReporter &BR) const {
+    // Only examine function declarations.
+    if (const FunctionDecl *FD = dyn_cast<FunctionDecl>(D)) {
+      // Focus on the target function.
+      if (FD->getNameAsString() == "bch2_trans_fs_usage_apply" && FD->hasBody()) {
+        ASTContext &Context = FD->getASTContext();
+        BchUsageVisitor Visitor(BR, *BT, Context);
+        Visitor.TraverseStmt(FD->getBody());
+      }
+    }
+  }
+};
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker",
+      "Detects insufficient integer width for sector count and mismatched format specifiers",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

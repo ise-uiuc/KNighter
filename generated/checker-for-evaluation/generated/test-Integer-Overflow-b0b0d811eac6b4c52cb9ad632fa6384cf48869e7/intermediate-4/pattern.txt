@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is performing multiplication between variables of different types without explicitly controlling the multiplication order or intermediate type conversion, which can lead to unintentional integer overflow. In this case, the multiplication involving types like dma_addr_t and integer values (e.g., pitch multiplied by height) can overflow due to implicit type promotion or mismatched operand widths. To prevent this, the multiplication should be broken into steps using an intermediate variable of a consistent type to ensure correct arithmetic and overflow avoidance.

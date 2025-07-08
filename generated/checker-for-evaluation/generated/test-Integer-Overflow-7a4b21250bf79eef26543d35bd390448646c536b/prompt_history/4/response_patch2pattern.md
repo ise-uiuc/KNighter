@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the unchecked possibility of integer overflow when calling a function like roundup_pow_of_two() that performs a left-shift on an unsigned long. On 32‐bit architectures, this left-shift can overflow, resulting in undefined behavior rather than reliably returning 0 when the value overflows. This pattern arises from performing computations on values that may be too large and relying on overflow to be handled gracefully, instead of explicitly checking the input value (in this case, attr->max_entries) before performing the operation.

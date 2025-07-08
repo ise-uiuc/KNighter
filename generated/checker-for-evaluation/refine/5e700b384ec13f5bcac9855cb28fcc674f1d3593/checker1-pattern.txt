@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the incorrect ordering of initialization steps, where the device is activated (opened) before its critical function pointers (client operations) are set. In this case, calling devm_serdev_device_open() too early marks the device as active, which may immediately trigger callbacks that access serdev->ops. Since serdev->ops hasn't been initialized yet with serdev_device_set_client_ops(), the callbacks can attempt to dereference a NULL pointer, leading to a race condition and potential system crash.

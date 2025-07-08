@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Failure to validate a configuration value received from an external source (here, the device's configuration) against an expected maximum. In this case, the code retrieves a "hash key size" from the device configuration without checking that it does not exceed a defined limit (VIRTIO_NET_RSS_MAX_KEY_SIZE). This insufficient bounds checking can lead to out-of-bound memory accesses or other memory corruption issues when the device reports an oversized hash key length.

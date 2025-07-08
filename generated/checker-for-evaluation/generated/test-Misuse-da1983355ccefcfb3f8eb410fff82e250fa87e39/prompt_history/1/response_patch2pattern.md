@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is using an uninitialized size indicator for a memory copy operation. In this case, the variable that defines the valid count of elements (num_trips) is updated only after the memcpy() call. Due to this ordering, fortify's __counted_by() check sees the copy buffer size as zero, triggering incorrect buffer overflow detection. The root cause is that the buffer size control variable is not set before the copy, leading to a mismatch between the intended and detected buffer sizes.

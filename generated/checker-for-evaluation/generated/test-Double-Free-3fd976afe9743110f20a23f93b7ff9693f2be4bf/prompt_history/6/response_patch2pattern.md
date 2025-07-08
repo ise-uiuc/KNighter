@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is using devm_kcalloc() (an auto-managed memory allocation API) to allocate a buffer that is later manually freed through a separate deallocation routine (in this case, via pinconf_generic_dt_free_map() which calls pinctrl_utils_free_map()). This results in a double free vulnerability because the auto-managed memory will also be freed automatically during the device's cleanup, leading to the same memory being freed twice.

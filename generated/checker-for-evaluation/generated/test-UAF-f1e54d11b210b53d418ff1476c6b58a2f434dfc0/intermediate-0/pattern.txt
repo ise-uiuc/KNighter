@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Directly freeing a shared metadata object using metadata_dst_free() without proper reference counting can result in a premature free. This causes a use‐after‐free bug when the metadata object is still referenced by other parts of the code (such as offloading packets). The correct approach is to use a release function (dst_release()) that decrements the object's reference count, ensuring the object isn’t freed while still in use.

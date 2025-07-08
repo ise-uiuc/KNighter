@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The root cause is that a structure containing implicit padding (or holes) is only partially initialized before being copied to user space. Without explicitly zeroing the entire memory block, uninitialized bytes can be leaked. This pattern occurs when a local structure is defined and then only some fields are set via a partial initializer, leaving holes that may contain sensitive kernel data, which are subsequently exposed when the structure is copied out.

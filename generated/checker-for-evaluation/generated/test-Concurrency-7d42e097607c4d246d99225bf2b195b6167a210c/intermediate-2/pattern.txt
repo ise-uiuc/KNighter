@@ -1,0 +1,3 @@
+## Bug Pattern
+
+A race condition leads to a use-after-free due to unsynchronized free() calls on a shared memory structure. In this case, the reset_data structure can be freed concurrently in two different execution paths – one in the worker thread and the other in the scheduling function – if a timeout occurs. The bug arises from not checking whether the completion has already been signaled (with completion_done()), thereby causing the potential of freeing the same memory twice. This pattern of conditionally freeing a shared resource based solely on mode, without verifying if it has already been completed or processed elsewhere, may result in a use-after-free if the asynchronous and synchronous flows race.

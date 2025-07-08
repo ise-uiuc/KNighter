@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using a generic user-space memory copy function (memdup_user()) to duplicate an array without performing safe multiplication of element count and size. This pattern fails to validate that the size calculation (e.g. 256 * sizeof(u32)) does not overflow or cause miscalculations, potentially leading to memory corruption or security issues. The proper approach is to use a dedicated array-copying wrapper (memdup_array_user()) that safely computes the total size and checks for overflow.

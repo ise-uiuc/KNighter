@@ -1,0 +1,191 @@
+```cpp
+#include "clang/AST/Expr.h"
+#include "clang/AST/Stmt.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/CheckerManager.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// Register a program state map to track whether a reset_data pointer has been
+// verified (i.e. its completion was checked using completion_done()).
+REGISTER_MAP_WITH_PROGRAMSTATE(ResetCheckedMap, const MemRegion*, bool)
+// Optionally track aliasing relationships for reset_data pointers.
+REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)
+
+namespace {
+
+class SAGenTestChecker
+    : public Checker<check::BranchCondition, check::PreCall, check::Bind> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker()
+      : BT(new BugType(this,
+             "Race condition: free without completion_done check",
+             "Concurrency")) {}
+
+  // Callback invoked when a branch condition is evaluated.
+  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;
+
+  // Callback invoked before a function call (e.g. kfree) is executed.
+  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+
+  // Callback invoked when a value is bound to a memory region (for alias tracking).
+  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;
+
+private:
+  // Helper to report a bug when a reset_data pointer is freed without being checked.
+  void reportResetDataRace(const CallEvent &Call, CheckerContext &C,
+                           const MemRegion *Region) const;
+};
+
+//
+// checkBranchCondition: Look for a condition that calls "completion_done".
+// If such a condition is found, attempt to extract the pointer argument (which
+// is expected to be reset_data->compl) and mark the associated reset_data as checked.
+//
+void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+
+  // Use the utility function to check if this branch condition's source text
+  // contains "completion_done".
+  if (!ExprHasName(cast<Expr>(Condition), "completion_done", C))
+    return;
+
+  // Try to find the CallExpr node corresponding to completion_done().
+  const CallExpr *CallToCompletion = findSpecificTypeInChildren<CallExpr>(Condition);
+  if (!CallToCompletion)
+    return;
+
+  // Assume that completion_done is called with one argument.
+  if (CallToCompletion->getNumArgs() < 1)
+    return;
+
+  const Expr *ArgExpr = CallToCompletion->getArg(0);
+  if (!ArgExpr)
+    return;
+
+  // Retrieve the memory region for the argument passed to completion_done.
+  const MemRegion *ArgReg = getMemRegionFromExpr(ArgExpr, C);
+  if (!ArgReg)
+    return;
+  ArgReg = ArgReg->getBaseRegion();
+
+  // It is expected that the pointer we obtain (from reset_data->compl)
+  // is a subregion of the reset_data container.
+  // Use a helper to try to locate the container_of call in parents.
+  const Expr *ContainerExpr = findSpecificTypeInParents<CallExpr>(ArgExpr, C);
+  const MemRegion *ResetDataReg = nullptr;
+  if (ContainerExpr) {
+    ResetDataReg = getMemRegionFromExpr(ContainerExpr, C);
+  }
+  // If we cannot get the container_of, fallback to using the argument's region.
+  if (!ResetDataReg)
+    ResetDataReg = ArgReg;
+
+  // Mark this reset_data region as having been verified (completion_done check performed).
+  State = State->set<ResetCheckedMap>(ResetDataReg, true);
+  C.addTransition(State);
+}
+
+//
+// checkPreCall: Intercept calls to kfree and check if the freed pointer (supposedly pointing
+// to reset_data) has been verified with a completion_done check.
+//
+void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+
+  // Use ExprHasName to accurately check the function name.
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr || !ExprHasName(OriginExpr, "kfree", C))
+    return;
+
+  if (Call.getNumArgs() < 1)
+    return;
+
+  SVal ArgVal = Call.getArgSVal(0);
+  const MemRegion *TargetReg = ArgVal.getAsRegion();
+  if (!TargetReg)
+    return;
+  TargetReg = TargetReg->getBaseRegion();
+
+  // Look up in our ResetCheckedMap whether the reset_data pointer has been checked.
+  const bool *Checked = State->get<ResetCheckedMap>(TargetReg);
+
+  // Also, follow any aliases.
+  if (!Checked) {
+    const MemRegion *Alias = State->get<PtrAliasMap>(TargetReg);
+    if (Alias) {
+      Alias = Alias->getBaseRegion();
+      Checked = State->get<ResetCheckedMap>(Alias);
+    }
+  }
+
+  if (!Checked || !(*Checked)) {
+    reportResetDataRace(Call, C, TargetReg);
+  }
+}
+
+//
+// checkBind: Track pointer aliasing between reset_data pointers.
+// If one pointer is known to be checked, propagate that property to its aliases.
+//
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  const MemRegion *LHSReg = Loc.getAsRegion();
+  if (!LHSReg)
+    return;
+  LHSReg = LHSReg->getBaseRegion();
+
+  if (const MemRegion *RHSReg = Val.getAsRegion()) {
+    RHSReg = RHSReg->getBaseRegion();
+    if (!RHSReg)
+      return;
+
+    // Establish aliasing between LHS and RHS.
+    State = State->set<PtrAliasMap>(LHSReg, RHSReg);
+    State = State->set<PtrAliasMap>(RHSReg, LHSReg);
+  }
+  C.addTransition(State);
+}
+
+//
+// reportResetDataRace: Generate a bug report indicating that a reset_data pointer
+// is being freed (via kfree) without a proper completion_done() check.
+//
+void SAGenTestChecker::reportResetDataRace(const CallEvent &Call, CheckerContext &C,
+                                             const MemRegion *Region) const {
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  auto R = std::make_unique<PathSensitiveBugReport>(
+      *BT, "Race condition: free of reset_data without verifying completion_done()", N);
+  R->addRange(Call.getSourceRange());
+  C.emitReport(std::move(R));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker",
+      "Detects race conditions due to freeing reset_data without a completion_done check",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+```

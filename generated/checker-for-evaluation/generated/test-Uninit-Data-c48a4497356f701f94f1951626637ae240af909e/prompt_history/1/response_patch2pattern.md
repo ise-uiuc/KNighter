@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using a firmware-loading API without checking its return value, which leaves a pointer variable uninitialized. This pattern results in the subsequent use (and release) of an uninitialized firmware pointer, potentially leading to undefined behavior. The proper approach is to check the return code from the firmware request function (e.g., request_firmware()) before dereferencing or releasing the pointer.

@@ -1,0 +1,159 @@
+```cpp
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/Lex/Lexer.h"  // for Lexer::getSourceText
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// Customize program states:
+// Map to track if a subflow object has been freed (true means freed).
+REGISTER_MAP_WITH_PROGRAMSTATE(FreedMemMap, const MemRegion *, bool)
+// Map to track pointer aliasing.
+REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)
+
+namespace {
+
+class SAGenTestChecker : public Checker<check::PostCall, check::Location, check::Bind> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() : BT(new BugType(this, "Use-After-Free", "Memory Error")) {}
+
+  // Callback invoked after a function call.
+  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+  // Callback invoked when a memory location is loaded or stored.
+  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;
+  // Callback invoked when a value is bound to a memory location (for alias tracking).
+  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+
+private:
+  // Helper to report use-after-free errors.
+  void reportUAF(const MemRegion *MR, const Stmt *S, CheckerContext &C) const;
+};
+
+void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr)
+    return;
+
+  // Check if the call is to mptcp_close_ssk. Use utility function ExprHasName for accuracy.
+  if (!ExprHasName(OriginExpr, "mptcp_close_ssk", C))
+    return;
+
+  // According to the bug pattern, the third parameter (index 2) is the subflow object
+  // that gets freed.
+  if (Call.getNumArgs() < 3)
+    return;
+  SVal SubflowVal = Call.getArgSVal(2);
+  const MemRegion *MR = SubflowVal.getAsRegion();
+  if (!MR)
+    return;
+
+  // Get the base region to uniquely identify the allocated subflow.
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+
+  // Mark this region as freed.
+  State = State->set<FreedMemMap>(MR, true);
+
+  // Propagate freed flag to any aliases registered in PtrAliasMap.
+  if (const MemRegion *Alias = State->get<PtrAliasMap>(MR)) {
+    State = State->set<FreedMemMap>(Alias, true);
+  }
+
+  C.addTransition(State);
+}
+
+void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+  // We are interested in load operations (read accesses).
+  if (!IsLoad)
+    return;
+
+  ProgramStateRef State = C.getState();
+  const MemRegion *MR = Loc.getAsRegion();
+  if (!MR)
+    return;
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+
+  // Check if this region (or one of its aliases) is marked as freed.
+  const bool *FreedFlag = State->get<FreedMemMap>(MR);
+  if (FreedFlag && *FreedFlag) {
+    // UAF detected: a read is performed from a memory region that is freed.
+    reportUAF(MR, S, C);
+  } else {
+    // Also check if there is an alias that is marked as freed.
+    if (const MemRegion *Alias = State->get<PtrAliasMap>(MR)) {
+      Alias = Alias->getBaseRegion();
+      if (Alias) {
+        FreedFlag = State->get<FreedMemMap>(Alias);
+        if (FreedFlag && *FreedFlag) {
+          reportUAF(MR, S, C);
+        }
+      }
+    }
+  }
+}
+
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  const MemRegion *LHSReg = Loc.getAsRegion();
+  if (!LHSReg)
+    return;
+  LHSReg = LHSReg->getBaseRegion();
+  if (!LHSReg)
+    return;
+
+  const MemRegion *RHSReg = Val.getAsRegion();
+  if (!RHSReg)
+    return;
+  RHSReg = RHSReg->getBaseRegion();
+  if (!RHSReg)
+    return;
+
+  // Record aliasing between LHS and RHS.
+  State = State->set<PtrAliasMap>(LHSReg, RHSReg);
+  State = State->set<PtrAliasMap>(RHSReg, LHSReg);
+  C.addTransition(State);
+}
+
+void SAGenTestChecker::reportUAF(const MemRegion *MR, const Stmt *S, CheckerContext &C) const {
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  auto Report = std::make_unique<PathSensitiveBugReport>(
+      *BT, "Use-after-free: region was freed via mptcp_close_ssk and then read", N);
+  Report->addRange(S->getSourceRange());
+  C.emitReport(std::move(Report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects use-after-free read of subflow objects freed by mptcp_close_ssk", 
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+```

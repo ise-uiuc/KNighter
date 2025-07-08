@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing arithmetic on an unsigned count (here, iter->count) without ensuring that the subtraction value (computed by rounding up the read size) is less than the original count. This can lead to an unsigned integer underflow when the computed shortening is greater than or equal to the current iter->count, which may cause the count to wrap around and result in memory mismanagement or a crash.

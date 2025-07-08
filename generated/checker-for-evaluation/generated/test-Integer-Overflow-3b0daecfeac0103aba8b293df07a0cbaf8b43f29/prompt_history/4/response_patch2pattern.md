@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is performing dynamic memory allocation by directly multiplying the element size with a count value that can be under the control of user input (or otherwise unchecked), which may lead to an integer overflow. If an overflow occurs, the resulting allocation size will be smaller than intended, potentially causing buffer overflows or data corruption. Using a function like kcalloc, which checks for integer overflow during the multiplication, mitigates this issue.

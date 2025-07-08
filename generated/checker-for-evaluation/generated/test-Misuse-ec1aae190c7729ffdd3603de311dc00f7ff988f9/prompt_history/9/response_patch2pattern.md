@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is updating a flexible-array member’s counter (size field) after the data has already been accessed or copied, which undermines the intended bounds-checking of that member. In this case, the flexible-array member "data" is annotated with a counter ("datalen") meant for run-time checks. By delaying the update of "datalen" until after the memcpy to "data", the code allows an out-of-bounds access vulnerability due to the counter still being zero (or uninitialized) during the copy operation. This misplacement of the counter update prior to handling the flexible array data is the root cause that can lead to buffer overflow issues.

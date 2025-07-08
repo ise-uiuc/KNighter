@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The patch addresses arithmetic operations (specifically multiplication) performed on operands of different integer types without explicit handling. Such mixed-type multiplications can lead to unintentional integer overflows due to implicit casting or type size differences. By introducing an intermediate variable of a consistent type for the multiplier and separating the calculation steps, the risk of overflow is mitigated.

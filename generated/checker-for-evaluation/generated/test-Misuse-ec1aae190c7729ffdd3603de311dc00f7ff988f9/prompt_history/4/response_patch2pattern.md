@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an out-of-order update of metadata for a flexible array member. In this case, the length field (datalen) that is used for run-time bounds checking (via FORTIFY_SOURCE and __counted_by annotation) is updated only after the flexible array (data) has been accessed with memcpy. This incorrect ordering means that the bounds check is based on an outdated (or zero) datalen value, potentially allowing a buffer overflow.

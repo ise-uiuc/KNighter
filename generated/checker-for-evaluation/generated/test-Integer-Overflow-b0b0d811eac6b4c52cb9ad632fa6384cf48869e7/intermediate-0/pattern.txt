@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is performing arithmetic (especially multiplications and additions) directly between variables of different types (for example, combining dma_addr_t with 32‐bit integer values) in a single expression. This mixing of types can result in unintentional integer overflow due to implicit type conversion and promotion issues. The fix involves breaking the operation into separate steps using an intermediate variable of an appropriate type (like int) so that the multiplication and addition are computed safely without overflow.

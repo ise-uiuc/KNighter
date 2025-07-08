@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is using an uninitialized pointer returned by a function (in this case, the firmware pointer “fw”) without checking the return value for an error. The code assumes that "fw" will be non-NULL to indicate success, but request_firmware() may fail and leave "fw" uninitialized. Consequently, later checks and calls like release_firmware(fw) operate on an uninitialized pointer, which can lead to undefined behavior. The correct approach is to check the return value of request_firmware() before using "fw".

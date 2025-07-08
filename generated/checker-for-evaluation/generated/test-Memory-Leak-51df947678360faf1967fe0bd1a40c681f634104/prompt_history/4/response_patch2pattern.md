@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Failure to release dynamically allocated resources on error paths. In this patch, when rvu_rep_devlink_port_register() fails, the allocated net_device (ndev) is not freed before exiting, resulting in a memory leak. This pattern—omitting proper cleanup of allocated memory in error handling—can lead to resource leaks if an initialization subroutine fails, leaving the allocated memory unfreed.

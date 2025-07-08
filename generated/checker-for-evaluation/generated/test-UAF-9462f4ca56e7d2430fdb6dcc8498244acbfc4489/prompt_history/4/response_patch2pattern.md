@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Accessing and freeing shared memory (linked list elements) without proper synchronization. The tx queues (tx_ctrl_list and tx_data_list) are freed while other threads may still be accessing them, leading to a use-after-free race condition. The core issue is the unsynchronized removal and deallocation of queued items, which is resolved by guarding the access with the appropriate lock (tx_lock).

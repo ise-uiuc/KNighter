@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an off-by-one error in the cleanup loop during error handling. In the error path, the loop that disables the clocks uses the condition "while (--i > 0)", which skips the first clock (index 0) and thereby fails to properly release all resources. This pattern can lead to resource leaks when the cleanup loop does not include every enabled resource due to incorrect loop boundary handling.

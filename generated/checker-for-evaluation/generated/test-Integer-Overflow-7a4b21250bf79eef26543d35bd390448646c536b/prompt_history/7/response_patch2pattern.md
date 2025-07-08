@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is performing arithmetic operations that could overflow—and even invoke undefined behavior—without first validating the input to ensure it is within safe limits. In this case, using roundup_pow_of_two() on attr->max_entries on 32‑bit architectures may lead to an overflow during a left-shift operation, causing undefined behavior. The error is rooted in not checking that the value is limited (e.g., attr->max_entries is below a threshold) before performing the rounding operation that involves bit shifts.

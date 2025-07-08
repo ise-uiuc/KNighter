@@ -1,0 +1,158 @@
+```cpp
+#include "clang/AST/Expr.h"
+#include "clang/AST/Decl.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+  
+// Register a program state map for tracking if a flexible-array counter (datalen)
+// has been updated. True means it has been updated.
+REGISTER_MAP_WITH_PROGRAMSTATE(FlexCounterUpdateMap, const MemRegion*, bool)
+// Optionally, register a pointer alias map to track aliases to the event structure.
+REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+namespace {
+
+/// SAGenTestChecker - This checker identifies instances where the flexible-array
+/// counter "datalen" is updated after the flexible array "data" has been accessed
+/// (e.g. via memcpy), which may lead to out-of-bounds memory accesses.
+class SAGenTestChecker : public Checker<check::PreCall, check::Bind> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() 
+    : BT(new BugType(this,
+         "Flexible-array counter updated after data access",
+         "Buffer Overflow")) {}
+
+  /// Callback for function calls. We intercept memcpy calls to ensure that the
+  /// counter for the flexible-array member is updated BEFORE the data is copied.
+  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+
+  /// Callback for bindings. We intercept assignments to record when the counter field
+  /// "datalen" is updated.
+  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;
+
+private:
+  /// reportBug - Generates a non-fatal error node and emits a bug report.
+  void reportBug(const CallEvent &Call, CheckerContext &C, const MemRegion *MR) const;
+};
+
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,
+                                 CheckerContext &C) const {
+  // We are interested in assignments to the 'datalen' member.
+  // Use the utility function to check if the source text of the store expression
+  // contains "datalen". This should match expressions like "event->datalen".
+  if (!StoreE)
+    return;
+  
+  if (!ExprHasName(StoreE, "datalen", C))
+    return;
+
+  // Get the memory region corresponding to the LHS of the assignment.
+  ProgramStateRef State = C.getState();
+  const MemRegion *MR = getMemRegionFromExpr(StoreE, C);
+  if (!MR)
+    return;
+  
+  // Get the base region for alias resolution.
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+
+  // Mark that, for the event structure associated with this region, the counter
+  // "datalen" has been updated.
+  State = State->set<FlexCounterUpdateMap>(MR, true);
+  
+  // Optionally, record aliasing information.
+  // If the same event structure is bound over different aliases, record them.
+  const MemRegion *LHSRegion = getMemRegionFromExpr(StoreE, C);
+  if (LHSRegion) {
+    LHSRegion = LHSRegion->getBaseRegion();
+    State = State->set<PtrAliasMap>(LHSRegion, LHSRegion);
+  }
+  
+  C.addTransition(State);
+}
+
+void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+  // Identify memcpy calls. Use the utility function ExprHasName for accurate matching.
+  const Expr *Origin = Call.getOriginExpr();
+  if (!Origin || !ExprHasName(Origin, "memcpy", C))
+    return;
+
+  // Retrieve the destination argument of memcpy.
+  const CallExpr *CE = dyn_cast<CallExpr>(Origin);
+  if (!CE || CE->getNumArgs() < 1)
+    return;
+  
+  const Expr *DestExpr = CE->getArg(0);
+  if (!DestExpr)
+    return;
+
+  // We are interested only if the destination corresponds to the flexible-array member "data".
+  if (!ExprHasName(DestExpr, "data", C))
+    return;
+
+  // Get the memory region for the destination.
+  const MemRegion *MR = getMemRegionFromExpr(DestExpr, C);
+  if (!MR)
+    return;
+  
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+
+  // Check the program state whether the counter (datalen) has been updated for this region.
+  ProgramStateRef State = C.getState();
+  const bool *Updated = State->get<FlexCounterUpdateMap>(MR);
+  if (!Updated || !(*Updated)) {
+    // The counter update was not performed before this memcpy.
+    reportBug(Call, C, MR);
+  }
+}
+
+void SAGenTestChecker::reportBug(const CallEvent &Call, CheckerContext &C,
+                                 const MemRegion *MR) const {
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  
+  auto Report = std::make_unique<PathSensitiveBugReport>(
+      *BT,
+      "Flexible-array counter (datalen) should be updated before accessing flexible-array member (data) via memcpy",
+      N);
+  Report->addRange(Call.getSourceRange());
+  C.emitReport(std::move(Report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects flexible-array counter update after accessing flexible array data",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+```

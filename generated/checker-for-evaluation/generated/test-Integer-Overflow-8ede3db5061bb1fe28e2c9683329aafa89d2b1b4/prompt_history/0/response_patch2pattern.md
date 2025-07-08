@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is performing an overflow check on an unsigned value by casting it to an int. By casting a size_t variable (controllen) to int, negative values may result even when the unsigned arithmetic would correctly indicate an overflow. This type conversion can hide genuine overflow conditions, as the overflow-checking function (check_add_overflow()) operates on the wrong type. Removing the unnecessary casts ensures that the arithmetic checks use the correct unsigned semantics and properly detect overflows.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing arithmetic operations (specifically multiplications) directly on variables of different integer types—such as combining a dma_addr_t with an int—can lead to unintentional integer overflows. The pattern involves doing mixed-type multiplications without explicitly isolating or properly casting the operands, resulting in possible overflow errors. The fix resolves this by splitting the multiplication into steps using an intermediary integer variable to compute the multiplier, thereby ensuring that the operation is carried out correctly without the risk of overflow.

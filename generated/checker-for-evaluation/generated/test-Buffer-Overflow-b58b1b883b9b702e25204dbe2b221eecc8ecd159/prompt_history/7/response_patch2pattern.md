@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is subtracting a computed length from an unsigned counter without first ensuring that the subtraction won’t underflow. Here, the code calculates a “shorten” value using a rounding-up operation, and then directly subtracts it from iter->count. If “shorten” is greater than or equal to iter->count, the subtraction underflows, leading to an erroneous large value. This pattern—failing to check that the computed subtraction amount does not exceed the original unsigned count—can cause similar underflow issues in other code.

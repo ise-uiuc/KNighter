@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the use of an insufficiently wide integer type (unsigned int) for values that can exceed 32-bit limits, leading to integer overflow. In this case, disk sector counts are manipulated and logged using an unsigned type and format specifier (%u) when they should be handled as 64-bit values (u64, with %llu). This mismatch can cause arithmetic overflows and incorrect logging when the disk usage values exceed what a 32-bit integer can represent.

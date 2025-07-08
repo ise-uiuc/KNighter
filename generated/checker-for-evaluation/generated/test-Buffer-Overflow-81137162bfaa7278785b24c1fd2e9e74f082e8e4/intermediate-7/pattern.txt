@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an unbounded string copy (strcpy) into a fixed-size destination buffer can result in a buffer overflow if the source string's length exceeds the allocated size of the destination. This pattern occurs when code assumes the source string will always be shorter than, or equal to, the destination buffer's length without actually enforcing a size limit. Replacing strcpy with a bounded copy function like strscpy, which includes explicit length verification, prevents overwriting adjacent memory.

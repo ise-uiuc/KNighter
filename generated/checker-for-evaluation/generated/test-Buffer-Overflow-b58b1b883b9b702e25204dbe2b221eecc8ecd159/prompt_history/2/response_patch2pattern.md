@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing arithmetic on the iov_iter count without checking for underflow. In this case, subtracting a rounded-up value (from round_up(ret, block_bytes(c))) from the iterator's count may result in a negative value (underflow) if the calculated shorten value is equal to or greater than the current count. The bug pattern is neglecting to validate that the subtraction will not underflow the iter->count variable.

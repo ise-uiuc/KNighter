@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using device-managed allocation functions (like devm_kcalloc()) to allocate memory that is later explicitly freed can lead to double free errors. In this patch, the memory allocated with devm_kcalloc() is automatically freed by the device's resource management mechanism at device removal, but it is also explicitly freed by a separate call (via pinconf_generic_dt_free_map() which internally calls pinctrl_utils_free_map()). This mix of automatic (devm_*) and manual memory management causes the same memory region to be freed twice, leading to undefined behavior.

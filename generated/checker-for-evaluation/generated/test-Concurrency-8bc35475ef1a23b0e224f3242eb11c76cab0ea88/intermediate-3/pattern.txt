@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Reading a shared memory field (work->data) unconditionally—before checking a controlling flag (from_cancel)—can lead to spurious data race detections. In this code, the work->data field is read even in execution paths where its value isn’t used, allowing concurrent modifications to trigger false positive race reports. The pattern highlights the importance of conditionally accessing shared data only after verifying that the operation requiring that data is needed, thereby avoiding unnecessary and potentially racy reads.

@@ -1,0 +1,135 @@
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/Stmt.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Frontend/CompilerInstance.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/AnalysisManager.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+
+using namespace clang;
+using namespace ento;
+// Removed: using namespace taint;
+
+namespace {
+// This checker detects an incorrect iteration in the error cleanup loop,
+// where the loop condition uses '--i > 0' instead of the correct '--i >= 0'.
+// This mistake causes the first element (index 0) not to be cleaned up.
+class SAGenTestChecker :
+  public Checker<check::ASTCodeBody> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() :
+    BT(new BugType(this, "Cleanup Loop Bug",
+                   "Loop Iteration")) {}
+
+  // This callback inspects the body of functions.
+  void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr,
+                        BugReporter &BR) const;
+
+private:
+  // No additional self-defined functions are required.
+};
+
+void SAGenTestChecker::checkASTCodeBody(const Decl *D,
+                                          AnalysisManager &Mgr,
+                                          BugReporter &BR) const {
+  // We are interested only in function definitions.
+  const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+  if (!FD)
+    return;
+
+  // We check only the target function: "gsc_runtime_resume".
+  if (FD->getNameAsString() != "gsc_runtime_resume")
+    return;
+
+  // Get the function body.
+  const Stmt *Body = FD->getBody();
+  if (!Body)
+    return;
+
+  // Define a RecursiveASTVisitor to locate the problematic while loop.
+  class Visitor : public RecursiveASTVisitor<Visitor> {
+    BugReporter &BR;
+    const BugType *BT;
+  public:
+    Visitor(BugReporter &br, const BugType *bt) : BR(br), BT(bt) {}
+
+    bool VisitWhileStmt(WhileStmt *WS) {
+      // Get the loop condition.
+      const Expr *Cond = WS->getCond();
+      if (!Cond)
+        return true;
+      Cond = Cond->IgnoreParenCasts();
+
+      // Look for a binary operator in the condition.
+      const BinaryOperator *BO = dyn_cast<BinaryOperator>(Cond);
+      if (!BO)
+        return true;
+
+      // We are looking for a ">" comparison.
+      if (BO->getOpcode() != BO_GT)
+        return true;
+
+      // The LHS should be a prefix decrement operation (i.e., --i).
+      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();
+      const UnaryOperator *UO = dyn_cast<UnaryOperator>(LHS);
+      if (!UO || UO->getOpcode() != UO_PreDec)
+        return true;
+
+      // Verify the sub-expression of the prefix decrement is the variable 'i'.
+      const Expr *SubExpr = UO->getSubExpr()->IgnoreParenCasts();
+      const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(SubExpr);
+      if (!DRE)
+        return true;
+      if (DRE->getDecl()->getNameAsString() != "i")
+        return true;
+
+      // The RHS should be an integer literal with value 0.
+      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();
+      const IntegerLiteral *IL = dyn_cast<IntegerLiteral>(RHS);
+      if (!IL)
+        return true;
+      if (!IL->getValue().isZero())
+        return true;
+
+      // We have matched a condition of the form: (--i > 0)
+      // Report the bug: the condition should be (--i >= 0)
+      PathDiagnosticLocation Loc =
+          PathDiagnosticLocation::createBegin(WS, BR.getSourceManager(), BR.getLangOpts());
+      auto Report = std::make_unique<BasicBugReport>(*BT,
+         "Cleanup loop condition '--i > 0' skips 0th element; use '--i >= 0' instead", Loc);
+      Report->addRange(WS->getSourceRange());
+      BR.emitReport(std::move(Report));
+
+      return true;
+    }
+  };
+
+  Visitor V(BR, BT.get());
+  // Traverse the function body.
+  V.TraverseStmt(const_cast<Stmt*>(Body));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker",
+      "Detects incorrect iteration in error cleanup loops (should use '--i >= 0')",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

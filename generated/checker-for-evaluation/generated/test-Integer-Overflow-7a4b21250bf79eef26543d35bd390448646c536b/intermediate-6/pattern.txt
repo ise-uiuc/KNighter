@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is using a rounding function (roundup_pow_of_two) that internally performs bit-shifts which can overflow on 32-bit architectures, leading to undefined behavior. The root issue arises when a value (attr->max_entries) is too large and causes a shift overflow before a proper check is performed. This allows the function to potentially compute an incorrect (zero or otherwise invalid) value without detecting the overflow condition, possibly causing further errors. The safe approach is to pre-check the input value against an upper limit before performing operations that might involve shifting.

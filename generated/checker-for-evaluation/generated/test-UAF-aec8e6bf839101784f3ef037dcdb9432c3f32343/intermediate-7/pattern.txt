@@ -1,0 +1,3 @@
+## Bug Pattern
+
+A use‐after‐free vulnerability caused by not setting a pointer to NULL after the associated resource is freed. In this case, after closing the block device (via btrfs_close_bdev()), the pointer (device->bdev_file) still holds a non-NULL value, even though the memory has been released. Subsequent checks that rely on the pointer being non-NULL end up dereferencing a dangling pointer, leading to a use‐after‐free bug.

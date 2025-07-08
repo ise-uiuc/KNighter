@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the failure to free an allocated resource on an error path. In this case, when a function (rvu_rep_devlink_port_register) fails during the initialization of a net device (ndev), the already allocated memory for the device is not released immediately, leading to a memory leak. This pattern occurs when error handling paths neglect to clean up resources that have been successfully allocated before encountering an error.

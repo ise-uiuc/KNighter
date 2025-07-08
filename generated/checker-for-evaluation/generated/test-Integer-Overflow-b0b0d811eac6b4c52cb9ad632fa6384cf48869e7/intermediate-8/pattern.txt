@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing arithmetic (specifically multiplication) on variables of different types without isolating the multiplier can result in unintentional integer overflows. In this patch, multiplying a dma_addr_t variable together with an integer directly may overflow because of type differences. The remedy is to compute the multiplier separately—in an int variable—and then add that value to the dma_addr_t, ensuring that type promotion and arithmetic are handled safely.

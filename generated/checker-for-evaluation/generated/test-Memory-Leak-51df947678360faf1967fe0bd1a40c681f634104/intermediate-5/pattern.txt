@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Failure to free an allocated resource before exiting an error path. In this case, when rvu_rep_devlink_port_register() fails, the previously allocated net_device (via alloc_etherdev) is not freed, leading to a memory leak. This pattern—allocating resources and not properly cleaning them up when subsequent initialization fails—is a common source of memory leaks in error handling paths.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Allocating an array using kzalloc() where the total size is computed via multiplication of the element size and the count without checking for integer overflow. This pattern is dangerous because if the multiplication overflows, it results in a much smaller allocation than expected, leading to potential buffer overflows when the buffer is subsequently used. Using kcalloc(), which safely performs this multiplication and checks for overflow, prevents the issue.

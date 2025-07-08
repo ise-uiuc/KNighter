@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the failure to initialize a structure that contains internal padding (or holes) before copying it to user space. In this case, the auto-declared structure (struct tc_skbmod opt) was partially initialized without clearing the entire memory, leaving its padding uninitialized. When this structure is later copied to user space, it may leak kernel stack data, leading to a potential kernel information leak vulnerability.

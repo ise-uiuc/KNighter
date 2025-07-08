@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is exposing a partially initialized kernel object to user space by performing the user id allocation (via xa_alloc) before guaranteeing that all internal references are properly acquired. This ordering permits a race condition where an attacker may destroy the object (freeing remaining resources) before the creation completes, resulting in a use-after-free vulnerability.

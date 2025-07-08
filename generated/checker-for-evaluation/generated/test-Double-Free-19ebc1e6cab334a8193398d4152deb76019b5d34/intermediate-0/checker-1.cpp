@@ -1,0 +1,146 @@
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include <memory>
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// REGISTER a program state map: PtrStateMap maps a pointer’s memory region to a bool flag.
+// The flag is false when the pointer is live (or reinitialized to NULL), and true once it has been freed.
+REGISTER_MAP_WITH_PROGRAMSTATE(PtrStateMap, const MemRegion *, bool)
+// REGISTER a program state map for pointer aliasing.
+REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)
+
+namespace {
+
+class SAGenTestChecker 
+  : public Checker< check::PreCall, check::Bind> {
+  
+  mutable std::unique_ptr<BugType> BT;
+  
+public:
+  SAGenTestChecker() 
+    : BT(new BugType(this, "Double free of ea pointer detected")) {}
+
+  // Callback invoked before a function call is executed.
+  void checkPreCall (const CallEvent &Call, CheckerContext &C) const;
+  
+  // Callback invoked when a value is bound to a memory region
+  void checkBind (SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+  
+private:
+  // Helper function to report a bug.
+  void reportDoubleFree(const CallEvent &Call, CheckerContext &C, const MemRegion *Region) const;
+};
+
+void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  
+  // Detect a call to "kfree"
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr || !ExprHasName(OriginExpr, "kfree", C))
+    return;
+  
+  // Get the first argument of the kfree call.
+  SVal Arg0 = Call.getArgSVal(0);
+  // Obtain the memory region from the argument's expression.
+  const MemRegion *MR = getMemRegionFromExpr(Call.getArgExpr(0), C);
+  if (!MR)
+    return;
+  
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+  
+  // Check our program state map to see whether this pointer’s region was freed.
+  const bool *Freed = State->get<PtrStateMap>(MR);
+  if (Freed && *Freed) {
+    // Already freed: report double free bug.
+    reportDoubleFree(Call, C, MR);
+  } else {
+    // Mark the pointer as freed.
+    State = State->set<PtrStateMap>(MR, true);
+    C.addTransition(State);
+  }
+}
+
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  // We want to catch reinitialization of the variable "ea" to NULL.
+  // Check that the left-hand side expression (Loc) seems to refer to "ea".
+  // Use our utility to look up the name in the source text.
+  const Expr *LHSExpr = nullptr;
+  if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(S)) {
+    LHSExpr = DRE;
+  } else {
+    LHSExpr = dyn_cast<Expr>(S);
+  }
+  if (!LHSExpr)
+    return;
+  
+  if (!ExprHasName(LHSExpr, "ea", C))
+    return;
+  
+  // Check if the value being bound is a null pointer.
+  // Here we check if Val is a known zero value.
+  if (!Val.isZeroConstant())
+    return;
+  
+  // Get the memory region corresponding to the left-hand side.
+  const MemRegion *MR = getMemRegionFromExpr(LHSExpr, C);
+  if (!MR)
+    return;
+  
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return;
+  
+  // Reset the pointer state in our map: indicate that "ea" has been reinitialized (live).
+  State = State->set<PtrStateMap>(MR, false);
+  
+  // Also update aliasing: if there is any alias for MR in our PtrAliasMap, reset it.
+  if (const MemRegion* const* AliasMRPtr = State->get<PtrAliasMap>(MR)) {
+    const MemRegion *AliasMR = *AliasMRPtr;
+    State = State->set<PtrStateMap>(AliasMR, false);
+  }
+  
+  C.addTransition(State);
+}
+
+void SAGenTestChecker::reportDoubleFree(const CallEvent &Call, CheckerContext &C,
+                                          const MemRegion *Region) const {
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  
+  auto Report = std::make_unique<BasicBugReport>(
+      *BT, "Double free of ea pointer detected", N);
+  Report->addRange(Call.getSourceRange());
+  C.emitReport(std::move(Report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects failure to reinitialize 'ea' after free, potentially causing double free", 
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+  CLANG_ANALYZER_API_VERSION_STRING;

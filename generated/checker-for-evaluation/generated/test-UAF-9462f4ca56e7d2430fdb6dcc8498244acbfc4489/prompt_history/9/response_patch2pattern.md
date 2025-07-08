@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is unsynchronized access to shared dynamic memory—specifically, iterating over and freeing entries in a shared list without holding the proper lock. In this case, the tx_ctrl_list (and similarly tx_data_list) can be concurrently accessed by other threads. Without acquiring a spinlock to guard the list during cleanup, another thread may read or modify a list entry while it is being freed, leading to a use-after-free error.

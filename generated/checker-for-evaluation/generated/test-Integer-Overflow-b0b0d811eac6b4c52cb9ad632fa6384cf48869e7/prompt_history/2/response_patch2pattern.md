@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Multiplying operands of different types directly (e.g., a dma_addr_t with an int) without isolating the multiplication into a uniform type can lead to unintentional integer overflow. This pattern occurs when arithmetic operations mix types with different sizes or signedness, causing intermediate results that may overflow before assignment. The fix involves breaking down the multiplication into separate steps with a dedicated intermediate variable, ensuring the multiplication is carried out in a controlled manner using a consistent data type.

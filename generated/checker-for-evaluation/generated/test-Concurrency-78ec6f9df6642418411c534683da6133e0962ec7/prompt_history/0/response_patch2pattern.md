@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing non-atomic read-modify-write operations on a shared per-CPU counter. In this patch, the counter (stats_updates) is updated concurrently from different CPU contexts without proper atomic synchronization. The bug arises when a variable used for accumulating statistics is modified using plain arithmetic (e.g., +=) without using atomic primitives or proper memory barriers, allowing concurrent accesses to lead to a data race. The use of READ_ONCE/WRITE_ONCE in the patch ensures that each individual read or write is done atomically, preventing the data race that can occur when multiple CPUs concurrently update a shared statistic.

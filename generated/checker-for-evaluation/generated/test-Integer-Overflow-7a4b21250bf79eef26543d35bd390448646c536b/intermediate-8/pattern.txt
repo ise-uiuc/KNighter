@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing unchecked arithmetic (a left-shift) to round up an integer to the next power of two without validating that the input is below a safe threshold can cause integer overflow—and even undefined behavior—on architectures with limited integer widths (such as 32-bit). In this case, calling roundup_pow_of_two() on a value that is too large may lead to overflow during the left shift, so the check for a zero result afterward is unreliable. The correct approach is to verify the input is within a safe range before performing the rounding operation.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Exposing a new handle (ID) to user space before fully initializing and securing the underlying object. In this case, the ID is allocated (via xa_alloc) before the object’s reference is incremented (via xe_file_get), which creates a window where an attacker can free or manipulate the object using that ID. This premature exposure of a partially initialized object leads to a race condition that can trigger a use-after-free vulnerability.

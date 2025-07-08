@@ -1,0 +1,176 @@
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/Stmt.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/AnalysisManager.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/StaticAnalyzer/Core/PathDiagnosticConsumers.h"
+#include <memory>
+
+using namespace clang;
+using namespace ento;
+
+namespace {
+
+// BodyVisitor: Visits the statements inside a ForStmt body in order to
+// check for a bound-check against "VG_NUM_DCFCLK_DPM_LEVELS" and for any array
+// subscript on "DcfClocks" with the loop variable as index.
+class BodyVisitor : public RecursiveASTVisitor<BodyVisitor> {
+  const std::string &LoopVarName;
+  ASTContext &Ctx;
+  bool &HasBoundCheck;
+  bool &AccessesDcfClocks;
+
+public:
+  BodyVisitor(const std::string &LV, ASTContext &Ctx, bool &BC, bool &ADC)
+      : LoopVarName(LV), Ctx(Ctx), HasBoundCheck(BC), AccessesDcfClocks(ADC) {}
+
+  bool VisitIfStmt(IfStmt *IfS) {
+    if (Expr *Cond = IfS->getCond()) {
+      SourceManager &SM = Ctx.getSourceManager();
+      CharSourceRange Range = CharSourceRange::getTokenRange(Cond->getSourceRange());
+      StringRef Text = Lexer::getSourceText(Range, SM, Ctx.getLangOpts());
+      if (Text.contains("VG_NUM_DCFCLK_DPM_LEVELS"))
+        HasBoundCheck = true;
+    }
+    return true;
+  }
+
+  bool VisitArraySubscriptExpr(ArraySubscriptExpr *ASE) {
+    // Check if the base of the subscript is a member expression referring to "DcfClocks"
+    Expr *Base = ASE->getBase()->IgnoreParenCasts();
+    if (MemberExpr *ME = dyn_cast<MemberExpr>(Base)) {
+      if (ME->getMemberNameInfo().getAsString() == "DcfClocks") {
+        // Check if the index is a reference to the loop variable.
+        Expr *Idx = ASE->getIdx()->IgnoreParenCasts();
+        if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(Idx)) {
+          if (DRE->getDecl()->getNameAsString() == LoopVarName) {
+            AccessesDcfClocks = true;
+          }
+        }
+      }
+    }
+    return true;
+  }
+  // Continue traversal.
+};
+
+// ForLoopVisitor: Visits each ForStmt in the AST and checks for the following:
+// 1. The condition of the loop uses "VG_NUM_SOC_VOLTAGE_LEVELS".
+// 2. The loop variable (e.g. "i") is used to index an array "DcfClocks" 
+//    in the loop body.
+// 3. There is not an inner bound check (if-statement checking "VG_NUM_DCFCLK_DPM_LEVELS").
+// If these conditions are met, it emits a bug report.
+class ForLoopVisitor : public RecursiveASTVisitor<ForLoopVisitor> {
+  BugReporter &BR;
+  const BugType *BT;
+  ASTContext &Ctx;
+
+public:
+  ForLoopVisitor(BugReporter &BR, const BugType *BT, ASTContext &Ctx)
+      : BR(BR), BT(BT), Ctx(Ctx) {}
+
+  bool VisitForStmt(ForStmt *FS) {
+    // Ensure the loop has a condition.
+    Expr *Cond = FS->getCond();
+    if (!Cond)
+      return true;
+
+    SourceManager &SM = Ctx.getSourceManager();
+    CharSourceRange CondRange = CharSourceRange::getTokenRange(Cond->getSourceRange());
+    StringRef CondText = Lexer::getSourceText(CondRange, SM, Ctx.getLangOpts());
+
+    // Check that the condition contains the upper bound macro "VG_NUM_SOC_VOLTAGE_LEVELS".
+    if (!CondText.contains("VG_NUM_SOC_VOLTAGE_LEVELS"))
+      return true;
+
+    // Attempt to extract the loop variable name from the initialization.
+    std::string LoopVarName;
+    if (DeclStmt *DS = dyn_cast_or_null<DeclStmt>(FS->getInit())) {
+      if (DS->isSingleDecl()) {
+        if (VarDecl *VD = dyn_cast<VarDecl>(DS->getSingleDecl())) {
+          LoopVarName = VD->getNameAsString();
+        }
+      }
+    }
+    if (LoopVarName.empty())
+      return true; // Couldn't determine loop variable name; skip.
+
+    // Traverse the loop body to see if it:
+    //   (a) accesses the DcfClocks array using the loop variable, and
+    //   (b) whether there is a bound-check against VG_NUM_DCFCLK_DPM_LEVELS.
+    bool HasBoundCheck = false;
+    bool AccessesDcfClocks = false;
+    if (Stmt *Body = FS->getBody()) {
+      BodyVisitor BV(LoopVarName, Ctx, HasBoundCheck, AccessesDcfClocks);
+      BV.TraverseStmt(Body);
+    }
+
+    // If the loop body contains an access to the DcfClocks array via the loop variable
+    // and it does NOT include an if-statement checking "VG_NUM_DCFCLK_DPM_LEVELS",
+    // then report a potential out-of-bounds error.
+    if (AccessesDcfClocks && !HasBoundCheck) {
+      // Report at the location of the for-statement.
+      SourceLocation ReportLoc = FS->getForLoc();
+      SmallString<128> SB;
+      SB.append("Possible out-of-bounds access in DcfClocks array: loop bound "
+                "uses VG_NUM_SOC_VOLTAGE_LEVELS without checking against VG_NUM_DCFCLK_DPM_LEVELS");
+      // Create a PathDiagnosticLocation from the SourceLocation using the ASTContext.
+      PathDiagnosticLocation BugLoc = PathDiagnosticLocation::createBegin(ReportLoc,
+                                         Ctx.getSourceManager(), Ctx.getLangOpts());
+      auto R = std::make_unique<BasicBugReport>(*BT, SB.str(), BugLoc);
+      BR.emitReport(std::move(R));
+    }
+
+    return true;
+  }
+  // Continue traversing.
+};
+
+class SAGenTestChecker : public Checker<check::ASTCodeBody> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() 
+      : BT(new BugType(this, "Out-of-bounds DcfClocks Access",
+                       "Buffer Overflow")) {}
+
+  void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr,
+                        BugReporter &BR) const;
+
+  // No additional callbacks needed.
+};
+
+void SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr,
+                                          BugReporter &BR) const {
+  // Only process function-like declarations that have a body.
+  const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+  if (!FD || !FD->hasBody())
+    return;
+
+  // Use the current ASTContext.
+  ASTContext &Ctx = FD->getASTContext();
+  // Traverse the body of the function.
+  ForLoopVisitor FLV(BR, BT.get(), Ctx);
+  FLV.TraverseStmt(FD->getBody());
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects the use of an incorrect loop bound when indexing the DcfClocks array", 
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;

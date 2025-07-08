@@ -1,0 +1,150 @@
+```cpp
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/AST/Decl.h"
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// Customize program state: map the MemRegion of the "num_trips" field to a bool that indicates if it has been initialized.
+REGISTER_MAP_WITH_PROGRAMSTATE(NumTripsInitMap, const MemRegion*, bool)
+
+namespace {
+
+class SAGenTestChecker 
+  : public Checker<check::PreCall, check::Bind> {
+  mutable std::unique_ptr<BugType> BT;
+
+public:
+  SAGenTestChecker() 
+    : BT(new BugType(this, "Uninitialized Size Indicator",
+                     "The size indicator (num_trips) is used by memcpy before being initialized")) {}
+
+  // Callback when a call is about to be executed.
+  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+  // Callback when a value is bound to a location.
+  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+
+private:
+  void reportUninitSizeIndicator(const CallEvent &Call, CheckerContext &C, const MemRegion *Reg) const;
+};
+
+//
+// checkBind: Track assignments to the "num_trips" field.
+// We inspect the left-hand-side of a binding. If it is a MemberExpr whose member name is "num_trips",
+// we mark its corresponding memory region as initialized in the program state.
+//
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,
+                                 CheckerContext &C) const {
+  // Check if the left-hand side is a MemberExpr.
+  if (!StoreE)
+    return;
+  const MemberExpr *ME = dyn_cast<MemberExpr>(StoreE->IgnoreImplicit());
+  if (!ME)
+    return;
+  
+  // Check the name of the member.
+  if (ME->getMemberDecl()->getNameAsString() != "num_trips")
+    return;
+  
+  // Retrieve the memory region corresponding to the binding.
+  const MemRegion *MR = getMemRegionFromExpr(StoreE, C);
+  if (!MR)
+    return;
+  
+  MR = MR->getBaseRegion();
+  ProgramStateRef State = C.getState();
+  State = State->set<NumTripsInitMap>(MR, true);
+  C.addTransition(State);
+}
+
+//
+// checkPreCall: Analyze memcpy calls within thermal_zone_device_register_with_trips.
+// If the size argument (third argument) of memcpy depends on num_trips and that field has not yet been initialized,
+// we report a bug.
+//
+void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+  // Verify that we are in the function thermal_zone_device_register_with_trips.
+  const StackFrameContext *SFC = C.getStackFrame();
+  if (!SFC)
+    return;
+  const FunctionDecl *FD = SFC->getDecl();
+  if (!FD)
+    return;
+  if (FD->getNameAsString() != "thermal_zone_device_register_with_trips")
+    return;
+
+  // Ensure the call is to memcpy.
+  const Expr *OriginExpr = Call.getOriginExpr();
+  if (!OriginExpr)
+    return;
+  if (!ExprHasName(OriginExpr, "memcpy", C))
+    return;
+
+  // memcpy has three arguments: dst, src, and size.
+  if (Call.getNumArgs() < 3)
+    return;
+  
+  // Retrieve the third argument (size).
+  const Expr *SizeArg = Call.getArgExpr(2);
+  if (!SizeArg)
+    return;
+  
+  // Check if the size argument refers to "num_trips". We use ExprHasName utility.
+  if (!ExprHasName(SizeArg, "num_trips", C))
+    return;
+
+  // Retrieve the memory region associated with the size expression.
+  const MemRegion *NumTripsRegion = getMemRegionFromExpr(SizeArg, C);
+  if (!NumTripsRegion)
+    return;
+  NumTripsRegion = NumTripsRegion->getBaseRegion();
+
+  ProgramStateRef State = C.getState();
+  const bool *IsInitialized = State->get<NumTripsInitMap>(NumTripsRegion);
+  // If there's no record or it is false, then the num_trips field has not been initialized.
+  if (!IsInitialized || !(*IsInitialized)) {
+    reportUninitSizeIndicator(Call, C, NumTripsRegion);
+  }
+}
+
+//
+// reportUninitSizeIndicator: Report an error node when memcpy is called with an uninitialized size indicator.
+//
+void SAGenTestChecker::reportUninitSizeIndicator(const CallEvent &Call, CheckerContext &C, const MemRegion *Reg) const {
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+  auto report = std::make_unique<PathSensitiveBugReport>(
+      *BT, "memcpy call uses uninitialized size indicator (num_trips) before assignment", N);
+  report->addRange(Call.getSourceRange());
+  C.emitReport(std::move(report));
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker", 
+      "Detects memcpy calls that use an uninitialized size indicator (num_trips)", 
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+```

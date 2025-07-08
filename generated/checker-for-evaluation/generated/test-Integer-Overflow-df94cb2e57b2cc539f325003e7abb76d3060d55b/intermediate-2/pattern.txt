@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using an insufficiently wide integer type (unsigned int) for sector counts and related arithmetic, which can lead to integer overflow when dealing with large sector reservations. This involves both the declaration of variables to hold values that may exceed 32 bits and the use of mismatched format specifiers (using %u instead of %llu), resulting in arithmetic errors and incorrect calculations.

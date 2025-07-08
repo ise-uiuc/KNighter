@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is an off-by-one error in loop boundary conditions when accessing consecutive array elements. In this case, the loop iterates over an array where each iteration accesses the current element and the next one using index i and i+1. However, if the loop runs until the total number of array elements, the final iteration will cause the code to access an element outside the array's bounds, resulting in a buffer overflow.

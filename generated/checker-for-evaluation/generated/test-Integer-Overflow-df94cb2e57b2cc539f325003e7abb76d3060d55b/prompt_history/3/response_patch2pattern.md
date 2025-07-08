@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is the use of an insufficiently wide integer type to track or calculate disk sector values, leading to an integer overflow. In the buggy code, fields and variables that represent disk sectors (such as disk_res_sectors and the 'sectors' parameter) are declared with types (unsigned) that cannot handle large values. This causes arithmetic on these values to overflow when the actual number of sectors exceeds the capacity of the type, leading to incorrect calculations and potential kernel panic. The fix involves switching to a wider type (u64) and using appropriate macros (like min_t(u64, ...)) and format specifiers to safely represent and process these values.

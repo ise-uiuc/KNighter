@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is failing to validate that the user-provided input length is sufficient before copying data from user space. In this case, the code was using functions like copy_from_sockptr without checking that the optlen (the length of the data provided by the user) is at least as large as the size of the data structure being copied. This improper validation can lead to copying more data than intended, resulting in slab-out-of-bounds errors. The patch fixes this by replacing the simple copy function with bt_copy_from_sockptr, which properly validates the provided length against the expected size prior to copying.

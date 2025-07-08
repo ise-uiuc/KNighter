@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Performing multiplications between variables of different integer types directly (for example, mixing dma_addr_t with int) without explicitly handling type conversion can lead to unintentional integer overflow. The root issue is that the arithmetic operation may be done in a type that doesn't properly accommodate the size of the result. The fix involves breaking the operation into two steps using a temporary multiplier variable of an appropriate type to ensure safe multiplication and prevent overflow.

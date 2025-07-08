@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using a function like roundup_pow_of_two() without first checking that its input is within a safe range for 32-bit arithmetic can lead to an overflow during a 32-bit left-shift operation. This undefined behavior occurs when the input (here, attr->max_entries) is too large and causes the internal shift to overflow before any post-check is applied, potentially resulting in an incorrect value or a crash.

@@ -1,0 +1,3 @@
+## Bug Pattern
+
+The bug pattern is performing an unchecked multiplication to determine the allocation size. By directly multiplying the element size with a count (args->num_of_nodes) in the allocation call (using kzalloc), an integer overflow can occur if the product exceeds the maximum value representable, leading to an undersized allocation and potential buffer overflows. Using kcalloc mitigates this risk by performing the multiplication safely with inherent overflow checks.
