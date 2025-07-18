@@ -54,7 +54,7 @@ class Linux(TargetFactory):
         pattern = rf"-o\s+.*?/{stem_name}\.o"
         match = re.search(pattern, Linux._build_commands)
         if match:
-            all_matches = re.findall(pattern, Linux.command_content)
+            all_matches = re.findall(pattern, Linux._build_commands)
             all_matches = [match[3:] for match in all_matches]
             # Sort by edit distance to the file name
             all_matches.sort(

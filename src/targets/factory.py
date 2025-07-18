@@ -2,7 +2,7 @@ import os
 import git
 from abc import ABC, abstractmethod
 
-from tools import get_function_codes
+from tools import get_function_codes_with_config, truncate_large_file
 
 
 class TargetFactory(ABC):
@@ -71,7 +71,7 @@ class TargetFactory(ABC):
         diff = commit.repo.git.diff(parent_id, commit.hexsha)
 
         # Get affected function code
-        func_code_set = get_function_codes(commit)
+        func_code_set = get_function_codes_with_config(commit)
 
         # Build the markdown content in parts for better readability
         sections = []
@@ -81,8 +81,18 @@ class TargetFactory(ABC):
 
         # Add buggy code section
         sections.append("## Buggy Code\n")
-        for func_name, _, func_code in func_code_set:
-            sections.append(f"```c\n// {func_name}\n{func_code}\n```\n")
+        for file_path, func_name, func_code in func_code_set:
+            if func_name.startswith("WHOLE_FILE_"):
+                # Handle whole file fallback case
+                file_name = func_name.replace("WHOLE_FILE_", "")
+                
+                # Truncate very large files to avoid overwhelming the prompt
+                truncated_code = truncate_large_file(func_code, max_lines=500)
+                
+                sections.append(f"```c\n// Complete file: {file_path} (tree-sitter fallback)\n{truncated_code}\n```\n")
+            else:
+                # Handle normal function case
+                sections.append(f"```c\n// Function: {func_name} in {file_path}\n{func_code}\n```\n")
 
         # Add patch diff
         sections.append("## Bug Fix Patch\n\n```diff\n" + diff + "\n```\n")

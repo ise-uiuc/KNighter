@@ -1,14 +1,18 @@
 import re
 import subprocess as sp
 from pathlib import Path
+from collections import defaultdict
+import random
+from typing import List, Tuple, Optional
 
 from loguru import logger
+from html2text import html2text
 
 from backends.factory import AnalysisBackendFactory
+from checker_data import ReportData
 from targets.factory import TargetFactory
 from targets.linux import Linux
-from tools import monitor_build_output, target_objects
-
+from tools import monitor_build_output, target_objects, remove_text_section
 
 class ClangBackend(AnalysisBackendFactory):
     """
@@ -87,7 +91,7 @@ class ClangBackend(AnalysisBackendFactory):
         patch,
         target: TargetFactory,
         skip_build_checker=False,
-    ):
+    ) -> Tuple[int, int]:
 
         if target._target_type == "linux":
             return self._validate_checker_linux(
@@ -107,7 +111,7 @@ class ClangBackend(AnalysisBackendFactory):
         jobs=32,
         output_dir="tmp",
         **kwargs,
-    ):
+    ) -> int:
         """
         Run the checker against a commit and patch.
         This will dispatch the analysis to the appropriate method based on the target type.
@@ -272,6 +276,7 @@ class ClangBackend(AnalysisBackendFactory):
         arch = kwargs.get("arch", "x86")
         timeout = kwargs.get("timeout", 1800)
 
+        # FIXME: THIS CAN BE SKIPPED
         build_res, _ = self.build_checker(checker_code, Path("tmp"), attempt=1)
         if build_res != 0:
             logger.error("Build failed, skipping analysis.")
@@ -374,8 +379,79 @@ class ClangBackend(AnalysisBackendFactory):
         # Filter out non-c files
         matches = [match + ".c" for match in matches]
         # Delete the prefix linux path
-        linux_path += "/"
-        matches = [match.replace(linux_path, "") for match in matches]
+        # FIXME: This could be wrong
+        target_path = str(target.repo.working_dir)
+        target_path += "/"
+        matches = [match.replace(target_path, "") for match in matches]
         # Replace .c with .o
         matches = [target.get_object_name(match) for match in matches]
         return matches
+
+    @staticmethod
+    def extract_reports(
+        report_dir, output_dir, sampled_num=5, stop_num=5, max_num=100, seed=0
+    ) -> Tuple[Optional[List[ReportData]], int]:
+        """
+        Extract reports from the report directory and process them into markdown files.
+        """
+        report_dir = Path(report_dir)
+        stop_num = max(sampled_num, stop_num)
+
+        # Sort the report dir by time
+        report_dir_list = sorted(
+            [x for x in report_dir.iterdir() if x.is_dir()],
+            key=lambda x: x.stat().st_ctime,
+        )
+        if not report_dir_list:
+            logger.error("No report found!")
+            return None, 0
+        clustered_report_dir = defaultdict(list)
+
+        # The latest report dir
+        report_dir = report_dir_list[-1]
+
+        report_tmp_dir = Path(output_dir)
+        report_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        report_html_list = list(report_dir.glob("*.html"))
+        num_reports = len(report_html_list)
+        if num_reports < stop_num:
+            logger.warning(f"< {stop_num} reports!")
+            return None, num_reports
+
+        max_len = min(max_num, num_reports)
+        # Filename pattern example: `File:| drivers/video/backlight/qcom-wled.c`
+        filename_pattern = re.compile(r"File:\| (.+)")
+        for report_html in report_html_list[:max_len]:
+            html_content = report_html.read_text()
+            md_content = html2text(html_content)
+            # This is specific to the report format
+            md_content = remove_text_section(md_content, html_content)
+            filename = filename_pattern.search(md_content)
+            if filename:
+                filename = filename.group(1)
+            else:
+                filename = "default"
+
+            filename = filename.replace("/", "_").replace(".c", "").replace(".h", "").strip()
+            id_name = f"{filename}-{report_html.stem}"
+            report_md = report_tmp_dir / (id_name + ".md")
+            report_md.write_text(md_content)
+
+            report_data = ReportData(
+                report_id=id_name,
+                report_content=md_content,
+                report_triage="",
+                report_objects=[],
+            )
+            clustered_report_dir[filename].append(report_data)
+
+        # Sample the reports
+        random.seed(seed)
+        sample_size = min(5, len(clustered_report_dir))
+        logger.warning(f"Sample size: {sample_size}")
+        selected_keys = random.sample(list(clustered_report_dir.keys()), sample_size)
+        reports = []
+        for key in selected_keys:
+            reports.append(clustered_report_dir[key][0])
+        return reports, len(clustered_report_dir)

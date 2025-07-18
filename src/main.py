@@ -5,7 +5,7 @@ import git
 
 import agent
 from checker_gen import gen_checker
-from checker_refine import refine_checker, scan, triage_report
+from checker_refine import refine_checker, scan, scan_single_checker, triage_report
 from commit_label import label_commits
 from global_config import global_config, logger
 from model import init_llm
@@ -40,6 +40,7 @@ def main(mode: str, *args, **kwargs):
         "gen": (gen_checker, "Generate new checkers"),
         "refine": (refine_checker, "Refine and improve checkers"),
         "scan": (scan, "Scan the kernel with valid checkers"),
+        "scan_single": (scan_single_checker, "Scan with a single checker from file"),
         "triage": (triage_report, "Triage the report"),
         "label": (label_commits, "Label commits"),
     }

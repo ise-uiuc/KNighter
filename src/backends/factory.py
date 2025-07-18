@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import List, Optional, Tuple
 
+from checker_data import ReportData
 from targets.factory import TargetFactory
 
 
@@ -36,7 +38,7 @@ class AnalysisBackendFactory(ABC):
         patch: str,
         target: TargetFactory,
         skip_build_checker=False,
-    ):
+    ) -> Tuple[int, int]:
         """
         Validate the checker against a commit and patch.
 
@@ -45,6 +47,8 @@ class AnalysisBackendFactory(ABC):
             patch (str): The patch to apply.
             target (TargetFactory): The target to be tested.
             skip_build_checker (bool): Whether to skip building the checker.
+        Returns:
+            Tuple[int, int]: The number of true positives and true negatives.
         """
         raise NotImplementedError("Subclasses must implement this method.")
 
@@ -85,5 +89,27 @@ class AnalysisBackendFactory(ABC):
         Args:
             report (str): The report to parse.
             target (TargetFactory): The target to be tested.
+        """
+        raise NotImplementedError("Subclasses must implement this method.")
+
+    @staticmethod
+    @abstractmethod
+    def extract_reports(
+        report_dir: str,
+        output_dir: str,
+        sampled_num: int = 5,
+        stop_num: int = 5,
+        max_num: int = 100,
+        seed: int = 0,
+    ) -> Tuple[Optional[List[ReportData]], int]:
+        """
+        Extract reports from the report directory.
+
+        Args:
+            report_dir (str): The directory containing the reports.
+            output_dir (TargetFactory): The directory to store the extracted reports.
+            sampled_num (int): The number of reports to sample.
+            stop_num (int): The number of reports to stop at.
+            seed (int): The seed for random sampling.
         """
         raise NotImplementedError("Subclasses must implement this method.")

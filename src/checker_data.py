@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import List, Optional, Set
 import enum
 import yaml
 
@@ -322,10 +322,50 @@ class RefinementResult(pydantic.BaseModel):
     attempt_id: int
     refine_attempt_list: List[RefineAttempt] = []
     error_objects: Set[str] = set()
+    original_checker_code: Optional[str] = None  # Store the code before this refinement
 
     def __str__(self):
         tp_rate = self.num_TP / (self.num_TP + self.num_FP + 0.00001)
         return f"{self.result},{tp_rate:.2f},{self.num_reports},{self.attempt_id}"
+    
+    def save_refined_code(self, output_dir: Path, checker_id: str) -> None:
+        """Save the successfully refined checker code to files."""
+        output_dir = Path(output_dir)
+        refinement_dir = output_dir / "refinements"
+        refinement_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save the refined code if this attempt was successful
+        if self.refined and self.checker_code:
+            refined_file = refinement_dir / f"refined_attempt_{self.attempt_id}.cpp"
+            refined_file.write_text(self.checker_code)
+            
+            # Also save as the latest successful refinement
+            latest_file = refinement_dir / "latest_refined.cpp"
+            latest_file.write_text(self.checker_code)
+            
+            # Save metadata about this refinement
+            metadata = {
+                "attempt_id": self.attempt_id,
+                "result": self.result,
+                "refined": self.refined,
+                "num_reports": self.num_reports,
+                "num_TP": self.num_TP,
+                "num_FP": self.num_FP,
+                "precision": self.num_TP / (self.num_TP + self.num_FP) if (self.num_TP + self.num_FP) > 0 else 0,
+                "refinement_attempts": len(self.refine_attempt_list)
+            }
+            metadata_file = refinement_dir / f"refined_attempt_{self.attempt_id}_metadata.yaml"
+            import yaml
+            metadata_file.write_text(yaml.dump(metadata, default_flow_style=False))
+        
+        # Always save the current state (even if not refined)
+        attempt_file = refinement_dir / f"attempt_{self.attempt_id}.cpp"
+        attempt_file.write_text(self.checker_code)
+        
+        # Save original code for comparison (if available)
+        if self.original_checker_code:
+            original_file = refinement_dir / f"attempt_{self.attempt_id}_original.cpp"
+            original_file.write_text(self.original_checker_code)
 
 class ReportData(pydantic.BaseModel):
     report_id: str

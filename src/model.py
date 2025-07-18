@@ -103,7 +103,7 @@ def invoke_llm(
     failed_count = 0
     while True:
         try:
-            if model in ["gpt-4o", "o1", "o3-mini", "o1-mini", "o1-preview"]:
+            if model in ["gpt-4o", "o1", "o3-mini", "o1-mini", "o1-preview", "o4-mini", "gpt-4.1"]:
                 client = openai_client
             elif model == "deepseek-reasoner":
                 client = deepseek_client
@@ -126,7 +126,7 @@ def invoke_llm(
                     "temperature": temperature,
                 }
                 response = client.complete(payload)
-            elif model in ["o1-preview", "o1-mini", "o1", "o3-mini"]:
+            elif model in ["o1-preview", "o1-mini", "o1", "o3-mini", "o4-mini"]:
                 response = client.chat.completions.create(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
