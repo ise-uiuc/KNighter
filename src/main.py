@@ -5,7 +5,6 @@ import fire
 import agent
 from checker_gen import gen_checker
 from checker_refine import refine_checker, scan, scan_single_checker, triage_report, check_refinement_status, refine_unrefined_checkers, list_successfully_changed_checkers
-from checker_refine_group import refine_checker_group_from_dir
 from model import list_available_models
 from commit_label import label_commits
 from global_config import global_config, logger
