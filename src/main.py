@@ -1,11 +1,12 @@
 from pathlib import Path
 
 import fire
-import git
 
 import agent
 from checker_gen import gen_checker
-from checker_refine import refine_checker, scan, scan_single_checker, triage_report
+from checker_refine import refine_checker, scan, scan_single_checker, triage_report, check_refinement_status, refine_unrefined_checkers, list_successfully_changed_checkers
+from checker_refine_group import refine_checker_group_from_dir
+from model import list_available_models
 from commit_label import label_commits
 from global_config import global_config, logger
 from model import init_llm
@@ -39,6 +40,11 @@ def main(mode: str, *args, **kwargs):
     modes = {
         "gen": (gen_checker, "Generate new checkers"),
         "refine": (refine_checker, "Refine and improve checkers"),
+        "refine_group": (refine_checker_group_from_dir, "Refine multiple checkers in a group with separate reports"),
+        "refine_status": (lambda checker_dir, detailed=False: check_refinement_status(checker_dir, detailed), "Check refinement status of checkers"),
+        "refine_unrefined": (refine_unrefined_checkers, "Refine only checkers that haven't been successfully refined"),
+        "list_changed": (list_successfully_changed_checkers, "List checkers with successful code changes"),
+        "list_models": (lambda: print(f"Available models: {list_available_models()}"), "List all available models"),
         "scan": (scan, "Scan the kernel with valid checkers"),
         "scan_single": (scan_single_checker, "Scan with a single checker from file"),
         "triage": (triage_report, "Triage the report"),

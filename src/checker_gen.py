@@ -312,7 +312,7 @@ def gen_checker_worker(
         try:
             if use_multi:
                 # Step 1: Pattern Extraction
-                step_name = progress.start_step("🔍 Pattern Extraction")
+                step_name = progress.start_step("🧩 Pattern Extraction")
                 pattern = patch2pattern(id, i, patch, use_general=use_general)
                 progress.complete_step(step_name, f"Extracted {len(pattern)} chars")
                 

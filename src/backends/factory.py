@@ -64,6 +64,8 @@ class AnalysisBackendFactory(ABC):
         object_to_analyze=None,
         jobs=32,
         output_dir="tmp",
+        skip_build_checker=False,
+        skip_checkout=False,
         **kwargs,
     ):
         """

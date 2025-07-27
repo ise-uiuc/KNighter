@@ -1,6 +1,6 @@
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import loguru
 import yaml
@@ -107,5 +107,30 @@ class GlobalConfig:
     def scan_commit(self) -> Optional[str]:
         """Get the scan commit."""
         return self.get("scan_commit", "HEAD")
+    
+    @property
+    def max_fp_reports_for_refinement(self) -> int:
+        """Get the maximum number of false positive reports to use for refinement."""
+        return self.get("max_fp_reports_for_refinement", 5)
+    
+    @property
+    def max_fp_reports_for_batch(self) -> int:
+        """Get the maximum number of false positive reports to use for batch refinement."""
+        return self.get("max_fp_reports_for_batch", 5)
+    
+    @property
+    def group_scan_targets(self) -> List[str]:
+        """Get the default scan targets for group scanning."""
+        return self.get("group_scan_targets", ["drivers/"])
+    
+    @property
+    def group_scan_timeout(self) -> int:
+        """Get the timeout for group scanning in seconds."""
+        return self.get("group_scan_timeout", 3600)  # 60 minutes for large groups
+    
+    @property
+    def group_scan_jobs(self) -> int:
+        """Get the number of parallel jobs for group scanning."""
+        return self.get("group_scan_jobs", 32)
 
 global_config = GlobalConfig()
