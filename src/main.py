@@ -39,7 +39,6 @@ def main(mode: str, *args, **kwargs):
     modes = {
         "gen": (gen_checker, "Generate new checkers"),
         "refine": (refine_checker, "Refine and improve checkers"),
-        "refine_group": (refine_checker_group_from_dir, "Refine multiple checkers in a group with separate reports"),
         "refine_status": (lambda checker_dir, detailed=False: check_refinement_status(checker_dir, detailed), "Check refinement status of checkers"),
         "refine_unrefined": (refine_unrefined_checkers, "Refine only checkers that haven't been successfully refined"),
         "list_changed": (list_successfully_changed_checkers, "List checkers with successful code changes"),
