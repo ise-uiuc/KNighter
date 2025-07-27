@@ -1,110 +1,101 @@
-import subprocess as sp
-import time
 from pathlib import Path
+from typing import Optional, Tuple
 
-import local_config
 from agent import repair_syntax
-from local_config import logger
-from tools import extract_checker_code, grab_cpp_code
+from global_config import global_config, logger
+from tools import extract_checker_code
+
+# Define constants for clarity
+MAX_REPAIR_ATTEMPTS = 4
 
 
-def repairChecker(
+def repair_checker(
     id: str,
-    idx: int,
-    checker_file_path: str,
-    llvm_build_dir: str,
-    max_idx: int = 4,
-    intermeidate_dir: Path = None,
-    checker_code=None,
-) -> tuple:
+    repair_name: str,
+    checker_code: str,
+    max_idx: int = MAX_REPAIR_ATTEMPTS,
+    intermediate_dir: Optional[Path] = None,
+) -> Tuple[bool, Optional[str]]:
     """
-    Repairs the checker code by compiling and updating it based on error messages.
+    Repair the checker code using a language model.
 
     Args:
-        id (str): The identifier for the repair process.
-        idx (int): The index of the repair process.
-        checker_file_path (str): The file path to the checker code.
-        llvm_build_dir (str): The directory path for LLVM build.
-        max_idx (int, optional): The maximum number of times to try repairing. Defaults to 4.
-        intermeidate_dir (Path, optional): The directory path for intermediate files. Defaults to None.
-        checker_code (str, optional): The code of the checker. Defaults to None.
-
+        id (str): The ID of the checker.
+        repair_name (str): The name of the repair.
+        checker_code (str): Initial checker code.
+        max_idx (int): The maximum number of repair attempts.
+        intermediate_dir (Optional[Path]): Directory for intermediate files.
     Returns:
-        tuple: A tuple containing a boolean indicating whether the repair succeeded and the repaired checker code.
+        Tuple[bool, Optional[str], list]: A tuple containing:
+            - success (bool): Whether the repair was successful.
+            - repaired_code (Optional[str]): The repaired checker code.
     """
-    global_config = local_config.get_config()
 
-    basedir = Path(global_config.get("result_dir")) / id
-    prompt_history_dir = basedir / "prompt_history" / str(idx)
+    base_dir = Path(global_config.result_dir) / id
+
+    # Setup directories
+    prompt_history_dir = base_dir / "prompt_history" / repair_name
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
-    response_checker = prompt_history_dir / "response_checker.md"
 
-    if intermeidate_dir is None:
-        intermeidate_dir = Path(basedir) / f"intermediate-{idx}"
-    intermeidate_dir.mkdir(parents=True, exist_ok=True)
+    if intermediate_dir is None:
+        intermediate_dir = base_dir / f"intermediate-{repair_name}"
+    intermediate_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy checker code to compile
-    if checker_code is None:
-        content = response_checker.read_text()
-        checker_code = grab_cpp_code(content)
-        checker_code = checker_code.lstrip("```cpp\n")
-        checker_code = checker_code.rstrip("```")
-
-    checker_file_path = Path(checker_file_path)
-    checker_file_path.write_text(checker_code)
-
-    times = 1
-    log_dir = basedir / "build_logs" / str(idx)
+    log_dir = base_dir / "build_logs" / repair_name
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # try first time
-    logger.info(f"start compiling, times: {times}")
+    current_checker_code = checker_code
 
-    log_std = log_dir / f"build_log{times}.log"
-    log_stderr = log_dir / f"build_error_log{times}.log"
-    compile_res = sp.run(
-        f"make SAGenTestPlugin -j32 > {log_std} 2>{log_stderr}",
-        shell=True,
-        cwd=llvm_build_dir,
-    )
+    for attempt in range(1, max_idx + 2):
+        # Allow max_idx attempts + 1 initial try
+        logger.info(f"Compilation attempt {attempt}/{max_idx + 1}")
 
-    # keep trying
-    error_content = log_stderr.read_text().strip()
-
-    while compile_res.returncode != 0:
-        if times > max_idx:
-            logger.error(f"repair failed after trying {max_idx} times!")
-            return (False, None)
-
-        # Update the checker code for the loop
-        checker_code = checker_file_path.read_text()
-        llm_response = repair_syntax(id, idx, times, checker_code, error_content)
-        new_checker_code = extract_checker_code(llm_response)
-        if new_checker_code is None:
-            logger.error("fail to grab new checker code from LLM response")
-            times += 1
-            continue
-
-        # Write back the new checker
-        checker_file_path.write_text(new_checker_code)
-        (intermeidate_dir / f"checker-{times}.cpp").write_text(new_checker_code)
-
-        # Wait for the write operation to complete
-        time.sleep(1)
-        # Try another time
-        times += 1
-        logger.info(f"start compiling, times: {times}")
-        log_std = log_dir / f"build_log{times}.log"
-        log_stderr = log_dir / f"build_error_log{times}.log"
-        compile_res = sp.run(
-            f"make SAGenTestPlugin -j32 > {log_std} 2>{log_stderr}",
-            shell=True,
-            cwd=llvm_build_dir,
+        return_code, stderr_content = global_config.backend.build_checker(
+            current_checker_code,
+            log_dir,
+            attempt=attempt,
         )
-        error_content = log_stderr.read_text().strip()
 
-    # compiling succeed
-    logger.info("Syntax repair succeed! ")
+        if return_code == 0:
+            logger.info("Syntax repair successful!")
+            # Read the successfully compiled code back, in case _run_compilation modified it (unlikely here)
+            final_code = current_checker_code
+            return True, final_code
 
-    checker_code = checker_file_path.read_text()
-    return (True, checker_code)
+        # Compilation failed
+        logger.warning(
+            f"Compilation attempt {attempt} failed with return code {return_code}."
+        )
+        if not stderr_content:
+            logger.warning("Compilation failed, but stderr was empty.")
+            return False, None
+        if attempt > max_idx:
+            logger.error(f"Repair failed after {max_idx} attempts.")
+            return False, None
+
+        # Attempt repair
+        logger.info(f"Attempting repair {attempt} using LLM...")
+        try:
+            llm_response = repair_syntax(
+                id, repair_name, attempt, current_checker_code, stderr_content
+            )
+            new_checker_code = extract_checker_code(llm_response)
+
+            if new_checker_code is None:
+                logger.error(
+                    f"Failed to extract new checker code from LLM response for attempt {attempt}."
+                )
+                continue
+            else:
+                # Write back the new checker code for the next attempt
+                current_checker_code = new_checker_code
+                (intermediate_dir / f"checker-{attempt}.cpp").write_text(
+                    current_checker_code
+                )
+        except Exception as e:
+            logger.error(f"Error during LLM repair call for attempt {attempt}: {e}")
+            # Decide whether to retry or fail
+            return False, None
+    # Should not be reached if loop logic is correct, but as a safeguard:
+    logger.error("Exited repair loop unexpectedly.")
+    return False, None

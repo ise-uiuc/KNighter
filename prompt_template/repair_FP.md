@@ -21,6 +21,7 @@ Note, the repaired checker needs to still **detect the target buggy code**.
 2. Handle corner cases gracefully
 3. You could register a program state like `REGISTER_MAP_WITH_PROGRAMSTATE(...)` to track the information you need.
 4. Follow Clang Static Analyzer best practices for checker development
+5. DO NOT remove any existing `#include` in the checker code.
 
 You could add some functions like `bool isFalsePositive(...)` to help you define and detect the false positive.
 
