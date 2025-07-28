@@ -25,7 +25,7 @@ class KernelFunction:
         node: Node,
     ):
         self.file_path = file_path
-        self.node = Node
+        self.node = node
 
         if node.type != "function_definition":
             raise ValueError("Node is not a function definition")

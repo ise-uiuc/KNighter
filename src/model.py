@@ -8,6 +8,7 @@ from openai import OpenAI
 
 try:
     import anthropic
+
     ANTHROPIC_AVAILABLE = True
 except ImportError:
     anthropic = None
@@ -63,13 +64,15 @@ def init_llm():
 
     if "google_key" in key_config:
         google_client = genai.Client(api_key=key_config["google_key"])
-    
+
     if "claude_key" in key_config:
         if ANTHROPIC_AVAILABLE:
             claude_client = anthropic.Anthropic(api_key=key_config["claude_key"])
             logger.info("Claude client initialized successfully")
         else:
-            logger.warning("Claude API key provided but anthropic library not available. Install with: pip install anthropic")
+            logger.warning(
+                "Claude API key provided but anthropic library not available. Install with: pip install anthropic"
+            )
 
     if not any(
         [
@@ -93,7 +96,7 @@ def num_tokens_from_string(string: str) -> int:
     # Claude roughly uses 1 token per 4 characters for English text
     if model_config.get("model", "").startswith("claude"):
         return len(string) // 4
-    
+
     num_tokens = len(encoding.encode(string))
     return num_tokens
 
@@ -115,7 +118,7 @@ def invoke_llm(
         "local-deepseek",
         "claude",
         "claude-3-5-sonnet",
-        "claude-3-5-haiku", 
+        "claude-3-5-haiku",
         "claude-3-opus",
         "claude-4-sonnet",
     ]:
@@ -131,7 +134,15 @@ def invoke_llm(
     failed_count = 0
     while True:
         try:
-            if model in ["gpt-4o", "o1", "o3-mini", "o1-mini", "o1-preview", "o4-mini", "gpt-4.1"]:
+            if model in [
+                "gpt-4o",
+                "o1",
+                "o3-mini",
+                "o1-mini",
+                "o1-preview",
+                "o4-mini",
+                "gpt-4.1",
+            ]:
                 client = openai_client
             elif model == "deepseek-reasoner":
                 client = deepseek_client
@@ -144,9 +155,17 @@ def invoke_llm(
                 client = nv_client
             elif model == "google":
                 client = google_client
-            elif model in ["claude", "claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus", "claude-4-sonnet"]:
+            elif model in [
+                "claude",
+                "claude-3-5-sonnet",
+                "claude-3-5-haiku",
+                "claude-3-opus",
+                "claude-4-sonnet",
+            ]:
                 if not claude_client:
-                    raise ValueError(f"Claude model {model} requested but Claude client not initialized. Check your claude_key configuration.")
+                    raise ValueError(
+                        f"Claude model {model} requested but Claude client not initialized. Check your claude_key configuration."
+                    )
                 client = claude_client
             else:
                 raise ValueError(f"Model {model} not supported")
@@ -181,24 +200,28 @@ def invoke_llm(
                     model="gemini-2.0-flash",
                     contents=prompt,
                 )
-            elif model in ["claude", "claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus", "claude-4-sonnet"]:
+            elif model in [
+                "claude",
+                "claude-3-5-sonnet",
+                "claude-3-5-haiku",
+                "claude-3-opus",
+                "claude-4-sonnet",
+            ]:
                 # Map model names to actual Claude model identifiers
                 claude_model_map = {
                     "claude": "claude-4-sonnet-20250514",  # Default to Claude 4 Sonnet
-                    "claude-3-5-sonnet": "claude-3-5-sonnet-20241022", 
+                    "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
                     "claude-3-5-haiku": "claude-3-5-haiku-20241022",
                     "claude-3-opus": "claude-3-opus-20240229",
-                    "claude-4-sonnet": "claude-4-sonnet-20250514"
+                    "claude-4-sonnet": "claude-4-sonnet-20250514",
                 }
                 actual_model = claude_model_map.get(model, model_config["claude_model"])
-                
+
                 response = client.messages.create(
                     model=actual_model,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ]
+                    messages=[{"role": "user", "content": prompt}],
                 )
             else:
                 response = client.chat.completions.create(
@@ -229,7 +252,13 @@ def invoke_llm(
                 continue
             if model == "google":
                 return response.text
-            elif model in ["claude", "claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus", "claude-4-sonnet"]:
+            elif model in [
+                "claude",
+                "claude-3-5-sonnet",
+                "claude-3-5-haiku",
+                "claude-3-opus",
+                "claude-4-sonnet",
+            ]:
                 # Claude returns a different response format
                 answer = response.content[0].text
                 if "<think>" in answer or "</think>" in answer:
@@ -255,20 +284,30 @@ def get_embeddings(text: str):
 def list_available_models() -> dict:
     """
     List all available models based on initialized clients.
-    
+
     Returns:
         dict: Available models by provider
     """
     available = {
-        "openai": [] if not openai_client else ["gpt-4o", "o1", "o3-mini", "o1-mini", "o1-preview"],
+        "openai": []
+        if not openai_client
+        else ["gpt-4o", "o1", "o3-mini", "o1-mini", "o1-preview"],
         "deepseek": [] if not deepseek_client else ["deepseek-reasoner"],
         "google": [] if not google_client else ["google"],
         "nvidia": [] if not nv_client else ["nv-deepseek"],
         "azure": [] if not azure_deepseek_client else ["azure-deepseek"],
         "local": ["local-deepseek"],  # Always available
-        "claude": [] if not claude_client else ["claude", "claude-3-5-sonnet", "claude-3-5-haiku", "claude-3-opus", "claude-4-sonnet"]
+        "claude": []
+        if not claude_client
+        else [
+            "claude",
+            "claude-3-5-sonnet",
+            "claude-3-5-haiku",
+            "claude-3-opus",
+            "claude-4-sonnet",
+        ],
     }
-    
+
     # Filter out empty providers
     return {k: v for k, v in available.items() if v}
 
@@ -276,29 +315,80 @@ def list_available_models() -> dict:
 def get_model_info(model_name: str) -> dict:
     """
     Get information about a specific model.
-    
+
     Args:
         model_name: Name of the model
-        
+
     Returns:
         dict: Model information including provider, capabilities, etc.
     """
     model_info = {
         # OpenAI models
-        "gpt-4o": {"provider": "OpenAI", "type": "chat", "max_tokens": 128000, "capabilities": ["reasoning", "coding"]},
-        "o1": {"provider": "OpenAI", "type": "reasoning", "max_tokens": 65536, "capabilities": ["advanced_reasoning"]},
-        "o3-mini": {"provider": "OpenAI", "type": "reasoning", "max_tokens": 65536, "capabilities": ["reasoning", "efficiency"]},
-        
+        "gpt-4o": {
+            "provider": "OpenAI",
+            "type": "chat",
+            "max_tokens": 128000,
+            "capabilities": ["reasoning", "coding"],
+        },
+        "o1": {
+            "provider": "OpenAI",
+            "type": "reasoning",
+            "max_tokens": 65536,
+            "capabilities": ["advanced_reasoning"],
+        },
+        "o3-mini": {
+            "provider": "OpenAI",
+            "type": "reasoning",
+            "max_tokens": 65536,
+            "capabilities": ["reasoning", "efficiency"],
+        },
         # Claude models
-        "claude": {"provider": "Anthropic", "type": "chat", "max_tokens": 200000, "capabilities": ["reasoning", "coding", "analysis"], "actual_model": "claude-4-sonnet-20250514"},
-        "claude-3-5-sonnet": {"provider": "Anthropic", "type": "chat", "max_tokens": 200000, "capabilities": ["reasoning", "coding", "analysis"]},
-        "claude-3-5-haiku": {"provider": "Anthropic", "type": "chat", "max_tokens": 200000, "capabilities": ["fast_response", "cost_effective"]},
-        "claude-3-opus": {"provider": "Anthropic", "type": "chat", "max_tokens": 200000, "capabilities": ["advanced_reasoning", "complex_tasks"]},
-        "claude-4-sonnet": {"provider": "Anthropic", "type": "chat", "max_tokens": 200000, "capabilities": ["latest_model", "enhanced_reasoning", "improved_coding"]},
-        
+        "claude": {
+            "provider": "Anthropic",
+            "type": "chat",
+            "max_tokens": 200000,
+            "capabilities": ["reasoning", "coding", "analysis"],
+            "actual_model": "claude-4-sonnet-20250514",
+        },
+        "claude-3-5-sonnet": {
+            "provider": "Anthropic",
+            "type": "chat",
+            "max_tokens": 200000,
+            "capabilities": ["reasoning", "coding", "analysis"],
+        },
+        "claude-3-5-haiku": {
+            "provider": "Anthropic",
+            "type": "chat",
+            "max_tokens": 200000,
+            "capabilities": ["fast_response", "cost_effective"],
+        },
+        "claude-3-opus": {
+            "provider": "Anthropic",
+            "type": "chat",
+            "max_tokens": 200000,
+            "capabilities": ["advanced_reasoning", "complex_tasks"],
+        },
+        "claude-4-sonnet": {
+            "provider": "Anthropic",
+            "type": "chat",
+            "max_tokens": 200000,
+            "capabilities": ["latest_model", "enhanced_reasoning", "improved_coding"],
+        },
         # Other models
-        "deepseek-reasoner": {"provider": "DeepSeek", "type": "reasoning", "max_tokens": 8192, "capabilities": ["reasoning", "coding"]},
-        "google": {"provider": "Google", "type": "chat", "max_tokens": 2097152, "capabilities": ["multimodal", "reasoning"]},
+        "deepseek-reasoner": {
+            "provider": "DeepSeek",
+            "type": "reasoning",
+            "max_tokens": 8192,
+            "capabilities": ["reasoning", "coding"],
+        },
+        "google": {
+            "provider": "Google",
+            "type": "chat",
+            "max_tokens": 2097152,
+            "capabilities": ["multimodal", "reasoning"],
+        },
     }
-    
-    return model_info.get(model_name, {"provider": "Unknown", "type": "unknown", "capabilities": []})
+
+    return model_info.get(
+        model_name, {"provider": "Unknown", "type": "unknown", "capabilities": []}
+    )

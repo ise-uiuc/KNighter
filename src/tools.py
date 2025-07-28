@@ -12,6 +12,7 @@ from queue import Queue
 
 from bs4 import BeautifulSoup
 from loguru import logger
+
 from kparser.kfunction import KernelFunction
 
 
@@ -126,7 +127,7 @@ def monitor_build_output(process, warning_limit=100, timeout=None):
     except ImportError:
         logger.warning("psutil not available, using basic process termination")
         psutil = None
-    
+
     warning_count = 0
     output_lines = []
     process_completed = True
@@ -135,7 +136,7 @@ def monitor_build_output(process, warning_limit=100, timeout=None):
     def read_output(stream, queue, stop_event):
         """Read output stream line by line and put in queue."""
         try:
-            text_stream = io.TextIOWrapper(stream, encoding="utf-8", errors='replace')
+            text_stream = io.TextIOWrapper(stream, encoding="utf-8", errors="replace")
             while not stop_event.is_set():
                 try:
                     # Use readline with a small timeout to allow checking stop_event
@@ -189,10 +190,18 @@ def monitor_build_output(process, warning_limit=100, timeout=None):
                         output_lines.append(line)
                         if "warning:" in line.lower():
                             warning_count += 1
-                            if warning_count <= 10:  # Only log first 10 warnings to reduce spam
-                                logger.warning(f"Warning {warning_count}: {line.strip()}")
-                            elif warning_count % 10 == 0:  # Log every 10th warning after that
-                                logger.warning(f"{warning_count} warnings found so far...")
+                            if (
+                                warning_count <= 10
+                            ):  # Only log first 10 warnings to reduce spam
+                                logger.warning(
+                                    f"Warning {warning_count}: {line.strip()}"
+                                )
+                            elif (
+                                warning_count % 10 == 0
+                            ):  # Log every 10th warning after that
+                                logger.warning(
+                                    f"{warning_count} warnings found so far..."
+                                )
                 except Exception:
                     pass
 
@@ -207,22 +216,28 @@ def monitor_build_output(process, warning_limit=100, timeout=None):
                         if "warning:" in line.lower():
                             warning_count += 1
                             if warning_count <= 10:
-                                logger.warning(f"Warning {warning_count}: {line.strip()}")
+                                logger.warning(
+                                    f"Warning {warning_count}: {line.strip()}"
+                                )
                             elif warning_count % 10 == 0:
-                                logger.warning(f"{warning_count} warnings found so far...")
+                                logger.warning(
+                                    f"{warning_count} warnings found so far..."
+                                )
                 except Exception:
                     pass
 
             # Check warning count
             if warning_limit > 0 and warning_count > warning_limit:
-                logger.error(f"Warning limit of {warning_limit} exceeded! Build stopped.")
+                logger.error(
+                    f"Warning limit of {warning_limit} exceeded! Build stopped."
+                )
                 process_completed = False
                 break
 
     finally:
         # Cleanup: Signal threads to stop
         stop_monitoring.set()
-        
+
         # Terminate the process if it's still running
         if process.poll() is None:
             logger.info("Terminating build process...")
@@ -263,12 +278,12 @@ def monitor_build_output(process, warning_limit=100, timeout=None):
 def force_terminate_process_group(process, psutil_module, timeout=10):
     """
     Force terminate a process and all its children with proper cleanup.
-    
+
     Args:
         process: subprocess.Popen object
         psutil_module: psutil module (passed to avoid import issues)
         timeout: Maximum time to wait for graceful termination
-        
+
     Returns:
         bool: True if process was successfully terminated
     """
@@ -280,58 +295,60 @@ def force_terminate_process_group(process, psutil_module, timeout=10):
         try:
             parent = psutil_module.Process(process.pid)
             children = parent.children(recursive=True)
-            
+
             # First, try graceful termination
-            logger.info(f"Terminating process group (PID: {process.pid}) and {len(children)} children...")
-            
+            logger.info(
+                f"Terminating process group (PID: {process.pid}) and {len(children)} children..."
+            )
+
             # Send SIGTERM to all processes
             for child in children:
                 try:
                     child.terminate()
                 except (psutil_module.NoSuchProcess, psutil_module.AccessDenied):
                     pass
-            
+
             parent.terminate()
-            
+
             # Wait for processes to terminate gracefully
             try:
-                process.wait(timeout=timeout//2)
+                process.wait(timeout=timeout // 2)
                 logger.info("Process group terminated gracefully")
                 return True
             except subprocess.TimeoutExpired:
                 logger.warning("Graceful termination timed out, using SIGKILL")
-                
+
         except (psutil_module.NoSuchProcess, psutil_module.AccessDenied):
             # Fallback to original method if psutil fails
             logger.warning("Could not access process group, using fallback method")
-            
+
         # If graceful termination failed, use SIGKILL
         try:
             parent = psutil_module.Process(process.pid)
             children = parent.children(recursive=True)
-            
+
             # Kill all child processes
             for child in children:
                 try:
                     child.kill()
                 except (psutil_module.NoSuchProcess, psutil_module.AccessDenied):
                     pass
-            
+
             parent.kill()
-            
+
         except (psutil_module.NoSuchProcess, psutil_module.AccessDenied):
             # Final fallback
             process.kill()
-            
+
         # Final wait
         try:
-            process.wait(timeout=timeout//2)
+            process.wait(timeout=timeout // 2)
             logger.info("Process group killed successfully")
             return True
         except subprocess.TimeoutExpired:
             logger.error("Failed to kill process group!")
             return False
-            
+
     except Exception as e:
         logger.error(f"Error terminating process group: {e}")
         # Last resort fallback
@@ -360,33 +377,35 @@ def _drain_queue(queue, output_lines):
 def create_monitored_process(cmd, cwd=None, **kwargs):
     """
     Create a subprocess with proper process group setup for easier cleanup.
-    
+
     Args:
         cmd: Command to execute
         cwd: Working directory
         **kwargs: Additional subprocess.Popen arguments
-        
+
     Returns:
         subprocess.Popen object
     """
     import os
-    
+
     # Default arguments for better process management
     default_kwargs = {
-        'stdout': subprocess.PIPE,
-        'stderr': subprocess.PIPE,
-        'shell': True,
-        'bufsize': 1,
-        'preexec_fn': os.setsid if os.name != 'nt' else None,  # Create new process group on Unix
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "shell": True,
+        "bufsize": 1,
+        "preexec_fn": os.setsid
+        if os.name != "nt"
+        else None,  # Create new process group on Unix
     }
-    
+
     # Update with user-provided kwargs
     default_kwargs.update(kwargs)
-    
+
     # Set working directory if provided
     if cwd:
-        default_kwargs['cwd'] = cwd
-    
+        default_kwargs["cwd"] = cwd
+
     return subprocess.Popen(cmd, **default_kwargs)
 
 
@@ -528,18 +547,18 @@ def get_changed_lines_in_diff(diff):
 def get_function_codes(commit, include_whole_file_fallback=True, max_file_size_kb=100):
     """
     Extract function codes from commit diffs using tree-sitter.
-    
+
     Args:
         commit: Git commit object
         include_whole_file_fallback: If True, include whole file content when tree-sitter fails
         max_file_size_kb: Maximum file size in KB to include as whole file (default: 100KB)
-        
+
     Returns:
         Set of tuples: (file_path, function_name, function_code)
     """
     codes = set()
     diffs = commit.diff(commit.hexsha + "^", create_patch=True)
-    
+
     for diff in diffs:
         if diff.a_path.endswith(".c") or diff.a_path.endswith(".h"):
             file_content_before = commit.repo.git.show(
@@ -550,12 +569,12 @@ def get_function_codes(commit, include_whole_file_fallback=True, max_file_size_k
             # Try to extract functions using tree-sitter
             temp_file = Path("__temp.c")
             temp_file.write_text(file_content_before)
-            
+
             try:
                 functions = KernelFunction.from_file(temp_file)
                 if temp_file.exists():
                     temp_file.unlink()
-                
+
                 # Check if we found any functions containing changed lines
                 functions_found = False
                 for func in functions:
@@ -564,38 +583,58 @@ def get_function_codes(commit, include_whole_file_fallback=True, max_file_size_k
                         if start_line <= int(line) <= end_line:
                             codes.add((diff.a_path, func.name, func.code))
                             functions_found = True
-                
+
                 # Fallback: if tree-sitter didn't find any relevant functions, include whole file
                 if not functions_found and include_whole_file_fallback:
-                    file_size_kb = len(file_content_before.encode('utf-8')) / 1024
-                    
+                    file_size_kb = len(file_content_before.encode("utf-8")) / 1024
+
                     if file_size_kb <= max_file_size_kb:
-                        logger.warning(f"Tree-sitter failed to find functions for {diff.a_path}, including whole file ({file_size_kb:.1f}KB)")
-                        
+                        logger.warning(
+                            f"Tree-sitter failed to find functions for {diff.a_path}, including whole file ({file_size_kb:.1f}KB)"
+                        )
+
                         # Create a "whole file" entry
                         file_name = Path(diff.a_path).name
-                        codes.add((diff.a_path, f"WHOLE_FILE_{file_name}", file_content_before))
+                        codes.add(
+                            (
+                                diff.a_path,
+                                f"WHOLE_FILE_{file_name}",
+                                file_content_before,
+                            )
+                        )
                     else:
-                        logger.warning(f"Tree-sitter failed for {diff.a_path}, but file too large ({file_size_kb:.1f}KB > {max_file_size_kb}KB), skipping")
-                    
+                        logger.warning(
+                            f"Tree-sitter failed for {diff.a_path}, but file too large ({file_size_kb:.1f}KB > {max_file_size_kb}KB), skipping"
+                        )
+
             except Exception as e:
                 logger.error(f"Tree-sitter parsing failed for {diff.a_path}: {e}")
-                
+
                 # Clean up temp file if it exists
                 if temp_file.exists():
                     temp_file.unlink()
-                
+
                 # Fallback: include whole file when tree-sitter completely fails
                 if include_whole_file_fallback:
-                    file_size_kb = len(file_content_before.encode('utf-8')) / 1024
-                    
+                    file_size_kb = len(file_content_before.encode("utf-8")) / 1024
+
                     if file_size_kb <= max_file_size_kb:
-                        logger.warning(f"Including whole file {diff.a_path} due to tree-sitter failure ({file_size_kb:.1f}KB)")
+                        logger.warning(
+                            f"Including whole file {diff.a_path} due to tree-sitter failure ({file_size_kb:.1f}KB)"
+                        )
                         file_name = Path(diff.a_path).name
-                        codes.add((diff.a_path, f"WHOLE_FILE_{file_name}", file_content_before))
+                        codes.add(
+                            (
+                                diff.a_path,
+                                f"WHOLE_FILE_{file_name}",
+                                file_content_before,
+                            )
+                        )
                     else:
-                        logger.warning(f"Tree-sitter failed for {diff.a_path}, but file too large ({file_size_kb:.1f}KB > {max_file_size_kb}KB), skipping")
-    
+                        logger.warning(
+                            f"Tree-sitter failed for {diff.a_path}, but file too large ({file_size_kb:.1f}KB > {max_file_size_kb}KB), skipping"
+                        )
+
     return codes
 
 
@@ -605,11 +644,11 @@ def get_function_codes_with_config(commit):
     """
     try:
         from global_config import global_config
-        
+
         # Check if whole file fallback is enabled in config
         fallback_enabled = global_config.get("tree_sitter_fallback_enabled", True)
         max_file_size = global_config.get("tree_sitter_fallback_max_size_kb", 100)
-        
+
         return get_function_codes(commit, fallback_enabled, max_file_size)
     except ImportError:
         # Fallback to default behavior if global_config is not available
@@ -619,25 +658,27 @@ def get_function_codes_with_config(commit):
 def truncate_large_file(content: str, max_lines: int = 500) -> str:
     """
     Truncate file content if it's too large, keeping the beginning and end.
-    
+
     Args:
         content: File content to potentially truncate
         max_lines: Maximum number of lines to keep
-        
+
     Returns:
         Truncated content with indication if truncation occurred
     """
-    lines = content.split('\n')
+    lines = content.split("\n")
     if len(lines) <= max_lines:
         return content
-    
+
     # Keep first and last portions
     keep_each = max_lines // 2
     first_part = lines[:keep_each]
     last_part = lines[-keep_each:]
-    
-    truncated_content = '\n'.join(first_part)
-    truncated_content += f'\n\n// ... [TRUNCATED: {len(lines) - max_lines} lines omitted] ...\n\n'
-    truncated_content += '\n'.join(last_part)
-    
+
+    truncated_content = "\n".join(first_part)
+    truncated_content += (
+        f"\n\n// ... [TRUNCATED: {len(lines) - max_lines} lines omitted] ...\n\n"
+    )
+    truncated_content += "\n".join(last_part)
+
     return truncated_content
