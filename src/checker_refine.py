@@ -851,10 +851,10 @@ def refine_checker_attempt(
             refine_result.result = "Perfect"
             return refine_result
     else:
+        scan_bug_report_dir = report_dir / "main-report"
         # Standard scanning and report processing
         if scan:
             # Only create directories and scan if scan=True
-            scan_bug_report_dir = _get_report_dir(report_dir, attempt_id, last_scan_id)
             scan_bug_report_dir.mkdir(parents=True, exist_ok=True)
 
             # Scan the target
@@ -935,15 +935,6 @@ def _initialize_refinement(
         refine_result.result = "Failed"
         return False
 
-def _get_report_dir(
-    checker_dir: Path,
-    attempt_id: int,
-    last_scan_id: Optional[int]
-) -> Path:
-    """Get the appropriate report directory path."""
-    if last_scan_id is not None:
-        return checker_dir / f"main-report-{last_scan_id}"
-    return checker_dir / f"main-report-{attempt_id}"
 
 def _scan_target(
     checker_code: str,
@@ -1591,23 +1582,28 @@ def triage_report(report_dir):
     """
     report_dir = Path(report_dir)
     commit_bug_num = {}
-    for commit_dir in report_dir.iterdir():
-        if not commit_dir.is_dir():
-            continue
-        logger.info(f"Processing {commit_dir.name}...")
 
-        md_report_dir = commit_dir / "kernel_reports_md"
+    for checker_dir in report_dir.iterdir():
+        if not checker_dir.is_dir():
+            continue
+        logger.info(f"Processing {checker_dir.name}...")
+
+        checker_data = CheckerData.load_checker_data_from_dir(checker_dir)
+        triage_output_dir = checker_dir / "triage_output"
+
+        md_report_dir = triage_output_dir / "kernel_reports_md"
         md_report_dir.mkdir(parents=True, exist_ok=True)
 
         final_report_dir = None
-        for i in range(5, 0, -1):
-            temp_dir = commit_dir / f"kernel-report-{i}"
+        for i in range(10, 0, -1):
+            temp_dir = checker_dir / f"scan-reports-{i}" / "main-report"
             if temp_dir.exists() and temp_dir.is_dir():
                 final_report_dir = temp_dir
                 break
         if final_report_dir is None:
             logger.warning("No final report found!")
             continue
+        logger.info(f"Final report directory: {final_report_dir}")
 
         # Collect reports
         file_reports, too_many_reports = collect_reports(final_report_dir)
@@ -1615,16 +1611,16 @@ def triage_report(report_dir):
             logger.warning("Too many reports!")
             continue
 
-        check_report_dir = commit_dir / "check_reports"
+        check_report_dir = triage_output_dir / "check_reports"
         check_report_dir.mkdir(parents=True, exist_ok=True)
 
-        is_bug_dir = commit_dir / "is_bug"
-        is_not_bug_dir = commit_dir / "is_not_bug"
+        is_bug_dir = triage_output_dir / "is_bug"
+        is_not_bug_dir = triage_output_dir / "is_not_bug"
         is_bug_dir.mkdir(parents=True, exist_ok=True)
         is_not_bug_dir.mkdir(parents=True, exist_ok=True)
 
-        pattern = (commit_dir / "checker1-pattern.txt").read_text()
-        patch = (commit_dir / "patch.md").read_text()
+        pattern = checker_data.pattern
+        patch = checker_data.patch
         num_bug = 0
         num_not_bug = 0
         bug_files = []
@@ -1650,7 +1646,7 @@ def triage_report(report_dir):
                 check_result = check_report_file.read_text()
             else:
                 check_result = check_report(
-                    commit_dir.name, 0, file_name, md_content, pattern, patch
+                    checker_dir.name, 0, file_name, md_content, pattern, patch
                 )
                 check_report_file.write_text(check_result)
 
@@ -1668,8 +1664,8 @@ def triage_report(report_dir):
                 (is_bug_dir / f"{file_name}.html").write_text(html_content)
                 (is_bug_dir / f"{file_name}.check").write_text(check_result)
 
-        commit_bug_num[commit_dir.name] = (num_bug, num_not_bug)
-        (commit_dir / "bug_files.txt").write_text("\n".join(bug_files))
+        commit_bug_num[checker_dir.name] = (num_bug, num_not_bug)
+        (triage_output_dir / "bug_files.txt").write_text("\n".join(bug_files))
 
     logger.warning("finish")
     answer_text = f"Commit ID,Num_Bugs,Num_Not_Bugs\n"

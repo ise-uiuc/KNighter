@@ -113,10 +113,8 @@ The result dir is `/path/to/result-checkers`, which is specified in the `config.
 2. Collect and refine the checkers.
 
 ```sh
-# Under knighter
-python3 scripts/collect_checkers.py /path/to/result-checkers /path/to/result-valid-checkers
+# Under src
+python3 main.py refine --checker_dir=/path/to/result-checkers --config_file=config-refine.yaml
 ```
 
-```sh
-python3 main.py refine --checker_dir=/path/to/result-valid-checkers --config_file=config.yaml
-```
+Note, you need to set up the `config-refine.yaml` file, which includes the config settings for the refine process, like the output directory.
