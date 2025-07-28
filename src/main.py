@@ -4,11 +4,16 @@ import fire
 
 import agent
 from checker_gen import gen_checker
-from checker_refine import refine_checker, scan, scan_single_checker, triage_report, check_refinement_status, refine_unrefined_checkers, list_successfully_changed_checkers
-from model import list_available_models
+from checker_refine import (
+    check_refinement_status,
+    list_successfully_changed_checkers,
+    refine_checker,
+    refine_unrefined_checkers,
+)
+from checker_scan import scan, scan_single_checker, triage_report
 from commit_label import label_commits
 from global_config import global_config, logger
-from model import init_llm
+from model import init_llm, list_available_models
 
 
 def init_config(config_file: str):
@@ -39,10 +44,24 @@ def main(mode: str, *args, **kwargs):
     modes = {
         "gen": (gen_checker, "Generate new checkers"),
         "refine": (refine_checker, "Refine and improve checkers"),
-        "refine_status": (lambda checker_dir, detailed=False: check_refinement_status(checker_dir, detailed), "Check refinement status of checkers"),
-        "refine_unrefined": (refine_unrefined_checkers, "Refine only checkers that haven't been successfully refined"),
-        "list_changed": (list_successfully_changed_checkers, "List checkers with successful code changes"),
-        "list_models": (lambda: print(f"Available models: {list_available_models()}"), "List all available models"),
+        "refine_status": (
+            lambda checker_dir, detailed=False: check_refinement_status(
+                checker_dir, detailed
+            ),
+            "Check refinement status of checkers",
+        ),
+        "refine_unrefined": (
+            refine_unrefined_checkers,
+            "Refine only checkers that haven't been successfully refined",
+        ),
+        "list_changed": (
+            list_successfully_changed_checkers,
+            "List checkers with successful code changes",
+        ),
+        "list_models": (
+            lambda: print(f"Available models: {list_available_models()}"),
+            "List all available models",
+        ),
         "scan": (scan, "Scan the kernel with valid checkers"),
         "scan_single": (scan_single_checker, "Scan with a single checker from file"),
         "triage": (triage_report, "Triage the report"),
