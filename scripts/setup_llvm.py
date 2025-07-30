@@ -10,6 +10,35 @@ def setup_llvm(llvm_dir_str: str):
     if not llvm_dir.exists():
         logger.error(f"LLVM directory {llvm_dir} does not exist.")
 
+        # Download the zip file
+        zip_filename = "llvmorg-18.1.8.zip"
+        zip_path = llvm_dir.parent / zip_filename
+
+        logger.info("Downloading LLVM source...")
+        sp.run(
+            [
+                "wget",
+                "https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-18.1.8.zip",
+                "-O",
+                str(zip_path),
+            ],
+            cwd=llvm_dir.parent,
+            check=True,
+        )
+
+        logger.info("Extracting LLVM source...")
+        # Extract the zip file - this creates llvm-project-llvmorg-18.1.8/
+        sp.run(["unzip", str(zip_path)], cwd=llvm_dir.parent, check=True)
+
+        # Rename the extracted directory to the desired llvm_dir name
+        extracted_dir = llvm_dir.parent / "llvm-project-llvmorg-18.1.8"
+        if extracted_dir.exists():
+            extracted_dir.rename(llvm_dir)
+
+        # Delete the zip file
+        logger.info("Cleaning up zip file...")
+        zip_path.unlink()
+
     llvm_abs_dir = llvm_dir.resolve()
 
     # Prepare the plugin files
