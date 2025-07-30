@@ -21,12 +21,29 @@ class AnalysisBackendFactory(ABC):
         self.backend_path = Path(backend_path)
 
     @abstractmethod
-    def build_checker(self, checker_code: str, log_dir: Path, attempt=1, **kwargs):
+    @abstractmethod
+    def build_checker(
+        self,
+        checker_code: str,
+        log_dir: Path,
+        checker_name: str = "SAGenTest",
+        attempt: int = 1,
+        jobs: int = 8,
+        timeout: int = 300,
+    ) -> Tuple[int, str]:
         """
-        Build the checker in the backend.
+        Build/validate the checker code.
 
         Args:
-            **kwargs: Additional arguments for the build command.
+            checker_code (str): The checker code to build/validate.
+            log_dir (Path): Directory for build logs.
+            checker_name (str): Name of the checker.
+            attempt (int): Attempt number.
+            jobs (int): Number of parallel jobs.
+            timeout (int): Timeout in seconds.
+
+        Returns:
+            Tuple[int, str]: (return_code, error_message)
         """
         raise NotImplementedError("Subclasses must implement this method.")
 
@@ -37,18 +54,20 @@ class AnalysisBackendFactory(ABC):
         commit_id: str,
         patch: str,
         target: TargetFactory,
-        skip_build_checker=False,
+        skip_build_checker: bool = False,
     ) -> Tuple[int, int]:
         """
         Validate the checker against a commit and patch.
 
         Args:
+            checker_code (str): The checker code to validate.
             commit_id (str): The commit ID to validate against.
-            patch (str): The patch to apply.
-            target (TargetFactory): The target to be tested.
+            patch (str): The patch content.
+            target (TargetFactory): The target to validate against.
             skip_build_checker (bool): Whether to skip building the checker.
+
         Returns:
-            Tuple[int, int]: The number of true positives and true negatives.
+            Tuple[int, int]: (TP_count, TN_count)
         """
         raise NotImplementedError("Subclasses must implement this method.")
 
@@ -61,26 +80,41 @@ class AnalysisBackendFactory(ABC):
         checker_code: str,
         commit_id: str,
         target: TargetFactory,
-        object_to_analyze=None,
-        jobs=32,
-        output_dir="tmp",
-        skip_build_checker=False,
-        skip_checkout=False,
+        object_to_analyze: Optional[str] = None,
+        jobs: int = 32,
+        output_dir: str = "tmp",
         **kwargs,
-    ):
+    ) -> int:
         """
-        Run the checker against a commit and patch.
+        Run the checker against a commit.
 
         Args:
-            checker_code (str): The code of the checker to run.
-            commit_id (str): The commit ID to validate against.
-            target (TargetFactory): The target to be tested.
-            object_to_analyze (str): The object to analyze.
-            jobs (int): The number of jobs to run in parallel.
-            output_dir (str): The directory to store the output.
-            **kwargs: Additional arguments for the run command.
+            checker_code (str): The checker code to run.
+            commit_id (str): The commit ID to run against.
+            target (TargetFactory): The target to run against.
+            object_to_analyze (Optional[str]): Specific object to analyze.
+            jobs (int): Number of parallel jobs.
+            output_dir (str): Output directory for results.
+            **kwargs: Additional arguments.
+
+        Returns:
+            int: Number of bugs found, or negative value for errors.
         """
         raise NotImplementedError("Subclasses must implement this method.")
+    
+    @staticmethod
+    @abstractmethod
+    def get_num_bugs(content: str) -> int:
+        """
+        Extract number of bugs from analysis output.
+
+        Args:
+            content (str): The analysis output content.
+
+        Returns:
+            int: Number of bugs found.
+        """
+        pass
 
     @staticmethod
     @abstractmethod
