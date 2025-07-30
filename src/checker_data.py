@@ -197,6 +197,11 @@ class CheckerData:
         self.refinement_history: List[RefineResult] = []
         self.final_checker_code: Optional[str] = None
 
+        # Add semgrep-specific fields
+        self.semgrep_rule: Optional[str] = None  # For semgrep rules
+        self.repaired_semgrep_rule: Optional[str] = None  # Repaired semgrep rule
+        self.final_semgrep_rule: Optional[str] = None  # Final semgrep rule
+    
     def update_base_result_dir(self, base_result_dir: Path):
         """Updates the base result directory."""
         self._base_result_dir = base_result_dir
@@ -246,7 +251,7 @@ class CheckerData:
 
     def to_dict(self) -> dict:
         """Converts the CheckerData instance to a JSON-serializable dictionary."""
-        return {
+        result = {
             "commit_id": self.commit_id,
             "commit_type": self.commit_type,
             "index": self.index,
@@ -266,6 +271,13 @@ class CheckerData:
             # "refinement_history": [hist.to_dict() for hist in self.refinement_history],
             # "final_checker_code": self.final_checker_code,
         }
+        # Add semgrep fields
+        result.update({
+            "semgrep_rule": self.semgrep_rule,
+            "repaired_semgrep_rule": self.repaired_semgrep_rule,
+            "final_semgrep_rule": self.final_semgrep_rule,
+        })
+        return result
 
     @property
     def checker_id(self) -> str:
@@ -311,6 +323,13 @@ class CheckerData:
         (output_dir / "score.txt").write_text(
             f"TP: {self.tp_score}\nTN: {self.tn_score}"
         )
+        # Add semgrep rule files
+        if self.semgrep_rule:
+            (output_dir / "semgrep-rule-initial.yml").write_text(self.semgrep_rule)
+        if self.repaired_semgrep_rule:
+            (output_dir / "semgrep-rule-repaired.yml").write_text(self.repaired_semgrep_rule)
+        if self.final_semgrep_rule:
+            (output_dir / "semgrep-rule-final.yml").write_text(self.final_semgrep_rule)
 
     @staticmethod
     def load_checker_data_from_file(file_path: str) -> "CheckerData":
@@ -379,6 +398,19 @@ class CheckerData:
             checker_data.tp_score = int(score_content[0].split(":")[-1].strip())
             checker_data.tn_score = int(score_content[1].split(":")[-1].strip())
 
+        # Load semgrep rule files if they exist
+        semgrep_initial_file = dir_path / "semgrep-rule-initial.yml"
+        if semgrep_initial_file.exists():
+            checker_data.semgrep_rule = semgrep_initial_file.read_text()
+            
+        semgrep_repaired_file = dir_path / "semgrep-rule-repaired.yml"
+        if semgrep_repaired_file.exists():
+            checker_data.repaired_semgrep_rule = semgrep_repaired_file.read_text()
+            
+        semgrep_final_file = dir_path / "semgrep-rule-final.yml"
+        if semgrep_final_file.exists():
+            checker_data.final_semgrep_rule = semgrep_final_file.read_text()
+        
         return checker_data
 
 

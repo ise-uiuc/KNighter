@@ -7,6 +7,8 @@ from model import get_embeddings
 
 example_dir = Path(__file__).parent.parent / "checker_database"
 example_list = []
+semgrep_example_dir = Path(__file__).parent.parent / "prompt_template" / "semgrep_examples"
+semgrep_example_list = []
 
 
 class ExampleChecker:
@@ -54,6 +56,32 @@ def init_example():
             continue
         example_list.append(ExampleChecker.load_example_from_dir(checker_dir))
 
+def init_semgrep_example():
+    """Initialize only semgrep examples for semgrep rule generation."""
+    global semgrep_example_list
+    if not semgrep_example_dir.exists():
+        return
+    
+    for example_dir in semgrep_example_dir.iterdir():
+        if not example_dir.is_dir():
+            continue
+        # For semgrep examples, we might not have embeddings, so we can skip that part
+        # or implement a simpler version without embeddings
+        try:
+            pattern = (example_dir / "pattern.md").read_text() if (example_dir / "pattern.md").exists() else ""
+            plan = (example_dir / "plan.md").read_text() if (example_dir / "plan.md").exists() else ""
+            semgrep_rule = (example_dir / "semgrep_rule.yml").read_text() if (example_dir / "semgrep_rule.yml").exists() else ""
+            
+            # Create a simplified example for semgrep
+            semgrep_example = {
+                'pattern': pattern,
+                'plan': plan,
+                'semgrep_rule': semgrep_rule,
+                'dir': example_dir
+            }
+            semgrep_example_list.append(semgrep_example)
+        except Exception as e:
+            print(f"Error loading semgrep example from {example_dir}: {e}")
 
 def choose_example(content: str, type: str, num_samples=3):
     """Choose the most similar example checker for the given content."""
