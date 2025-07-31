@@ -8,7 +8,7 @@ from loguru import logger
 def setup_llvm(llvm_dir_str: str):
     llvm_dir = Path(llvm_dir_str)
     if not llvm_dir.exists():
-        logger.error(f"LLVM directory {llvm_dir} does not exist.")
+        logger.warning(f"LLVM directory {llvm_dir} does not exist.")
 
         # Download the zip file
         zip_filename = "llvmorg-18.1.8.zip"

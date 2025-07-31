@@ -1,37 +1,41 @@
+import difflib
+import enum
 from pathlib import Path
 from typing import List, Optional, Set
-import enum
-import yaml
-import difflib
 
 import pydantic
+import yaml
 
 CHECKER_ID_PREFIX = "KN-"
 
-def generate_diff_patch(original_code: str, refined_code: str, original_filename: str, refined_filename: str) -> str:
+
+def generate_diff_patch(
+    original_code: str, refined_code: str, original_filename: str, refined_filename: str
+) -> str:
     """Generate a unified diff patch between two code strings.
-    
+
     Args:
         original_code: The original code as a string
         refined_code: The refined/modified code as a string
         original_filename: Name to use for the original file in the diff header
         refined_filename: Name to use for the refined file in the diff header
-        
+
     Returns:
         A string containing the unified diff patch
     """
     original_lines = original_code.splitlines(keepends=True)
     refined_lines = refined_code.splitlines(keepends=True)
-    
+
     diff = difflib.unified_diff(
         original_lines,
         refined_lines,
         fromfile=original_filename,
         tofile=refined_filename,
-        lineterm=""
+        lineterm="",
     )
-    
+
     return "".join(diff)
+
 
 class CheckerStatus(enum.Enum):
     """Enum representing the status of a checker generation process."""
@@ -59,13 +63,13 @@ class RefineAttempt(pydantic.BaseModel):
         output_dir.mkdir(parents=True, exist_ok=True)
 
         self.report_data.dump(output_dir)
-        
+
         (output_dir / "original_code.cpp").write_text(self.original_code)
         if self.initial_refine_code:
             (output_dir / "initial_refine_code.cpp").write_text(
                 self.initial_refine_code
             )
-            
+
         if self.syntax_correct_refine_code:
             (output_dir / "syntax_correct_refine_code.cpp").write_text(
                 self.syntax_correct_refine_code
@@ -74,10 +78,10 @@ class RefineAttempt(pydantic.BaseModel):
                 self.original_code,
                 self.syntax_correct_refine_code,
                 "original_code.cpp",
-                "syntax_correct_refine_code.cpp"
+                "syntax_correct_refine_code.cpp",
             )
             (output_dir / "original_to_syntax_correct.patch").write_text(diff_patch)
-            
+
         if self.semantic_correct_refine_code:
             (output_dir / "semantic_correct_refine_code.cpp").write_text(
                 self.semantic_correct_refine_code
@@ -86,14 +90,17 @@ class RefineAttempt(pydantic.BaseModel):
                 self.original_code,
                 self.semantic_correct_refine_code,
                 "original_code.cpp",
-                "semantic_correct_refine_code.cpp"
+                "semantic_correct_refine_code.cpp",
             )
             (output_dir / "original_to_semantic_correct.patch").write_text(diff_patch)
 
         if self.killed_objects:
-            (output_dir / "killed_objects.txt").write_text("\n".join(self.killed_objects))
+            (output_dir / "killed_objects.txt").write_text(
+                "\n".join(self.killed_objects)
+            )
 
-        (output_dir / "reasoning_process.txt").write_text(self.reasoning_process) 
+        (output_dir / "reasoning_process.txt").write_text(self.reasoning_process)
+
 
 # Placeholder for refinement results, assuming it might be defined elsewhere
 # or based on the structure of refine.log entries.
@@ -113,12 +120,12 @@ class RefineResult:
             result  # e.g., "Perfect", "Uncompilable", "High-TP", "Refined"
         )
         self.refined: bool = refined
-        self.checker_code: Optional[str] = (
-            checker_code  # Code after refinement if successful
-        )
-        self.scan_id: Optional[int] = (
-            scan_id  # ID of the scan performed before this refinement
-        )
+        self.checker_code: Optional[
+            str
+        ] = checker_code  # Code after refinement if successful
+        self.scan_id: Optional[
+            int
+        ] = scan_id  # ID of the scan performed before this refinement
 
     def __str__(self) -> str:
         return (
@@ -154,7 +161,12 @@ class CheckerData:
     """
 
     def __init__(
-        self, commit_id: str, commit_type: str, base_result_dir: Path, index: int, patch: Optional[str] = None
+        self,
+        commit_id: str,
+        commit_type: str,
+        base_result_dir: Path,
+        index: int,
+        patch: Optional[str] = None,
     ):
         self._status: CheckerStatus = CheckerStatus.INIT
         # Basic attributes
@@ -173,9 +185,9 @@ class CheckerData:
 
         # Syntax Repair
         self.syntax_repair_log: List[RepairResult] = []  # List of repair attempts
-        self.repaired_checker_code: Optional[str] = (
-            None  # Code after repairChecker step
-        )
+        self.repaired_checker_code: Optional[
+            str
+        ] = None  # Code after repairChecker step
 
         # Evaluation results
         self.tp_score: int = -10  # True Positives, default from checker_gen.py
@@ -184,7 +196,7 @@ class CheckerData:
         # Data from the refinement phase (checker_refine.py)
         self.refinement_history: List[RefineResult] = []
         self.final_checker_code: Optional[str] = None
-    
+
     def update_base_result_dir(self, base_result_dir: Path):
         """Updates the base result directory."""
         self._base_result_dir = base_result_dir
@@ -268,7 +280,7 @@ class CheckerData:
             + "-"
             + str(self.index)
         )
-    
+
     @property
     def output_dir(self) -> str:
         """Generates the output directory path for the checker."""
@@ -281,7 +293,7 @@ class CheckerData:
             (self._base_result_dir / f"checker-{self.checker_id}.yaml").open("w"),
             default_flow_style=False,
         )
-    
+
     def dump_dir(self):
         """Dumps the CheckerData instance to a directory."""
         output_dir = Path(self.output_dir)
@@ -299,7 +311,7 @@ class CheckerData:
         (output_dir / "score.txt").write_text(
             f"TP: {self.tp_score}\nTN: {self.tn_score}"
         )
-    
+
     @staticmethod
     def load_checker_data_from_file(file_path: str) -> "CheckerData":
         """Loads CheckerData from a YAML file."""
@@ -323,13 +335,15 @@ class CheckerData:
         checker_data.tp_score = data.get("tp_score", -10)
         checker_data.tn_score = data.get("tn_score", -10)
         return checker_data
-    
+
     @staticmethod
     def load_checker_data_from_dir(dir_path: str) -> "CheckerData":
         """Loads CheckerData from a directory."""
         # First check whether the dir_path is with the PREFIX
         if not dir_path.name.startswith(CHECKER_ID_PREFIX):
-            raise ValueError(f"Directory {dir_path} does not start with {CHECKER_ID_PREFIX}")
+            raise ValueError(
+                f"Directory {dir_path} does not start with {CHECKER_ID_PREFIX}"
+            )
 
         # For instance, KN-Null-Pointer-Dereference-2e29b997-0
         splits = dir_path.name.split("-")
@@ -351,8 +365,12 @@ class CheckerData:
         checker_data.pattern = (dir_path / "pattern.txt").read_text()
         checker_data.plan = (dir_path / "plan.txt").read_text()
         checker_data.refined_plan = (dir_path / "refined_plan.txt").read_text()
-        checker_data.initial_checker_code = (dir_path / "checker-initial.cpp").read_text()
-        checker_data.repaired_checker_code = (dir_path / "checker-repaired.cpp").read_text()
+        checker_data.initial_checker_code = (
+            dir_path / "checker-initial.cpp"
+        ).read_text()
+        checker_data.repaired_checker_code = (
+            dir_path / "checker-repaired.cpp"
+        ).read_text()
 
         score_file = dir_path / "score.txt"
         if score_file.exists():
@@ -360,7 +378,7 @@ class CheckerData:
             print(score_content)
             checker_data.tp_score = int(score_content[0].split(":")[-1].strip())
             checker_data.tn_score = int(score_content[1].split(":")[-1].strip())
-        
+
         return checker_data
 
 
@@ -379,22 +397,22 @@ class RefinementResult(pydantic.BaseModel):
     def __str__(self):
         tp_rate = self.num_TP / (self.num_TP + self.num_FP + 0.00001)
         return f"{self.result},{tp_rate:.2f},{self.num_reports},{self.attempt_id}"
-    
+
     def save_refined_code(self, output_dir: Path, checker_id: str) -> None:
         """Save the successfully refined checker code to files."""
         output_dir = Path(output_dir)
         refinement_dir = output_dir / "refinements"
         refinement_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Save the refined code if this attempt was successful
         if self.refined and self.checker_code:
             refined_file = refinement_dir / f"refined_attempt_{self.attempt_id}.cpp"
             refined_file.write_text(self.checker_code)
-            
+
             # Also save as the latest successful refinement
             latest_file = refinement_dir / "latest_refined.cpp"
             latest_file.write_text(self.checker_code)
-            
+
             # Save metadata about this refinement
             metadata = {
                 "attempt_id": self.attempt_id,
@@ -403,17 +421,22 @@ class RefinementResult(pydantic.BaseModel):
                 "num_reports": self.num_reports,
                 "num_TP": self.num_TP,
                 "num_FP": self.num_FP,
-                "precision": self.num_TP / (self.num_TP + self.num_FP) if (self.num_TP + self.num_FP) > 0 else 0,
-                "refinement_attempts": len(self.refine_attempt_list)
+                "precision": self.num_TP / (self.num_TP + self.num_FP)
+                if (self.num_TP + self.num_FP) > 0
+                else 0,
+                "refinement_attempts": len(self.refine_attempt_list),
             }
-            metadata_file = refinement_dir / f"refined_attempt_{self.attempt_id}_metadata.yaml"
+            metadata_file = (
+                refinement_dir / f"refined_attempt_{self.attempt_id}_metadata.yaml"
+            )
             import yaml
+
             metadata_file.write_text(yaml.dump(metadata, default_flow_style=False))
-        
+
         # Always save the current state (even if not refined)
         attempt_file = refinement_dir / f"attempt_{self.attempt_id}.cpp"
         attempt_file.write_text(self.checker_code)
-        
+
         # Save original code for comparison (if available)
         if self.original_checker_code:
             # Generate and save diff between original and refined code
@@ -421,10 +444,11 @@ class RefinementResult(pydantic.BaseModel):
                 self.original_checker_code,
                 self.checker_code,
                 f"attempt_{self.attempt_id}_original.cpp",
-                f"attempt_{self.attempt_id}.cpp"
+                f"attempt_{self.attempt_id}.cpp",
             )
             diff_file = refinement_dir / f"attempt_{self.attempt_id}_diff.patch"
             diff_file.write_text(diff_patch)
+
 
 class ReportData(pydantic.BaseModel):
     report_id: str

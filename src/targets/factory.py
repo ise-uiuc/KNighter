@@ -1,6 +1,8 @@
 import os
-import git
 from abc import ABC, abstractmethod
+from typing import List
+
+import git
 
 from tools import get_function_codes_with_config, truncate_large_file
 
@@ -45,6 +47,20 @@ class TargetFactory(ABC):
         """
         raise NotImplementedError("Subclasses must implement this method.")
 
+    @staticmethod
+    @abstractmethod
+    def get_objects_from_patch(patch: str) -> List[str]:
+        """
+        Get the objects to analyze from a patch.
+
+        Args:
+            patch (str): The patch to analyze.
+
+        Returns:
+            List[str]: The objects to analyze.
+        """
+        raise NotImplementedError("Subclasses must implement this method.")
+
     def get_patch(self, commit_id: str) -> str:
         """
         Get the patch for a specific commit formatted as Markdown.
@@ -85,14 +101,18 @@ class TargetFactory(ABC):
             if func_name.startswith("WHOLE_FILE_"):
                 # Handle whole file fallback case
                 file_name = func_name.replace("WHOLE_FILE_", "")
-                
+
                 # Truncate very large files to avoid overwhelming the prompt
                 truncated_code = truncate_large_file(func_code, max_lines=500)
-                
-                sections.append(f"```c\n// Complete file: {file_path} (tree-sitter fallback)\n{truncated_code}\n```\n")
+
+                sections.append(
+                    f"```c\n// Complete file: {file_path} (tree-sitter fallback)\n{truncated_code}\n```\n"
+                )
             else:
                 # Handle normal function case
-                sections.append(f"```c\n// Function: {func_name} in {file_path}\n{func_code}\n```\n")
+                sections.append(
+                    f"```c\n// Function: {func_name} in {file_path}\n{func_code}\n```\n"
+                )
 
         # Add patch diff
         sections.append("## Bug Fix Patch\n\n```diff\n" + diff + "\n```\n")

@@ -1,6 +1,3 @@
-import re
-import subprocess
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -14,8 +11,7 @@ from checker_data import (
 )
 from checker_repair import repair_checker
 from global_config import global_config, logger
-from kernel_commands import generate_command
-from tools import extract_checker_code, monitor_build_output, remove_text_section
+from tools import extract_checker_code
 
 
 def refine_checker(checker_dir, scan=True, max_tries=3, max_fp_reports=None):
@@ -601,6 +597,7 @@ def refine_checker_with_max_attempts(
             logger.info(f"Attempt {attempt + 1} successful - checker refined!")
         else:
             # Failed attempt - reuse scan results for next attempt
+            # Do not need to scan again
             if last_scan_id is None:
                 last_scan_id = attempt
             scan = False
@@ -984,10 +981,10 @@ def refine_checker_attempt(
             refine_result.result = "Perfect"
             return refine_result
     else:
-        scan_bug_report_dir = report_dir / "main-report"
         # Standard scanning and report processing
         if scan:
             # Only create directories and scan if scan=True
+            scan_bug_report_dir = report_dir / "main-report"
             scan_bug_report_dir.mkdir(parents=True, exist_ok=True)
 
             # Scan the target
@@ -1003,6 +1000,9 @@ def refine_checker_attempt(
             )
         else:
             # Now we are using last step's reports
+            report_dir = Path(checker_data.output_dir) / f"scan-reports-{last_scan_id}"
+            scan_bug_report_dir = report_dir / "main-report"
+
             reports = _process_reports(scan_bug_report_dir, attempt_id, last_scan_id)
             total_reports_in_backend = len(reports)
 

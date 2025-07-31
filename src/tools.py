@@ -16,35 +16,6 @@ from loguru import logger
 from kparser.kfunction import KernelFunction
 
 
-def id_maker() -> str:
-    return "{0:%Y-%m-%d-%H%M%S%f}".format(datetime.datetime.now())
-
-
-def target_objects(patch_content: str):
-    # Find `--- a/` lines in the patch
-    pattern = r"^--- a/(.*)$"
-    matches = re.findall(pattern, patch_content, re.MULTILINE)
-    # Filter out non-c files
-    matches = [match for match in matches if match.endswith(".c")]
-    # Replace .c with .o
-    matches = [object_name(match) for match in matches]
-    return matches
-
-
-def report_objects(report_content: str, linux_path: str):
-    # Find `File:| XXX.c`
-    pattern = r"File:\| (.*).c"
-    matches = re.findall(pattern, report_content)
-    # Filter out non-c files
-    matches = [match + ".c" for match in matches]
-    # Delete the prefix linux path
-    linux_path += "/"
-    matches = [match.replace(linux_path, "") for match in matches]
-    # Replace .c with .o
-    matches = [object_name(match) for match in matches]
-    return matches
-
-
 def grab_error_message(error_content: str) -> list:
     pattern = r"error:.*\n\s*\d+\s*\|\s+.*\n"
     error_list = re.findall(pattern, error_content, re.MULTILINE)
@@ -70,15 +41,21 @@ def grab_cpp_code(llm_response: str) -> str:
     match = re.search(pattern, llm_response)
     if match:
         return match.group()
-    else:
-        return None
+
+    pattern = r"```\n([\s\S]*?)\n```"
+    match = re.search(pattern, llm_response)
+    if match:
+        return match.group()
+    return None
 
 
 def extract_checker_code(llm_response: str) -> str:
     checker_code = grab_cpp_code(llm_response)
     if checker_code is None:
+        logger.error("Failed to extract checker code!")
         return None
     checker_code = checker_code.lstrip("```cpp\n")
+    checker_code = checker_code.lstrip("```\n")
     checker_code = checker_code.rstrip("```")
     return checker_code
 
@@ -509,6 +486,8 @@ def path_similarity(path1, path2):
 def object_name(file_name: str) -> str:
     file_path = Path(file_name)
     stem_name = file_path.stem
+
+    # This should be
     command_content = Path("commands.txt").read_text()
 
     # Pattern is like `-o XXX/stem_name.o`

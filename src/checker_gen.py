@@ -182,6 +182,10 @@ def gen_checker(
                 logger.info(f"Skip {line}")
                 continue
 
+        if not line.strip():
+            # Skip empty lines
+            continue
+
         commit_id, commit_type = line.split(",")
         batch_summary["total_commits"] += 1
 
