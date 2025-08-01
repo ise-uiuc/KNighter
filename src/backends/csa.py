@@ -12,7 +12,7 @@ from backends.factory import AnalysisBackendFactory
 from checker_data import ReportData
 from targets.factory import TargetFactory
 from targets.linux import Linux
-from tools import monitor_build_output, remove_text_section, target_objects
+from tools import monitor_build_output, remove_text_section
 
 
 class ClangBackend(AnalysisBackendFactory):
@@ -491,7 +491,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         # Get the modified objects from the patch
         num_bug_obj = {}
-        objects = target_objects(patch)
+        objects = target.get_objects_from_patch(patch)
         for obj in objects:
             comd = comd_prefix + f"make LLVM=1 ARCH=x86 {obj} -j8"
             logger.info("Running: " + comd)

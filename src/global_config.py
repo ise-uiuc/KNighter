@@ -1,6 +1,6 @@
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, List, Optional
 
 import loguru
 import yaml
@@ -15,6 +15,7 @@ logger = loguru.logger
 
 class GlobalConfig:
     """Singleton class to manage global configuration settings."""
+
     _instance = None
 
     def __new__(cls, *args, **kwargs):
@@ -27,12 +28,14 @@ class GlobalConfig:
         self._config: Dict[str, Any] = {}
         self._keys: Dict[str, Any] = {}
 
-    def setup(self, config_path: str = "config.yaml", keys_path: str = "llm_keys.yaml"):
+    def setup(self, config_path: str = "config.yaml"):
         if self._initialized:
             logger.warning("GlobalConfig is already initialized.")
             return
 
         self._load_config(config_path)
+
+        keys_path = self.get("key_file", "llm_keys.yaml")
         self._load_keys(keys_path)
         self._initialized = True
         self._keys["model"] = self.get("model")
@@ -102,35 +105,36 @@ class GlobalConfig:
     def scan_timeout(self) -> Optional[int]:
         """Get the scan timeout."""
         return self.get("scan_timeout", 600)
-    
+
     @property
     def scan_commit(self) -> Optional[str]:
         """Get the scan commit."""
         return self.get("scan_commit", "HEAD")
-    
+
     @property
     def max_fp_reports_for_refinement(self) -> int:
         """Get the maximum number of false positive reports to use for refinement."""
         return self.get("max_fp_reports_for_refinement", 5)
-    
+
     @property
     def max_fp_reports_for_batch(self) -> int:
         """Get the maximum number of false positive reports to use for batch refinement."""
         return self.get("max_fp_reports_for_batch", 5)
-    
+
     @property
     def group_scan_targets(self) -> List[str]:
         """Get the default scan targets for group scanning."""
         return self.get("group_scan_targets", ["drivers/"])
-    
+
     @property
     def group_scan_timeout(self) -> int:
         """Get the timeout for group scanning in seconds."""
         return self.get("group_scan_timeout", 3600)  # 60 minutes for large groups
-    
+
     @property
     def group_scan_jobs(self) -> int:
         """Get the number of parallel jobs for group scanning."""
         return self.get("group_scan_jobs", 32)
+
 
 global_config = GlobalConfig()

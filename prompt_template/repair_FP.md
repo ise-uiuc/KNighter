@@ -50,6 +50,7 @@ Analysis:
 # Formatting
 
 Please provide the whole checker code after fixing the false positive.
+The refined code must be surrounded by ```cpp and ```.
 Your response should be like:
 
 Refinment Plan:
