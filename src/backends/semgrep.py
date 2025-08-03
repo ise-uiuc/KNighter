@@ -162,8 +162,7 @@ class SemgrepBackend(AnalysisBackendFactory):
         target.checkout_commit(commit_id, is_before=True)
         
         # Get modified files from patch
-        from tools import target_objects
-        objects = target_objects(patch)
+        objects = target.get_objects_from_patch(patch)
         
         for obj in objects:
             # Convert object to source file for Semgrep scanning
