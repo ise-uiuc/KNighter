@@ -1411,8 +1411,3 @@ def _scan_objects(checker_code: str, objects: List[str], report_dir: str) -> Lis
 
 def get_object_id(object_name: str) -> str:
     return object_name.replace("/", "-").replace(".o", "").strip()
-
-
-# All scanning functions have been moved to checker_scan.py
-# Import them from there if needed:
-# from checker_scan import scan, scan_batch_checkers, scan_single_checker, collect_reports, triage_report

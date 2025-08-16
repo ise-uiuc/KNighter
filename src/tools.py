@@ -403,11 +403,11 @@ def get_source_code(html_text):
             continue
         relevant_line_numbers = list(relevant_lines[file_id].keys())
         relevant_line_numbers.sort(key=int)
-        # Expand the relevant line numbers to include the lines before and after 10 lines
+        # Expand the relevant line numbers to include the lines before 50 and after 30 lines
         expanded_line_numbers = set()
         for line_no in relevant_line_numbers:
             expanded_line_numbers.add(line_no)
-            for i in range(-10, 11):
+            for i in range(-50, 31):
                 expanded_line_numbers.add(str(int(line_no) + i))
 
         for line in table.find_all("tr"):

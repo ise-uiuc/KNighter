@@ -634,7 +634,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             stderr=sp.PIPE,
         )
         output, completed = monitor_build_output(
-            scan_process, warning_limit=100, timeout=timeout
+            scan_process, warning_limit=300, timeout=timeout
         )
 
         num_bugs = 0
@@ -748,11 +748,13 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         matches = re.findall(pattern, report)
         # Filter out non-c files
         matches = [match + ".c" for match in matches]
+        matches = [Path(match).absolute().resolve().as_posix() for match in matches]
         # Delete the prefix linux path
         # FIXME: This could be wrong
-        target_path = str(target.repo.working_dir)
+        target_path = Path(target.repo.working_dir).absolute().resolve().as_posix()
         target_path += "/"
         matches = [match.replace(target_path, "") for match in matches]
+
         # Replace .c with .o
         matches = [target.get_object_name(match) for match in matches]
         return matches
@@ -803,6 +805,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             else:
                 filename = "default"
 
+            filename = str(Path(filename).resolve())
             filename = (
                 filename.replace("/", "_").replace(".c", "").replace(".h", "").strip()
             )
@@ -818,11 +821,30 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             )
             clustered_report_dir[filename].append(report_data)
 
-        # Sample the reports
         random.seed(seed)
+        # Sample the reports
+        filtered_keys = []
         sample_size = min(sampled_num, len(clustered_report_dir))
         logger.warning(f"Sample size: {sample_size}")
-        selected_keys = random.sample(list(clustered_report_dir.keys()), sample_size)
+
+        for key in clustered_report_dir.keys():
+            if any(pattern in key for pattern in ["_include_"]):
+                # We don't want to sample the include files
+                continue
+            filtered_keys.append(key)
+
+        if len(filtered_keys) < sampled_num:
+            logger.warning(
+                f"Not enough ({sampled_num - len(filtered_keys)}) keys starting with 'drivers/'..."
+            )
+            other_keys = [
+                key for key in clustered_report_dir.keys() if key not in filtered_keys
+            ]
+            filtered_keys.extend(
+                random.sample(other_keys, sampled_num - len(filtered_keys))
+            )
+
+        selected_keys = random.sample(filtered_keys, sample_size)
         reports = []
         for key in selected_keys:
             reports.append(clustered_report_dir[key][0])
