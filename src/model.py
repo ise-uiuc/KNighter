@@ -36,7 +36,7 @@ model_config = {
     "deepseek_model": "deepseek-reasoner",
     "model_o1": "o1-preview-2024-09-12",
     "claude_model": "claude-4-sonnet-20250514",
-    "temperature": 0.7,
+    "temperature": 1.0,
     "max_tokens": 16000,
 }
 
@@ -110,20 +110,6 @@ def invoke_llm(
     """Invoke the LLM model with the given prompt."""
     model = model_config["model"]
 
-    if model == "gpt-4o" and model_config["model"] in [
-        "google",
-        "nv-deepseek",
-        "deepseek-reasoner",
-        "o3-mini",
-        "local-deepseek",
-        "claude",
-        "claude-3-5-sonnet",
-        "claude-3-5-haiku",
-        "claude-3-opus",
-        "claude-4-sonnet",
-    ]:
-        model = model_config["model"]
-
     logger.info(f"start LLM process: {model}")
     num_tokens = num_tokens_from_string(prompt)
     logger.info("Token counts: {}".format(num_tokens))
@@ -142,6 +128,7 @@ def invoke_llm(
                 "o1-preview",
                 "o4-mini",
                 "gpt-4.1",
+                "gpt-5",
             ]:
                 client = openai_client
             elif model == "deepseek-reasoner":
@@ -177,6 +164,12 @@ def invoke_llm(
                     "temperature": temperature,
                 }
                 response = client.complete(payload)
+            elif model == "gpt-5":
+                # GPT-5 does not support temperature
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             elif model in ["o1-preview", "o1-mini", "o1", "o3-mini", "o4-mini"]:
                 response = client.chat.completions.create(
                     model=model,
@@ -229,7 +222,7 @@ def invoke_llm(
                     messages=[{"role": "user", "content": prompt}],
                     temperature=temperature,
                     n=1,
-                    max_tokens=max_tokens,
+                    max_completion_tokens=max_tokens,
                 )
 
         except Exception as e:
@@ -260,12 +253,20 @@ def invoke_llm(
                 "claude-4-sonnet",
             ]:
                 # Claude returns a different response format
+                logger.info(f"Response input tokens: {response.usage.prompt_tokens}")
+                logger.info(
+                    f"Response output tokens: {response.usage.completion_tokens}"
+                )
                 answer = response.content[0].text
                 if "<think>" in answer or "</think>" in answer:
                     # Delete the content between <think> and </think> tags
                     answer = answer.split("</think>")[-1].strip()
                 return answer
             else:
+                logger.info(f"Response input tokens: {response.usage.prompt_tokens}")
+                logger.info(
+                    f"Response output tokens: {response.usage.completion_tokens}"
+                )
                 answer = response.choices[0].message.content
                 if "<think>" in answer or "</think>" in answer:
                     # Delete the content between <think> and </think> tags

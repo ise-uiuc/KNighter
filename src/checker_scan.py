@@ -275,12 +275,7 @@ def collect_reports(commit_report_dir: str, max_num_reports=100) -> tuple[dict, 
     commit_report_dir = Path(commit_report_dir)
     file_reports = defaultdict(list)
 
-    num_html_file = len(list(commit_report_dir.rglob("*.html")))
-    logger.info(f"Number of HTML files: {num_html_file}")
-    if num_html_file > max_num_reports:
-        logger.warning(f"Too many reports: {num_html_file}!")
-        return {}, True
-
+    # First pass: collect all reports and group by filename
     for report_file in commit_report_dir.rglob("*.html"):
         if report_file.stem == "index":
             continue
@@ -291,13 +286,21 @@ def collect_reports(commit_report_dir: str, max_num_reports=100) -> tuple[dict, 
 
         # Extract filename from the title tag
         title_pattern = re.compile(r"<title>(.+)</title>")
-        match = title_pattern.search("\n".join(html_content.splitlines()[:10]))
+        match = title_pattern.search("\n".join(html_content.splitlines()[:100]))
         if match:
             file_name = match.group(1)
         else:
             file_name = "default"
         file_name = file_name.replace("/", "_").replace(".c", "").replace(".h", "")
         file_reports[file_name].append((md_content, html_content))
+
+    # Count unique filenames instead of total HTML files
+    num_unique_files = len(file_reports)
+    logger.info(f"Number of unique files with reports: {num_unique_files}")
+    if num_unique_files > max_num_reports:
+        logger.warning(f"Too many reports: {num_unique_files}!")
+        return {}, True
+
     return file_reports, False
 
 
@@ -323,7 +326,7 @@ def triage_report(report_dir):
         md_report_dir.mkdir(parents=True, exist_ok=True)
 
         final_report_dir = None
-        for i in range(10, 0, -1):
+        for i in range(10, -1, -1):
             temp_dir = checker_dir / f"scan-reports-{i}" / "main-report"
             if temp_dir.exists() and temp_dir.is_dir():
                 final_report_dir = temp_dir

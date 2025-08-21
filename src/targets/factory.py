@@ -1,5 +1,6 @@
 import os
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import List
 
 import git
@@ -123,6 +124,8 @@ class TargetFactory(ABC):
     @staticmethod
     def path_similarity(path1, path2):
         """Calculate the similarity of two paths based on their components."""
+        path1 = str(Path(path1).resolve())
+        path2 = str(Path(path2).resolve())
         components1 = path1.split(os.sep)
         components2 = path2.split(os.sep)
 

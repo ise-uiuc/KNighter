@@ -136,5 +136,10 @@ class GlobalConfig:
         """Get the number of parallel jobs for group scanning."""
         return self.get("group_scan_jobs", 32)
 
+    @property
+    def jobs(self) -> int:
+        """Get the number of parallel jobs."""
+        return self.get("jobs", 32)
+
 
 global_config = GlobalConfig()
