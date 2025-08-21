@@ -1073,6 +1073,7 @@ def _scan_target(
             checker_code,
             commit_id=global_config.scan_commit,
             target=global_config.target,
+            jobs=global_config.jobs,
             timeout=timeout,
             output_dir=bug_report_dir,
         )

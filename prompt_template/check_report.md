@@ -13,12 +13,19 @@ Please evaluate thoroughly using the following process:
 - **First, understand** the reported code pattern and its control/data flow.
 - **Then, compare** it against the target bug pattern characteristics.
 - **Finally, validate** against the **pre-/post-patch** behavior:
-  - If it matches the bug pattern, the reported path should be present in the **buggy function** and should be **prevented** by the **fix patch** (e.g., via a bounds check or early exit).
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
 
-- If there are issues related to possible value ranges, **infer tight minimum and maximum values** for the involved variables and verify whether the reported code path can actually be triggered (e.g., integer overflow, array out-of-bounds).
-  - For example, determine:
-    - The **maximum** value of a variable that could cause an **integer overflow**.
-    - The **minimum/maximum** values of an array index that could lead to **out-of-bounds** access.
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
 
 If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
 
