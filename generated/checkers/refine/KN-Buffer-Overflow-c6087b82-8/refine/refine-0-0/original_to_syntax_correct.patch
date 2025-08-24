@@ -1,0 +1,139 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -56,6 +56,10 @@   void getLenArgRegionOrSymbol(const Expr *LenArg, CheckerContext &C,
+                                const MemRegion* &LenReg, SymbolRef &LenSym) const;
+
++  // False positive filter: when it's clear the copy length cannot exceed the array size.
++  bool isLengthDefinitelyWithinArray(const Expr *LenArg, uint64_t ArraySize,
++                                     SymbolRef LenSym, CheckerContext &C) const;
++
+   void reportUnbounded(const CallEvent &Call, const Expr *Dst,
+                        const Expr *Len, CheckerContext &C) const;
+ };
+@@ -64,7 +68,7 @@   const Expr *OE = Call.getOriginExpr();
+   if (!OE)
+     return false;
+-  // Use textual match as recommended to be robust with macros and wrappers.
++  // Use textual match to be robust with macros and wrappers.
+   if (ExprHasName(OE, "copy_from_user", C))
+     return true;
+   if (ExprHasName(OE, "__copy_from_user", C))
+@@ -146,6 +150,42 @@   // Try to get symbol
+   SVal SV = State->getSVal(LenArg, C.getLocationContext());
+   LenSym = SV.getAsSymbol();
++}
++
++bool SAGenTestChecker::isLengthDefinitelyWithinArray(const Expr *LenArg, uint64_t ArraySize,
++                                                     SymbolRef LenSym, CheckerContext &C) const {
++  // Constant length case
++  llvm::APSInt ConstLen;
++  if (EvaluateExprToInt(ConstLen, LenArg, C)) {
++    // Treat any constant length <= ArraySize as safe from overflow.
++    if (ConstLen.isSigned()) {
++      if (ConstLen.isNegative())
++        return true; // negative size is impossible at runtime for size_t, but treat as non-overflow here
++      if ((uint64_t)ConstLen.getSExtValue() <= ArraySize)
++        return true;
++    } else {
++      if (ConstLen.getZExtValue() <= ArraySize)
++        return true;
++    }
++    return false; // constant greater than ArraySize is definitely unsafe
++  }
++
++  // Symbolic length case: use inferred maximum bound
++  if (LenSym) {
++    if (const llvm::APSInt *MaxV = inferSymbolMaxVal(LenSym, C)) {
++      uint64_t MaxVal = MaxV->isSigned() ? (uint64_t)MaxV->getSExtValue()
++                                         : MaxV->getZExtValue();
++      if (MaxVal <= ArraySize)
++        return true;
++    }
++
++    // Heuristic: if we recorded this symbol as bounded by a min(sizeof, ...), accept it.
++    ProgramStateRef State = C.getState();
++    if (State->contains<BoundedLenSyms>(LenSym))
++      return true;
++  }
++
++  return false;
+ }
+
+ void SAGenTestChecker::reportUnbounded(const CallEvent &Call, const Expr *Dst,
+@@ -227,7 +267,7 @@   if (!DstArg || !LenArg)
+     return;
+
+-  // Identify destination as a fixed-size array
++  // Identify destination as a provable fixed-size array
+   llvm::APInt ArraySizeAP;
+   const MemRegion *ArrReg = nullptr;
+   std::string ArrName;
+@@ -235,9 +275,8 @@     return; // Only warn when destination is a provable fixed-size array
+
+   uint64_t ArraySize = ArraySizeAP.getZExtValue();
+-  uint64_t SafeCopyLimit = (ArraySize > 0) ? (ArraySize - 1) : 0;
+-
+-  // 1) Len directly contains sizeof(array)
++
++  // 1) Len directly contains sizeof(array) => safe
+   if (exprContainsSizeofOfArray(LenArg, ArrReg, ArrName, C))
+     return;
+
+@@ -252,41 +291,37 @@   if (BoundRegForArray && LenReg && (BoundRegForArray == LenReg))
+     return;
+
+-  // 3) Try to infer if Len is constant and exceeds the array size
++  // 3) Length is provably within the array (constant or by inferred max)
++  if (isLengthDefinitelyWithinArray(LenArg, ArraySize, LenSym, C))
++    return;
++
++  // 4) If length is provably larger than array size, report immediately.
++  //    We only get here if constant-evaluation didn't already conclude "safe".
+   llvm::APSInt ConstLen;
+   if (EvaluateExprToInt(ConstLen, LenArg, C)) {
+-    // If definitely larger than the array, report.
+-    if (ConstLen.isSigned() ? ConstLen.getSExtValue() > (int64_t)ArraySize
+-                            : ConstLen.getZExtValue() > ArraySize) {
++    bool DefinitelyLarger = false;
++    if (ConstLen.isSigned())
++      DefinitelyLarger = !ConstLen.isNegative() &&
++                         (uint64_t)ConstLen.getSExtValue() > ArraySize;
++    else
++      DefinitelyLarger = ConstLen.getZExtValue() > ArraySize;
++
++    if (DefinitelyLarger) {
+       reportUnbounded(Call, DstArg, LenArg, C);
+       return;
+     }
+-    // If definitely <= SafeCopyLimit, consider safe.
+-    if (ConstLen.isSigned() ? ConstLen.getSExtValue() <= (int64_t)SafeCopyLimit
+-                            : ConstLen.getZExtValue() <= SafeCopyLimit) {
+-      return;
+-    }
+-    // Otherwise, do not early report here; continue checks.
+-  }
+-
+-  // 4) Infer maximal value for symbolic Len
+-  if (LenSym) {
++  } else if (LenSym) {
+     if (const llvm::APSInt *MaxV = inferSymbolMaxVal(LenSym, C)) {
+-      uint64_t MaxVal = MaxV->isSigned() ? (uint64_t)MaxV->getSExtValue() : MaxV->getZExtValue();
+-      if (MaxVal <= SafeCopyLimit)
+-        return; // safely bounded
++      uint64_t MaxVal = MaxV->isSigned() ? (uint64_t)MaxV->getSExtValue()
++                                         : MaxV->getZExtValue();
+       if (MaxVal > ArraySize) {
+-        // Definitely can exceed buffer size.
+         reportUnbounded(Call, DstArg, LenArg, C);
+         return;
+       }
+     }
+-    // Weak heuristic: if we heuristically said the symbol is bounded, accept it.
+-    if (State->contains<BoundedLenSyms>(LenSym))
+-      return;
+-  }
+-
+-  // 5) If none of the above proved it's safe, warn.
++  }
++
++  // 5) Unknown or potentially unbounded (e.g., user-supplied nbytes with no clamp) => warn.
+   reportUnbounded(Call, DstArg, LenArg, C);
+ }

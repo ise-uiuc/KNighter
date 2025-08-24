@@ -1,0 +1,418 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -25,8 +25,11 @@ using namespace ento;
+ using namespace taint;
+
+-// Program states
+-REGISTER_MAP_WITH_PROGRAMSTATE(PartiallyInitAgg, const VarDecl*, char)
++// Program states:
++// - SuspectAgg: Local aggregate (record) that has implicit padding and is not
++//   known to be fully zeroed. Exporting sizeof(var) may leak init padding.
++// - ZeroCleared: Local aggregate that is known to be zeroed entirely.
++REGISTER_SET_WITH_PROGRAMSTATE(SuspectAgg, const VarDecl*)
+ REGISTER_SET_WITH_PROGRAMSTATE(ZeroCleared, const VarDecl*)
+
+ // Utility functions provided by the prompt
+@@ -34,18 +37,69 @@ const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
+ template <typename T>
+ const T* findSpecificTypeInChildren(const Stmt *S);
+-bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C);
+-const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C);
+-bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E);
+-bool getStringSize(llvm::APInt &StringSize, const Expr *E);
+-const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C);
++
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C) {
++  Expr::EvalResult ExprRes;
++  if (expr->EvaluateAsInt(ExprRes, C.getASTContext())) {
++    EvalRes = ExprRes.Val.getInt();
++    return true;
++  }
++  return false;
++}
++
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C) {
++  ProgramStateRef State = C.getState();
++  const llvm::APSInt *maxVal = State->getConstraintManager().getSymMaxVal(State, Sym);
++  return maxVal;
++}
++
++// The expression should be the DeclRefExpr of the array
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E) {
++  if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E->IgnoreImplicit())) {
++    if (const VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++      QualType QT = VD->getType();
++      if (const ConstantArrayType *ArrayType = dyn_cast<ConstantArrayType>(QT.getTypePtr())) {
++        ArraySize = ArrayType->getSize();
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool getStringSize(llvm::APInt &StringSize, const Expr *E) {
++  if (const auto *SL = dyn_cast<StringLiteral>(E->IgnoreImpCasts())) {
++    StringSize = llvm::APInt(32, SL->getLength());
++    return true;
++  }
++  return false;
++}
++
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C) {
++  ProgramStateRef State = C.getState();
++  return State->getSVal(E, C.getLocationContext()).getAsRegion();
++}
++
+ struct KnownDerefFunction {
+-  const char *Name;
+-  llvm::SmallVector<unsigned, 4> Params;
++  const char *Name;                    ///< The function name.
++  llvm::SmallVector<unsigned, 4> Params; ///< The parameter indices that get dereferenced.
+ };
++
+ bool functionKnownToDeref(const CallEvent &Call,
+                           llvm::SmallVectorImpl<unsigned> &DerefParams);
+-bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
++
++// Determines if the source text of an expression contains a specified name.
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C) {
++  if (!E)
++    return false;
++
++  const SourceManager &SM = C.getSourceManager();
++  const LangOptions &LangOpts = C.getLangOpts();
++  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());
++  StringRef ExprText = Lexer::getSourceText(Range, SM, LangOpts);
++
++  return ExprText.contains(Name);
++}
+
+ namespace {
+
+@@ -79,9 +133,8 @@       static bool hasImplicitPadding(QualType QT, ASTContext &Ctx);
+
+       void markZeroCleared(ProgramStateRef &State, const VarDecl *VD) const;
+-      void markPartiallyInit(ProgramStateRef &State, const VarDecl *VD) const;
+-
+-      // Additional helpers to eliminate false positives and strengthen matching
++      void markSuspect(ProgramStateRef &State, const VarDecl *VD) const;
++
+       static bool calleeNameIs(const CallEvent &Call, StringRef Name);
+       static bool isBraceZeroInitializedVar(const VarDecl *VD);
+       static bool isExplicitZeroInitExpr(const Expr *E);
+@@ -95,26 +148,19 @@ const VarDecl *SAGenTestChecker::getLocalStructVarFromAddrArg(const Expr *ArgE) {
+   if (!ArgE) return nullptr;
+   const Expr *E = ArgE->IgnoreParenImpCasts();
+-  const auto *UO = dyn_cast<UnaryOperator>(E);
+-  if (!UO || UO->getOpcode() != UO_AddrOf)
+-    return nullptr;
+-
+-  const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
+-  const auto *DRE = dyn_cast<DeclRefExpr>(Sub);
+-  if (!DRE)
+-    return nullptr;
+-
+-  const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+-  if (!VD)
+-    return nullptr;
+-
+-  if (!VD->hasLocalStorage())
+-    return nullptr;
+-
+-  if (!VD->getType()->isRecordType())
+-    return nullptr;
+-
+-  return VD;
++
++  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    if (UO->getOpcode() == UO_AddrOf) {
++      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
++      if (const auto *DRE = dyn_cast<DeclRefExpr>(Sub)) {
++        if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++          if (VD->hasLocalStorage() && VD->getType()->isRecordType())
++            return VD;
++        }
++      }
++    }
++  }
++  return nullptr;
+ }
+
+ bool SAGenTestChecker::isZeroBraceInit(const InitListExpr *ILE) {
+@@ -128,7 +174,6 @@     const Expr *Init = ILE->getInit(0);
+     if (!Init) return false;
+
+-    // Any designated initializer is considered non-zeroing
+     if (isa<DesignatedInitExpr>(Init))
+       return false;
+
+@@ -174,7 +219,6 @@ }
+
+ bool SAGenTestChecker::isNetlinkExportCall(const CallEvent &Call, unsigned &LenIdx, unsigned &DataIdx, CheckerContext &C) {
+-  // Prefer identifier-based matching; fall back to source text as a last resort.
+   if (calleeNameIs(Call, "nla_put_64bit") || ExprHasName(Call.getOriginExpr(), "nla_put_64bit", C)) {
+     // nla_put_64bit(skb, attrtype, len, data, padtype)
+     if (Call.getNumArgs() >= 4) {
+@@ -237,7 +281,6 @@   return QualType();
+ }
+
+-// Follow element types down to the base, so arrays of records delegate to the record.
+ QualType SAGenTestChecker::unwrapArrayElementBaseType(QualType T) {
+   const Type *Ty = T.getTypePtr();
+   while (const auto *AT = dyn_cast<ArrayType>(Ty)) {
+@@ -247,11 +290,11 @@   return T;
+ }
+
+-// Precise padding detection using ASTRecordLayout and bit-level coverage:
+-// - Computes gaps between the end of one field and the start of the next,
+-//   using bitfield widths where applicable.
+-// - Detects tail padding if total size in bits exceeds the end of the last field.
+-// - Recurses into nested records and arrays of records.
++// Robust padding detection using ASTRecordLayout:
++// - Use field indices from FieldDecl to query field offsets in bits.
++// - Detect inter-field gaps and tail padding.
++// - Recurse into nested records and arrays of records.
++// - Skip tail padding check in the presence of a flexible array member.
+ bool SAGenTestChecker::hasImplicitPadding(QualType QT, ASTContext &Ctx) {
+   QT = QT.getCanonicalType().getUnqualifiedType();
+
+@@ -275,52 +318,54 @@   if (!RD)
+     return false;
+
+-  if (RD->isUnion()) {
+-    // Exporting an entire union object may copy bytes from inactive members.
+-    return true;
+-  }
++  if (RD->isUnion())
++    return true;
+
+   const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
+
+   uint64_t BitsCovered = 0;
+-  unsigned Index = 0;
+
+   for (const FieldDecl *FD : RD->fields()) {
+-    // Recurse into nested records/array-of-records
++    // Recurse into nested records/arrays-of-records
+     {
+       QualType Base = unwrapArrayElementBaseType(FD->getType());
+       if (Base->isRecordType() && hasImplicitPadding(Base, Ctx))
+         return true;
+     }
+
+-    uint64_t Begin = Layout.getFieldOffset(Index);
+-    // Compute the number of bits this field actually occupies in the layout.
++    // Compute this field's begin offset and width in bits.
++    unsigned FieldIdx = FD->getFieldIndex();
++    uint64_t Begin = Layout.getFieldOffset(FieldIdx);
++
+     uint64_t WidthBits = 0;
+     if (FD->isBitField()) {
+       const Expr *BW = FD->getBitWidth();
+-      if (!BW)
+-        return true; // conservative
+-      if (BW->isValueDependent())
+-        return true; // conservative
+-      WidthBits = FD->getBitWidthValue(Ctx);
++      if (!BW || BW->isValueDependent())
++        return true; // conservative: unknown layout
++      uint64_t BWVal = FD->getBitWidthValue(Ctx);
++      // Zero-width bitfields are used for alignment -> implies padding
++      if (BWVal == 0)
++        return true;
++      WidthBits = BWVal;
+     } else {
+       WidthBits = Ctx.getTypeSize(FD->getType());
+     }
+
++    // Inter-field padding detected if there's a gap.
+     if (Begin > BitsCovered)
+-      return true; // gap (inter-field padding) detected
++      return true;
+
+     uint64_t End = Begin + WidthBits;
+     if (End > BitsCovered)
+       BitsCovered = End;
+-
+-    ++Index;
+-  }
+-
+-  // Tail padding: total allocated size vs bits covered by fields.
+-  uint64_t TotalSizeBits = Layout.getSize().getQuantity() * 8ULL;
+-  if (TotalSizeBits > BitsCovered)
+-    return true;
++  }
++
++  // Tail padding: if the record has a flexible array member, ignore tail check.
++  if (!RD->hasFlexibleArrayMember()) {
++    uint64_t TotalSizeBits = Ctx.getTypeSize(QT);
++    if (TotalSizeBits > BitsCovered)
++      return true;
++  }
+
+   return false;
+ }
+@@ -328,12 +373,13 @@ void SAGenTestChecker::markZeroCleared(ProgramStateRef &State, const VarDecl *VD) const {
+   if (!VD) return;
+   State = State->add<ZeroCleared>(VD);
+-  State = State->remove<PartiallyInitAgg>(VD);
+-}
+-
+-void SAGenTestChecker::markPartiallyInit(ProgramStateRef &State, const VarDecl *VD) const {
++  State = State->remove<SuspectAgg>(VD);
++}
++
++void SAGenTestChecker::markSuspect(ProgramStateRef &State, const VarDecl *VD) const {
+   if (!VD) return;
+-  State = State->set<PartiallyInitAgg>(VD, 1);
++  State = State->add<SuspectAgg>(VD);
++  State = State->remove<ZeroCleared>(VD);
+ }
+
+ bool SAGenTestChecker::isExplicitZeroInitExpr(const Expr *E) {
+@@ -354,18 +400,17 @@   const Expr *I = Init->IgnoreImplicit();
+   if (const auto *ILE = dyn_cast<InitListExpr>(I))
+     return isZeroBraceInit(ILE);
+-  // Very defensive: accept a single explicit 0 initializer
+   return isExplicitZeroInitExpr(I);
+ }
+
+ bool SAGenTestChecker::isFalsePositive(const VarDecl *VD, CheckerContext &C) {
+-  // If the var was brace-zero-initialized ("{}" or "{0}"), it's fully zeroed,
+-  // including padding. Exporting it is safe.
++  ProgramStateRef State = C.getState();
++
++  // If the var was brace-zero-initialized ("{}" or "{0}") or was zero-cleared later,
++  // it's safe to export even if the type has padding.
+   if (isBraceZeroInitializedVar(VD))
+     return true;
+
+-  // Path-sensitive knowledge: if we've already marked it zero-cleared (via memset, etc.), it's safe.
+-  ProgramStateRef State = C.getState();
+   if (State->contains<ZeroCleared>(VD))
+     return true;
+
+@@ -376,6 +421,7 @@
+ void SAGenTestChecker::checkPostStmt(const DeclStmt *DS, CheckerContext &C) const {
+   if (!DS) return;
++
+   ProgramStateRef State = C.getState();
+   bool Changed = false;
+
+@@ -387,30 +433,18 @@     if (!VD->hasLocalStorage())
+       continue;
+
+-    if (!VD->getType()->isRecordType())
++    QualType T = VD->getType();
++    if (!T->isRecordType())
+       continue;
+
+-    if (!VD->hasInit())
++    // Only interesting if the type actually has implicit padding.
++    if (!hasImplicitPadding(T, C.getASTContext()))
+       continue;
+
+-    const Expr *Init = VD->getInit();
+-    if (!Init)
+-      continue;
+-
+-    const Expr *I = Init->IgnoreImplicit();
+-    const auto *ILE = dyn_cast<InitListExpr>(I);
+-    if (!ILE) {
+-      // If not an init-list, still record if it's equivalent to zero-init.
+-      if (isExplicitZeroInitExpr(I)) {
+-        ProgramStateRef NewState = State->add<ZeroCleared>(VD);
+-        if (NewState != State) { State = NewState; Changed = true; }
+-      }
+-      continue;
+-    }
+-
+-    // If zero-brace init, mark cleared regardless of padding.
+-    if (isZeroBraceInit(ILE)) {
++    // If brace-zero-initialized -> safe
++    if (isBraceZeroInitializedVar(VD)) {
+       ProgramStateRef NewState = State->add<ZeroCleared>(VD);
++      NewState = NewState->remove<SuspectAgg>(VD);
+       if (NewState != State) {
+         State = NewState;
+         Changed = true;
+@@ -418,10 +452,40 @@       continue;
+     }
+
+-    // Only interesting if the type actually has implicit padding.
+-    if (isNonZeroingInitList(ILE) &&
+-        hasImplicitPadding(VD->getType(), C.getASTContext())) {
+-      ProgramStateRef NewState = State->set<PartiallyInitAgg>(VD, 1);
++    // Non-zeroing initializer or no initializer at all:
++    // The struct padding is not initialized. Mark suspect.
++    if (VD->hasInit()) {
++      const Expr *Init = VD->getInit();
++      const Expr *I = Init ? Init->IgnoreImplicit() : nullptr;
++      const auto *ILE = dyn_cast_or_null<InitListExpr>(I);
++      if (ILE && isNonZeroingInitList(ILE)) {
++        ProgramStateRef NewState = State->add<SuspectAgg>(VD);
++        NewState = NewState->remove<ZeroCleared>(VD);
++        if (NewState != State) {
++          State = NewState;
++          Changed = true;
++        }
++      } else if (I && isExplicitZeroInitExpr(I)) {
++        ProgramStateRef NewState = State->add<ZeroCleared>(VD);
++        NewState = NewState->remove<SuspectAgg>(VD);
++        if (NewState != State) {
++          State = NewState;
++          Changed = true;
++        }
++      } else {
++        // Some non-zeroing initialization form -> still suspect
++        ProgramStateRef NewState = State->add<SuspectAgg>(VD);
++        NewState = NewState->remove<ZeroCleared>(VD);
++        if (NewState != State) {
++          State = NewState;
++          Changed = true;
++        }
++      }
++    } else {
++      // No initializer. Since this is a padded aggregate, it may have
++      // uninitialized bytes (including padding). Mark suspect.
++      ProgramStateRef NewState = State->add<SuspectAgg>(VD);
++      NewState = NewState->remove<ZeroCleared>(VD);
+       if (NewState != State) {
+         State = NewState;
+         Changed = true;
+@@ -460,9 +524,9 @@   if (!sizeofCoversVar(VD, LenE, C))
+     return;
+
+-  // Mark as zero-cleared and remove partial-init flag
++  // Mark as zero-cleared and remove suspect mark.
+   State = State->add<ZeroCleared>(VD);
+-  State = State->remove<PartiallyInitAgg>(VD);
++  State = State->remove<SuspectAgg>(VD);
+   C.addTransition(State);
+ }
+
+@@ -480,20 +544,21 @@   if (!sizeofCoversVar(VD, LenE, C))
+     return;
+
+-  // If the record type has no implicit padding/holes, exporting it cannot leak
+-  // uninitialized padding bytes. Do not warn.
++  // The record type must have implicit padding; otherwise there is no risk of
++  // leaking uninitialized padding bytes.
+   if (!hasImplicitPadding(VD->getType(), C.getASTContext()))
+     return;
+
+   // Eliminate false positives where the aggregate is brace-zero-initialized
+-  // (or otherwise known zeroed).
++  // or was zero-cleared via memset/memzero before export.
+   if (isFalsePositive(VD, C))
+     return;
+
+   ProgramStateRef State = C.getState();
+
+-  // Warn only if we have evidence of risky partial init via init-list.
+-  if (!State->get<PartiallyInitAgg>(VD))
++  // Warn only if the variable is marked suspect: padded aggregate not known to
++  // be zeroed.
++  if (!State->contains<SuspectAgg>(VD))
+     return;
+
+   reportLeak(Call, C);

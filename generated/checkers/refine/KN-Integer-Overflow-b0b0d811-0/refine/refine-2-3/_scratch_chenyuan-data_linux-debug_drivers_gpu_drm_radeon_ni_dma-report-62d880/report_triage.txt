@@ -1,0 +1,7 @@
+- Decision: NotABug
+- Reason: The flagged line performs a 32-bit multiply whose result is then added to a 64-bit address:
+  - Types: addr is uint64_t; ndw is unsigned (32-bit); incr is uint32_t.
+  - Expression: addr += (ndw / 2) * incr; — the multiplication is indeed done in 32-bit.
+  - Bounds: ndw is capped to 0xFFFFE, so ndw/2 ≤ 524,287. In this radeon NI path, incr is the GPU page size, which for radeon NI is 4096 bytes (no 64KB “big pages” here). Thus the product is ≤ 524,287 × 4096 = 2,147,418,112, which fits well within 32-bit. Therefore no truncation occurs before the value is widened to 64-bit for addition to addr.
+  - Similarly, pe += ndw * 4 is also safe: max 1,048,574 × 4 = 4,194,296 < 2^32.
+  - Since overflow is not feasible under the driver’s constraints and usage, this does not constitute a real bug matching the target pattern.

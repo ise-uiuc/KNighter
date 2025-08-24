@@ -1,0 +1,385 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: d8c561741ef83980114b3f7f95ffac54600f3f16
+commit_type: Double-Free
+index: 4
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/Expr.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/StmtVisitor.h\"\n#include\
+  \ \"llvm/ADT/SmallVector.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Program state: map error variable region to the sq\
+  \ object region.\nREGISTER_MAP_WITH_PROGRAMSTATE(ErrVarSqMap, const MemRegion*,\
+  \ const MemRegion*)\n\nnamespace {\n\nstatic const MemRegion *getBaseRegFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n\
+  }\n\nstatic bool isCallNamed(const CallExpr *CE, StringRef Name, CheckerContext\
+  \ &C) {\n  if (!CE)\n    return false;\n  const Expr *Callee = CE->getCallee();\n\
+  \  if (!Callee)\n    return false;\n  return ExprHasName(Callee, Name, C);\n}\n\n\
+  static const CallExpr *findCallByName(const Stmt *S, StringRef Name, CheckerContext\
+  \ &C) {\n  if (!S)\n    return nullptr;\n\n  if (const auto *CE = dyn_cast<CallExpr>(S))\
+  \ {\n    if (isCallNamed(CE, Name, C))\n      return CE;\n  }\n\n  for (const Stmt\
+  \ *Child : S->children()) {\n    if (const CallExpr *Found = findCallByName(Child,\
+  \ Name, C))\n      return Found;\n  }\n  return nullptr;\n}\n\nstatic void collectDeclRefExprs(const\
+  \ Stmt *S, llvm::SmallVectorImpl<const DeclRefExpr *> &Out) {\n  if (!S)\n    return;\n\
+  \  if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {\n    Out.push_back(DRE);\n\
+  \  }\n  for (const Stmt *Child : S->children())\n    collectDeclRefExprs(Child,\
+  \ Out);\n}\n\nstatic const MemRegion *getSqRegionFromSetSqRdyCall(const CallExpr\
+  \ *CE, CheckerContext &C) {\n  if (!CE)\n    return nullptr;\n  if (CE->getNumArgs()\
+  \ < 2)\n    return nullptr;\n  const Expr *Arg1 = CE->getArg(1);\n  if (!Arg1)\n\
+  \    return nullptr;\n\n  const Expr *E = Arg1; // Do not IgnoreImplicit before\
+  \ getMemRegionFromExpr as per suggestions.\n  // Expecting MemberExpr referencing\
+  \ \"sqn\", get its base expression for 'sq'.\n  if (const auto *ME = dyn_cast<MemberExpr>(E->IgnoreParenCasts()))\
+  \ {\n    const ValueDecl *VD = ME->getMemberDecl();\n    if (!VD)\n      return\
+  \ nullptr;\n    if (VD->getName() != \"sqn\")\n      return nullptr;\n    const\
+  \ Expr *Base = ME->getBase();\n    if (!Base)\n      return nullptr;\n    return\
+  \ getBaseRegFromExpr(Base, C);\n  }\n\n  // If not a MemberExpr, conservatively\
+  \ try to derive a region anyway (best-effort).\n  return getBaseRegFromExpr(E, C);\n\
+  }\n\nstatic const MemRegion *getSqRegionFromCloseSqCall(const CallExpr *CE, CheckerContext\
+  \ &C) {\n  if (!CE)\n    return nullptr;\n  if (CE->getNumArgs() < 1)\n    return\
+  \ nullptr;\n  const Expr *Arg0 = CE->getArg(0);\n  if (!Arg0)\n    return nullptr;\n\
+  \  return getBaseRegFromExpr(Arg0, C);\n}\n\nstatic bool branchHasDestroySq(const\
+  \ Stmt *Branch, CheckerContext &C) {\n  if (!Branch)\n    return false;\n  if (findCallByName(Branch,\
+  \ \"mlx5_core_destroy_sq\", C))\n    return true;\n  if (findCallByName(Branch,\
+  \ \"hws_send_ring_destroy_sq\", C))\n    return true;\n  return false;\n}\n\nstatic\
+  \ bool isZeroIntegerLiteral(const Expr *E, CheckerContext &C) {\n  if (!E)\n   \
+  \ return false;\n  llvm::APSInt Val;\n  if (EvaluateExprToInt(Val, E, C)) {\n  \
+  \  return Val == 0;\n  }\n  return false;\n}\n\n// Decide if the failure branch\
+  \ is the 'then' or 'else' for an if-statement whose condition is CondE.\n// Default:\
+  \ Then is failure. If condition is logically \"err == 0\" or \"!err\", then Else\
+  \ is failure.\nstatic bool failureIsThen(const Expr *CondE, const MemRegion *ErrReg,\
+  \ CheckerContext &C) {\n  if (!CondE || !ErrReg)\n    return true;\n\n  // Strip\
+  \ parens; keep implicit casts for region mapping when needed elsewhere.\n  CondE\
+  \ = CondE->IgnoreParens();\n\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      // if (!err) -> failure is else-branch\n\
+  \      return false;\n    }\n  } else if (const auto *BO = dyn_cast<BinaryOperator>(CondE))\
+  \ {\n    if (!BO->isComparisonOp())\n      return true;\n\n    const Expr *LHS =\
+  \ BO->getLHS();\n    const Expr *RHS = BO->getRHS();\n\n    const MemRegion *LHSReg\
+  \ = getBaseRegFromExpr(LHS, C);\n    const MemRegion *RHSReg = getBaseRegFromExpr(RHS,\
+  \ C);\n\n    bool LHSIsErr = (LHSReg && LHSReg == ErrReg);\n    bool RHSIsErr =\
+  \ (RHSReg && RHSReg == ErrReg);\n\n    // Only reason about cases comparing err\
+  \ to 0.\n    if ((LHSIsErr && isZeroIntegerLiteral(RHS, C)) ||\n        (RHSIsErr\
+  \ && isZeroIntegerLiteral(LHS, C))) {\n      BinaryOperator::Opcode Op = BO->getOpcode();\n\
+  \      if (Op == BO_EQ) {\n        // if (err == 0) -> failure is else-branch\n\
+  \        return false;\n      }\n      // if (err != 0), if (err < 0), etc. -> treat\
+  \ as failure in then-branch\n      return true;\n    }\n  }\n\n  // Default conservative\
+  \ choice: Then is failure.\n  return true;\n}\n\nclass SAGenTestChecker : public\
+  \ Checker<check::Bind, check::BranchCondition> {\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\npublic:\n  SAGenTestChecker() : BT(new BugType(this, \"Over-broad cleanup\
+  \ in failure path\", \"API Misuse\")) {}\n\n  void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n  void checkBranchCondition(const Stmt\
+  \ *Condition, CheckerContext &C) const;\n\nprivate:\n  void reportAtCall(const CallExpr\
+  \ *CE, CheckerContext &C) const {\n    if (!CE)\n      return;\n    ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n    if (!N)\n      return;\n    auto R =\
+  \ std::make_unique<PathSensitiveBugReport>(\n        *BT, \"Wrong cleanup on failure:\
+  \ hws_send_ring_close_sq may double free; use destroy_sq.\", N);\n    R->addRange(CE->getSourceRange());\n\
+  \    C.emitReport(std::move(R));\n  }\n};\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  if (!S)\n    return;\n\
+  \n  // We are interested in assignments like: err = hws_send_ring_set_sq_rdy(mdev,\
+  \ sq->sqn);\n  const BinaryOperator *BO = findSpecificTypeInChildren<BinaryOperator>(S);\n\
+  \  if (!BO)\n    return;\n  if (BO->getOpcode() != BO_Assign)\n    return;\n\n \
+  \ const Expr *LHS = BO->getLHS();\n  const Expr *RHS = BO->getRHS();\n  if (!LHS\
+  \ || !RHS)\n    return;\n\n  const MemRegion *ErrVarReg = getBaseRegFromExpr(LHS,\
+  \ C);\n  if (!ErrVarReg)\n    return;\n\n  const CallExpr *RHSCall = findSpecificTypeInChildren<CallExpr>(RHS);\n\
+  \  if (!RHSCall)\n    return;\n  if (!isCallNamed(RHSCall, \"hws_send_ring_set_sq_rdy\"\
+  , C))\n    return;\n\n  const MemRegion *SqReg = getSqRegionFromSetSqRdyCall(RHSCall,\
+  \ C);\n  if (!SqReg)\n    return;\n\n  ProgramStateRef State = C.getState();\n \
+  \ State = State->set<ErrVarSqMap>(ErrVarReg, SqReg);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  if (!Condition)\n    return;\n\n  const IfStmt *IS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IS)\n    return;\n\n  const Expr *CondE = dyn_cast<Expr>(Condition);\n\
+  \  if (!CondE)\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  // Mode\
+  \ 1: direct call in condition: if (hws_send_ring_set_sq_rdy(mdev, sq->sqn)) { ...\
+  \ }\n  if (const CallExpr *CondCall = findSpecificTypeInChildren<CallExpr>(CondE))\
+  \ {\n    if (isCallNamed(CondCall, \"hws_send_ring_set_sq_rdy\", C)) {\n      const\
+  \ MemRegion *SqReg = getSqRegionFromSetSqRdyCall(CondCall, C);\n      if (!SqReg)\n\
+  \        return;\n\n      const Stmt *ThenS = IS->getThen();\n      if (!ThenS)\n\
+  \        return;\n\n      // If correct destroy is present, skip.\n      if (branchHasDestroySq(ThenS,\
+  \ C))\n        return;\n\n      const CallExpr *CloseCall = findCallByName(ThenS,\
+  \ \"hws_send_ring_close_sq\", C);\n      if (!CloseCall)\n        return;\n\n  \
+  \    const MemRegion *CloseArgReg = getSqRegionFromCloseSqCall(CloseCall, C);\n\
+  \      if (!CloseArgReg)\n        return;\n\n      if (CloseArgReg->getBaseRegion()\
+  \ == SqReg->getBaseRegion()) {\n        reportAtCall(CloseCall, C);\n      }\n \
+  \     return;\n    }\n  }\n\n  // Mode 2: variable-checked pattern: if (err) { hws_send_ring_close_sq(sq);\
+  \ }\n  // Find any DeclRefExpr in condition that matches a key in ErrVarSqMap.\n\
+  \  llvm::SmallVector<const DeclRefExpr *, 8> CondDREs;\n  collectDeclRefExprs(CondE,\
+  \ CondDREs);\n\n  const MemRegion *ErrVarReg = nullptr;\n  const MemRegion *SqReg\
+  \ = nullptr;\n\n  for (const DeclRefExpr *DRE : CondDREs) {\n    const MemRegion\
+  \ *Reg = getBaseRegFromExpr(DRE, C);\n    if (!Reg)\n      continue;\n    if (const\
+  \ MemRegion *MappedSq = State->get<ErrVarSqMap>(Reg)) {\n      ErrVarReg = Reg;\n\
+  \      SqReg = MappedSq;\n      break;\n    }\n  }\n\n  if (!ErrVarReg || !SqReg)\n\
+  \    return;\n\n  bool ThenIsFailure = failureIsThen(CondE, ErrVarReg, C);\n  const\
+  \ Stmt *FailureBranch = ThenIsFailure ? IS->getThen() : IS->getElse();\n  if (!FailureBranch)\n\
+  \    return;\n\n  if (branchHasDestroySq(FailureBranch, C))\n    return;\n\n  const\
+  \ CallExpr *CloseCall = findCallByName(FailureBranch, \"hws_send_ring_close_sq\"\
+  , C);\n  if (!CloseCall)\n    return;\n\n  const MemRegion *CloseArgReg = getSqRegionFromCloseSqCall(CloseCall,\
+  \ C);\n  if (!CloseArgReg)\n    return;\n\n  if (CloseArgReg->getBaseRegion() ==\
+  \ SqReg->getBaseRegion()) {\n    reportAtCall(CloseCall, C);\n  }\n}\n\n} // end\
+  \ anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects wrong cleanup on failure: using hws_send_ring_close_sq instead\
+  \ of the proper destroy_sq\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nnet/mlx5: HWS, fixed double-free in error flow of\
+  \ creating SQ\n\nWhen SQ creation fails, call the appropriate mlx5_core destroy\
+  \ function.\n\nThis fixes the following smatch warnings:\n  divers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c:739\n\
+  \    hws_send_ring_open_sq() warn: 'sq->dep_wqe' double freed\n    hws_send_ring_open_sq()\
+  \ warn: 'sq->wq_ctrl.buf.frags' double freed\n    hws_send_ring_open_sq() warn:\
+  \ 'sq->wr_priv' double freed\n\nFixes: 2ca62599aa0b (\"net/mlx5: HWS, added send\
+  \ engine and context handling\")\nReported-by: Dan Carpenter <dan.carpenter@linaro.org>\n\
+  Closes: https://lore.kernel.org/all/e4ebc227-4b25-49bf-9e4c-14b7ea5c6a07@stanley.mountain/\n\
+  Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>\nSigned-off-by: Saeed Mahameed\
+  \ <saeedm@nvidia.com>\n\n## Buggy Code\n\n```c\n// Function: hws_send_ring_create_sq\
+  \ in drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\nstatic\
+  \ int hws_send_ring_create_sq(struct mlx5_core_dev *mdev, u32 pdn,\n\t\t\t\t   void\
+  \ *sqc_data,\n\t\t\t\t   struct mlx5hws_send_engine *queue,\n\t\t\t\t   struct mlx5hws_send_ring_sq\
+  \ *sq,\n\t\t\t\t   struct mlx5hws_send_ring_cq *cq)\n{\n\tvoid *in, *sqc, *wq;\n\
+  \tint inlen, err;\n\tu8 ts_format;\n\n\tinlen = MLX5_ST_SZ_BYTES(create_sq_in) +\n\
+  \t\tsizeof(u64) * sq->wq_ctrl.buf.npages;\n\tin = kvzalloc(inlen, GFP_KERNEL);\n\
+  \tif (!in)\n\t\treturn -ENOMEM;\n\n\tsqc = MLX5_ADDR_OF(create_sq_in, in, ctx);\n\
+  \twq = MLX5_ADDR_OF(sqc, sqc, wq);\n\n\tmemcpy(sqc, sqc_data, MLX5_ST_SZ_BYTES(sqc));\n\
+  \tMLX5_SET(sqc, sqc, cqn, cq->mcq.cqn);\n\n\tMLX5_SET(sqc, sqc, state, MLX5_SQC_STATE_RST);\n\
+  \tMLX5_SET(sqc, sqc, flush_in_error_en, 1);\n\n\tts_format = mlx5_is_real_time_sq(mdev)\
+  \ ? MLX5_TIMESTAMP_FORMAT_REAL_TIME :\n\t\t\t\t\t\t MLX5_TIMESTAMP_FORMAT_FREE_RUNNING;\n\
+  \tMLX5_SET(sqc, sqc, ts_format, ts_format);\n\n\tMLX5_SET(wq, wq, wq_type, MLX5_WQ_TYPE_CYCLIC);\n\
+  \tMLX5_SET(wq, wq, uar_page, mdev->mlx5e_res.hw_objs.bfreg.index);\n\tMLX5_SET(wq,\
+  \ wq, log_wq_pg_sz, sq->wq_ctrl.buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT);\n\tMLX5_SET64(wq,\
+  \ wq, dbr_addr, sq->wq_ctrl.db.dma);\n\n\tmlx5_fill_page_frag_array(&sq->wq_ctrl.buf,\n\
+  \t\t\t\t  (__be64 *)MLX5_ADDR_OF(wq, wq, pas));\n\n\terr = mlx5_core_create_sq(mdev,\
+  \ in, inlen, &sq->sqn);\n\n\tkvfree(in);\n\n\treturn err;\n}\n```\n\n## Bug Fix\
+  \ Patch\n\n```diff\ndiff --git a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\
+  \ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\nindex a1adbb48735c..0c7989184c30\
+  \ 100644\n--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\n\
+  +++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\n@@ -653,6\
+  \ +653,12 @@ static int hws_send_ring_create_sq(struct mlx5_core_dev *mdev, u32\
+  \ pdn,\n \treturn err;\n }\n \n+static void hws_send_ring_destroy_sq(struct mlx5_core_dev\
+  \ *mdev,\n+\t\t\t\t     struct mlx5hws_send_ring_sq *sq)\n+{\n+\tmlx5_core_destroy_sq(mdev,\
+  \ sq->sqn);\n+}\n+\n static int hws_send_ring_set_sq_rdy(struct mlx5_core_dev *mdev,\
+  \ u32 sqn)\n {\n \tvoid *in, *sqc;\n@@ -696,7 +702,7 @@ static int hws_send_ring_create_sq_rdy(struct\
+  \ mlx5_core_dev *mdev, u32 pdn,\n \n \terr = hws_send_ring_set_sq_rdy(mdev, sq->sqn);\n\
+  \ \tif (err)\n-\t\thws_send_ring_close_sq(sq);\n+\t\thws_send_ring_destroy_sq(mdev,\
+  \ sq);\n \n \treturn err;\n }\n```\n"
+pattern: "## Bug Pattern\n\nUsing an over-broad \u201Cclose/free-all\u201D cleanup\
+  \ routine in an intermediate error path of partial initialization. Specifically,\
+  \ after successfully creating a HW SQ but failing to transition it to ready, the\
+  \ code called hws_send_ring_close_sq(sq), which frees software-side allocations\
+  \ (e.g., sq->dep_wqe, sq->wq_ctrl.buf.frags, sq->wr_priv) that will be freed again\
+  \ by the outer error-unwind, causing double free. The correct pattern is to call\
+  \ the matching low-level destroy (mlx5_core_destroy_sq) for the created HW object\
+  \ only.\n\nExample:\n```\nerr = hws_send_ring_set_sq_rdy(mdev, sq->sqn);\nif (err)\n\
+  \    hws_send_ring_close_sq(sq);  // Wrong: frees too much; leads to double free\
+  \ later\n// Should be:\nif (err)\n    mlx5_core_destroy_sq(mdev, sq->sqn);  // Only\
+  \ undo the created HW SQ\n```"
+plan: "1. Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(ErrVarSqMap, const MemRegion*,\
+  \ const MemRegion*)\n  - Key: MemRegion of an integer \u201Cerror\u201D variable\
+  \ that receives the return value of hws_send_ring_set_sq_rdy.\n  - Value: MemRegion\
+  \ of the sq object whose sq->sqn was passed to hws_send_ring_set_sq_rdy.\n- No other\
+  \ custom traits or alias maps are needed.\n\n2. Chosen callbacks and detailed implementation\n\
+  \nA) checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C)\n- Goal: Record\
+  \ when an error variable is assigned the result of hws_send_ring_set_sq_rdy(mdev,\
+  \ sq->sqn).\n- Steps:\n  1) Ensure S is a BinaryOperator assignment (BO_Assign).\
+  \ Use findSpecificTypeInChildren<BinaryOperator>(S). If not found, return.\n  2)\
+  \ Extract LHS expression and obtain its MemRegion via getMemRegionFromExpr(LHS,\
+  \ C). If null, return.\n  3) From the RHS, find CallExpr: findSpecificTypeInChildren<CallExpr>(RHS).\
+  \ If absent, return.\n  4) Check callee name == \"hws_send_ring_set_sq_rdy\". If\
+  \ not, return.\n  5) Extract the second argument (index 1). Expect a MemberExpr\
+  \ referencing \"sqn\". Validate either:\n     - The argument is a MemberExpr whose\
+  \ member name equals \"sqn\", and get its base expression (likely DeclRefExpr \u2018\
+  sq\u2019). Obtain its MemRegion via getMemRegionFromExpr(Base, C). If null, return.\n\
+  \  6) Update state: State = State->set<ErrVarSqMap>(ErrVarRegion, SqRegion) and\
+  \ C.addTransition(State).\n- Rationale: This maps the specific \u201Cerr\u201D variable\
+  \ to the sq object associated with the set-to-ready call.\n\nB) checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C)\n- Goal: Detect the misuse pattern in the\
+  \ failure branch immediately guarding the set-to-ready result.\n- Common utilities\
+  \ needed:\n  - Get the enclosing IfStmt using findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C).\n  - A small helper to scan a statement subtree for a call by name: use findSpecificTypeInChildren<CallExpr>(Subtree)\
+  \ and then check the callee name. If needed, scan sequentially by iterating compound\
+  \ children (IfStmt->getThen()) and checking each descendant (keep it simple: call\
+  \ findSpecificTypeInChildren on the whole Then subtree).\n  - A helper to extract\
+  \ the sq MemRegion from a call argument:\n    - For hws_send_ring_set_sq_rdy: take\
+  \ arg[1] as MemberExpr \u201Csqn\u201D, take its base expr, then getMemRegionFromExpr(base).\n\
+  \    - For hws_send_ring_close_sq: take arg[0] and call getMemRegionFromExpr(arg0).\n\
+  - Two detection modes:\n\n  Mode 1: Direct-call-in-condition pattern\n  - Inspect\
+  \ Condition subtree for a CallExpr to \"hws_send_ring_set_sq_rdy\".\n  - If found:\n\
+  \    - Extract the sq MemRegion from arg[1] (sq->sqn) as described above. If extraction\
+  \ fails, stop.\n    - The failure path is the \u2018then\u2019 branch if condition\
+  \ is used as-is (e.g., if (hws_send_ring_set_sq_rdy(...))). You can conservatively\
+  \ assume Then is the failure branch for this direct-call pattern.\n    - In the\
+  \ Then branch subtree, search for a call to \"hws_send_ring_close_sq\".\n      -\
+  \ If found, get the MemRegion of arg[0] and compare with the sq region from the\
+  \ condition. If equal, this is the bug.\n      - Before reporting, optionally check\
+  \ that the Then subtree does not contain a call to \"mlx5_core_destroy_sq\" or \"\
+  hws_send_ring_destroy_sq\" to avoid flagging a correct cleanup (use another findSpecificTypeInChildren<CallExpr>\
+  \ and compare callee name); if it does, skip reporting.\n    - Report: emit a bug\
+  \ at the hws_send_ring_close_sq call site.\n\n  Mode 2: Variable-checked pattern\
+  \ (err variable)\n  - Try to obtain a DeclRefExpr within Condition that refers to\
+  \ a variable region present in ErrVarSqMap:\n    - Use findSpecificTypeInChildren<DeclRefExpr>(Condition),\
+  \ get MemRegion, and look up in ErrVarSqMap.\n    - If found, retrieve the mapped\
+  \ sq MemRegion (SqReg).\n  - Decide the failure branch (which side corresponds to\
+  \ a nonzero/failed err):\n    - If condition is just \u201Cerr\u201D, \u201C(err\
+  \ != 0)\u201D, \u201C(err < 0)\u201D, assume Then is failure.\n    - If condition\
+  \ is \u201C!err\u201D, or \u201C(err == 0)\u201D, assume Else is failure.\n    -\
+  \ Keep this simple by checking for UnaryOperator \u2018!\u2019 or BinaryOperator\
+  \ kinds EQ, NE, LT, LE, GT, GE and the constant 0 on the other side. If not sure,\
+  \ default to Then as failure.\n  - In the selected failure branch subtree, look\
+  \ for a call to \"hws_send_ring_close_sq\".\n    - If found, get MemRegion of its\
+  \ first arg and compare with SqReg. If equal, this is the bug.\n    - Similarly,\
+  \ skip reporting if the same branch subtree also contains \"mlx5_core_destroy_sq\"\
+  \ or \"hws_send_ring_destroy_sq\".\n  - Report at the close call site.\n\n- Reporting\
+  \ details:\n  - Create a non-fatal error node with generateNonFatalErrorNode().\n\
+  \  - Use a concise message, e.g., \"Wrong cleanup on failure: hws_send_ring_close_sq\
+  \ may double free; use destroy_sq.\"\n\nC) checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C)\n- Optional safeguard (not strictly required): If a call to \"hws_send_ring_close_sq\"\
+  \ is seen, try to find an enclosing IfStmt with a condition matching Mode 1 or Mode\
+  \ 2 logic (by going up via findSpecificTypeInParents to the enclosing IfStmt). If\
+  \ both the condition and the close call match the misuse pattern, report here. This\
+  \ is redundant if checkBranchCondition already flags it; include only if needed\
+  \ to catch cases missed by checkBranchCondition. Prefer keeping it disabled for\
+  \ simplicity.\n\n3. Notes and simplifications\n- This checker is intentionally scoped\
+  \ to the mlx5 HWS SQ flow:\n  - Creator/readiness function name: \"hws_send_ring_set_sq_rdy\"\
+  .\n  - Bad cleanup function: \"hws_send_ring_close_sq\".\n  - Correct cleanup: \"\
+  mlx5_core_destroy_sq\" or its wrapper \"hws_send_ring_destroy_sq\".\n- We rely on\
+  \ the common kernel idiom \u201Cerr = foo(); if (err) \u2026\u201D and the direct-call\
+  \ predicate idiom \u201Cif (foo()) \u2026\u201D. We do not attempt complex alias\
+  \ tracking beyond the sq variable extraction and err mapping described.\n- We do\
+  \ not need to model values symbolically; the checker is syntactic/structural with\
+  \ light region comparisons only.\n\n4. Utility usage\n- findSpecificTypeInParents\
+  \ and findSpecificTypeInChildren:\n  - To find the enclosing IfStmt from the condition.\n\
+  \  - To find CallExprs inside the condition or branch bodies.\n- getMemRegionFromExpr:\n\
+  \  - To compare that the same sq object is passed to set_sq_rdy (via sq->sqn) and\
+  \ hws_send_ring_close_sq (via sq).\n- ExprHasName:\n  - Optional for quick checks\
+  \ like ensuring the member name is \u201Csqn\u201D when parsing the arg to set_sq_rdy.\
+  \ Prefer using MemberExpr and checking the FieldDecl\u2019s name via getMemberDecl()->getName()\
+  \ when possible.\n\n5. Bug report\n- Use PathSensitiveBugReport with a short message:\n\
+  \  - Title: \"Over-broad cleanup in failure path\"\n  - Message: \"hws_send_ring_close_sq\
+  \ may double free; call destroy_sq on failure.\"\n- Anchor the report on the CallExpr\
+  \ to hws_send_ring_close_sq."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/Expr.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/StmtVisitor.h\"\n#include\
+  \ \"llvm/ADT/SmallVector.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Program state: map error variable region to the sq\
+  \ object region.\nREGISTER_MAP_WITH_PROGRAMSTATE(ErrVarSqMap, const MemRegion*,\
+  \ const MemRegion*)\n\nnamespace {\n\nstatic const MemRegion *getBaseRegFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n\
+  }\n\nstatic bool isCallNamed(const CallExpr *CE, StringRef Name, CheckerContext\
+  \ &C) {\n  if (!CE)\n    return false;\n  const Expr *Callee = CE->getCallee();\n\
+  \  if (!Callee)\n    return false;\n  return ExprHasName(Callee, Name, C);\n}\n\n\
+  static const CallExpr *findCallByName(const Stmt *S, StringRef Name, CheckerContext\
+  \ &C) {\n  if (!S)\n    return nullptr;\n\n  if (const auto *CE = dyn_cast<CallExpr>(S))\
+  \ {\n    if (isCallNamed(CE, Name, C))\n      return CE;\n  }\n\n  for (const Stmt\
+  \ *Child : S->children()) {\n    if (const CallExpr *Found = findCallByName(Child,\
+  \ Name, C))\n      return Found;\n  }\n  return nullptr;\n}\n\nstatic void collectDeclRefExprs(const\
+  \ Stmt *S, llvm::SmallVectorImpl<const DeclRefExpr *> &Out) {\n  if (!S)\n    return;\n\
+  \  if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {\n    Out.push_back(DRE);\n\
+  \  }\n  for (const Stmt *Child : S->children())\n    collectDeclRefExprs(Child,\
+  \ Out);\n}\n\nstatic const MemRegion *getSqRegionFromSetSqRdyCall(const CallExpr\
+  \ *CE, CheckerContext &C) {\n  if (!CE)\n    return nullptr;\n  if (CE->getNumArgs()\
+  \ < 2)\n    return nullptr;\n  const Expr *Arg1 = CE->getArg(1);\n  if (!Arg1)\n\
+  \    return nullptr;\n\n  const Expr *E = Arg1; // Do not IgnoreImplicit before\
+  \ getMemRegionFromExpr as per suggestions.\n  // Expecting MemberExpr referencing\
+  \ \"sqn\", get its base expression for 'sq'.\n  if (const auto *ME = dyn_cast<MemberExpr>(E->IgnoreParenCasts()))\
+  \ {\n    const ValueDecl *VD = ME->getMemberDecl();\n    if (!VD)\n      return\
+  \ nullptr;\n    if (VD->getName() != \"sqn\")\n      return nullptr;\n    const\
+  \ Expr *Base = ME->getBase();\n    if (!Base)\n      return nullptr;\n    return\
+  \ getBaseRegFromExpr(Base, C);\n  }\n\n  // If not a MemberExpr, conservatively\
+  \ try to derive a region anyway (best-effort).\n  return getBaseRegFromExpr(E, C);\n\
+  }\n\nstatic const MemRegion *getSqRegionFromCloseSqCall(const CallExpr *CE, CheckerContext\
+  \ &C) {\n  if (!CE)\n    return nullptr;\n  if (CE->getNumArgs() < 1)\n    return\
+  \ nullptr;\n  const Expr *Arg0 = CE->getArg(0);\n  if (!Arg0)\n    return nullptr;\n\
+  \  return getBaseRegFromExpr(Arg0, C);\n}\n\nstatic bool branchHasDestroySq(const\
+  \ Stmt *Branch, CheckerContext &C) {\n  if (!Branch)\n    return false;\n  if (findCallByName(Branch,\
+  \ \"mlx5_core_destroy_sq\", C))\n    return true;\n  if (findCallByName(Branch,\
+  \ \"hws_send_ring_destroy_sq\", C))\n    return true;\n  return false;\n}\n\nstatic\
+  \ bool isZeroIntegerLiteral(const Expr *E, CheckerContext &C) {\n  if (!E)\n   \
+  \ return false;\n  llvm::APSInt Val;\n  if (EvaluateExprToInt(Val, E, C)) {\n  \
+  \  return Val == 0;\n  }\n  return false;\n}\n\n// Decide if the failure branch\
+  \ is the 'then' or 'else' for an if-statement whose condition is CondE.\n// Default:\
+  \ Then is failure. If condition is logically \"err == 0\" or \"!err\", then Else\
+  \ is failure.\nstatic bool failureIsThen(const Expr *CondE, const MemRegion *ErrReg,\
+  \ CheckerContext &C) {\n  if (!CondE || !ErrReg)\n    return true;\n\n  // Strip\
+  \ parens; keep implicit casts for region mapping when needed elsewhere.\n  CondE\
+  \ = CondE->IgnoreParens();\n\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      // if (!err) -> failure is else-branch\n\
+  \      return false;\n    }\n  } else if (const auto *BO = dyn_cast<BinaryOperator>(CondE))\
+  \ {\n    if (!BO->isComparisonOp())\n      return true;\n\n    const Expr *LHS =\
+  \ BO->getLHS();\n    const Expr *RHS = BO->getRHS();\n\n    const MemRegion *LHSReg\
+  \ = getBaseRegFromExpr(LHS, C);\n    const MemRegion *RHSReg = getBaseRegFromExpr(RHS,\
+  \ C);\n\n    bool LHSIsErr = (LHSReg && LHSReg == ErrReg);\n    bool RHSIsErr =\
+  \ (RHSReg && RHSReg == ErrReg);\n\n    // Only reason about cases comparing err\
+  \ to 0.\n    if ((LHSIsErr && isZeroIntegerLiteral(RHS, C)) ||\n        (RHSIsErr\
+  \ && isZeroIntegerLiteral(LHS, C))) {\n      BinaryOperator::Opcode Op = BO->getOpcode();\n\
+  \      if (Op == BO_EQ) {\n        // if (err == 0) -> failure is else-branch\n\
+  \        return false;\n      }\n      // if (err != 0), if (err < 0), etc. -> treat\
+  \ as failure in then-branch\n      return true;\n    }\n  }\n\n  // Default conservative\
+  \ choice: Then is failure.\n  return true;\n}\n\nclass SAGenTestChecker : public\
+  \ Checker<check::Bind, check::BranchCondition> {\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\npublic:\n  SAGenTestChecker() : BT(new BugType(this, \"Over-broad cleanup\
+  \ in failure path\", \"API Misuse\")) {}\n\n  void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n  void checkBranchCondition(const Stmt\
+  \ *Condition, CheckerContext &C) const;\n\nprivate:\n  void reportAtCall(const CallExpr\
+  \ *CE, CheckerContext &C) const {\n    if (!CE)\n      return;\n    ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n    if (!N)\n      return;\n    auto R =\
+  \ std::make_unique<PathSensitiveBugReport>(\n        *BT, \"Wrong cleanup on failure:\
+  \ hws_send_ring_close_sq may double free; use destroy_sq.\", N);\n    R->addRange(CE->getSourceRange());\n\
+  \    C.emitReport(std::move(R));\n  }\n};\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  if (!S)\n    return;\n\
+  \n  // We are interested in assignments like: err = hws_send_ring_set_sq_rdy(mdev,\
+  \ sq->sqn);\n  const BinaryOperator *BO = findSpecificTypeInChildren<BinaryOperator>(S);\n\
+  \  if (!BO)\n    return;\n  if (BO->getOpcode() != BO_Assign)\n    return;\n\n \
+  \ const Expr *LHS = BO->getLHS();\n  const Expr *RHS = BO->getRHS();\n  if (!LHS\
+  \ || !RHS)\n    return;\n\n  const MemRegion *ErrVarReg = getBaseRegFromExpr(LHS,\
+  \ C);\n  if (!ErrVarReg)\n    return;\n\n  const CallExpr *RHSCall = findSpecificTypeInChildren<CallExpr>(RHS);\n\
+  \  if (!RHSCall)\n    return;\n  if (!isCallNamed(RHSCall, \"hws_send_ring_set_sq_rdy\"\
+  , C))\n    return;\n\n  const MemRegion *SqReg = getSqRegionFromSetSqRdyCall(RHSCall,\
+  \ C);\n  if (!SqReg)\n    return;\n\n  ProgramStateRef State = C.getState();\n \
+  \ State = State->set<ErrVarSqMap>(ErrVarReg, SqReg);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  if (!Condition)\n    return;\n\n  const IfStmt *IS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IS)\n    return;\n\n  const Expr *CondE = dyn_cast<Expr>(Condition);\n\
+  \  if (!CondE)\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  // Mode\
+  \ 1: direct call in condition: if (hws_send_ring_set_sq_rdy(mdev, sq->sqn)) { ...\
+  \ }\n  if (const CallExpr *CondCall = findSpecificTypeInChildren<CallExpr>(CondE))\
+  \ {\n    if (isCallNamed(CondCall, \"hws_send_ring_set_sq_rdy\", C)) {\n      const\
+  \ MemRegion *SqReg = getSqRegionFromSetSqRdyCall(CondCall, C);\n      if (!SqReg)\n\
+  \        return;\n\n      const Stmt *ThenS = IS->getThen();\n      if (!ThenS)\n\
+  \        return;\n\n      // If correct destroy is present, skip.\n      if (branchHasDestroySq(ThenS,\
+  \ C))\n        return;\n\n      const CallExpr *CloseCall = findCallByName(ThenS,\
+  \ \"hws_send_ring_close_sq\", C);\n      if (!CloseCall)\n        return;\n\n  \
+  \    const MemRegion *CloseArgReg = getSqRegionFromCloseSqCall(CloseCall, C);\n\
+  \      if (!CloseArgReg)\n        return;\n\n      if (CloseArgReg->getBaseRegion()\
+  \ == SqReg->getBaseRegion()) {\n        reportAtCall(CloseCall, C);\n      }\n \
+  \     return;\n    }\n  }\n\n  // Mode 2: variable-checked pattern: if (err) { hws_send_ring_close_sq(sq);\
+  \ }\n  // Find any DeclRefExpr in condition that matches a key in ErrVarSqMap.\n\
+  \  llvm::SmallVector<const DeclRefExpr *, 8> CondDREs;\n  collectDeclRefExprs(CondE,\
+  \ CondDREs);\n\n  const MemRegion *ErrVarReg = nullptr;\n  const MemRegion *SqReg\
+  \ = nullptr;\n\n  for (const DeclRefExpr *DRE : CondDREs) {\n    const MemRegion\
+  \ *Reg = getBaseRegFromExpr(DRE, C);\n    if (!Reg)\n      continue;\n    if (const\
+  \ MemRegion *const *MappedSq = State->get<ErrVarSqMap>(Reg)) {\n      ErrVarReg\
+  \ = Reg;\n      SqReg = *MappedSq;\n      break;\n    }\n  }\n\n  if (!ErrVarReg\
+  \ || !SqReg)\n    return;\n\n  bool ThenIsFailure = failureIsThen(CondE, ErrVarReg,\
+  \ C);\n  const Stmt *FailureBranch = ThenIsFailure ? IS->getThen() : IS->getElse();\n\
+  \  if (!FailureBranch)\n    return;\n\n  if (branchHasDestroySq(FailureBranch, C))\n\
+  \    return;\n\n  const CallExpr *CloseCall = findCallByName(FailureBranch, \"hws_send_ring_close_sq\"\
+  , C);\n  if (!CloseCall)\n    return;\n\n  const MemRegion *CloseArgReg = getSqRegionFromCloseSqCall(CloseCall,\
+  \ C);\n  if (!CloseArgReg)\n    return;\n\n  if (CloseArgReg->getBaseRegion() ==\
+  \ SqReg->getBaseRegion()) {\n    reportAtCall(CloseCall, C);\n  }\n}\n\n} // end\
+  \ anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects wrong cleanup on failure: using hws_send_ring_close_sq instead\
+  \ of the proper destroy_sq\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

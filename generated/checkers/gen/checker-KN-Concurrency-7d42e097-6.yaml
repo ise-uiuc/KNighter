@@ -1,0 +1,400 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 7d42e097607c4d246d99225bf2b195b6167a210c
+commit_type: Concurrency
+index: 6
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Type.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ No custom program states required for this checker.\n\nnamespace {\n\nstatic const\
+  \ FunctionDecl *getDirectCallee(const CallExpr *CE) {\n  if (!CE) return nullptr;\n\
+  \  return CE->getDirectCallee();\n}\n\nstatic StringRef getCalleeName(const CallExpr\
+  \ *CE) {\n  if (const FunctionDecl *FD = getDirectCallee(CE)) {\n    if (const IdentifierInfo\
+  \ *II = FD->getIdentifier())\n      return II->getName();\n  }\n  return StringRef();\n\
+  }\n\nstatic const VarDecl *getVarDeclFromDeclRefBase(const Expr *E) {\n  if (!E)\
+  \ return nullptr;\n  E = E->IgnoreParenImpCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n      return VD;\n\
+  \  }\n  return nullptr;\n}\n\n// Extract the base variable from an argument that\
+  \ looks like &ctx->compl or ctx->compl\nstatic const VarDecl *extractBaseVarFromComplArg(const\
+  \ Expr *Arg) {\n  if (!Arg) return nullptr;\n  const Expr *E = Arg->IgnoreParenImpCasts();\n\
+  \  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode() ==\
+  \ UO_AddrOf)\n      E = UO->getSubExpr()->IgnoreParenImpCasts();\n  }\n\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(E)) {\n    const ValueDecl *Member = ME->getMemberDecl();\n\
+  \    if (!Member) return nullptr;\n    // We expect field named 'compl' (Linux completion\
+  \ field)\n    if (Member->getIdentifier() && Member->getName().equals(\"compl\"\
+  )) {\n      const Expr *Base = ME->getBase();\n      if (!Base) return nullptr;\n\
+  \      return getVarDeclFromDeclRefBase(Base);\n    }\n  }\n  return nullptr;\n\
+  }\n\nstatic const VarDecl *extractVarFromExprSimple(const Expr *E) {\n  if (!E)\
+  \ return nullptr;\n  E = E->IgnoreParenImpCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n      return VD;\n\
+  \  }\n  return nullptr;\n}\n\nstatic bool isWorkHandler(const FunctionDecl *FD)\
+  \ {\n  if (!FD) return false;\n  if (!FD->hasBody()) return false;\n  if (FD->param_size()\
+  \ < 1) return false;\n\n  const ParmVarDecl *P0 = FD->getParamDecl(0);\n  if (!P0)\
+  \ return false;\n\n  QualType QT = P0->getType();\n  if (!QT->isPointerType()) return\
+  \ false;\n\n  QualType Pointee = QT->getPointeeType();\n  if (const auto *RT = Pointee->getAs<RecordType>())\
+  \ {\n    const RecordDecl *RD = RT->getDecl();\n    if (const IdentifierInfo *II\
+  \ = RD->getIdentifier()) {\n      // We expect 'work_struct'\n      if (II->getName().equals(\"\
+  work_struct\"))\n        return true;\n    }\n  }\n  // Fallback heuristic (rarely\
+  \ needed) - rely on type spelling\n  std::string S;\n  llvm::raw_string_ostream\
+  \ OS(S);\n  QT.print(OS, PrintingPolicy(FD->getASTContext().getLangOpts()));\n \
+  \ OS.flush();\n  return (S.find(\"work_struct *\") != std::string::npos);\n}\n\n\
+  // Recursively check for kfree(var) inside a statement subtree.\nstatic bool containsKfreeOfVar(const\
+  \ Stmt *S, const VarDecl *VD) {\n  if (!S || !VD) return false;\n  for (const Stmt\
+  \ *Child : S->children()) {\n    if (!Child) continue;\n    if (const auto *CE =\
+  \ dyn_cast<CallExpr>(Child)) {\n      StringRef Callee = getCalleeName(CE);\n  \
+  \    if (Callee.equals(\"kfree\") && CE->getNumArgs() >= 1) {\n        const VarDecl\
+  \ *ArgVD = extractVarFromExprSimple(CE->getArg(0));\n        if (ArgVD == VD)\n\
+  \          return true;\n      }\n    }\n    if (containsKfreeOfVar(Child, VD))\n\
+  \      return true;\n  }\n  return false;\n}\n\n// Visitor to scan work handler\
+  \ function body for usage/free/guard patterns.\nclass WorkerVisitor : public RecursiveASTVisitor<WorkerVisitor>\
+  \ {\npublic:\n  WorkerVisitor(llvm::SmallPtrSetImpl<const VarDecl*> &CtxVars,\n\
+  \                bool &UsedComplete, bool &UsedKfree, bool &HasGuard)\n      : ObservedCtxVars(CtxVars),\
+  \ UsedComplete(UsedComplete),\n        UsedKfree(UsedKfree), HasGuard(HasGuard)\
+  \ {}\n\n  bool VisitCallExpr(CallExpr *CE) {\n    StringRef Name = getCalleeName(CE);\n\
+  \    if (Name.empty())\n      return true;\n\n    if ((Name.equals(\"complete\"\
+  ) || Name.equals(\"complete_all\")) && CE->getNumArgs() >= 1) {\n      if (const\
+  \ VarDecl *Base = extractBaseVarFromComplArg(CE->getArg(0))) {\n        ObservedCtxVars.insert(Base);\n\
+  \        UsedComplete = true;\n      }\n    } else if (Name.equals(\"completion_done\"\
+  ) && CE->getNumArgs() >= 1) {\n      if (const VarDecl *Base = extractBaseVarFromComplArg(CE->getArg(0)))\
+  \ {\n        ObservedCtxVars.insert(Base);\n        HasGuard = true;\n      }\n\
+  \    } else if (Name.equals(\"kfree\") && CE->getNumArgs() >= 1) {\n      if (const\
+  \ VarDecl *V = extractVarFromExprSimple(CE->getArg(0))) {\n        if (ObservedCtxVars.count(V))\n\
+  \          UsedKfree = true;\n      }\n    }\n\n    return true;\n  }\n\nprivate:\n\
+  \  llvm::SmallPtrSetImpl<const VarDecl*> &ObservedCtxVars;\n  bool &UsedComplete;\n\
+  \  bool &UsedKfree;\n  bool &HasGuard;\n};\n\nclass SAGenTestChecker : public Checker<check::ASTCodeBody,\
+  \ check::BranchCondition> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Work handler missing completion_done\
+  \ guard\", \"Concurrency\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n      void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n\n   private:\n      // Helper to report AST-level\
+  \ issue (worker side).\n      void reportWorker(const FunctionDecl *FD, BugReporter\
+  \ &BR) const;\n      // Helper to report branch-based issue (submitter side).\n\
+  \      void reportSubmitter(const IfStmt *IfS, CheckerContext &C) const;\n};\n\n\
+  void SAGenTestChecker::reportWorker(const FunctionDecl *FD, BugReporter &BR) const\
+  \ {\n  if (!BT || !FD) return;\n  PathDiagnosticLocation Loc = PathDiagnosticLocation::createBegin(FD,\
+  \ BR.getSourceManager());\n  auto R = std::make_unique<BasicBugReport>(\n      *BT,\
+  \ \"work handler lacks completion_done() guard before using/freeing shared context\"\
+  , Loc);\n  BR.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::reportSubmitter(const\
+  \ IfStmt *IfS, CheckerContext &C) const {\n  if (!BT || !IfS) return;\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"frees work context on timeout while worker may still use it\", N);\n\
+  \  R->addRange(IfS->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\nvoid\
+  \ SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const {\n  if (!D) return;\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  if (!isWorkHandler(FD))\n    return;\n\
+  \n  Stmt *Body = FD->getBody();\n  if (!Body)\n    return;\n\n  llvm::SmallPtrSet<const\
+  \ VarDecl*, 4> ObservedCtxVars;\n  bool UsedComplete = false;\n  bool UsedKfree\
+  \ = false;\n  bool HasGuard = false;\n\n  WorkerVisitor V(ObservedCtxVars, UsedComplete,\
+  \ UsedKfree, HasGuard);\n  V.TraverseStmt(Body);\n\n  if ((UsedComplete || UsedKfree)\
+  \ && !HasGuard) {\n    reportWorker(FD, BR);\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition) return;\n  const\
+  \ auto *CondE = dyn_cast<Expr>(Condition);\n  if (!CondE) return;\n\n  const Expr\
+  \ *E = CondE->IgnoreParenCasts();\n\n  // Pattern: if (!wait_for_completion_timeout(&ctx->compl,\
+  \ ...)) { kfree(ctx); }\n  const UnaryOperator *UO = dyn_cast<UnaryOperator>(E);\n\
+  \  if (!UO || UO->getOpcode() != UO_LNot)\n    return;\n\n  const Expr *Sub = UO->getSubExpr();\n\
+  \  if (!Sub) return;\n  Sub = Sub->IgnoreParenCasts();\n\n  const auto *CE = dyn_cast<CallExpr>(Sub);\n\
+  \  if (!CE) return;\n\n  StringRef Callee = getCalleeName(CE);\n  if (!Callee.equals(\"\
+  wait_for_completion_timeout\"))\n    return;\n\n  if (CE->getNumArgs() < 1)\n  \
+  \  return;\n\n  const VarDecl *CtxVar = extractBaseVarFromComplArg(CE->getArg(0));\n\
+  \  if (!CtxVar)\n    return;\n\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IfS) return;\n\n  const Stmt *Then = IfS->getThen();\n  if (!Then)\
+  \ return;\n\n  if (containsKfreeOfVar(Then, CtxVar)) {\n    reportSubmitter(IfS,\
+  \ C);\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects missing completion_done() guard in work handlers and free-on-timeout\
+  \ of shared work context\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ncrypto: qat - resolve race condition during AER recovery\n\
+  \nDuring the PCI AER system's error recovery process, the kernel driver\nmay encounter\
+  \ a race condition with freeing the reset_data structure's\nmemory. If the device\
+  \ restart will take more than 10 seconds the function\nscheduling that restart will\
+  \ exit due to a timeout, and the reset_data\nstructure will be freed. However, this\
+  \ data structure is used for\ncompletion notification after the restart is completed,\
+  \ which leads\nto a UAF bug.\n\nThis results in a KFENCE bug notice.\n\n  BUG: KFENCE:\
+  \ use-after-free read in adf_device_reset_worker+0x38/0xa0 [intel_qat]\n  Use-after-free\
+  \ read at 0x00000000bc56fddf (in kfence-#142):\n  adf_device_reset_worker+0x38/0xa0\
+  \ [intel_qat]\n  process_one_work+0x173/0x340\n\nTo resolve this race condition,\
+  \ the memory associated to the container\nof the work_struct is freed on the worker\
+  \ if the timeout expired,\notherwise on the function that schedules the worker.\n\
+  The timeout detection can be done by checking if the caller is\nstill waiting for\
+  \ completion or not by using completion_done() function.\n\nFixes: d8cba25d2c68\
+  \ (\"crypto: qat - Intel(R) QAT driver framework\")\nCc: <stable@vger.kernel.org>\n\
+  Signed-off-by: Damian Muszynski <damian.muszynski@intel.com>\nReviewed-by: Giovanni\
+  \ Cabiddu <giovanni.cabiddu@intel.com>\nSigned-off-by: Herbert Xu <herbert@gondor.apana.org.au>\n\
+  \n## Buggy Code\n\n```c\n// Function: adf_device_reset_worker in drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  static void adf_device_reset_worker(struct work_struct *work)\n{\n\tstruct adf_reset_dev_data\
+  \ *reset_data =\n\t\t  container_of(work, struct adf_reset_dev_data, reset_work);\n\
+  \tstruct adf_accel_dev *accel_dev = reset_data->accel_dev;\n\tunsigned long wait_jiffies\
+  \ = msecs_to_jiffies(10000);\n\tstruct adf_sriov_dev_data sriov_data;\n\n\tadf_dev_restarting_notify(accel_dev);\n\
+  \tif (adf_dev_restart(accel_dev)) {\n\t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n\t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n\t\t\tkfree(reset_data);\n\
+  \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\n\");\n\t\treturn;\n\
+  \t}\n\n\tsriov_data.accel_dev = accel_dev;\n\tinit_completion(&sriov_data.compl);\n\
+  \tINIT_WORK(&sriov_data.sriov_work, adf_device_sriov_worker);\n\tqueue_work(device_sriov_wq,\
+  \ &sriov_data.sriov_work);\n\tif (wait_for_completion_timeout(&sriov_data.compl,\
+  \ wait_jiffies))\n\t\tadf_pf2vf_notify_restarted(accel_dev);\n\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\n\t/* The dev is back\
+  \ alive. Notify the caller if in sync mode */\n\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n\
+  \t\tcomplete(&reset_data->compl);\n\telse\n\t\tkfree(reset_data);\n}\n```\n\n```c\n\
+  // Function: adf_slot_reset in drivers/crypto/intel/qat/qat_common/adf_aer.c\nstatic\
+  \ pci_ers_result_t adf_slot_reset(struct pci_dev *pdev)\n{\n\tstruct adf_accel_dev\
+  \ *accel_dev = adf_devmgr_pci_to_accel_dev(pdev);\n\tint res = 0;\n\n\tif (!accel_dev)\
+  \ {\n\t\tpr_err(\"QAT: Can't find acceleration device\\n\");\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\
+  \t}\n\n\tif (!pdev->is_busmaster)\n\t\tpci_set_master(pdev);\n\tpci_restore_state(pdev);\n\
+  \tpci_save_state(pdev);\n\tres = adf_dev_up(accel_dev, false);\n\tif (res && res\
+  \ != -EALREADY)\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\n\tadf_reenable_sriov(accel_dev);\n\
+  \tadf_pf2vf_notify_restarted(accel_dev);\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\treturn PCI_ERS_RESULT_RECOVERED;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/crypto/intel/qat/qat_common/adf_aer.c\
+  \ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\nindex 3597e7605a14..9da2278bd5b7\
+  \ 100644\n--- a/drivers/crypto/intel/qat/qat_common/adf_aer.c\n+++ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  @@ -130,7 +130,8 @@ static void adf_device_reset_worker(struct work_struct *work)\n\
+  \ \tif (adf_dev_restart(accel_dev)) {\n \t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n \t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n-\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n+\t\tif (reset_data->mode\
+  \ == ADF_DEV_RESET_ASYNC ||\n+\t\t    completion_done(&reset_data->compl))\n \t\t\
+  \tkfree(reset_data);\n \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\\
+  n\");\n \t\treturn;\n@@ -146,11 +147,19 @@ static void adf_device_reset_worker(struct\
+  \ work_struct *work)\n \tadf_dev_restarted_notify(accel_dev);\n \tclear_bit(ADF_STATUS_RESTARTING,\
+  \ &accel_dev->status);\n \n-\t/* The dev is back alive. Notify the caller if in\
+  \ sync mode */\n-\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n-\t\tcomplete(&reset_data->compl);\n\
+  -\telse\n+\t/*\n+\t * The dev is back alive. Notify the caller if in sync mode\n\
+  +\t *\n+\t * If device restart will take a more time than expected,\n+\t * the schedule_reset()\
+  \ function can timeout and exit. This can be\n+\t * detected by calling the completion_done()\
+  \ function. In this case\n+\t * the reset_data structure needs to be freed here.\n\
+  +\t */\n+\tif (reset_data->mode == ADF_DEV_RESET_ASYNC ||\n+\t    completion_done(&reset_data->compl))\n\
+  \ \t\tkfree(reset_data);\n+\telse\n+\t\tcomplete(&reset_data->compl);\n }\n \n static\
+  \ int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n@@ -183,8 +192,9\
+  \ @@ static int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n \t\
+  \t\tdev_err(&GET_DEV(accel_dev),\n \t\t\t\t\"Reset device timeout expired\\n\");\n\
+  \ \t\t\tret = -EFAULT;\n+\t\t} else {\n+\t\t\tkfree(reset_data);\n \t\t}\n-\t\t\
+  kfree(reset_data);\n \t\treturn ret;\n \t}\n \treturn 0;\n```\n"
+pattern: "## Bug Pattern\n\nFreeing the work item\u2019s context from the submitting\
+  \ thread after a timeout while the worker still uses that context. Specifically:\n\
+  - A heap-allocated structure (containing a completion and work_struct) is shared\
+  \ between the submitter and the worker.\n- The submitter waits for completion with\
+  \ a timeout and frees the structure on timeout.\n- The worker, unaware of the timeout,\
+  \ unconditionally accesses the structure (e.g., calls complete() or reads fields),\
+  \ causing a use-after-free.\n- Ownership/lifetime is split by a mode flag (sync/async)\
+  \ but does not account for the sync timeout case; there is no check (e.g., completion_done())\
+  \ in the worker to detect that the waiter gave up and transferred freeing responsibility."
+plan: "Plan to detect \u201Cwork context freed by submitter after timeout while worker\
+  \ still uses it\u201D (missing completion_done() guard)\n\n1) Program state customization\n\
+  - No custom program state is strictly necessary. This pattern can be identified\
+  \ with AST-centric scans and minimal heuristics.\n- Do not register any ProgramState\
+  \ maps by default. Keep it simple and focus on two complementary AST checks:\n \
+  \ - Worker-side: work handler uses the context (complete()/kfree()) without a completion_done()\
+  \ guard.\n  - Submitter-side: submitter frees the context in the timeout branch\
+  \ right after wait_for_completion_timeout().\n\n2) Callback functions and how to\
+  \ implement\n\nA. checkASTCodeBody: worker-side detection (primary and simplest,\
+  \ no state)\nGoal: In a work handler (void f(struct work_struct *)), detect:\n-\
+  \ The handler derives a context from work via container_of(work,...).\n- It calls\
+  \ complete(&ctx->compl) and/or kfree(ctx).\n- It does not call completion_done(&ctx->compl)\
+  \ anywhere in the handler.\nThis indicates the worker is unaware of submitter timeout\
+  \ and may access/free a context that the submitter already freed.\n\nSteps:\n1.\
+  \ Identify a work handler:\n   - For each FunctionDecl D with a body, check if the\
+  \ first parameter exists and its QualType pretty string contains \"work_struct *\"\
+  \ (or is a pointer to \u2018struct work_struct\u2019).\n   - Record the parameter\
+  \ name, e.g., \"work\".\n2. Heuristically derive the \u201Ccontext variable\u201D\
+  \ name:\n   - Traverse all local variable declarations (VarDecl with init).\n  \
+  \ - If the initializer\u2019s source (ExprHasName) contains both the work parameter\
+  \ name and \"container_of\", treat this VarDecl as the \u201Cctx\u201D variable\
+  \ candidate.\n   - If multiple candidates exist, pick the first one; store its IdentifierInfo()->getName()\
+  \ as CtxName.\n   - If no local that looks like container_of is found, as a fallback,\
+  \ still try to detect complete(&X->compl) and completion_done(&X->compl) calls whose\
+  \ arguments don\u2019t mention \"work\" but consistently mention one variable name;\
+  \ pick that as CtxName.\n3. Scan for uses:\n   - Walk all CallExpr in the function\
+  \ body:\n     - If callee identifier is \"complete\" or \"complete_all\":\n    \
+  \   - Let Arg0 be the call\u2019s first argument. If ExprHasName(Arg0, CtxName)\
+  \ and ExprHasName(Arg0, \"compl\"), mark UsedComplete = true.\n     - If callee\
+  \ identifier is \"kfree\":\n       - If the single argument\u2019s text ExprHasName(Arg0,\
+  \ CtxName), mark UsedKfree = true.\n     - If callee identifier is \"completion_done\"\
+  :\n       - If Arg0 mentions both CtxName and \"compl\", mark HasGuard = true.\n\
+  4. Report:\n   - If (UsedComplete || UsedKfree) && !HasGuard, report a bug at the\
+  \ function location:\n     - Message: \"work handler lacks completion_done() guard\
+  \ before using/freeing shared context\"\n   - Use a BasicBugReport or PathSensitiveBugReport\
+  \ (the AST code body callback is fine for a basic report).\nNotes:\n- Rely on ExprHasName\
+  \ to match source substrings such as \u201Cctx->compl\u201D, \u201C&ctx->compl\u201D\
+  . This keeps the logic simple and robust in kernel macro-heavy code.\n- This directly\
+  \ flags the missing guard that caused the real UAF.\n\nB. checkBranchCondition:\
+  \ submitter-side detection (secondary, low false-negative heuristic)\nGoal: In a\
+  \ submitter function, detect freeing the work-item context in the timeout branch\
+  \ after wait_for_completion_timeout(&ctx->compl, \u2026), while the worker may still\
+  \ use it.\nWe purposefully focus on the \u201Cif (!wait_for_completion_timeout(...))\
+  \ { kfree(ctx); }\u201D pattern.\n\nSteps:\n1. On each branch condition, check for\
+  \ the pattern of negated wait:\n   - If Condition is a UnaryOperator '!' whose subexpr\
+  \ is a CallExpr Call.\n   - Check that the callee identifier is \"wait_for_completion_timeout\"\
+  .\n2. Extract the context from the wait call:\n   - From Call\u2019s first argument\
+  \ Arg0 (the completion), try to peel \u201C&ctx->compl\u201D:\n     - If Arg0 is\
+  \ a UnaryOperator \u2018&\u2019 of a MemberExpr ME:\n       - If ME\u2019s name\
+  \ contains \"compl\" (use ExprHasName(ME, \"compl\")), then ME->getBase() is the\
+  \ expression for \u201Cctx\u201D.\n       - If ME->getBase() is a DeclRefExpr, get\
+  \ ctx variable name (CtxName).\n     - If the exact shape differs, fallback to source\
+  \ heuristics:\n       - Get text of Arg0 using ExprHasName and attempt to find the\
+  \ token before \u201C->compl\u201D to identify the variable. If not possible, skip\
+  \ to avoid FPs.\n3. Find the IfStmt corresponding to the condition:\n   - Use findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C) to get the owning IfStmt IfS.\n   - The \u201Cthen\u201D branch of IfS corresponds\
+  \ to timeout (because it\u2019s the negated call).\n4. Search for kfree(ctx) in\
+  \ the timeout branch:\n   - Use findSpecificTypeInChildren<CallExpr>(IfS->getThen())\
+  \ to get a child call (note: helper returns only one; if not kfree, recursively\
+  \ scan children manually if desired. For simplicity: if the first call found is\
+  \ kfree with argument containing CtxName, flag. If not, iterate shallowly over compound\
+  \ children to find kfree).\n   - When you find CallExpr with callee \"kfree\" and\
+  \ argument contains CtxName (ExprHasName), record FoundTimeoutFree = true.\n5. Optionally,\
+  \ ensure this context is a work item context:\n   - In the same function body, search\
+  \ for a queue_work family call that uses &ctx->work:\n     - Look for CallExpr callee\
+  \ \"queue_work\" (or \"queue_delayed_work\" etc. if desired).\n     - Check if any\
+  \ argument contains both CtxName and \"work\" (ExprHasName(arg, CtxName) && ExprHasName(arg,\
+  \ \"work\")).\n     - If found, mark QueuedWork = true.\n6. Report:\n   - If FoundTimeoutFree\
+  \ is true and QueuedWork is true, report:\n     - Message: \"frees work context\
+  \ on timeout while worker may still use it\"\n\nC. Optional: checkASTCodeBody: submitter\
+  \ unconditional free after wait\nTo partially catch the specific variant where the\
+  \ free happens unconditionally after the if:\n1. In function body, search for a\
+  \ CallExpr to wait_for_completion_timeout as in B. Extract CtxName.\n2. After locating\
+  \ that IfStmt with condition of either \u201C!wait_for_completion_timeout(...)\u201D\
+  \ or \u201Cwait_for_completion_timeout(...)\u201D:\n   - Look for any kfree(ctx)\
+  \ in the sibling/next statements (e.g., in the same compound block following the\
+  \ IfStmt). A simple heuristic:\n     - Get the CompoundStmt that contains the IfStmt\
+  \ (findSpecificTypeInParents<CompoundStmt>).\n     - Iterate its children after\
+  \ the IfStmt node; if any kfree call\u2019s arg mentions CtxName, then report the\
+  \ same warning as in B.\n3. Again optionally gate on having observed queue_work(...,\
+  \ &ctx->work) earlier in the function.\n\n3) Reporting\n- Use generateNonFatalErrorNode()\
+  \ and std::make_unique<PathSensitiveBugReport> for branch-based report in checkBranchCondition;\
+  \ or std::make_unique<BasicBugReport> in checkASTCodeBody if not relying on path.\n\
+  - Keep messages short:\n  - Worker: \"work handler lacks completion_done() guard\
+  \ before using/freeing shared context\"\n  - Submitter: \"frees work context on\
+  \ timeout while worker may still use it\"\n\n4) Helper utilities used\n- ExprHasName\
+  \ to match substrings like \"container_of\", variable names, \"->compl\", \"&...\"\
+  .\n- findSpecificTypeInParents<IfStmt> to locate the enclosing IfStmt from a condition\
+  \ in checkBranchCondition.\n- findSpecificTypeInChildren<CallExpr> to search for\
+  \ kfree in the then-branch (best-effort).\n- Optionally, EvaluateExprToInt is not\
+  \ required here.\n- getMemRegionFromExpr is not required in the simplified approach.\n\
+  \n5) Summary of the simplest actionable steps\n- Implement worker-side AST scan\
+  \ in checkASTCodeBody, as it pinpoints the missing completion_done() guard which\
+  \ is the root cause in the worker.\n- Implement submitter-side timeout-free detection\
+  \ via checkBranchCondition for the common pattern \u201Cif (!wait_for_completion_timeout(&ctx->compl,\
+  \ ...)) kfree(ctx);\u201D with an optional confirmation that queue_work(..., &ctx->work)\
+  \ appears in the same function.\n- Optionally, catch unconditional free after the\
+  \ if by scanning sibling statements in checkASTCodeBody."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Type.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ No custom program states required for this checker.\n\nnamespace {\n\nstatic const\
+  \ FunctionDecl *getDirectCallee(const CallExpr *CE) {\n  if (!CE) return nullptr;\n\
+  \  return CE->getDirectCallee();\n}\n\nstatic StringRef getCalleeName(const CallExpr\
+  \ *CE) {\n  if (const FunctionDecl *FD = getDirectCallee(CE)) {\n    if (const IdentifierInfo\
+  \ *II = FD->getIdentifier())\n      return II->getName();\n  }\n  return StringRef();\n\
+  }\n\nstatic const VarDecl *getVarDeclFromDeclRefBase(const Expr *E) {\n  if (!E)\
+  \ return nullptr;\n  E = E->IgnoreParenImpCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n      return VD;\n\
+  \  }\n  return nullptr;\n}\n\n// Extract the base variable from an argument that\
+  \ looks like &ctx->compl or ctx->compl\nstatic const VarDecl *extractBaseVarFromComplArg(const\
+  \ Expr *Arg) {\n  if (!Arg) return nullptr;\n  const Expr *E = Arg->IgnoreParenImpCasts();\n\
+  \  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode() ==\
+  \ UO_AddrOf)\n      E = UO->getSubExpr()->IgnoreParenImpCasts();\n  }\n\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(E)) {\n    const ValueDecl *Member = ME->getMemberDecl();\n\
+  \    if (!Member) return nullptr;\n    // We expect field named 'compl' (Linux completion\
+  \ field)\n    if (Member->getIdentifier() && Member->getName().equals(\"compl\"\
+  )) {\n      const Expr *Base = ME->getBase();\n      if (!Base) return nullptr;\n\
+  \      return getVarDeclFromDeclRefBase(Base);\n    }\n  }\n  return nullptr;\n\
+  }\n\nstatic const VarDecl *extractVarFromExprSimple(const Expr *E) {\n  if (!E)\
+  \ return nullptr;\n  E = E->IgnoreParenImpCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n      return VD;\n\
+  \  }\n  return nullptr;\n}\n\nstatic bool isWorkHandler(const FunctionDecl *FD)\
+  \ {\n  if (!FD) return false;\n  if (!FD->hasBody()) return false;\n  if (FD->param_size()\
+  \ < 1) return false;\n\n  const ParmVarDecl *P0 = FD->getParamDecl(0);\n  if (!P0)\
+  \ return false;\n\n  QualType QT = P0->getType();\n  if (!QT->isPointerType()) return\
+  \ false;\n\n  QualType Pointee = QT->getPointeeType();\n  if (const auto *RT = Pointee->getAs<RecordType>())\
+  \ {\n    const RecordDecl *RD = RT->getDecl();\n    if (const IdentifierInfo *II\
+  \ = RD->getIdentifier()) {\n      // We expect 'work_struct'\n      if (II->getName().equals(\"\
+  work_struct\"))\n        return true;\n    }\n  }\n  // Fallback heuristic (rarely\
+  \ needed) - rely on type spelling\n  std::string S;\n  llvm::raw_string_ostream\
+  \ OS(S);\n  QT.print(OS, PrintingPolicy(FD->getASTContext().getLangOpts()));\n \
+  \ OS.flush();\n  return (S.find(\"work_struct *\") != std::string::npos);\n}\n\n\
+  // Recursively check for kfree(var) inside a statement subtree.\nstatic bool containsKfreeOfVar(const\
+  \ Stmt *S, const VarDecl *VD) {\n  if (!S || !VD) return false;\n  for (const Stmt\
+  \ *Child : S->children()) {\n    if (!Child) continue;\n    if (const auto *CE =\
+  \ dyn_cast<CallExpr>(Child)) {\n      StringRef Callee = getCalleeName(CE);\n  \
+  \    if (Callee.equals(\"kfree\") && CE->getNumArgs() >= 1) {\n        const VarDecl\
+  \ *ArgVD = extractVarFromExprSimple(CE->getArg(0));\n        if (ArgVD == VD)\n\
+  \          return true;\n      }\n    }\n    if (containsKfreeOfVar(Child, VD))\n\
+  \      return true;\n  }\n  return false;\n}\n\n// Visitor to scan work handler\
+  \ function body for usage/free/guard patterns.\nclass WorkerVisitor : public RecursiveASTVisitor<WorkerVisitor>\
+  \ {\npublic:\n  WorkerVisitor(llvm::SmallPtrSetImpl<const VarDecl*> &CtxVars,\n\
+  \                bool &UsedComplete, bool &UsedKfree, bool &HasGuard)\n      : ObservedCtxVars(CtxVars),\
+  \ UsedComplete(UsedComplete),\n        UsedKfree(UsedKfree), HasGuard(HasGuard)\
+  \ {}\n\n  bool VisitCallExpr(CallExpr *CE) {\n    StringRef Name = getCalleeName(CE);\n\
+  \    if (Name.empty())\n      return true;\n\n    if ((Name.equals(\"complete\"\
+  ) || Name.equals(\"complete_all\")) && CE->getNumArgs() >= 1) {\n      if (const\
+  \ VarDecl *Base = extractBaseVarFromComplArg(CE->getArg(0))) {\n        ObservedCtxVars.insert(Base);\n\
+  \        UsedComplete = true;\n      }\n    } else if (Name.equals(\"completion_done\"\
+  ) && CE->getNumArgs() >= 1) {\n      if (const VarDecl *Base = extractBaseVarFromComplArg(CE->getArg(0)))\
+  \ {\n        ObservedCtxVars.insert(Base);\n        HasGuard = true;\n      }\n\
+  \    } else if (Name.equals(\"kfree\") && CE->getNumArgs() >= 1) {\n      if (const\
+  \ VarDecl *V = extractVarFromExprSimple(CE->getArg(0))) {\n        if (ObservedCtxVars.count(V))\n\
+  \          UsedKfree = true;\n      }\n    }\n\n    return true;\n  }\n\nprivate:\n\
+  \  llvm::SmallPtrSetImpl<const VarDecl*> &ObservedCtxVars;\n  bool &UsedComplete;\n\
+  \  bool &UsedKfree;\n  bool &HasGuard;\n};\n\nclass SAGenTestChecker : public Checker<check::ASTCodeBody,\
+  \ check::BranchCondition> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Work handler missing completion_done\
+  \ guard\", \"Concurrency\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n      void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n\n   private:\n      // Helper to report AST-level\
+  \ issue (worker side).\n      void reportWorker(const FunctionDecl *FD, BugReporter\
+  \ &BR) const;\n      // Helper to report branch-based issue (submitter side).\n\
+  \      void reportSubmitter(const IfStmt *IfS, CheckerContext &C) const;\n};\n\n\
+  void SAGenTestChecker::reportWorker(const FunctionDecl *FD, BugReporter &BR) const\
+  \ {\n  if (!BT || !FD) return;\n  PathDiagnosticLocation Loc = PathDiagnosticLocation::createBegin(FD,\
+  \ BR.getSourceManager());\n  auto R = std::make_unique<BasicBugReport>(\n      *BT,\
+  \ \"work handler lacks completion_done() guard before using/freeing shared context\"\
+  , Loc);\n  BR.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::reportSubmitter(const\
+  \ IfStmt *IfS, CheckerContext &C) const {\n  if (!BT || !IfS) return;\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"frees work context on timeout while worker may still use it\", N);\n\
+  \  R->addRange(IfS->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\nvoid\
+  \ SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const {\n  if (!D) return;\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  if (!isWorkHandler(FD))\n    return;\n\
+  \n  Stmt *Body = FD->getBody();\n  if (!Body)\n    return;\n\n  llvm::SmallPtrSet<const\
+  \ VarDecl*, 4> ObservedCtxVars;\n  bool UsedComplete = false;\n  bool UsedKfree\
+  \ = false;\n  bool HasGuard = false;\n\n  WorkerVisitor V(ObservedCtxVars, UsedComplete,\
+  \ UsedKfree, HasGuard);\n  V.TraverseStmt(Body);\n\n  if ((UsedComplete || UsedKfree)\
+  \ && !HasGuard) {\n    reportWorker(FD, BR);\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition) return;\n  const\
+  \ auto *CondE = dyn_cast<Expr>(Condition);\n  if (!CondE) return;\n\n  const Expr\
+  \ *E = CondE->IgnoreParenCasts();\n\n  // Pattern: if (!wait_for_completion_timeout(&ctx->compl,\
+  \ ...)) { kfree(ctx); }\n  const UnaryOperator *UO = dyn_cast<UnaryOperator>(E);\n\
+  \  if (!UO || UO->getOpcode() != UO_LNot)\n    return;\n\n  const Expr *Sub = UO->getSubExpr();\n\
+  \  if (!Sub) return;\n  Sub = Sub->IgnoreParenCasts();\n\n  const auto *CE = dyn_cast<CallExpr>(Sub);\n\
+  \  if (!CE) return;\n\n  StringRef Callee = getCalleeName(CE);\n  if (!Callee.equals(\"\
+  wait_for_completion_timeout\"))\n    return;\n\n  if (CE->getNumArgs() < 1)\n  \
+  \  return;\n\n  const VarDecl *CtxVar = extractBaseVarFromComplArg(CE->getArg(0));\n\
+  \  if (!CtxVar)\n    return;\n\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IfS) return;\n\n  const Stmt *Then = IfS->getThen();\n  if (!Then)\
+  \ return;\n\n  if (containsKfreeOfVar(Then, CtxVar)) {\n    reportSubmitter(IfS,\
+  \ C);\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects missing completion_done() guard in work handlers and free-on-timeout\
+  \ of shared work context\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

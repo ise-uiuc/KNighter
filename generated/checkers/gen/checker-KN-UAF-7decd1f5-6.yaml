@@ -1,0 +1,444 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 7decd1f5904a489d3ccdcf131972f94645681689
+commit_type: UAF
+index: 6
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// ================= Program States =================\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(FreedUnderUnlockSet, const MemRegion*)\nREGISTER_TRAIT_WITH_PROGRAMSTATE(InUnlockedRegion,\
+  \ bool)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PostCall,\
+  \ check::Bind, check::Location> {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n\
+  \  SAGenTestChecker() : BT(new BugType(this, \"Use-after-free after unlocked close\"\
+  , \"Memory Safety\")) {}\n\n  void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const;\n\nprivate:\n  // Helper predicates\n  static bool isSpinUnlock(const\
+  \ CallEvent &Call, CheckerContext &C);\n  static bool isSpinLock(const CallEvent\
+  \ &Call, CheckerContext &C);\n  static bool isKnownFreeFunc(const CallEvent &Call,\
+  \ CheckerContext &C,\n                              llvm::SmallVectorImpl<unsigned>\
+  \ &FreedParamIdxs);\n\n  static const MemRegion *getBaseRegionFromExpr(const Expr\
+  \ *E, CheckerContext &C);\n  void reportUAF(const Stmt *AccessS, CheckerContext\
+  \ &C) const;\n};\n\n// ---------------- Helper Implementations ----------------\n\
+  \nbool SAGenTestChecker::isSpinUnlock(const CallEvent &Call, CheckerContext &C)\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, \"spin_unlock_bh\", C) || ExprHasName(E, \"spin_unlock\", C);\n\
+  }\n\nbool SAGenTestChecker::isSpinLock(const CallEvent &Call, CheckerContext &C)\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, \"spin_lock_bh\", C) || ExprHasName(E, \"spin_lock\", C);\n}\n\n\
+  // Known-freeing function table tailored for the target bug\nbool SAGenTestChecker::isKnownFreeFunc(const\
+  \ CallEvent &Call, CheckerContext &C,\n                                       llvm::SmallVectorImpl<unsigned>\
+  \ &FreedParamIdxs) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return\
+  \ false;\n\n  // For this pattern, mptcp_close_ssk(sk, ssk, subflow) may free 'subflow'\
+  \ (arg index 2)\n  if (ExprHasName(E, \"mptcp_close_ssk\", C)) {\n    FreedParamIdxs.push_back(2);\n\
+  \    return true;\n  }\n  return false;\n}\n\nconst MemRegion *SAGenTestChecker::getBaseRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return nullptr;\n  const MemRegion *MR\
+  \ = getMemRegionFromExpr(E, C);\n  if (!MR) return nullptr;\n  MR = MR->getBaseRegion();\n\
+  \  return MR;\n}\n\nvoid SAGenTestChecker::reportUAF(const Stmt *AccessS, CheckerContext\
+  \ &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n \
+  \   return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\
+  \ \"Use-after-free after close under unlocked region\", N);\n  if (AccessS)\n  \
+  \  R->addRange(AccessS->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n\
+  // ---------------- Checker Callbacks ----------------\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  // Track unlocked window\n  if (isSpinUnlock(Call,\
+  \ C)) {\n    State = State->set<InUnlockedRegion>(true);\n    Changed = true;\n\
+  \  } else if (isSpinLock(Call, C)) {\n    State = State->set<InUnlockedRegion>(false);\n\
+  \    Changed = true;\n  }\n\n  // If currently in the unlocked window, mark pointer\
+  \ variables passed to\n  // known-freeing functions as possibly freed under unlock.\n\
+  \  const bool *UnlockedPtr = State->get<InUnlockedRegion>();\n  bool InUnlocked\
+  \ = (UnlockedPtr && *UnlockedPtr);\n\n  llvm::SmallVector<unsigned, 4> FreedIdxs;\n\
+  \  if (InUnlocked && isKnownFreeFunc(Call, C, FreedIdxs)) {\n    for (unsigned Idx\
+  \ : FreedIdxs) {\n      if (Idx >= Call.getNumArgs())\n        continue;\n     \
+  \ const Expr *ArgE = Call.getArgExpr(Idx);\n      const MemRegion *MR = getBaseRegionFromExpr(ArgE,\
+  \ C);\n      if (!MR)\n        continue;\n      State = State->add<FreedUnderUnlockSet>(MR);\n\
+  \      Changed = true;\n    }\n  }\n\n  if (Changed)\n    C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // If a pointer variable\
+  \ that we tracked as \"freed under unlock\" is reassigned,\n  // remove it from\
+  \ the set to avoid stale reports.\n  if (const MemRegion *LReg = Loc.getAsRegion())\
+  \ {\n    LReg = LReg->getBaseRegion();\n    if (LReg) {\n      auto Set = State->get<FreedUnderUnlockSet>();\n\
+  \      if (Set && Set->contains(LReg)) {\n        State = State->remove<FreedUnderUnlockSet>(LReg);\n\
+  \        C.addTransition(State);\n      }\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {\n  if (!IsLoad ||\
+  \ !S)\n    return;\n\n  ProgramStateRef State = C.getState();\n  // Only warn after\
+  \ the lock is reacquired (i.e., not in the unlocked window)\n  const bool *UnlockedPtr\
+  \ = State->get<InUnlockedRegion>();\n  if (UnlockedPtr && *UnlockedPtr)\n    return;\n\
+  \n  const MemRegion *BaseVarReg = nullptr;\n\n  // Focus on dereference patterns:\
+  \ 'ptr->field', '*ptr', 'ptr[i]'\n  if (const auto *ME = dyn_cast<MemberExpr>(S))\
+  \ {\n    if (!ME->isArrow())\n      return; // Only track '->', not '.'\n    const\
+  \ Expr *Base = ME->getBase();\n    BaseVarReg = getBaseRegionFromExpr(Base, C);\n\
+  \  } else if (const auto *UO = dyn_cast<UnaryOperator>(S)) {\n    if (UO->getOpcode()\
+  \ != UO_Deref)\n      return;\n    const Expr *Base = UO->getSubExpr();\n    BaseVarReg\
+  \ = getBaseRegionFromExpr(Base, C);\n  } else if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(S))\
+  \ {\n    const Expr *Base = ASE->getBase();\n    BaseVarReg = getBaseRegionFromExpr(Base,\
+  \ C);\n  } else {\n    // Other expressions are not targeted.\n    return;\n  }\n\
+  \n  if (!BaseVarReg)\n    return;\n\n  auto Set = State->get<FreedUnderUnlockSet>();\n\
+  \  if (Set && Set->contains(BaseVarReg)) {\n    reportUAF(S, C);\n  }\n}\n\n} //\
+  \ end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects use-after-free when an object may be freed by a close function\
+  \ between spin_unlock and spin_lock, then accessed after lock\",\n      \"\");\n\
+  }\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nmptcp: pm: fix UaF read in mptcp_pm_nl_rm_addr_or_subflow\n\
+  \nSyzkaller reported this splat:\n\n  ==================================================================\n\
+  \  BUG: KASAN: slab-use-after-free in mptcp_pm_nl_rm_addr_or_subflow+0xb44/0xcc0\
+  \ net/mptcp/pm_netlink.c:881\n  Read of size 4 at addr ffff8880569ac858 by task\
+  \ syz.1.2799/14662\n\n  CPU: 0 UID: 0 PID: 14662 Comm: syz.1.2799 Not tainted 6.12.0-rc2-syzkaller-00307-g36c254515dc6\
+  \ #0\n  Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 1.16.3-debian-1.16.3-2~bpo12+1\
+  \ 04/01/2014\n  Call Trace:\n   <TASK>\n   __dump_stack lib/dump_stack.c:94 [inline]\n\
+  \   dump_stack_lvl+0x116/0x1f0 lib/dump_stack.c:120\n   print_address_description\
+  \ mm/kasan/report.c:377 [inline]\n   print_report+0xc3/0x620 mm/kasan/report.c:488\n\
+  \   kasan_report+0xd9/0x110 mm/kasan/report.c:601\n   mptcp_pm_nl_rm_addr_or_subflow+0xb44/0xcc0\
+  \ net/mptcp/pm_netlink.c:881\n   mptcp_pm_nl_rm_subflow_received net/mptcp/pm_netlink.c:914\
+  \ [inline]\n   mptcp_nl_remove_id_zero_address+0x305/0x4a0 net/mptcp/pm_netlink.c:1572\n\
+  \   mptcp_pm_nl_del_addr_doit+0x5c9/0x770 net/mptcp/pm_netlink.c:1603\n   genl_family_rcv_msg_doit+0x202/0x2f0\
+  \ net/netlink/genetlink.c:1115\n   genl_family_rcv_msg net/netlink/genetlink.c:1195\
+  \ [inline]\n   genl_rcv_msg+0x565/0x800 net/netlink/genetlink.c:1210\n   netlink_rcv_skb+0x165/0x410\
+  \ net/netlink/af_netlink.c:2551\n   genl_rcv+0x28/0x40 net/netlink/genetlink.c:1219\n\
+  \   netlink_unicast_kernel net/netlink/af_netlink.c:1331 [inline]\n   netlink_unicast+0x53c/0x7f0\
+  \ net/netlink/af_netlink.c:1357\n   netlink_sendmsg+0x8b8/0xd70 net/netlink/af_netlink.c:1901\n\
+  \   sock_sendmsg_nosec net/socket.c:729 [inline]\n   __sock_sendmsg net/socket.c:744\
+  \ [inline]\n   ____sys_sendmsg+0x9ae/0xb40 net/socket.c:2607\n   ___sys_sendmsg+0x135/0x1e0\
+  \ net/socket.c:2661\n   __sys_sendmsg+0x117/0x1f0 net/socket.c:2690\n   do_syscall_32_irqs_on\
+  \ arch/x86/entry/common.c:165 [inline]\n   __do_fast_syscall_32+0x73/0x120 arch/x86/entry/common.c:386\n\
+  \   do_fast_syscall_32+0x32/0x80 arch/x86/entry/common.c:411\n   entry_SYSENTER_compat_after_hwframe+0x84/0x8e\n\
+  \  RIP: 0023:0xf7fe4579\n  Code: b8 01 10 06 03 74 b4 01 10 07 03 74 b0 01 10 08\
+  \ 03 74 d8 01 00 00 00 00 00 00 00 00 00 00 00 00 00 51 52 55 89 e5 0f 34 cd 80\
+  \ <5d> 5a 59 c3 90 90 90 90 8d b4 26 00 00 00 00 8d b4 26 00 00 00 00\n  RSP: 002b:00000000f574556c\
+  \ EFLAGS: 00000296 ORIG_RAX: 0000000000000172\n  RAX: ffffffffffffffda RBX: 000000000000000b\
+  \ RCX: 0000000020000140\n  RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000000000000\n\
+  \  RBP: 0000000000000000 R08: 0000000000000000 R09: 0000000000000000\n  R10: 0000000000000000\
+  \ R11: 0000000000000296 R12: 0000000000000000\n  R13: 0000000000000000 R14: 0000000000000000\
+  \ R15: 0000000000000000\n   </TASK>\n\n  Allocated by task 5387:\n   kasan_save_stack+0x33/0x60\
+  \ mm/kasan/common.c:47\n   kasan_save_track+0x14/0x30 mm/kasan/common.c:68\n   poison_kmalloc_redzone\
+  \ mm/kasan/common.c:377 [inline]\n   __kasan_kmalloc+0xaa/0xb0 mm/kasan/common.c:394\n\
+  \   kmalloc_noprof include/linux/slab.h:878 [inline]\n   kzalloc_noprof include/linux/slab.h:1014\
+  \ [inline]\n   subflow_create_ctx+0x87/0x2a0 net/mptcp/subflow.c:1803\n   subflow_ulp_init+0xc3/0x4d0\
+  \ net/mptcp/subflow.c:1956\n   __tcp_set_ulp net/ipv4/tcp_ulp.c:146 [inline]\n \
+  \  tcp_set_ulp+0x326/0x7f0 net/ipv4/tcp_ulp.c:167\n   mptcp_subflow_create_socket+0x4ae/0x10a0\
+  \ net/mptcp/subflow.c:1764\n   __mptcp_subflow_connect+0x3cc/0x1490 net/mptcp/subflow.c:1592\n\
+  \   mptcp_pm_create_subflow_or_signal_addr+0xbda/0x23a0 net/mptcp/pm_netlink.c:642\n\
+  \   mptcp_pm_nl_fully_established net/mptcp/pm_netlink.c:650 [inline]\n   mptcp_pm_nl_work+0x3a1/0x4f0\
+  \ net/mptcp/pm_netlink.c:943\n   mptcp_worker+0x15a/0x1240 net/mptcp/protocol.c:2777\n\
+  \   process_one_work+0x958/0x1b30 kernel/workqueue.c:3229\n   process_scheduled_works\
+  \ kernel/workqueue.c:3310 [inline]\n   worker_thread+0x6c8/0xf00 kernel/workqueue.c:3391\n\
+  \   kthread+0x2c1/0x3a0 kernel/kthread.c:389\n   ret_from_fork+0x45/0x80 arch/x86/kernel/process.c:147\n\
+  \   ret_from_fork_asm+0x1a/0x30 arch/x86/entry/entry_64.S:244\n\n  Freed by task\
+  \ 113:\n   kasan_save_stack+0x33/0x60 mm/kasan/common.c:47\n   kasan_save_track+0x14/0x30\
+  \ mm/kasan/common.c:68\n   kasan_save_free_info+0x3b/0x60 mm/kasan/generic.c:579\n\
+  \   poison_slab_object mm/kasan/common.c:247 [inline]\n   __kasan_slab_free+0x51/0x70\
+  \ mm/kasan/common.c:264\n   kasan_slab_free include/linux/kasan.h:230 [inline]\n\
+  \   slab_free_hook mm/slub.c:2342 [inline]\n   slab_free mm/slub.c:4579 [inline]\n\
+  \   kfree+0x14f/0x4b0 mm/slub.c:4727\n   kvfree+0x47/0x50 mm/util.c:701\n   kvfree_rcu_list+0xf5/0x2c0\
+  \ kernel/rcu/tree.c:3423\n   kvfree_rcu_drain_ready kernel/rcu/tree.c:3563 [inline]\n\
+  \   kfree_rcu_monitor+0x503/0x8b0 kernel/rcu/tree.c:3632\n   kfree_rcu_shrink_scan+0x245/0x3a0\
+  \ kernel/rcu/tree.c:3966\n   do_shrink_slab+0x44f/0x11c0 mm/shrinker.c:435\n   shrink_slab+0x32b/0x12a0\
+  \ mm/shrinker.c:662\n   shrink_one+0x47e/0x7b0 mm/vmscan.c:4818\n   shrink_many\
+  \ mm/vmscan.c:4879 [inline]\n   lru_gen_shrink_node mm/vmscan.c:4957 [inline]\n\
+  \   shrink_node+0x2452/0x39d0 mm/vmscan.c:5937\n   kswapd_shrink_node mm/vmscan.c:6765\
+  \ [inline]\n   balance_pgdat+0xc19/0x18f0 mm/vmscan.c:6957\n   kswapd+0x5ea/0xbf0\
+  \ mm/vmscan.c:7226\n   kthread+0x2c1/0x3a0 kernel/kthread.c:389\n   ret_from_fork+0x45/0x80\
+  \ arch/x86/kernel/process.c:147\n   ret_from_fork_asm+0x1a/0x30 arch/x86/entry/entry_64.S:244\n\
+  \n  Last potentially related work creation:\n   kasan_save_stack+0x33/0x60 mm/kasan/common.c:47\n\
+  \   __kasan_record_aux_stack+0xba/0xd0 mm/kasan/generic.c:541\n   kvfree_call_rcu+0x74/0xbe0\
+  \ kernel/rcu/tree.c:3810\n   subflow_ulp_release+0x2ae/0x350 net/mptcp/subflow.c:2009\n\
+  \   tcp_cleanup_ulp+0x7c/0x130 net/ipv4/tcp_ulp.c:124\n   tcp_v4_destroy_sock+0x1c5/0x6a0\
+  \ net/ipv4/tcp_ipv4.c:2541\n   inet_csk_destroy_sock+0x1a3/0x440 net/ipv4/inet_connection_sock.c:1293\n\
+  \   tcp_done+0x252/0x350 net/ipv4/tcp.c:4870\n   tcp_rcv_state_process+0x379b/0x4f30\
+  \ net/ipv4/tcp_input.c:6933\n   tcp_v4_do_rcv+0x1ad/0xa90 net/ipv4/tcp_ipv4.c:1938\n\
+  \   sk_backlog_rcv include/net/sock.h:1115 [inline]\n   __release_sock+0x31b/0x400\
+  \ net/core/sock.c:3072\n   __tcp_close+0x4f3/0xff0 net/ipv4/tcp.c:3142\n   __mptcp_close_ssk+0x331/0x14d0\
+  \ net/mptcp/protocol.c:2489\n   mptcp_close_ssk net/mptcp/protocol.c:2543 [inline]\n\
+  \   mptcp_close_ssk+0x150/0x220 net/mptcp/protocol.c:2526\n   mptcp_pm_nl_rm_addr_or_subflow+0x2be/0xcc0\
+  \ net/mptcp/pm_netlink.c:878\n   mptcp_pm_nl_rm_subflow_received net/mptcp/pm_netlink.c:914\
+  \ [inline]\n   mptcp_nl_remove_id_zero_address+0x305/0x4a0 net/mptcp/pm_netlink.c:1572\n\
+  \   mptcp_pm_nl_del_addr_doit+0x5c9/0x770 net/mptcp/pm_netlink.c:1603\n   genl_family_rcv_msg_doit+0x202/0x2f0\
+  \ net/netlink/genetlink.c:1115\n   genl_family_rcv_msg net/netlink/genetlink.c:1195\
+  \ [inline]\n   genl_rcv_msg+0x565/0x800 net/netlink/genetlink.c:1210\n   netlink_rcv_skb+0x165/0x410\
+  \ net/netlink/af_netlink.c:2551\n   genl_rcv+0x28/0x40 net/netlink/genetlink.c:1219\n\
+  \   netlink_unicast_kernel net/netlink/af_netlink.c:1331 [inline]\n   netlink_unicast+0x53c/0x7f0\
+  \ net/netlink/af_netlink.c:1357\n   netlink_sendmsg+0x8b8/0xd70 net/netlink/af_netlink.c:1901\n\
+  \   sock_sendmsg_nosec net/socket.c:729 [inline]\n   __sock_sendmsg net/socket.c:744\
+  \ [inline]\n   ____sys_sendmsg+0x9ae/0xb40 net/socket.c:2607\n   ___sys_sendmsg+0x135/0x1e0\
+  \ net/socket.c:2661\n   __sys_sendmsg+0x117/0x1f0 net/socket.c:2690\n   do_syscall_32_irqs_on\
+  \ arch/x86/entry/common.c:165 [inline]\n   __do_fast_syscall_32+0x73/0x120 arch/x86/entry/common.c:386\n\
+  \   do_fast_syscall_32+0x32/0x80 arch/x86/entry/common.c:411\n   entry_SYSENTER_compat_after_hwframe+0x84/0x8e\n\
+  \n  The buggy address belongs to the object at ffff8880569ac800\n   which belongs\
+  \ to the cache kmalloc-512 of size 512\n  The buggy address is located 88 bytes\
+  \ inside of\n   freed 512-byte region [ffff8880569ac800, ffff8880569aca00)\n\n \
+  \ The buggy address belongs to the physical page:\n  page: refcount:1 mapcount:0\
+  \ mapping:0000000000000000 index:0x0 pfn:0x569ac\n  head: order:2 mapcount:0 entire_mapcount:0\
+  \ nr_pages_mapped:0 pincount:0\n  flags: 0x4fff00000000040(head|node=1|zone=1|lastcpupid=0x7ff)\n\
+  \  page_type: f5(slab)\n  raw: 04fff00000000040 ffff88801ac42c80 dead000000000100\
+  \ dead000000000122\n  raw: 0000000000000000 0000000080100010 00000001f5000000 0000000000000000\n\
+  \  head: 04fff00000000040 ffff88801ac42c80 dead000000000100 dead000000000122\n \
+  \ head: 0000000000000000 0000000080100010 00000001f5000000 0000000000000000\n  head:\
+  \ 04fff00000000002 ffffea00015a6b01 ffffffffffffffff 0000000000000000\n  head: 0000000000000004\
+  \ 0000000000000000 00000000ffffffff 0000000000000000\n  page dumped because: kasan:\
+  \ bad access detected\n  page_owner tracks the page as allocated\n  page last allocated\
+  \ via order 2, migratetype Unmovable, gfp_mask 0xd20c0(__GFP_IO|__GFP_FS|__GFP_NOWARN|__GFP_NORETRY|__GFP_COMP|__GFP_NOMEMALLOC),\
+  \ pid 10238, tgid 10238 (kworker/u32:6), ts 597403252405, free_ts 597177952947\n\
+  \   set_page_owner include/linux/page_owner.h:32 [inline]\n   post_alloc_hook+0x2d1/0x350\
+  \ mm/page_alloc.c:1537\n   prep_new_page mm/page_alloc.c:1545 [inline]\n   get_page_from_freelist+0x101e/0x3070\
+  \ mm/page_alloc.c:3457\n   __alloc_pages_noprof+0x223/0x25a0 mm/page_alloc.c:4733\n\
+  \   alloc_pages_mpol_noprof+0x2c9/0x610 mm/mempolicy.c:2265\n   alloc_slab_page\
+  \ mm/slub.c:2412 [inline]\n   allocate_slab mm/slub.c:2578 [inline]\n   new_slab+0x2ba/0x3f0\
+  \ mm/slub.c:2631\n   ___slab_alloc+0xd1d/0x16f0 mm/slub.c:3818\n   __slab_alloc.constprop.0+0x56/0xb0\
+  \ mm/slub.c:3908\n   __slab_alloc_node mm/slub.c:3961 [inline]\n   slab_alloc_node\
+  \ mm/slub.c:4122 [inline]\n   __kmalloc_cache_noprof+0x2c5/0x310 mm/slub.c:4290\n\
+  \   kmalloc_noprof include/linux/slab.h:878 [inline]\n   kzalloc_noprof include/linux/slab.h:1014\
+  \ [inline]\n   mld_add_delrec net/ipv6/mcast.c:743 [inline]\n   igmp6_leave_group\
+  \ net/ipv6/mcast.c:2625 [inline]\n   igmp6_group_dropped+0x4ab/0xe40 net/ipv6/mcast.c:723\n\
+  \   __ipv6_dev_mc_dec+0x281/0x360 net/ipv6/mcast.c:979\n   addrconf_leave_solict\
+  \ net/ipv6/addrconf.c:2253 [inline]\n   __ipv6_ifa_notify+0x3f6/0xc30 net/ipv6/addrconf.c:6283\n\
+  \   addrconf_ifdown.isra.0+0xef9/0x1a20 net/ipv6/addrconf.c:3982\n   addrconf_notify+0x220/0x19c0\
+  \ net/ipv6/addrconf.c:3781\n   notifier_call_chain+0xb9/0x410 kernel/notifier.c:93\n\
+  \   call_netdevice_notifiers_info+0xbe/0x140 net/core/dev.c:1996\n   call_netdevice_notifiers_extack\
+  \ net/core/dev.c:2034 [inline]\n   call_netdevice_notifiers net/core/dev.c:2048\
+  \ [inline]\n   dev_close_many+0x333/0x6a0 net/core/dev.c:1589\n  page last free\
+  \ pid 13136 tgid 13136 stack trace:\n   reset_page_owner include/linux/page_owner.h:25\
+  \ [inline]\n   free_pages_prepare mm/page_alloc.c:1108 [inline]\n   free_unref_page+0x5f4/0xdc0\
+  \ mm/page_alloc.c:2638\n   stack_depot_save_flags+0x2da/0x900 lib/stackdepot.c:666\n\
+  \   kasan_save_stack+0x42/0x60 mm/kasan/common.c:48\n   kasan_save_track+0x14/0x30\
+  \ mm/kasan/common.c:68\n   unpoison_slab_object mm/kasan/common.c:319 [inline]\n\
+  \   __kasan_slab_alloc+0x89/0x90 mm/kasan/common.c:345\n   kasan_slab_alloc include/linux/kasan.h:247\
+  \ [inline]\n   slab_post_alloc_hook mm/slub.c:4085 [inline]\n   slab_alloc_node\
+  \ mm/slub.c:4134 [inline]\n   kmem_cache_alloc_noprof+0x121/0x2f0 mm/slub.c:4141\n\
+  \   skb_clone+0x190/0x3f0 net/core/skbuff.c:2084\n   do_one_broadcast net/netlink/af_netlink.c:1462\
+  \ [inline]\n   netlink_broadcast_filtered+0xb11/0xef0 net/netlink/af_netlink.c:1540\n\
+  \   netlink_broadcast+0x39/0x50 net/netlink/af_netlink.c:1564\n   uevent_net_broadcast_untagged\
+  \ lib/kobject_uevent.c:331 [inline]\n   kobject_uevent_net_broadcast lib/kobject_uevent.c:410\
+  \ [inline]\n   kobject_uevent_env+0xacd/0x1670 lib/kobject_uevent.c:608\n   device_del+0x623/0x9f0\
+  \ drivers/base/core.c:3882\n   snd_card_disconnect.part.0+0x58a/0x7c0 sound/core/init.c:546\n\
+  \   snd_card_disconnect+0x1f/0x30 sound/core/init.c:495\n   snd_usx2y_disconnect+0xe9/0x1f0\
+  \ sound/usb/usx2y/usbusx2y.c:417\n   usb_unbind_interface+0x1e8/0x970 drivers/usb/core/driver.c:461\n\
+  \   device_remove drivers/base/dd.c:569 [inline]\n   device_remove+0x122/0x170 drivers/base/dd.c:561\n\
+  \nThat's because 'subflow' is used just after 'mptcp_close_ssk(subflow)',\nwhich\
+  \ will initiate the release of its memory. Even if it is very likely\nthe release\
+  \ and the re-utilisation will be done later on, it is of\ncourse better to avoid\
+  \ any issues and read the content of 'subflow'\nbefore closing it.\n\nFixes: 1c1f72137598\
+  \ (\"mptcp: pm: only decrement add_addr_accepted for MPJ req\")\nCc: stable@vger.kernel.org\n\
+  Reported-by: syzbot+3c8b7a8e7df6a2a226ca@syzkaller.appspotmail.com\nCloses: https://lore.kernel.org/670d7337.050a0220.4cbc0.004f.GAE@google.com\n\
+  Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>\nAcked-by: Paolo Abeni\
+  \ <pabeni@redhat.com>\nLink: https://patch.msgid.link/20241015-net-mptcp-uaf-pm-rm-v1-1-c4ee5d987a64@kernel.org\n\
+  Signed-off-by: Paolo Abeni <pabeni@redhat.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ mptcp_pm_nl_rm_addr_or_subflow in net/mptcp/pm_netlink.c\nstatic void mptcp_pm_nl_rm_addr_or_subflow(struct\
+  \ mptcp_sock *msk,\n\t\t\t\t\t   const struct mptcp_rm_list *rm_list,\n\t\t\t\t\t\
+  \   enum linux_mptcp_mib_field rm_type)\n{\n\tstruct mptcp_subflow_context *subflow,\
+  \ *tmp;\n\tstruct sock *sk = (struct sock *)msk;\n\tu8 i;\n\n\tpr_debug(\"%s rm_list_nr\
+  \ %d\\n\",\n\t\t rm_type == MPTCP_MIB_RMADDR ? \"address\" : \"subflow\", rm_list->nr);\n\
+  \n\tmsk_owned_by_me(msk);\n\n\tif (sk->sk_state == TCP_LISTEN)\n\t\treturn;\n\n\t\
+  if (!rm_list->nr)\n\t\treturn;\n\n\tif (list_empty(&msk->conn_list))\n\t\treturn;\n\
+  \n\tfor (i = 0; i < rm_list->nr; i++) {\n\t\tu8 rm_id = rm_list->ids[i];\n\t\tbool\
+  \ removed = false;\n\n\t\tmptcp_for_each_subflow_safe(msk, subflow, tmp) {\n\t\t\
+  \tstruct sock *ssk = mptcp_subflow_tcp_sock(subflow);\n\t\t\tu8 remote_id = READ_ONCE(subflow->remote_id);\n\
+  \t\t\tint how = RCV_SHUTDOWN | SEND_SHUTDOWN;\n\t\t\tu8 id = subflow_get_local_id(subflow);\n\
+  \n\t\t\tif ((1 << inet_sk_state_load(ssk)) &\n\t\t\t    (TCPF_FIN_WAIT1 | TCPF_FIN_WAIT2\
+  \ | TCPF_CLOSING | TCPF_CLOSE))\n\t\t\t\tcontinue;\n\t\t\tif (rm_type == MPTCP_MIB_RMADDR\
+  \ && remote_id != rm_id)\n\t\t\t\tcontinue;\n\t\t\tif (rm_type == MPTCP_MIB_RMSUBFLOW\
+  \ && id != rm_id)\n\t\t\t\tcontinue;\n\n\t\t\tpr_debug(\" -> %s rm_list_ids[%d]=%u\
+  \ local_id=%u remote_id=%u mpc_id=%u\\n\",\n\t\t\t\t rm_type == MPTCP_MIB_RMADDR\
+  \ ? \"address\" : \"subflow\",\n\t\t\t\t i, rm_id, id, remote_id, msk->mpc_endpoint_id);\n\
+  \t\t\tspin_unlock_bh(&msk->pm.lock);\n\t\t\tmptcp_subflow_shutdown(sk, ssk, how);\n\
+  \n\t\t\t/* the following takes care of updating the subflows counter */\n\t\t\t\
+  mptcp_close_ssk(sk, ssk, subflow);\n\t\t\tspin_lock_bh(&msk->pm.lock);\n\n\t\t\t\
+  removed |= subflow->request_join;\n\t\t\tif (rm_type == MPTCP_MIB_RMSUBFLOW)\n\t\
+  \t\t\t__MPTCP_INC_STATS(sock_net(sk), rm_type);\n\t\t}\n\n\t\tif (rm_type == MPTCP_MIB_RMADDR)\n\
+  \t\t\t__MPTCP_INC_STATS(sock_net(sk), rm_type);\n\n\t\tif (!removed)\n\t\t\tcontinue;\n\
+  \n\t\tif (!mptcp_pm_is_kernel(msk))\n\t\t\tcontinue;\n\n\t\tif (rm_type == MPTCP_MIB_RMADDR\
+  \ && rm_id &&\n\t\t    !WARN_ON_ONCE(msk->pm.add_addr_accepted == 0)) {\n\t\t\t\
+  /* Note: if the subflow has been closed before, this\n\t\t\t * add_addr_accepted\
+  \ counter will not be decremented.\n\t\t\t */\n\t\t\tif (--msk->pm.add_addr_accepted\
+  \ < mptcp_pm_get_add_addr_accept_max(msk))\n\t\t\t\tWRITE_ONCE(msk->pm.accept_addr,\
+  \ true);\n\t\t}\n\t}\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/net/mptcp/pm_netlink.c\
+  \ b/net/mptcp/pm_netlink.c\nindex 1a78998fe1f4..db586a5b3866 100644\n--- a/net/mptcp/pm_netlink.c\n\
+  +++ b/net/mptcp/pm_netlink.c\n@@ -873,12 +873,12 @@ static void mptcp_pm_nl_rm_addr_or_subflow(struct\
+  \ mptcp_sock *msk,\n \t\t\t\t i, rm_id, id, remote_id, msk->mpc_endpoint_id);\n\
+  \ \t\t\tspin_unlock_bh(&msk->pm.lock);\n \t\t\tmptcp_subflow_shutdown(sk, ssk, how);\n\
+  +\t\t\tremoved |= subflow->request_join;\n \n \t\t\t/* the following takes care\
+  \ of updating the subflows counter */\n \t\t\tmptcp_close_ssk(sk, ssk, subflow);\n\
+  \ \t\t\tspin_lock_bh(&msk->pm.lock);\n \n-\t\t\tremoved |= subflow->request_join;\n\
+  \ \t\t\tif (rm_type == MPTCP_MIB_RMSUBFLOW)\n \t\t\t\t__MPTCP_INC_STATS(sock_net(sk),\
+  \ rm_type);\n \t\t}\n```\n"
+pattern: "## Bug Pattern\n\nUse-after-free by accessing a subflow object after a call\
+  \ that can free it while the protecting lock is released:\n\n- Sequence:\n  - Unlock\
+  \ protection\n  - Call a function that can destroy/free the object (e.g., mptcp_close_ssk(...,\
+  \ subflow))\n  - Reacquire lock\n  - Read a field from the (possibly freed) object\n\
+  \nIllustrative pattern:\n\nspin_unlock_bh(&lock);\ndestructive_close_or_release(obj);\
+  \  // may free 'obj' (possibly via RCU)\nspin_lock_bh(&lock);\nuse(obj->field);\
+  \                    // UAF read\n\nIn the patch, subflow->request_join was read\
+  \ after mptcp_close_ssk() (which can free subflow). The fix caches/uses the needed\
+  \ field before the close/free call."
+plan: "1) Program state\n\n- REGISTER_SET_WITH_PROGRAMSTATE(FreedUnderUnlockSet, const\
+  \ MemRegion*)\n  - Tracks pointer variables (their VarRegion) that were passed to\
+  \ a known \u201Cclose/free\u201D function while the code was outside the protecting\
+  \ lock. These variables are considered to point to possibly-freed objects.\n\n-\
+  \ REGISTER_TRAIT_WITH_PROGRAMSTATE(InUnlockedRegion, bool)\n  - Tracks whether the\
+  \ current path is inside an \u201Cunlocked window\u201D (i.e., past a spin_unlock[_bh]\
+  \ and before the corresponding spin_lock[_bh]).\n\nNotes:\n- We only store the pointer\
+  \ variable\u2019s region (e.g., the VarRegion for \u201Csubflow\u201D). We intentionally\
+  \ do not track aliases for simplicity. We will clear the \u201Cfreed\u201D mark\
+  \ when the variable is re-assigned.\n\n2) Helper matchers and tables\n\n- Spin-lock\
+  \ APIs:\n  - isSpinUnlock(Call): returns true if callee is spin_unlock_bh or spin_unlock.\n\
+  \  - isSpinLock(Call): returns true if callee is spin_lock_bh or spin_lock.\n\n\
+  - Known-freeing table:\n  - A small, hard-coded table of functions that may free/destroy\
+  \ the object passed in a specific argument index. For this bug pattern:\n    - \"\
+  mptcp_close_ssk\" frees arg index 2 (0-based), i.e., the \u201Csubflow\u201D pointer.\n\
+  \  - Helper: bool isKnownFreeFunc(const CallEvent &Call, SmallVectorImpl<unsigned>\
+  \ &FreedParamIdxs)\n\n- Small utilities to reuse:\n  - getMemRegionFromExpr(E, C)\
+  \ to get the MemRegion of an argument expression (we expect this to be the VarRegion\
+  \ of the pointer variable, e.g., for DeclRefExpr \u201Csubflow\u201D).\n  - In checkLocation,\
+  \ if S is a MemberExpr or a UnaryOperator('*'), obtain the base expression, then\
+  \ getMemRegionFromExpr on that base to retrieve the pointer variable region.\n\n\
+  3) Callback selection and detailed behavior\n\nA) checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const\n\n- Handle spin unlock/lock:\n  - If isSpinUnlock(Call):\n\
+  \    - Set InUnlockedRegion = true in the program state.\n  - Else if isSpinLock(Call):\n\
+  \    - Set InUnlockedRegion = false in the program state.\n\n- Handle known-free\
+  \ calls (only when currently unlocked):\n  - If isKnownFreeFunc(Call, FreedParamIdxs)\
+  \ AND InUnlockedRegion == true:\n    - For each index in FreedParamIdxs:\n     \
+  \ - const Expr* ArgE = Call.getArgExpr(idx)\n      - const MemRegion* R = getMemRegionFromExpr(ArgE,\
+  \ C)\n      - If R is non-null: add R to FreedUnderUnlockSet in state.\n    - This\
+  \ marks that the pointer variable (e.g., \u201Csubflow\u201D) refers to an object\
+  \ that may have been freed while the protecting lock was released.\n\nB) checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const\n\n- If the destination\
+  \ Loc is a MemRegionVal and LocRegion is in FreedUnderUnlockSet:\n  - Remove LocRegion\
+  \ from FreedUnderUnlockSet.\n  - Rationale: re-assignment of the pointer variable\
+  \ (e.g., \u201Csubflow = \u2026;\u201D) breaks the association with the previously\
+  \ freed object and avoids spurious reports.\n\nC) checkLocation(SVal Loc, bool IsLoad,\
+  \ const Stmt *S, CheckerContext &C) const\n\n- We only want to flag dereferences/field\
+  \ accesses of a pointer that was freed in an unlocked window. To stay simple and\
+  \ precise:\n  - If !IsLoad: return (we only care about reads; writes could be added\
+  \ similarly if desired).\n  - We require that we are currently NOT in an unlocked\
+  \ window (InUnlockedRegion == false). This makes the checker match the intended\
+  \ pattern: \u201Cunlock -> free -> lock -> read.\u201D\n  - If S is a MemberExpr:\n\
+  \    - const MemberExpr *ME = cast<MemberExpr>(S)\n    - const Expr *Base = ME->getBase()\n\
+  \    - const MemRegion *BaseVarR = getMemRegionFromExpr(Base, C)\n    - If BaseVarR\
+  \ is in FreedUnderUnlockSet:\n      - Report UAF (see reporting below).\n  - Else\
+  \ if S is a UnaryOperator with UO_Deref:\n    - const Expr *Base = cast<UnaryOperator>(S)->getSubExpr()\n\
+  \    - const MemRegion *BaseVarR = getMemRegionFromExpr(Base, C)\n    - If BaseVarR\
+  \ is in FreedUnderUnlockSet:\n      - Report UAF.\n  - (Optionally) handle ArraySubscriptExpr\
+  \ similarly by checking its base expression.\n\nNotes:\n- This approach avoids having\
+  \ to resolve the pointee\u2019s base region (which is often a symbolic heap region)\
+  \ and instead relies on tracking the pointer variable used as the base of the dereference\
+  \ or member access.\n- We keep the condition \u201Ccurrently locked\u201D (InUnlockedRegion\
+  \ == false) at report time to minimize false positives and to match the patched\
+  \ pattern.\n\nD) checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const\n\
+  \n- Clear state implicitly by function exit (no extra action required). If desired,\
+  \ we may explicitly reset InUnlockedRegion to false and clear FreedUnderUnlockSet.\n\
+  \n4) Bug reporting\n\n- When a violation is detected in checkLocation:\n  - Generate\
+  \ a non-fatal error node: auto N = C.generateNonFatalErrorNode()\n  - If N is null,\
+  \ return.\n  - Create a PathSensitiveBugReport with a short message:\n    - Title:\
+  \ \"Use-after-free after close under unlocked region\"\n    - Message: \"Reading\
+  \ from an object after a close that may free it while the lock was released.\"\n\
+  \  - Emit the report via C.emitReport(...).\n  - Optionally, add a note at the freeing\
+  \ call site by tracking the region in the state and using a path note if you store\
+  \ additional origin info (not required for the minimal solution).\n\n5) Summary\
+  \ of flow for the target bug\n\n- spin_unlock_bh(...) -> InUnlockedRegion = true\n\
+  - mptcp_close_ssk(..., ..., subflow) -> InUnlockedRegion == true -> record VarRegion(subflow)\
+  \ into FreedUnderUnlockSet\n- spin_lock_bh(...) -> InUnlockedRegion = false\n- Access\
+  \ subflow->request_join -> S is a MemberExpr, base is \u201Csubflow\u201D:\n  -\
+  \ BaseVarRegion(subflow) \u2208 FreedUnderUnlockSet and InUnlockedRegion == false\n\
+  \  - Report: \"Use-after-free after close under unlocked region\"\n\n6) Notes and\
+  \ limitations\n\n- The checker currently matches only listed known free/destroy\
+  \ functions (mptcp_close_ssk with freed arg index 2). You can extend the known-free\
+  \ table as needed.\n- The checker does not track pointer aliases for simplicity.\
+  \ If aliasing is important, introduce a PtrAliasMap via REGISTER_MAP_WITH_PROGRAMSTATE\
+  \ and update it in checkBind; then, when marking/looking up FreedUnderUnlockSet,\
+  \ include aliases. For this targeted pattern, the simple VarRegion-based approach\
+  \ is sufficient.\n- The checker purposely requires the access to happen when InUnlockedRegion\
+  \ == false to mirror the intended problematic sequence and reduce false positives."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// ================= Program States =================\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(FreedUnderUnlockSet, const MemRegion*)\nREGISTER_TRAIT_WITH_PROGRAMSTATE(InUnlockedRegion,\
+  \ bool)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PostCall,\
+  \ check::Bind, check::Location> {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n\
+  \  SAGenTestChecker() : BT(new BugType(this, \"Use-after-free after unlocked close\"\
+  , \"Memory Safety\")) {}\n\n  void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const;\n\nprivate:\n  // Helper predicates\n  static bool isSpinUnlock(const\
+  \ CallEvent &Call, CheckerContext &C);\n  static bool isSpinLock(const CallEvent\
+  \ &Call, CheckerContext &C);\n  static bool isKnownFreeFunc(const CallEvent &Call,\
+  \ CheckerContext &C,\n                              llvm::SmallVectorImpl<unsigned>\
+  \ &FreedParamIdxs);\n\n  static const MemRegion *getBaseRegionFromExpr(const Expr\
+  \ *E, CheckerContext &C);\n  void reportUAF(const Stmt *AccessS, CheckerContext\
+  \ &C) const;\n};\n\n// ---------------- Helper Implementations ----------------\n\
+  \nbool SAGenTestChecker::isSpinUnlock(const CallEvent &Call, CheckerContext &C)\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, \"spin_unlock_bh\", C) || ExprHasName(E, \"spin_unlock\", C);\n\
+  }\n\nbool SAGenTestChecker::isSpinLock(const CallEvent &Call, CheckerContext &C)\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, \"spin_lock_bh\", C) || ExprHasName(E, \"spin_lock\", C);\n}\n\n\
+  // Known-freeing function table tailored for the target bug\nbool SAGenTestChecker::isKnownFreeFunc(const\
+  \ CallEvent &Call, CheckerContext &C,\n                                       llvm::SmallVectorImpl<unsigned>\
+  \ &FreedParamIdxs) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return\
+  \ false;\n\n  // For this pattern, mptcp_close_ssk(sk, ssk, subflow) may free 'subflow'\
+  \ (arg index 2)\n  if (ExprHasName(E, \"mptcp_close_ssk\", C)) {\n    FreedParamIdxs.push_back(2);\n\
+  \    return true;\n  }\n  return false;\n}\n\nconst MemRegion *SAGenTestChecker::getBaseRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return nullptr;\n  const MemRegion *MR\
+  \ = getMemRegionFromExpr(E, C);\n  if (!MR) return nullptr;\n  MR = MR->getBaseRegion();\n\
+  \  return MR;\n}\n\nvoid SAGenTestChecker::reportUAF(const Stmt *AccessS, CheckerContext\
+  \ &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n \
+  \   return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\
+  \ \"Use-after-free after close under unlocked region\", N);\n  if (AccessS)\n  \
+  \  R->addRange(AccessS->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n\
+  // ---------------- Checker Callbacks ----------------\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  // Track unlocked window\n  if (isSpinUnlock(Call,\
+  \ C)) {\n    State = State->set<InUnlockedRegion>(true);\n    Changed = true;\n\
+  \  } else if (isSpinLock(Call, C)) {\n    State = State->set<InUnlockedRegion>(false);\n\
+  \    Changed = true;\n  }\n\n  // If currently in the unlocked window, mark pointer\
+  \ variables passed to\n  // known-freeing functions as possibly freed under unlock.\n\
+  \  bool InUnlocked = State->get<InUnlockedRegion>();\n\n  llvm::SmallVector<unsigned,\
+  \ 4> FreedIdxs;\n  if (InUnlocked && isKnownFreeFunc(Call, C, FreedIdxs)) {\n  \
+  \  for (unsigned Idx : FreedIdxs) {\n      if (Idx >= Call.getNumArgs())\n     \
+  \   continue;\n      const Expr *ArgE = Call.getArgExpr(Idx);\n      const MemRegion\
+  \ *MR = getBaseRegionFromExpr(ArgE, C);\n      if (!MR)\n        continue;\n   \
+  \   State = State->add<FreedUnderUnlockSet>(MR);\n      Changed = true;\n    }\n\
+  \  }\n\n  if (Changed)\n    C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n\n  // If a pointer variable that we tracked as \"freed under\
+  \ unlock\" is reassigned,\n  // remove it from the set to avoid stale reports.\n\
+  \  if (const MemRegion *LReg = Loc.getAsRegion()) {\n    LReg = LReg->getBaseRegion();\n\
+  \    if (LReg) {\n      auto Set = State->get<FreedUnderUnlockSet>();\n      if\
+  \ (Set.contains(LReg)) {\n        State = State->remove<FreedUnderUnlockSet>(LReg);\n\
+  \        C.addTransition(State);\n      }\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {\n  if (!IsLoad ||\
+  \ !S)\n    return;\n\n  ProgramStateRef State = C.getState();\n  // Only warn after\
+  \ the lock is reacquired (i.e., not in the unlocked window)\n  if (State->get<InUnlockedRegion>())\n\
+  \    return;\n\n  const MemRegion *BaseVarReg = nullptr;\n\n  // Focus on dereference\
+  \ patterns: 'ptr->field', '*ptr', 'ptr[i]'\n  if (const auto *ME = dyn_cast<MemberExpr>(S))\
+  \ {\n    if (!ME->isArrow())\n      return; // Only track '->', not '.'\n    const\
+  \ Expr *Base = ME->getBase();\n    BaseVarReg = getBaseRegionFromExpr(Base, C);\n\
+  \  } else if (const auto *UO = dyn_cast<UnaryOperator>(S)) {\n    if (UO->getOpcode()\
+  \ != UO_Deref)\n      return;\n    const Expr *Base = UO->getSubExpr();\n    BaseVarReg\
+  \ = getBaseRegionFromExpr(Base, C);\n  } else if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(S))\
+  \ {\n    const Expr *Base = ASE->getBase();\n    BaseVarReg = getBaseRegionFromExpr(Base,\
+  \ C);\n  } else {\n    // Other expressions are not targeted.\n    return;\n  }\n\
+  \n  if (!BaseVarReg)\n    return;\n\n  auto Set = State->get<FreedUnderUnlockSet>();\n\
+  \  if (Set.contains(BaseVarReg)) {\n    reportUAF(S, C);\n  }\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects use-after-free when an object may be freed by a close function\
+  \ between spin_unlock and spin_lock, then accessed after lock\",\n      \"\");\n\
+  }\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

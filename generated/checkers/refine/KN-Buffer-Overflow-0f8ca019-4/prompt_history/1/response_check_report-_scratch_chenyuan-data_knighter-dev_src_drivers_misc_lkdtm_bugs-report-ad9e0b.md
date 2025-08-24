@@ -1,0 +1,2 @@
+- Decision: NotABug
+- Reason: The flagged code is in LKDTM (Linux Kernel self-test module) and intentionally performs an out-of-bounds write to verify kernel bounds checking (UBSAN/BUG traps). The loop writes one byte past an 8-byte array by design. This does not match the target bug pattern of mismatched macro-defined loop bounds versus array capacity in display driver code, nor would it be fixed by adding a capacity check. It is an intentional test case, not a real kernel bug.

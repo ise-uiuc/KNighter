@@ -1,0 +1,334 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: d8c561741ef83980114b3f7f95ffac54600f3f16
+commit_type: Double-Free
+index: 3
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state: track\
+  \ resource phases and dataflow between set_ready return and err variable.\nREGISTER_MAP_WITH_PROGRAMSTATE(ResourcePhaseMap,\
+  \ const MemRegion*, unsigned)\nREGISTER_MAP_WITH_PROGRAMSTATE(SetReadyRetSymToRegionMap,\
+  \ SymbolRef, const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(ErrVarToResourceMap,\
+  \ const MemRegion*, const MemRegion*)\nREGISTER_SET_WITH_PROGRAMSTATE(AttemptedSetReadyRegions,\
+  \ const MemRegion*)\n\nnamespace {\n\nenum PhaseBits : unsigned {\n  PHASE_NONE\
+  \    = 0,\n  PHASE_CREATED = 1u << 0,\n  PHASE_READY   = 1u << 1\n};\n\nclass SAGenTestChecker\
+  \ : public Checker<\n                            check::PostCall,\n            \
+  \                check::PreCall,\n                            check::Bind> {\n \
+  \  mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Wrong close in error path (double free risk)\", \"Memory\
+  \ Management\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n\n   private:\n      // Helpers for function identification\n    \
+  \  static bool isCreateSQ(const CallEvent &Call, CheckerContext &C);\n      static\
+  \ bool isSetSqRdy(const CallEvent &Call, CheckerContext &C);\n      static bool\
+  \ isCloseSQ(const CallEvent &Call, CheckerContext &C);\n\n      // Extractors for\
+  \ sq MemRegion from calls\n      static const MemRegion* getSqRegionFromCreate(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static const MemRegion* getSqRegionFromSetRdy(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static const MemRegion* getSqRegionFromClose(const\
+  \ CallEvent &Call, CheckerContext &C);\n\n      // Extract error variable region\
+  \ from if condition\n      static const MemRegion* getErrVarRegionFromIfCond(const\
+  \ IfStmt *IfS, CheckerContext &C);\n\n      void reportWrongClose(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n};\n\n// ==== Helper implementations ====\n\n\
+  bool SAGenTestChecker::isCreateSQ(const CallEvent &Call, CheckerContext &C) {\n\
+  \  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return ExprHasName(E,\
+  \ \"hws_send_ring_create_sq\", C);\n}\n\nbool SAGenTestChecker::isSetSqRdy(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"hws_send_ring_set_sq_rdy\",\
+  \ C);\n}\n\nbool SAGenTestChecker::isCloseSQ(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, \"hws_send_ring_close_sq\", C);\n}\n\nconst MemRegion* SAGenTestChecker::getSqRegionFromCreate(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() <= 4)\n    return\
+  \ nullptr;\n  const Expr *Arg = Call.getArgExpr(4);\n  if (!Arg) return nullptr;\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(Arg, C);\n  if (!MR) return nullptr;\n\
+  \  return MR->getBaseRegion();\n}\n\nconst MemRegion* SAGenTestChecker::getSqRegionFromSetRdy(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() <= 1)\n    return\
+  \ nullptr;\n\n  const Expr *Arg = Call.getArgExpr(1);\n  if (!Arg) return nullptr;\n\
+  \n  // Expect pattern: sq->sqn; extract \"sq\"\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(Arg);\n\
+  \  if (!ME) return nullptr;\n\n  const Expr *Base = ME->getBase();\n  if (!Base)\
+  \ return nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(Base, C);\n  if\
+  \ (!MR) return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion* SAGenTestChecker::getSqRegionFromClose(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() == 0)\n    return\
+  \ nullptr;\n  const Expr *Arg = Call.getArgExpr(0);\n  if (!Arg) return nullptr;\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(Arg, C);\n  if (!MR) return nullptr;\n\
+  \  return MR->getBaseRegion();\n}\n\nconst MemRegion* SAGenTestChecker::getErrVarRegionFromIfCond(const\
+  \ IfStmt *IfS, CheckerContext &C) {\n  if (!IfS) return nullptr;\n  const Expr *Cond\
+  \ = IfS->getCond();\n  if (!Cond) return nullptr;\n\n  // Find a DeclRefExpr within\
+  \ the condition (e.g., \"if (err)\" or \"if (err != 0)\")\n  const DeclRefExpr *DRE\
+  \ = findSpecificTypeInChildren<DeclRefExpr>(Cond);\n  if (!DRE) return nullptr;\n\
+  \n  const MemRegion *MR = getMemRegionFromExpr(DRE, C);\n  if (!MR) return nullptr;\n\
+  \  return MR->getBaseRegion();\n}\n\n// ==== Checker callbacks ====\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Track creation phase\n  if (isCreateSQ(Call, C)) {\n    const MemRegion *SqReg\
+  \ = getSqRegionFromCreate(Call, C);\n    if (!SqReg)\n      return;\n    unsigned\
+  \ Phase = PHASE_NONE;\n    if (const unsigned *Old = State->get<ResourcePhaseMap>(SqReg))\n\
+  \      Phase = *Old;\n    Phase |= PHASE_CREATED;\n    State = State->set<ResourcePhaseMap>(SqReg,\
+  \ Phase);\n    C.addTransition(State);\n    return;\n  }\n\n  // Track set ready\
+  \ attempt and return symbol\n  if (isSetSqRdy(Call, C)) {\n    const MemRegion *SqReg\
+  \ = getSqRegionFromSetRdy(Call, C);\n    if (SqReg) {\n      State = State->add<AttemptedSetReadyRegions>(SqReg);\n\
+  \      // Map return symbol (err-like) to the sq region\n      SymbolRef RetSym\
+  \ = Call.getReturnValue().getAsSymbol();\n      if (RetSym) {\n        State = State->set<SetReadyRetSymToRegionMap>(RetSym,\
+  \ SqReg);\n      }\n      C.addTransition(State);\n    }\n    return;\n  }\n}\n\n\
+  void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Only handle cases\
+  \ where RHS is a symbol that we tracked from set_sq_rdy\n  SymbolRef Sym = Val.getAsSymbol();\n\
+  \  if (!Sym)\n    return;\n\n  const MemRegion *ResReg = State->get<SetReadyRetSymToRegionMap>(Sym);\n\
+  \  if (!ResReg)\n    return;\n\n  const MemRegion *LHSReg = Loc.getAsRegion();\n\
+  \  if (!LHSReg)\n    return;\n  LHSReg = LHSReg->getBaseRegion();\n  if (!LHSReg)\n\
+  \    return;\n\n  // Associate the LHS variable (err-like) with the resource region\n\
+  \  State = State->set<ErrVarToResourceMap>(LHSReg, ResReg);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  if (!isCloseSQ(Call, C))\n    return;\n\n  ProgramStateRef State =\
+  \ C.getState();\n  const MemRegion *SqReg = getSqRegionFromClose(Call, C);\n  if\
+  \ (!SqReg)\n    return;\n\n  // Must have attempted to set ready for this resource\n\
+  \  if (!State->contains<AttemptedSetReadyRegions>(SqReg))\n    return;\n\n  // The\
+  \ resource should be in CREATED and not READY\n  const unsigned *PhasePtr = State->get<ResourcePhaseMap>(SqReg);\n\
+  \  if (!PhasePtr)\n    return;\n\n  unsigned Phase = *PhasePtr;\n  if (!(Phase &\
+  \ PHASE_CREATED) || (Phase & PHASE_READY))\n    return;\n\n  // Find the surrounding\
+  \ if-statement guarding this close\n  const Expr *Orig = Call.getOriginExpr();\n\
+  \  if (!Orig)\n    return;\n\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Orig,\
+  \ C);\n  if (!IfS)\n    return;\n\n  const MemRegion *ErrReg = getErrVarRegionFromIfCond(IfS,\
+  \ C);\n  if (!ErrReg)\n    return;\n\n  const MemRegion *MappedRes = State->get<ErrVarToResourceMap>(ErrReg);\n\
+  \  if (!MappedRes)\n    return;\n\n  if (MappedRes != SqReg)\n    return;\n\n  //\
+  \ All conditions met: report problem\n  reportWrongClose(Call, C);\n}\n\nvoid SAGenTestChecker::reportWrongClose(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"hws_send_ring_close_sq in set_sq_rdy error path; call mlx5_core_destroy_sq\
+  \ instead (double free risk)\", N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects hws_send_ring_close_sq in set_sq_rdy error path; use destroy_sq\
+  \ to avoid double free\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nnet/mlx5: HWS, fixed double-free in error flow of\
+  \ creating SQ\n\nWhen SQ creation fails, call the appropriate mlx5_core destroy\
+  \ function.\n\nThis fixes the following smatch warnings:\n  divers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c:739\n\
+  \    hws_send_ring_open_sq() warn: 'sq->dep_wqe' double freed\n    hws_send_ring_open_sq()\
+  \ warn: 'sq->wq_ctrl.buf.frags' double freed\n    hws_send_ring_open_sq() warn:\
+  \ 'sq->wr_priv' double freed\n\nFixes: 2ca62599aa0b (\"net/mlx5: HWS, added send\
+  \ engine and context handling\")\nReported-by: Dan Carpenter <dan.carpenter@linaro.org>\n\
+  Closes: https://lore.kernel.org/all/e4ebc227-4b25-49bf-9e4c-14b7ea5c6a07@stanley.mountain/\n\
+  Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>\nSigned-off-by: Saeed Mahameed\
+  \ <saeedm@nvidia.com>\n\n## Buggy Code\n\n```c\n// Function: hws_send_ring_create_sq\
+  \ in drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\nstatic\
+  \ int hws_send_ring_create_sq(struct mlx5_core_dev *mdev, u32 pdn,\n\t\t\t\t   void\
+  \ *sqc_data,\n\t\t\t\t   struct mlx5hws_send_engine *queue,\n\t\t\t\t   struct mlx5hws_send_ring_sq\
+  \ *sq,\n\t\t\t\t   struct mlx5hws_send_ring_cq *cq)\n{\n\tvoid *in, *sqc, *wq;\n\
+  \tint inlen, err;\n\tu8 ts_format;\n\n\tinlen = MLX5_ST_SZ_BYTES(create_sq_in) +\n\
+  \t\tsizeof(u64) * sq->wq_ctrl.buf.npages;\n\tin = kvzalloc(inlen, GFP_KERNEL);\n\
+  \tif (!in)\n\t\treturn -ENOMEM;\n\n\tsqc = MLX5_ADDR_OF(create_sq_in, in, ctx);\n\
+  \twq = MLX5_ADDR_OF(sqc, sqc, wq);\n\n\tmemcpy(sqc, sqc_data, MLX5_ST_SZ_BYTES(sqc));\n\
+  \tMLX5_SET(sqc, sqc, cqn, cq->mcq.cqn);\n\n\tMLX5_SET(sqc, sqc, state, MLX5_SQC_STATE_RST);\n\
+  \tMLX5_SET(sqc, sqc, flush_in_error_en, 1);\n\n\tts_format = mlx5_is_real_time_sq(mdev)\
+  \ ? MLX5_TIMESTAMP_FORMAT_REAL_TIME :\n\t\t\t\t\t\t MLX5_TIMESTAMP_FORMAT_FREE_RUNNING;\n\
+  \tMLX5_SET(sqc, sqc, ts_format, ts_format);\n\n\tMLX5_SET(wq, wq, wq_type, MLX5_WQ_TYPE_CYCLIC);\n\
+  \tMLX5_SET(wq, wq, uar_page, mdev->mlx5e_res.hw_objs.bfreg.index);\n\tMLX5_SET(wq,\
+  \ wq, log_wq_pg_sz, sq->wq_ctrl.buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT);\n\tMLX5_SET64(wq,\
+  \ wq, dbr_addr, sq->wq_ctrl.db.dma);\n\n\tmlx5_fill_page_frag_array(&sq->wq_ctrl.buf,\n\
+  \t\t\t\t  (__be64 *)MLX5_ADDR_OF(wq, wq, pas));\n\n\terr = mlx5_core_create_sq(mdev,\
+  \ in, inlen, &sq->sqn);\n\n\tkvfree(in);\n\n\treturn err;\n}\n```\n\n## Bug Fix\
+  \ Patch\n\n```diff\ndiff --git a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\
+  \ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\nindex a1adbb48735c..0c7989184c30\
+  \ 100644\n--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\n\
+  +++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\n@@ -653,6\
+  \ +653,12 @@ static int hws_send_ring_create_sq(struct mlx5_core_dev *mdev, u32\
+  \ pdn,\n \treturn err;\n }\n \n+static void hws_send_ring_destroy_sq(struct mlx5_core_dev\
+  \ *mdev,\n+\t\t\t\t     struct mlx5hws_send_ring_sq *sq)\n+{\n+\tmlx5_core_destroy_sq(mdev,\
+  \ sq->sqn);\n+}\n+\n static int hws_send_ring_set_sq_rdy(struct mlx5_core_dev *mdev,\
+  \ u32 sqn)\n {\n \tvoid *in, *sqc;\n@@ -696,7 +702,7 @@ static int hws_send_ring_create_sq_rdy(struct\
+  \ mlx5_core_dev *mdev, u32 pdn,\n \n \terr = hws_send_ring_set_sq_rdy(mdev, sq->sqn);\n\
+  \ \tif (err)\n-\t\thws_send_ring_close_sq(sq);\n+\t\thws_send_ring_destroy_sq(mdev,\
+  \ sq);\n \n \treturn err;\n }\n```\n"
+pattern: "## Bug Pattern\n\nCalling a high-level \u201Cclose/free\u201D routine in\
+  \ a partial-initialization error path, causing resources to be freed twice when\
+  \ the top-level cleanup runs.\n\nConcretely: after creating a hardware SQ but before\
+  \ fully opening it (set to ready), the code used hws_send_ring_close_sq(sq) on failure.\
+  \ That \u201Cclose\u201D frees software-owned buffers (e.g., sq->dep_wqe, sq->wq_ctrl.buf.frags,\
+  \ sq->wr_priv) that the caller also frees during its unwind, leading to double-free.\
+  \ The correct cleanup at this stage is the matching low-level destroy of only the\
+  \ last acquired resource (mlx5_core_destroy_sq), not the full close that assumes\
+  \ full initialization."
+plan: "1) Program state customizations\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(ResourcePhaseMap,\
+  \ const MemRegion*, unsigned)\n  - Tracks the resource initialization phase for\
+  \ a specific object pointer (e.g., sq).\n  - Phase bits:\n    - CREATED = 1\n  \
+  \  - READY   = 2\n- REGISTER_MAP_WITH_PROGRAMSTATE(SetReadyRetSymToRegionMap, SymbolRef,\
+  \ const MemRegion*)\n  - Maps the symbolic return value of a set_ready-like call\
+  \ to the corresponding resource pointer region (e.g., sq).\n- REGISTER_MAP_WITH_PROGRAMSTATE(ErrVarToResourceMap,\
+  \ const MemRegion*, const MemRegion*)\n  - Maps an error variable (e.g., the MemRegion\
+  \ for \u201Cerr\u201D) to the resource pointer region it carries the error status\
+  \ for. This is populated when the set_ready return value flows into a variable.\n\
+  - REGISTER_SET_WITH_PROGRAMSTATE(AttemptedSetReadyRegions, const MemRegion*)\n \
+  \ - Records which resource regions had a set_ready attempt (so we only warn when\
+  \ a close happens after a readiness attempt and before READY).\n\n2) Helper predicates\
+  \ and extractors\n\n- bool isCreateSQ(const CallEvent &Call)\n  - Return true if\
+  \ callee name is exactly \"hws_send_ring_create_sq\".\n- bool isSetSqRdy(const CallEvent\
+  \ &Call)\n  - Return true if callee name is exactly \"hws_send_ring_set_sq_rdy\"\
+  .\n- bool isCloseSQ(const CallEvent &Call)\n  - Return true if callee name is exactly\
+  \ \"hws_send_ring_close_sq\".\n- const MemRegion* getSqRegionFromCreate(const CallEvent\
+  \ &Call, CheckerContext &C)\n  - Extract argument at index 4 (0-based) and return\
+  \ getMemRegionFromExpr for that argument.\n- const MemRegion* getSqRegionFromSetRdy(const\
+  \ CallEvent &Call, CheckerContext &C)\n  - Extract argument at index 1 (the \u201C\
+  sq->sqn\u201D expression).\n  - Find MemberExpr among its children (findSpecificTypeInChildren<MemberExpr>).\n\
+  \  - Get its base expression (the \u201Csq\u201D expression) and return getMemRegionFromExpr\
+  \ for that base.\n- const MemRegion* getSqRegionFromClose(const CallEvent &Call,\
+  \ CheckerContext &C)\n  - Extract argument at index 0 and return getMemRegionFromExpr\
+  \ for that argument.\n- const MemRegion* getErrVarRegionFromIfCond(const IfStmt\
+  \ *IfS, CheckerContext &C)\n  - From IfS->getCond(), find a DeclRefExpr (findSpecificTypeInChildren<DeclRefExpr>).\n\
+  \  - Return getMemRegionFromExpr for that DeclRefExpr. If not found, return nullptr.\n\
+  \n3) Callback: checkPostCall\n\n- Handle hws_send_ring_create_sq:\n  - If isCreateSQ(Call):\n\
+  \    - sqReg = getSqRegionFromCreate(Call, C).\n    - If sqReg != nullptr:\n   \
+  \   - Phase = ResourcePhaseMap.lookup(sqReg) or 0.\n      - ResourcePhaseMap[sqReg]\
+  \ = Phase | CREATED.\n- Handle hws_send_ring_set_sq_rdy:\n  - If isSetSqRdy(Call):\n\
+  \    - sqReg = getSqRegionFromSetRdy(Call, C).\n    - If sqReg != nullptr:\n   \
+  \   - Insert sqReg into AttemptedSetReadyRegions.\n      - SymRet = Call.getReturnValue().getAsSymbol().\n\
+  \      - If SymRet != nullptr: SetReadyRetSymToRegionMap[SymRet] = sqReg.\n    -\
+  \ Note: Do not set READY bit here; success/failure will be inferred from the error\
+  \ branch later.\n\n4) Callback: checkBind\n\n- Purpose: Link the set_ready return\
+  \ symbol to the local error variable (e.g., \"err\").\n- If Val is a symbolic SVal\
+  \ (SymbolRef SymVal):\n  - If SetReadyRetSymToRegionMap contains SymVal:\n    -\
+  \ If Loc is a MemRegion for a VarDecl (err-like variable): ErrVarToResourceMap[LocRegion]\
+  \ = SetReadyRetSymToRegionMap[SymVal].\n- Rationale: When code does \u201Cerr =\
+  \ hws_send_ring_set_sq_rdy(...); if (err) ...\u201D, this maps the \u201Cerr\u201D\
+  \ variable region to the resource (sq) that the error belongs to.\n\n5) Callback:\
+  \ checkPreCall\n\n- Detect the problematic cleanup call in the error branch after\
+  \ set_ready failure.\n- If isCloseSQ(Call):\n  - sqReg = getSqRegionFromClose(Call,\
+  \ C). If nullptr, return.\n  - Validate context to reduce false positives:\n   \
+  \ - Require sqReg \u2208 AttemptedSetReadyRegions.\n    - Phase = ResourcePhaseMap.lookup(sqReg).\
+  \ Require (Phase & CREATED) != 0. Also require ((Phase & READY) == 0).\n  - Find\
+  \ the surrounding IfStmt:\n    - IfS = findSpecificTypeInParents<IfStmt>(CallExprNode,\
+  \ C). If nullptr, return.\n    - errVarReg = getErrVarRegionFromIfCond(IfS, C).\
+  \ If nullptr, return.\n    - Look up mapped resource: mappedRes = ErrVarToResourceMap.lookup(errVarReg).\n\
+  \    - If mappedRes == sqReg:\n      - This close is guarded by an error condition\
+  \ that comes from set_ready for the same resource that is only in CREATED phase.\n\
+  \      - Report bug: generateNonFatalErrorNode and emit a PathSensitiveBugReport\
+  \ with a short message like:\n        - \"close_sq in set_sq_rdy error path; call\
+  \ destroy_sq instead (double free risk)\"\n\n6) Optional (not necessary for detection;\
+  \ keep it simple)\n\n- If you want to be more precise about READY:\n  - In BranchCondition,\
+  \ when the condition is \u201Cif (!err)\u201D or similar, and errVarReg maps to\
+  \ sqReg, you could mark sqReg as READY on the false (err==0) branch. This is not\
+  \ required for the defect at hand because the warning specifically targets the error\
+  \ branch immediately after set_ready.\n\n7) Notes for implementation simplicity\n\
+  \n- Keep the name checks exact as listed above to avoid overmatching.\n- The state\
+  \ is naturally scoped per path by CSA; no manual clearing is needed, but you can\
+  \ rely on default state initialization at function entry.\n- Use the provided utilities:\n\
+  \  - getMemRegionFromExpr to get MemRegion for arguments and variables.\n  - findSpecificTypeInParents\
+  \ to discover enclosing IfStmt for a call.\n  - findSpecificTypeInChildren to extract\
+  \ DeclRefExpr from an if-condition or MemberExpr from \u201Csq->sqn\u201D.\n- The\
+  \ report should be short and clear, created via std::make_unique<PathSensitiveBugReport>."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include <memory>\n\
+  \nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program\
+  \ state: track resource phases and dataflow between set_ready return and err variable.\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(ResourcePhaseMap, const MemRegion*, unsigned)\nREGISTER_MAP_WITH_PROGRAMSTATE(SetReadyRetSymToRegionMap,\
+  \ SymbolRef, const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(ErrVarToResourceMap,\
+  \ const MemRegion*, const MemRegion*)\nREGISTER_SET_WITH_PROGRAMSTATE(AttemptedSetReadyRegions,\
+  \ const MemRegion*)\n\nnamespace {\n\nenum PhaseBits : unsigned {\n  PHASE_NONE\
+  \    = 0,\n  PHASE_CREATED = 1u << 0,\n  PHASE_READY   = 1u << 1\n};\n\nclass SAGenTestChecker\
+  \ : public Checker<\n                            check::PostCall,\n            \
+  \                check::PreCall,\n                            check::Bind> {\n \
+  \  mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Wrong close in error path (double free risk)\", \"Memory\
+  \ Management\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n\n   private:\n      // Helpers for function identification\n    \
+  \  static bool isCreateSQ(const CallEvent &Call, CheckerContext &C);\n      static\
+  \ bool isSetSqRdy(const CallEvent &Call, CheckerContext &C);\n      static bool\
+  \ isCloseSQ(const CallEvent &Call, CheckerContext &C);\n\n      // Extractors for\
+  \ sq MemRegion from calls\n      static const MemRegion* getSqRegionFromCreate(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static const MemRegion* getSqRegionFromSetRdy(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static const MemRegion* getSqRegionFromClose(const\
+  \ CallEvent &Call, CheckerContext &C);\n\n      // Extract error variable region\
+  \ from if condition\n      static const MemRegion* getErrVarRegionFromIfCond(const\
+  \ IfStmt *IfS, CheckerContext &C);\n\n      void reportWrongClose(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n};\n\n// ==== Helper implementations ====\n\n\
+  bool SAGenTestChecker::isCreateSQ(const CallEvent &Call, CheckerContext &C) {\n\
+  \  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return ExprHasName(E,\
+  \ \"hws_send_ring_create_sq\", C);\n}\n\nbool SAGenTestChecker::isSetSqRdy(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"hws_send_ring_set_sq_rdy\",\
+  \ C);\n}\n\nbool SAGenTestChecker::isCloseSQ(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, \"hws_send_ring_close_sq\", C);\n}\n\nconst MemRegion* SAGenTestChecker::getSqRegionFromCreate(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() <= 4)\n    return\
+  \ nullptr;\n  const Expr *Arg = Call.getArgExpr(4);\n  if (!Arg) return nullptr;\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(Arg, C);\n  if (!MR) return nullptr;\n\
+  \  return MR->getBaseRegion();\n}\n\nconst MemRegion* SAGenTestChecker::getSqRegionFromSetRdy(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() <= 1)\n    return\
+  \ nullptr;\n\n  const Expr *Arg = Call.getArgExpr(1);\n  if (!Arg) return nullptr;\n\
+  \n  // Expect pattern: sq->sqn; extract \"sq\"\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(Arg);\n\
+  \  if (!ME) return nullptr;\n\n  const Expr *Base = ME->getBase();\n  if (!Base)\
+  \ return nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(Base, C);\n  if\
+  \ (!MR) return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion* SAGenTestChecker::getSqRegionFromClose(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() == 0)\n    return\
+  \ nullptr;\n  const Expr *Arg = Call.getArgExpr(0);\n  if (!Arg) return nullptr;\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(Arg, C);\n  if (!MR) return nullptr;\n\
+  \  return MR->getBaseRegion();\n}\n\nconst MemRegion* SAGenTestChecker::getErrVarRegionFromIfCond(const\
+  \ IfStmt *IfS, CheckerContext &C) {\n  if (!IfS) return nullptr;\n  const Expr *Cond\
+  \ = IfS->getCond();\n  if (!Cond) return nullptr;\n\n  // Find a DeclRefExpr within\
+  \ the condition (e.g., \"if (err)\" or \"if (err != 0)\")\n  const DeclRefExpr *DRE\
+  \ = findSpecificTypeInChildren<DeclRefExpr>(Cond);\n  if (!DRE) return nullptr;\n\
+  \n  const MemRegion *MR = getMemRegionFromExpr(DRE, C);\n  if (!MR) return nullptr;\n\
+  \  return MR->getBaseRegion();\n}\n\n// ==== Checker callbacks ====\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Track creation phase\n  if (isCreateSQ(Call, C)) {\n    const MemRegion *SqReg\
+  \ = getSqRegionFromCreate(Call, C);\n    if (!SqReg)\n      return;\n    unsigned\
+  \ Phase = PHASE_NONE;\n    if (const unsigned *Old = State->get<ResourcePhaseMap>(SqReg))\n\
+  \      Phase = *Old;\n    Phase |= PHASE_CREATED;\n    State = State->set<ResourcePhaseMap>(SqReg,\
+  \ Phase);\n    C.addTransition(State);\n    return;\n  }\n\n  // Track set ready\
+  \ attempt and return symbol\n  if (isSetSqRdy(Call, C)) {\n    const MemRegion *SqReg\
+  \ = getSqRegionFromSetRdy(Call, C);\n    if (SqReg) {\n      State = State->add<AttemptedSetReadyRegions>(SqReg);\n\
+  \      // Map return symbol (err-like) to the sq region\n      SymbolRef RetSym\
+  \ = Call.getReturnValue().getAsSymbol();\n      if (RetSym) {\n        State = State->set<SetReadyRetSymToRegionMap>(RetSym,\
+  \ SqReg);\n      }\n      C.addTransition(State);\n    }\n    return;\n  }\n}\n\n\
+  void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Only handle cases\
+  \ where RHS is a symbol that we tracked from set_sq_rdy\n  SymbolRef Sym = Val.getAsSymbol();\n\
+  \  if (!Sym)\n    return;\n\n  const MemRegion *const *ResRegPtr = State->get<SetReadyRetSymToRegionMap>(Sym);\n\
+  \  if (!ResRegPtr)\n    return;\n  const MemRegion *ResReg = *ResRegPtr;\n\n  const\
+  \ MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\n    return;\n  LHSReg\
+  \ = LHSReg->getBaseRegion();\n  if (!LHSReg)\n    return;\n\n  // Associate the\
+  \ LHS variable (err-like) with the resource region\n  State = State->set<ErrVarToResourceMap>(LHSReg,\
+  \ ResReg);\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isCloseSQ(Call, C))\n    return;\n\
+  \n  ProgramStateRef State = C.getState();\n  const MemRegion *SqReg = getSqRegionFromClose(Call,\
+  \ C);\n  if (!SqReg)\n    return;\n\n  // Must have attempted to set ready for this\
+  \ resource\n  if (!State->contains<AttemptedSetReadyRegions>(SqReg))\n    return;\n\
+  \n  // The resource should be in CREATED and not READY\n  const unsigned *PhasePtr\
+  \ = State->get<ResourcePhaseMap>(SqReg);\n  if (!PhasePtr)\n    return;\n\n  unsigned\
+  \ Phase = *PhasePtr;\n  if (!(Phase & PHASE_CREATED) || (Phase & PHASE_READY))\n\
+  \    return;\n\n  // Find the surrounding if-statement guarding this close\n  const\
+  \ Expr *Orig = Call.getOriginExpr();\n  if (!Orig)\n    return;\n\n  const IfStmt\
+  \ *IfS = findSpecificTypeInParents<IfStmt>(Orig, C);\n  if (!IfS)\n    return;\n\
+  \n  const MemRegion *ErrReg = getErrVarRegionFromIfCond(IfS, C);\n  if (!ErrReg)\n\
+  \    return;\n\n  const MemRegion *const *MappedResPtr = State->get<ErrVarToResourceMap>(ErrReg);\n\
+  \  if (!MappedResPtr)\n    return;\n  const MemRegion *MappedRes = *MappedResPtr;\n\
+  \n  if (MappedRes != SqReg)\n    return;\n\n  // All conditions met: report problem\n\
+  \  reportWrongClose(Call, C);\n}\n\nvoid SAGenTestChecker::reportWrongClose(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"hws_send_ring_close_sq in set_sq_rdy error path; call mlx5_core_destroy_sq\
+  \ instead (double free risk)\", N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects hws_send_ring_close_sq in set_sq_rdy error path; use destroy_sq\
+  \ to avoid double free\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

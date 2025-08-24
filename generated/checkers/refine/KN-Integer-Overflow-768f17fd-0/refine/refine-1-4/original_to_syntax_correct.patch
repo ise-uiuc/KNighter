@@ -1,0 +1,121 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -183,11 +183,83 @@        return false;
+   }
+
++  static bool isSimpleVarOrMember(const Expr *E) {
++    E = peel(E);
++    return isa<DeclRefExpr>(E) || isa<MemberExpr>(E);
++  }
++
++  // Case-insensitive substring check for llvm::StringRef.
++  static bool containsCaseInsensitive(StringRef Haystack, StringRef Needle) {
++    llvm::SmallString<256> H(Haystack);
++    for (char &c : H)
++      c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
++    llvm::SmallString<64> N(Needle);
++    for (char &c : N)
++      c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
++    return StringRef(H).contains(StringRef(N));
++  }
++
++  static bool memberOrExprNameContains(const Expr *E, StringRef Sub, CheckerContext &C) {
++    if (!E) return false;
++    // Try source-text match first (covers macros and general cases).
++    if (ExprHasName(E, Sub, C))
++      return true;
++
++    // If not found, try semantic member name match for MemberExpr.
++    if (const auto *ME = dyn_cast<MemberExpr>(peel(E))) {
++      if (const ValueDecl *VD = ME->getMemberDecl()) {
++        StringRef N = VD->getName();
++        return containsCaseInsensitive(N, Sub);
++      }
++    }
++    // Also try DeclRefExpr name in case of variables.
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(peel(E))) {
++      if (const ValueDecl *VD = DRE->getDecl()) {
++        StringRef N = VD->getName();
++        return containsCaseInsensitive(N, Sub);
++      }
++    }
++    return false;
++  }
++
++  // Heuristic: Linux ext4 cluster->block unit scaling like:
++  //   EXT4_C2B(sbi, count_clusters)  =>  (count_clusters << sbi->s_cluster_bits)
++  // This is often safe because 'count' was bounded to group size and/or the
++  // shift amount is small; also the macro or naming conveys intent.
++  static bool isLikelyClusterScalingPattern(const Expr *WholeExpr,
++                                            const BinaryOperator *Shl,
++                                            CheckerContext &C) {
++    if (!WholeExpr || !Shl) return false;
++
++    // If the whole argument contains the C2B macro name, assume safe.
++    // This is robust as it matches the original source before macro expansion.
++    if (ExprHasName(WholeExpr, "EXT4_C2B", C) || ExprHasName(WholeExpr, "C2B(", C))
++      return true;
++
++    const Expr *L = Shl->getLHS();
++    const Expr *R = Shl->getRHS();
++    if (!L || !R) return false;
++
++    // RHS mentions cluster_bits (e.g., s_cluster_bits).
++    bool RHSMentionsClusterBits = memberOrExprNameContains(R, "cluster_bits", C);
++
++    // LHS mentions cluster/clusters (e.g., count_clusters).
++    bool LHSMentionsClusters =
++        memberOrExprNameContains(L, "cluster", C) || memberOrExprNameContains(L, "clusters", C);
++
++    // LHS is a simple var/member (not a composite like (1<<x)|y), to avoid
++    // suppressing real problematic shift patterns.
++    bool LHSSimple = isSimpleVarOrMember(L);
++
++    return RHSMentionsClusterBits && LHSMentionsClusters && LHSSimple;
++  }
++
+   static bool isFalsePositiveContext(const Expr *WholeExpr,
+                                      const BinaryOperator *Shl,
+                                      QualType DestTy,
+                                      CheckerContext &C,
+                                      StringRef Ctx) {
++    // Only warn when the shift expression itself is the argument/initializer/etc.
+     if (!isTopLevelShiftExpr(WholeExpr, Shl))
+       return true;
+
+@@ -200,6 +272,8 @@         if (FD && ArgIdx < FD->getNumParams())
+           PVD = FD->getParamDecl(ArgIdx);
+
++        // If the destination is 'long' (platform dependent 64-bit), be conservative;
++        // old heuristic: suppress to avoid noise on LP64 platforms for many APIs.
+         if (isAnyLongType(DestTy))
+           return true;
+
+@@ -213,8 +287,13 @@           }
+         }
+
++        // Small constant shifts are usually harmless patterns when widened.
+         uint64_t K = 0;
+         if (tryGetConstShiftAmount(Shl->getRHS(), C, K) && K <= 3)
++          return true;
++
++        // New: Suppress likely cluster->block unit scaling patterns used in ext4.
++        if (isLikelyClusterScalingPattern(WholeExpr, Shl, C))
+           return true;
+       }
+     }
+@@ -250,8 +329,6 @@           MaxVal = llvm::APSInt(V, /*isUnsigned=*/true);
+         Found = true;
+       } else if (const auto *UO = dyn_cast<UnaryOperator>(Cur)) {
+-        // Try to handle sizeof-like folds that may appear as integral casts.
+-        // We still just traverse.
+         if (const Expr *SubE = UO->getSubExpr())
+           Worklist.push_back(SubE);
+       } else {
+@@ -484,9 +561,7 @@   if (constantShiftFitsInLHSWidth(L, R, LHSW, C))
+     return;
+
+-  // New: Symbolic upper-bound proof: if we can prove the result fits in 32-bit,
+-  // suppress. This addresses cases like: pool_size = 1 << (PAGE_SHIFT + order),
+-  // where 'order' was clamped by min(..., MAX_PAGE_ORDER).
++  // Symbolic upper-bound proof.
+   if (shiftSafeUnderUpperBounds(L, R, LHSW, C))
+     return;

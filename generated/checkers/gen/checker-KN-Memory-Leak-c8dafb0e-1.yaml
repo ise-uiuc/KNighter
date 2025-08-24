@@ -1,0 +1,232 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: c8dafb0e4398dacc362832098a04b97da3b0395b
+commit_type: Memory-Leak
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track req objects\
+  \ initialized by hwrm_req_init and not yet dropped.\nREGISTER_SET_WITH_PROGRAMSTATE(InitReqSet,\
+  \ const MemRegion*)\n// Track req objects that, after at least one post-init API\
+  \ call, must be dropped on all exits.\nREGISTER_SET_WITH_PROGRAMSTATE(MustDropSet,\
+  \ const MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<\n\
+  \        check::PostCall,\n        check::PreStmt<ReturnStmt>,\n        check::EndFunction>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"HWRM request leak\", \"Resource Management\")) {}\n\n\
+  \      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n   \
+  \   void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;\n      void\
+  \ checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;\n\n   private:\n\
+  \      bool callIsNamed(const CallEvent &Call, CheckerContext &C, StringRef Name)\
+  \ const;\n      const MemRegion *getReqRegionFromCallArg1(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      void reportMissingDrop(const Stmt *ExitStmt,\
+  \ CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::callIsNamed(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  return ExprHasName(Origin, Name, C);\n}\n\n\
+  const MemRegion *SAGenTestChecker::getReqRegionFromCallArg1(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  if (Call.getNumArgs() <= 1)\n    return nullptr;\n\
+  \  const Expr *ArgE = Call.getArgExpr(1);\n  if (!ArgE)\n    return nullptr;\n\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR)\n    return\
+  \ nullptr;\n\n  return MR->getBaseRegion();\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Match APIs using expression text for robustness.\n  bool IsInit = callIsNamed(Call,\
+  \ C, \"hwrm_req_init\");\n  bool IsDrop = callIsNamed(Call, C, \"hwrm_req_drop\"\
+  ) || callIsNamed(Call, C, \"bnxt_req_drop\");\n  bool IsPostInit =\n      callIsNamed(Call,\
+  \ C, \"hwrm_req_replace\") ||\n      callIsNamed(Call, C, \"hwrm_req_timeout\")\
+  \ ||\n      callIsNamed(Call, C, \"hwrm_req_hold\") ||\n      callIsNamed(Call,\
+  \ C, \"hwrm_req_send\");\n\n  if (!IsInit && !IsDrop && !IsPostInit)\n    return;\n\
+  \n  const MemRegion *ReqReg = getReqRegionFromCallArg1(Call, C);\n  if (!ReqReg)\n\
+  \    return;\n\n  if (IsInit) {\n    // Record that 'req' has been initialized.\n\
+  \    if (!State->contains<InitReqSet>(ReqReg)) {\n      State = State->add<InitReqSet>(ReqReg);\n\
+  \    }\n    // Do not add to MustDropSet yet; require a post-init call first.\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  if (IsPostInit) {\n    // After\
+  \ a post-init call, this req must be dropped on all exit paths.\n    if (State->contains<InitReqSet>(ReqReg))\
+  \ {\n      if (!State->contains<MustDropSet>(ReqReg)) {\n        State = State->add<MustDropSet>(ReqReg);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  if (IsDrop)\
+  \ {\n    // Drop resets both Init and MustDrop tracking for this req.\n    if (State->contains<InitReqSet>(ReqReg)\
+  \ || State->contains<MustDropSet>(ReqReg)) {\n      State = State->remove<InitReqSet>(ReqReg);\n\
+  \      State = State->remove<MustDropSet>(ReqReg);\n      C.addTransition(State);\n\
+  \    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::reportMissingDrop(const Stmt\
+  \ *ExitStmt, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const auto *S = State->get<MustDropSet>();\n  if (!S || S->isEmpty())\n    return;\n\
+  \n  // Report once per outstanding req region (usually one).\n  for (const MemRegion\
+  \ *ReqReg : *S) {\n    (void)ReqReg; // not used directly, kept for potential future\
+  \ notes.\n\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n    if (!N)\n\
+  \      continue;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \     *BT, \"Missing hwrm_req_drop() before return after HWRM request setup\", N);\n\
+  \n    if (ExitStmt)\n      R->addRange(ExitStmt->getSourceRange());\n\n    C.emitReport(std::move(R));\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkPreStmt(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  reportMissingDrop(RS, C);\n}\n\nvoid SAGenTestChecker::checkEndFunction(const\
+  \ ReturnStmt *RS, CheckerContext &C) const {\n  // Avoid duplicate reports for explicit\
+  \ returns; we already reported in checkPreStmt.\n  if (RS)\n    return;\n\n  //\
+  \ Report for implicit exit paths (e.g., reaching end of function).\n  reportMissingDrop(/*ExitStmt=*/nullptr,\
+  \ C);\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect missing hwrm_req_drop() on early returns after HWRM request setup\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbnxt_en: Fix possible memory leak when hwrm_req_replace\
+  \ fails\n\nWhen hwrm_req_replace() fails, the driver is not invoking bnxt_req_drop()\n\
+  which could cause a memory leak.\n\nFixes: bbf33d1d9805 (\"bnxt_en: update all firmware\
+  \ calls to use the new APIs\")\nReviewed-by: Pavan Chebbi <pavan.chebbi@broadcom.com>\n\
+  Signed-off-by: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>\nSigned-off-by: Michael\
+  \ Chan <michael.chan@broadcom.com>\nLink: https://patch.msgid.link/20250104043849.3482067-2-michael.chan@broadcom.com\n\
+  Signed-off-by: Jakub Kicinski <kuba@kernel.org>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ bnxt_send_msg in drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c\nint bnxt_send_msg(struct\
+  \ bnxt_en_dev *edev,\n\t\t\t struct bnxt_fw_msg *fw_msg)\n{\n\tstruct net_device\
+  \ *dev = edev->net;\n\tstruct bnxt *bp = netdev_priv(dev);\n\tstruct output *resp;\n\
+  \tstruct input *req;\n\tu32 resp_len;\n\tint rc;\n\n\tif (bp->fw_reset_state)\n\t\
+  \treturn -EBUSY;\n\n\trc = hwrm_req_init(bp, req, 0 /* don't care */);\n\tif (rc)\n\
+  \t\treturn rc;\n\n\trc = hwrm_req_replace(bp, req, fw_msg->msg, fw_msg->msg_len);\n\
+  \tif (rc)\n\t\treturn rc;\n\n\thwrm_req_timeout(bp, req, fw_msg->timeout);\n\tresp\
+  \ = hwrm_req_hold(bp, req);\n\trc = hwrm_req_send(bp, req);\n\tresp_len = le16_to_cpu(resp->resp_len);\n\
+  \tif (resp_len) {\n\t\tif (fw_msg->resp_max_len < resp_len)\n\t\t\tresp_len = fw_msg->resp_max_len;\n\
+  \n\t\tmemcpy(fw_msg->resp, resp, resp_len);\n\t}\n\thwrm_req_drop(bp, req);\n\t\
+  return rc;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c\
+  \ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c\nindex b771c84cdd89..0ed26e3a28f4\
+  \ 100644\n--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c\n+++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c\n\
+  @@ -208,7 +208,7 @@ int bnxt_send_msg(struct bnxt_en_dev *edev,\n \n \trc = hwrm_req_replace(bp,\
+  \ req, fw_msg->msg, fw_msg->msg_len);\n \tif (rc)\n-\t\treturn rc;\n+\t\tgoto drop_req;\n\
+  \ \n \thwrm_req_timeout(bp, req, fw_msg->timeout);\n \tresp = hwrm_req_hold(bp,\
+  \ req);\n@@ -220,6 +220,7 @@ int bnxt_send_msg(struct bnxt_en_dev *edev,\n \n \t\
+  \tmemcpy(fw_msg->resp, resp, resp_len);\n \t}\n+drop_req:\n \thwrm_req_drop(bp,\
+  \ req);\n \treturn rc;\n }\n```\n"
+pattern: "## Bug Pattern\n\nInitializing an HWRM request with hwrm_req_init() and\
+  \ then returning early on a subsequent failure (e.g., hwrm_req_replace() error)\
+  \ without calling hwrm_req_drop() to release the initialized request, leading to\
+  \ a resource/memory leak.\n\nExample:\nreq = hwrm_req_init(bp, req, ...);\nif (rc)\n\
+  \    return rc;\n\nrc = hwrm_req_replace(bp, req, ...);\nif (rc)\n    return rc;\
+  \   // BUG: missing hwrm_req_drop(bp, req);\n\nhwrm_req_drop(bp, req);  // must\
+  \ be called on all exit paths after init"
+plan: "1) Program state\n\n- REGISTER_SET_WITH_PROGRAMSTATE(InitReqSet, const MemRegion*)\n\
+  \  - Tracks req objects that have been initialized by hwrm_req_init() and not yet\
+  \ dropped.\n\n- REGISTER_SET_WITH_PROGRAMSTATE(MustDropSet, const MemRegion*)\n\
+  \  - Tracks req objects that, after at least one post-init HWRM request API usage\
+  \ (e.g., hwrm_req_replace()), must be released by hwrm_req_drop() on all exit paths.\n\
+  \nRationale:\n- We keep the checker simple and focused on the target pattern: after\
+  \ init and a subsequent HWRM API call (such as hwrm_req_replace), returning without\
+  \ hwrm_req_drop leads to a leak. Using two sets avoids modeling success/failure\
+  \ branches and prevents false positives from early returns right after a failed\
+  \ init.\n\n2) APIs to match and how to extract the req argument\n\n- Target functions\
+  \ (callee identifier names):\n  - Init: \"hwrm_req_init\"\n  - Post-init usage (requires\
+  \ drop on all exits): \"hwrm_req_replace\", \"hwrm_req_timeout\", \"hwrm_req_hold\"\
+  , \"hwrm_req_send\"\n  - Drop: \"hwrm_req_drop\"\n\n- The req argument is consistently\
+  \ the second formal parameter (index 1) for all listed APIs. Use getMemRegionFromExpr(Call.getArgExpr(1),\
+  \ C) to retrieve the region of req.\n\n3) Callback functions and logic\n\nA) checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C)\n\n- Identify the callee via Call.getCalleeIdentifier()->getName().\n\
+  - For each matched function, obtain the MemRegion of the req argument using getMemRegionFromExpr\
+  \ on parameter index 1. If null, do nothing.\n\n- If callee == \"hwrm_req_init\"\
+  :\n  - State = State->add<InitReqSet>(ReqRegion)\n  - Do not add to MustDropSet\
+  \ here (to avoid false positives if we later return due to init failure before any\
+  \ post-init API is called).\n\n- If callee in {\"hwrm_req_replace\",\"hwrm_req_timeout\"\
+  ,\"hwrm_req_hold\",\"hwrm_req_send\"}:\n  - If ReqRegion is present in InitReqSet,\
+  \ State = State->add<MustDropSet>(ReqRegion)\n  - Keep it in InitReqSet as well;\
+  \ it still represents a live initialization requiring drop.\n\n- If callee == \"\
+  hwrm_req_drop\":\n  - State = State->remove<InitReqSet>(ReqRegion)\n  - State =\
+  \ State->remove<MustDropSet>(ReqRegion)\n\n- Add the updated state as a transition\
+  \ with C.addTransition(State).\n\nB) checkPreStmt(const ReturnStmt *RS, CheckerContext\
+  \ &C)\n\n- On a return statement, if MustDropSet is non-empty, each region in MustDropSet\
+  \ indicates a req that must be dropped before exiting.\n- For each ReqRegion in\
+  \ MustDropSet:\n  - Create a non-fatal error node with C.generateNonFatalErrorNode().\n\
+  \  - Emit a PathSensitiveBugReport with a short message, e.g.:\n    - \"Missing\
+  \ hwrm_req_drop() before return after HWRM request setup\"\n  - Optionally, add\
+  \ a note range at RS to highlight the return.\n\n- This reports the specific early-return\
+  \ path where hwrm_req_drop() is not called after hwrm_req_replace()/other post-init\
+  \ operations.\n\nC) checkEndFunction(const ReturnStmt *RS, CheckerContext &C)\n\n\
+  - Also check on function end (implicit return from non-void) to catch paths exiting\
+  \ without an explicit return.\n- If MustDropSet is non-empty at end, report similarly\
+  \ for each ReqRegion.\n\n4) Additional details and constraints handling\n\n- We\
+  \ intentionally avoid modeling the success/failure (rc) of hwrm_req_init to keep\
+  \ the checker simple and focused. This prevents false positives on the canonical\
+  \ error path \u201Cif (rc) return rc;\u201D after init, because we only require\
+  \ a drop after we observe a post-init API call such as hwrm_req_replace().\n- This\
+  \ matches the target bug pattern: hwrm_req_init() followed by hwrm_req_replace(),\
+  \ then an early return on replace failure without hwrm_req_drop().\n\n5) Bug reporting\n\
+  \n- Create a single BugType for the checker, e.g., \"HWRM request leak\".\n- Use\
+  \ PathSensitiveBugReport for better path diagnostics.\n- Short, clear message:\n\
+  \  - \"Missing hwrm_req_drop() before return\"\n  - Optional extra context:\n  \
+  \  - \"hwrm_req_init() was followed by hwrm_req_replace(), but path returns without\
+  \ hwrm_req_drop().\"\n\n6) Notes on utilities and simplifications\n\n- Use getMemRegionFromExpr\
+  \ to consistently identify the req region from the second argument.\n- No need for\
+  \ alias tracking since req is passed directly in all involved APIs.\n- No need for\
+  \ checkBind, evalAssume, or checkBranchCondition for this pattern.\n- This design\
+  \ keeps the checker robust and simple while accurately flagging the target leak\
+  \ scenario fixed in the patch."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include <memory>\n\
+  #include <utility>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Track req objects initialized by hwrm_req_init and not yet dropped.\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(InitReqSet, const MemRegion*)\n// Track req objects\
+  \ that, after at least one post-init API call, must be dropped on all exits.\nREGISTER_SET_WITH_PROGRAMSTATE(MustDropSet,\
+  \ const MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<\n\
+  \        check::PostCall,\n        check::PreStmt<ReturnStmt>,\n        check::EndFunction>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"HWRM request leak\", \"Resource Management\")) {}\n\n\
+  \      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n   \
+  \   void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;\n      void\
+  \ checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;\n\n   private:\n\
+  \      bool callIsNamed(const CallEvent &Call, CheckerContext &C, StringRef Name)\
+  \ const;\n      const MemRegion *getReqRegionFromCallArg1(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      void reportMissingDrop(const Stmt *ExitStmt,\
+  \ CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::callIsNamed(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  return ExprHasName(Origin, Name, C);\n}\n\n\
+  const MemRegion *SAGenTestChecker::getReqRegionFromCallArg1(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  if (Call.getNumArgs() <= 1)\n    return nullptr;\n\
+  \  const Expr *ArgE = Call.getArgExpr(1);\n  if (!ArgE)\n    return nullptr;\n\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR)\n    return\
+  \ nullptr;\n\n  return MR->getBaseRegion();\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Match APIs using expression text for robustness.\n  bool IsInit = callIsNamed(Call,\
+  \ C, \"hwrm_req_init\");\n  bool IsDrop = callIsNamed(Call, C, \"hwrm_req_drop\"\
+  ) || callIsNamed(Call, C, \"bnxt_req_drop\");\n  bool IsPostInit =\n      callIsNamed(Call,\
+  \ C, \"hwrm_req_replace\") ||\n      callIsNamed(Call, C, \"hwrm_req_timeout\")\
+  \ ||\n      callIsNamed(Call, C, \"hwrm_req_hold\") ||\n      callIsNamed(Call,\
+  \ C, \"hwrm_req_send\");\n\n  if (!IsInit && !IsDrop && !IsPostInit)\n    return;\n\
+  \n  const MemRegion *ReqReg = getReqRegionFromCallArg1(Call, C);\n  if (!ReqReg)\n\
+  \    return;\n\n  if (IsInit) {\n    // Record that 'req' has been initialized.\n\
+  \    if (!State->contains<InitReqSet>(ReqReg)) {\n      State = State->add<InitReqSet>(ReqReg);\n\
+  \    }\n    // Do not add to MustDropSet yet; require a post-init call first.\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  if (IsPostInit) {\n    // After\
+  \ a post-init call, this req must be dropped on all exit paths.\n    if (State->contains<InitReqSet>(ReqReg))\
+  \ {\n      if (!State->contains<MustDropSet>(ReqReg)) {\n        State = State->add<MustDropSet>(ReqReg);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  if (IsDrop)\
+  \ {\n    // Drop resets both Init and MustDrop tracking for this req.\n    if (State->contains<InitReqSet>(ReqReg)\
+  \ || State->contains<MustDropSet>(ReqReg)) {\n      State = State->remove<InitReqSet>(ReqReg);\n\
+  \      State = State->remove<MustDropSet>(ReqReg);\n      C.addTransition(State);\n\
+  \    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::reportMissingDrop(const Stmt\
+  \ *ExitStmt, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  auto S = State->get<MustDropSet>();\n  if (S.isEmpty())\n    return;\n\n  //\
+  \ Report once per outstanding req region (usually one).\n  for (const MemRegion\
+  \ *ReqReg : S) {\n    (void)ReqReg; // not used directly, kept for potential future\
+  \ notes.\n\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n    if (!N)\n\
+  \      continue;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \     *BT, \"Missing hwrm_req_drop() before return after HWRM request setup\", N);\n\
+  \n    if (ExitStmt)\n      R->addRange(ExitStmt->getSourceRange());\n\n    C.emitReport(std::move(R));\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkPreStmt(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  reportMissingDrop(RS, C);\n}\n\nvoid SAGenTestChecker::checkEndFunction(const\
+  \ ReturnStmt *RS, CheckerContext &C) const {\n  // Avoid duplicate reports for explicit\
+  \ returns; we already reported in checkPreStmt.\n  if (RS)\n    return;\n\n  //\
+  \ Report for implicit exit paths (e.g., reaching end of function).\n  reportMissingDrop(/*ExitStmt=*/nullptr,\
+  \ C);\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect missing hwrm_req_drop() on early returns after HWRM request setup\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

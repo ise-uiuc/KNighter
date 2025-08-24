@@ -1,0 +1,125 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -137,6 +137,86 @@     return false;
+   }
+
++  // Peel parens and implicit casts to find the original (pre-promotion) integer type of an operand.
++  struct OrigIntInfo {
++    unsigned Width = 0;
++    bool IsUnsigned = false;
++    bool Valid = false;
++  };
++
++  OrigIntInfo getOriginalIntegerInfo(const Expr *E, CheckerContext &C) const {
++    OrigIntInfo Info;
++    if (!E) return Info;
++
++    const Expr *Cur = E;
++    // Do not use IgnoreParenImpCasts here; we want to walk casts ourselves to stop at the source.
++    while (true) {
++      if (const auto *PE = dyn_cast<ParenExpr>(Cur)) {
++        Cur = PE->getSubExpr();
++        continue;
++      }
++      if (const auto *ICE = dyn_cast<ImplicitCastExpr>(Cur)) {
++        switch (ICE->getCastKind()) {
++        case CK_NoOp:
++        case CK_LValueToRValue:
++        case CK_IntegralCast:
++        case CK_IntegralToBoolean:
++          Cur = ICE->getSubExpr();
++          continue;
++        default:
++          // Other implicit casts shouldn't matter for integer width; stop here.
++          break;
++        }
++      }
++      break;
++    }
++
++    QualType QT = Cur->getType();
++    if (!QT->isIntegerType())
++      return Info;
++
++    Info.Width = getIntWidth(QT, C);
++    Info.IsUnsigned = QT->isUnsignedIntegerType();
++
++    // If this is a reference to a bit-field, use its declared bit width.
++    if (const auto *ME = dyn_cast<MemberExpr>(Cur)) {
++      if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {
++        if (FD->isBitField()) {
++          unsigned BW = FD->getBitWidthValue(C.getASTContext());
++          if (BW)
++            Info.Width = BW;
++          Info.IsUnsigned = FD->getType()->isUnsignedIntegerType();
++        }
++      }
++    }
++
++    Info.Valid = true;
++    return Info;
++  }
++
++  // Require at least one original operand to be 32-bit or wider to match the intended bug pattern.
++  bool atLeastOneOperandOriginally32Plus(const BinaryOperator *B,
++                                         CheckerContext &C) const {
++    OrigIntInfo L = getOriginalIntegerInfo(B->getLHS(), C);
++    OrigIntInfo R = getOriginalIntegerInfo(B->getRHS(), C);
++
++    // If both known and both narrower than 32 bits, we don't want to warn.
++    if (L.Valid && R.Valid) {
++      if (L.Width < 32 && R.Width < 32)
++        return false;
++      return (L.Width >= 32) || (R.Width >= 32);
++    }
++
++    // If we only know one side, require that known side is >= 32.
++    if (L.Valid && L.Width < 32 && !R.Valid)
++      return false;
++    if (R.Valid && R.Width < 32 && !L.Valid)
++      return false;
++
++    // Otherwise be conservative and allow.
++    return true;
++  }
++
+   bool getImmediateNonTrivialParent(const Stmt *Child,
+                                     CheckerContext &C,
+                                     const Stmt *&OutParentStmt,
+@@ -612,7 +692,6 @@       if (!E) return false;
+       llvm::APSInt CI;
+       if (EvaluateExprToInt(CI, E, C)) {
+-        // Be conservative: accept 16 explicitly.
+         if (CI.isUnsigned() ? CI.getZExtValue() == 16
+                             : (CI.getExtValue() >= 0 && (uint64_t)CI.getExtValue() == 16))
+           return true;
+@@ -620,18 +699,14 @@       return ExprHasName(E, "PCI_MSIX_ENTRY_SIZE", C);
+     };
+
+-    // The other operand should be the parameter 'nr_entries' or a similar bounded name.
++    // The other operand should be the parameter 'nr_entries'.
+     auto IsNrEntriesParam = [&](const Expr *E) -> bool {
+       if (!E) return false;
+       E = E->IgnoreParenImpCasts();
+       if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+         if (const auto *PVD = dyn_cast<ParmVarDecl>(DRE->getDecl())) {
+-          if (PVD->getIdentifier()) {
+-            StringRef N = PVD->getName();
+-            if (N.equals("nr_entries"))
+-              return true;
+-            // Be conservative; only accept 'nr_entries' here.
+-          }
++          if (PVD->getIdentifier() && PVD->getName().equals("nr_entries"))
++            return true;
+         }
+       }
+       return false;
+@@ -704,6 +779,11 @@   const Stmt *UseSiteStmt = nullptr;
+   const Decl *UseSiteDecl = nullptr;
+   if (!isDirectWidenedUseTo64(E, C, UseSiteStmt, UseSiteDecl))
++    return;
++
++  // NEW: Focus on the intended bug pattern:
++  // suppress if both original operands are narrower than 32 bits.
++  if (!atLeastOneOperandOriginally32Plus(B, C))
+     return;
+
+   // If we can prove the product fits in the narrow arithmetic width, suppress.

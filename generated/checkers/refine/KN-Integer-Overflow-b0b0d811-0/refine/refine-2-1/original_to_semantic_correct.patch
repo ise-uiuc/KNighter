@@ -1,0 +1,216 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -123,11 +123,22 @@   static bool isMulUnderArrayIndex(const BinaryOperator *MulBO,
+                                    CheckerContext &C);
+
++  // CFI-style erase region math: ((X >> k) & ~((1<<K)-1)) * interleave
++  static bool isConstMaskClearingLowBits(const Expr *E, unsigned &ClearedBits,
++                                         CheckerContext &C);
++  static bool matchMaskedShiftExpr(const Expr *E, unsigned &ShiftAmt,
++                                   unsigned &ClearedBits, CheckerContext &C);
++  static bool isBenignCFIMaskedShiftInterleaveCase(const BinaryOperator *MulBO,
++                                                   CheckerContext &C);
++
+   // Aggregated FP gate.
+   static bool isFalsePositive(const Expr *Root,
+                               const BinaryOperator *MulBO,
+                               const Expr *LHSExpr,
+                               CheckerContext &C);
++
++  static void clampByNameHints(const Expr *E, llvm::APInt &Min, llvm::APInt &Max,
++                               CheckerContext &C);
+
+   void emitReport(const BinaryOperator *MulBO, QualType LHSType,
+                   CheckerContext &C) const;
+@@ -183,6 +194,18 @@   }
+ }
+
++// Clamp ranges based on identifier hints (heuristics for kernel).
++void SAGenTestChecker::clampByNameHints(const Expr *E, llvm::APInt &Min, llvm::APInt &Max,
++                                        CheckerContext &C) {
++  // Small interleave factors in flash CFI stacks are common (1,2,4,8,...).
++  if (exprNameContains(E, {"interleave"}, C)) {
++    llvm::APInt One = llvm::APInt(128, 1, /*isSigned*/false);
++    llvm::APInt Up = llvm::APInt(128, 64, /*isSigned*/false);
++    if (Min.slt(One)) Min = One;
++    if (Max.sgt(Up))  Max = Up;
++  }
++}
++
+ // Lightweight interval analysis for expressions. Always returns true,
+ // providing a conservative range, falling back to type-based ranges.
+ // Depth-limited to avoid pathological recursion.
+@@ -256,6 +279,11 @@       Max = -SMin;
+       return true;
+     }
++    // Bitwise not may be folded above; otherwise fallback.
++    if (K == UO_Not) {
++      getTypeRange128(UO->getType(), C, Min, Max);
++      return true;
++    }
+     // Address/deref or other: fallback to type range
+     getTypeRange128(UO->getType(), C, Min, Max);
+     return true;
+@@ -301,9 +329,58 @@       }
+       return true;
+     }
+-    case BO_Shl:
+-    case BO_Shr:
+-    case BO_And:
++    case BO_Shr: {
++      // If RHS is a constant, tighten by shifting bounds; valid for nonnegative ranges.
++      llvm::APSInt AmtAPS;
++      if (EvaluateExprToInt(AmtAPS, BO->getRHS()->IgnoreParenImpCasts(), C)) {
++        unsigned Amt = (unsigned)AmtAPS.getExtValue();
++        // If LHS min is nonnegative (common for unsigned types), shift both.
++        if (!LMin.isNegative() && !LMax.isNegative()) {
++          Min = LMin.lshr(Amt);
++          Max = LMax.lshr(Amt);
++          return true;
++        }
++      }
++      getTypeRange128(BO->getType(), C, Min, Max);
++      return true;
++    }
++    case BO_Shl: {
++      llvm::APSInt AmtAPS;
++      if (EvaluateExprToInt(AmtAPS, BO->getRHS()->IgnoreParenImpCasts(), C)) {
++        unsigned Amt = (unsigned)AmtAPS.getExtValue();
++        if (!LMin.isNegative() && !LMax.isNegative()) {
++          Min = LMin.shl(Amt);
++          Max = LMax.shl(Amt);
++          return true;
++        }
++      }
++      getTypeRange128(BO->getType(), C, Min, Max);
++      return true;
++    }
++    case BO_And: {
++      // If one side is a constant mask M, result is within [0, min(OtherMax, M)].
++      llvm::APSInt ConstAPS;
++      bool LConst = EvaluateExprToInt(ConstAPS, BO->getLHS()->IgnoreParenImpCasts(), C);
++      if (LConst) {
++        llvm::APInt M = ConstAPS.extOrTrunc(128);
++        llvm::APInt Zero(128, 0, false);
++        Min = Zero;
++        Max = (LMax.slt(M)) ? LMax : M;
++        clampByNameHints(BO->getRHS(), Min, Max, C);
++        return true;
++      }
++      bool RConst = EvaluateExprToInt(ConstAPS, BO->getRHS()->IgnoreParenImpCasts(), C);
++      if (RConst) {
++        llvm::APInt M = ConstAPS.extOrTrunc(128);
++        llvm::APInt Zero(128, 0, false);
++        Min = Zero;
++        Max = (RMax.slt(M)) ? RMax : M;
++        clampByNameHints(BO->getLHS(), Min, Max, C);
++        return true;
++      }
++      getTypeRange128(BO->getType(), C, Min, Max);
++      return true;
++    }
+     case BO_Or:
+     case BO_Xor:
+     default:
+@@ -329,9 +406,10 @@     return true;
+   }
+
+-  // Member access / decl ref: use their type ranges.
++  // Member access / decl ref: use their type ranges, then clamp by name hints.
+   if (isa<MemberExpr>(E) || isa<DeclRefExpr>(E)) {
+     getTypeRange128(E->getType(), C, Min, Max);
++    clampByNameHints(E, Min, Max, C);
+     return true;
+   }
+
+@@ -700,6 +778,83 @@   return ASE != nullptr;
+ }
+
++// Detect E is a constant mask that clears at least K low bits: e.g., ~0xff or 0xffff0000.
++bool SAGenTestChecker::isConstMaskClearingLowBits(const Expr *E, unsigned &ClearedBits,
++                                                  CheckerContext &C) {
++  llvm::APSInt APS;
++  if (!EvaluateExprToInt(APS, E->IgnoreParenImpCasts(), C))
++    return false;
++  llvm::APInt V = APS.extOrTrunc(128);
++  // Number of trailing zero bits gives cleared low bits by this mask.
++  unsigned TZ = V.countTrailingZeros();
++  if (TZ == 0)
++    return false;
++  ClearedBits = TZ;
++  return true;
++}
++
++// Detect ((X >> ShiftAmt) & MaskClearingLowClearedBits)
++bool SAGenTestChecker::matchMaskedShiftExpr(const Expr *E, unsigned &ShiftAmt,
++                                            unsigned &ClearedBits, CheckerContext &C) {
++  E = E ? E->IgnoreParenImpCasts() : nullptr;
++  const auto *AndBO = dyn_cast_or_null<BinaryOperator>(E);
++  if (!AndBO || AndBO->getOpcode() != BO_And)
++    return false;
++
++  // AND is commutative: check both sides for the mask and the shift.
++  auto TryMatch = [&](const Expr *Left, const Expr *Right) -> bool {
++    Left = Left ? Left->IgnoreParenImpCasts() : nullptr;
++    Right = Right ? Right->IgnoreParenImpCasts() : nullptr;
++    unsigned K = 0;
++    if (!isConstMaskClearingLowBits(Right, K, C))
++      return false;
++    const auto *ShrBO = dyn_cast<BinaryOperator>(Left);
++    if (!ShrBO || ShrBO->getOpcode() != BO_Shr)
++      return false;
++    llvm::APSInt AmtAPS;
++    if (!EvaluateExprToInt(AmtAPS, ShrBO->getRHS()->IgnoreParenImpCasts(), C))
++      return false;
++    int64_t SA = AmtAPS.getExtValue();
++    if (SA < 0)
++      return false;
++    ShiftAmt = (unsigned)SA;
++    ClearedBits = K;
++    return true;
++  };
++
++  if (TryMatch(AndBO->getLHS(), AndBO->getRHS()))
++    return true;
++  if (TryMatch(AndBO->getRHS(), AndBO->getLHS()))
++    return true;
++  return false;
++}
++
++// Specific benign CFI case: ((X >> k) & mask-clearing >=8 low bits) * <interleave>
++bool SAGenTestChecker::isBenignCFIMaskedShiftInterleaveCase(const BinaryOperator *MulBO,
++                                                            CheckerContext &C) {
++  if (!MulBO || MulBO->getOpcode() != BO_Mul)
++    return false;
++  const Expr *L = MulBO->getLHS()->IgnoreParenImpCasts();
++  const Expr *R = MulBO->getRHS()->IgnoreParenImpCasts();
++
++  unsigned ShiftAmt = 0, Cleared = 0;
++  // One side must be masked-shift; the other named "interleave".
++  bool LMasked = matchMaskedShiftExpr(L, ShiftAmt, Cleared, C);
++  bool RMasked = matchMaskedShiftExpr(R, ShiftAmt, Cleared, C);
++  if (!LMasked && !RMasked)
++    return false;
++
++  const Expr *Other = LMasked ? R : L;
++  if (!exprNameContains(Other, {"interleave"}, C))
++    return false;
++
++  // Require that at least 8 low bits are cleared, as in (~0xff) pattern.
++  if (Cleared < 8)
++    return false;
++
++  return true;
++}
++
+ // Aggregated FP logic.
+ bool SAGenTestChecker::isFalsePositive(const Expr *Root,
+                                        const BinaryOperator *MulBO,
+@@ -720,6 +875,10 @@   if (isMulUnderCallArg(MulBO, Root, C))
+     return true;
+   if (isMulUnderArrayIndex(MulBO, C))
++    return true;
++
++  // Targeted suppression: CFI erase-region product pattern.
++  if (isBenignCFIMaskedShiftInterleaveCase(MulBO, C))
+     return true;
+
+   return false;

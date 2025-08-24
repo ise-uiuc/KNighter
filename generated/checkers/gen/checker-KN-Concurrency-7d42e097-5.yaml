@@ -1,0 +1,522 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 7d42e097607c4d246d99225bf2b195b6167a210c
+commit_type: Concurrency
+index: 5
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/Stmt.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"llvm/ADT/DenseMap.h\"\n#include\
+  \ \"llvm/ADT/DenseSet.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include <utility>\n\
+  \nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// No\
+  \ custom program states needed for this checker.\nnamespace {\n\nstruct WorkerBodyInfo\
+  \ {\n  bool HasCompletionDone = false;\n  bool HasUseOrFree = false; // complete()/complete_all()/kfree()/kvfree()\n\
+  \  const Stmt *FirstUseOrFreeStmt = nullptr; // for reporting location\n};\n\n//\
+  \ The checker scans AST bodies and correlates submitter and worker functions.\n\
+  class SAGenTestChecker : public Checker<check::ASTCodeBody> {\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\n  // Cache of worker function analysis results.\n  mutable llvm::DenseMap<const\
+  \ FunctionDecl *, WorkerBodyInfo> WorkerInfoMap;\n\n  // Set of worker functions\
+  \ that are \"at risk\" due to submitter pattern\n  // (wait_for_completion_timeout\
+  \ + kfree of the same context).\n  mutable llvm::DenseSet<const FunctionDecl *>\
+  \ RiskyWorkers;\n\npublic:\n  SAGenTestChecker()\n      : BT(new BugType(this, \"\
+  Worker may use/free context after submitter timeout\",\n                       \"\
+  Concurrency\")) {}\n\n  void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr,\n\
+  \                        BugReporter &BR) const;\n\nprivate:\n  // Helpers\n  static\
+  \ const FunctionDecl *getDirectCallee(const CallExpr *CE) {\n    if (!CE) return\
+  \ nullptr;\n    return CE->getDirectCallee();\n  }\n\n  static bool isCallNamed(const\
+  \ CallExpr *CE, StringRef Name) {\n    if (!CE) return false;\n    if (const FunctionDecl\
+  \ *FD = getDirectCallee(CE)) {\n      return FD->getName() == Name;\n    }\n   \
+  \ return false;\n  }\n\n  static const FunctionDecl *getFunctionDeclFromExpr(const\
+  \ Expr *E) {\n    if (!E) return nullptr;\n    E = E->IgnoreParenImpCasts();\n \
+  \   if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n      if (const auto *FD\
+  \ = dyn_cast<FunctionDecl>(DRE->getDecl()))\n        return FD;\n    }\n    return\
+  \ nullptr;\n  }\n\n  // Return the root ValueDecl for expressions like:\n  //  \
+  \ - owner\n  //   - owner->field\n  //   - (&owner->field)\n  //   - (owner).field\n\
+  \  static const ValueDecl *getRootBaseDeclFromMember(const Expr *E) {\n    if (!E)\
+  \ return nullptr;\n    E = E->IgnoreParenImpCasts();\n\n    if (const auto *UO =\
+  \ dyn_cast<UnaryOperator>(E)) {\n      if (UO->getOpcode() == UO_AddrOf || UO->getOpcode()\
+  \ == UO_Deref)\n        return getRootBaseDeclFromMember(UO->getSubExpr());\n  \
+  \  }\n\n    if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n      const Expr *Base\
+  \ = ME->getBase();\n      if (!Base) return nullptr;\n      return getRootBaseDeclFromMember(Base);\n\
+  \    }\n\n    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n      return DRE->getDecl();\n\
+  \    }\n\n    return nullptr;\n  }\n\n  // Get owner decl from an expression like\
+  \ &owner->field or &owner.field.\n  static const ValueDecl *getOwnerDeclFromAddrOfMember(const\
+  \ Expr *E) {\n    if (!E) return nullptr;\n    E = E->IgnoreParenImpCasts();\n \
+  \   const UnaryOperator *UO = dyn_cast<UnaryOperator>(E);\n    if (!UO || UO->getOpcode()\
+  \ != UO_AddrOf)\n      return nullptr;\n\n    const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();\n\
+  \    const MemberExpr *ME = dyn_cast<MemberExpr>(Sub);\n    if (!ME)\n      return\
+  \ nullptr;\n\n    // Optional: ensure the member name looks like a work field when\
+  \ used for INIT_WORK\n    return getRootBaseDeclFromMember(ME);\n  }\n\n  // Does\
+  \ expr E ultimately refer to the same root decl as Owner?\n  static bool exprRootsToOwner(const\
+  \ Expr *E, const ValueDecl *Owner) {\n    if (!E || !Owner) return false;\n    const\
+  \ ValueDecl *VD = nullptr;\n\n    E = E->IgnoreParenImpCasts();\n    if (const auto\
+  \ *UO = dyn_cast<UnaryOperator>(E)) {\n      if (UO->getOpcode() == UO_AddrOf ||\
+  \ UO->getOpcode() == UO_Deref)\n        return exprRootsToOwner(UO->getSubExpr(),\
+  \ Owner);\n    }\n\n    if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n      VD\
+  \ = getRootBaseDeclFromMember(ME);\n    } else if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n      VD = DRE->getDecl();\n    } else {\n      VD = getRootBaseDeclFromMember(E);\n\
+  \    }\n\n    return VD && VD == Owner;\n  }\n\n  static bool occursAfter(SourceLocation\
+  \ A, SourceLocation B,\n                          const SourceManager &SM) {\n \
+  \   if (A.isInvalid() || B.isInvalid())\n      return false;\n    // True if B is\
+  \ before A => A occurs after B.\n    return SM.isBeforeInTranslationUnit(B, A);\n\
+  \  }\n\n  void analyzeWorkerBody(const FunctionDecl *FD, AnalysisManager &Mgr,\n\
+  \                         BugReporter &BR) const;\n\n  void analyzeSubmitterBody(const\
+  \ FunctionDecl *FD, AnalysisManager &Mgr,\n                            BugReporter\
+  \ &BR) const;\n\n  void maybeReport(const FunctionDecl *WorkerFD, AnalysisManager\
+  \ &Mgr,\n                   BugReporter &BR, const WorkerBodyInfo &Info) const;\n\
+  };\n\n// Scan a function body as a worker: does it call completion_done? does it\n\
+  // call complete()/complete_all()/kfree()/kvfree()?\nvoid SAGenTestChecker::analyzeWorkerBody(const\
+  \ FunctionDecl *FD,\n                                         AnalysisManager &Mgr,\n\
+  \                                         BugReporter &BR) const {\n  if (!FD ||\
+  \ !FD->hasBody())\n    return;\n\n  auto It = WorkerInfoMap.find(FD);\n  if (It\
+  \ != WorkerInfoMap.end()) {\n    // Already analyzed\n    return;\n  }\n\n  WorkerBodyInfo\
+  \ Info;\n\n  const Stmt *Body = FD->getBody();\n\n  class WorkerScanner : public\
+  \ RecursiveASTVisitor<WorkerScanner> {\n  public:\n    WorkerBodyInfo &I;\n    WorkerScanner(WorkerBodyInfo\
+  \ &InfoRef) : I(InfoRef) {}\n    bool VisitCallExpr(CallExpr *CE) {\n      if (!CE)\
+  \ return true;\n\n      if (const FunctionDecl *Callee = CE->getDirectCallee())\
+  \ {\n        StringRef Name = Callee->getName();\n        if (Name == \"completion_done\"\
+  ) {\n          I.HasCompletionDone = true;\n        } else if (Name == \"complete\"\
+  \ || Name == \"complete_all\" ||\n                   Name == \"kfree\" || Name ==\
+  \ \"kvfree\") {\n          if (!I.HasUseOrFree) {\n            I.HasUseOrFree =\
+  \ true;\n            I.FirstUseOrFreeStmt = CE;\n          }\n        }\n      }\n\
+  \      return true;\n    }\n  } Scanner(Info);\n\n  Scanner.TraverseStmt(const_cast<Stmt\
+  \ *>(Body));\n\n  WorkerInfoMap[FD] = Info;\n\n  // If this worker is marked risky,\
+  \ maybe report now.\n  if (RiskyWorkers.count(FD)) {\n    maybeReport(FD, Mgr, BR,\
+  \ Info);\n  }\n}\n\n// Scan a function that schedules workers and waits with timeout,\
+  \ then frees\n// the context. If that pattern is found, mark the associated worker\
+  \ function\n// as risky.\nvoid SAGenTestChecker::analyzeSubmitterBody(const FunctionDecl\
+  \ *FD,\n                                            AnalysisManager &Mgr,\n    \
+  \                                        BugReporter &BR) const {\n  if (!FD ||\
+  \ !FD->hasBody())\n    return;\n\n  const Stmt *Body = FD->getBody();\n  const SourceManager\
+  \ &SM = BR.getSourceManager();\n\n  struct OwnerRecord {\n    const FunctionDecl\
+  \ *WorkerFD = nullptr; // from INIT_WORK or similar\n    llvm::SmallVector<SourceLocation,\
+  \ 4> WaitLocs;\n    llvm::SmallVector<SourceLocation, 4> FreeLocs;\n    // Store\
+  \ which field name was used in INIT_WORK first arg; used to ensure it's a work field\n\
+  \    bool IsWorkLike = false;\n  };\n\n  llvm::DenseMap<const ValueDecl *, OwnerRecord>\
+  \ OwnerMap;\n\n  class SubmitterScanner : public RecursiveASTVisitor<SubmitterScanner>\
+  \ {\n  public:\n    const SourceManager &SM;\n    llvm::DenseMap<const ValueDecl\
+  \ *, OwnerRecord> &OM;\n    SubmitterScanner(const SourceManager &SMgr,\n      \
+  \               llvm::DenseMap<const ValueDecl *, OwnerRecord> &OwnerM)\n      \
+  \  : SM(SMgr), OM(OwnerM) {}\n\n    bool VisitCallExpr(CallExpr *CE) {\n      if\
+  \ (!CE) return true;\n\n      const FunctionDecl *Callee = CE->getDirectCallee();\n\
+  \      if (!Callee) return true;\n\n      StringRef Name = Callee->getName();\n\n\
+  \      // Detect INIT_WORK-like: first arg should be &owner->work, second is worker\n\
+  \      if (Name == \"INIT_WORK\" || Name == \"__INIT_WORK\" ||\n          Name ==\
+  \ \"INIT_WORK_ONSTACK\" || Name == \"init_work\") {\n\n        const Expr *Arg0\
+  \ = (CE->getNumArgs() >= 1) ? CE->getArg(0) : nullptr;\n        const Expr *Arg1\
+  \ = (CE->getNumArgs() >= 2) ? CE->getArg(1) : nullptr;\n        if (!Arg0 || !Arg1)\n\
+  \          return true;\n\n        // Check Arg0 is &owner->work-like\n        const\
+  \ Expr *A0 = Arg0->IgnoreParenImpCasts();\n        const UnaryOperator *UO = dyn_cast<UnaryOperator>(A0);\n\
+  \        if (!UO || UO->getOpcode() != UO_AddrOf)\n          return true;\n\n  \
+  \      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();\n        const\
+  \ MemberExpr *ME = dyn_cast<MemberExpr>(Sub);\n        if (!ME)\n          return\
+  \ true;\n\n        bool IsWorkLike = false;\n        if (const ValueDecl *MD = ME->getMemberDecl())\
+  \ {\n          StringRef FieldName = MD->getName();\n          if (FieldName.contains(\"\
+  work\"))\n            IsWorkLike = true;\n        }\n\n        const ValueDecl *Owner\
+  \ = SAGenTestChecker::getRootBaseDeclFromMember(ME);\n        if (!Owner)\n    \
+  \      return true;\n\n        const FunctionDecl *WorkerFD =\n            SAGenTestChecker::getFunctionDeclFromExpr(Arg1);\n\
+  \        // Record even if worker is null (keep owner for later events)\n      \
+  \  OwnerRecord &Rec = OM[Owner];\n        if (WorkerFD)\n          Rec.WorkerFD\
+  \ = WorkerFD;\n        Rec.IsWorkLike |= IsWorkLike;\n      }\n\n      // Detect\
+  \ wait_for_completion_timeout(&owner->compl, ...)\n      if (Name == \"wait_for_completion_timeout\"\
+  ) {\n        const Expr *Arg0 = (CE->getNumArgs() >= 1) ? CE->getArg(0) : nullptr;\n\
+  \        if (Arg0) {\n          const ValueDecl *Owner =\n              SAGenTestChecker::getOwnerDeclFromAddrOfMember(Arg0);\n\
+  \          if (Owner) {\n            OwnerRecord &Rec = OM[Owner];\n           \
+  \ Rec.WaitLocs.push_back(CE->getExprLoc());\n          }\n        }\n      }\n\n\
+  \      // Detect kfree(owner) or kvfree(owner)\n      if (Name == \"kfree\" || Name\
+  \ == \"kvfree\") {\n        const Expr *Arg0 = (CE->getNumArgs() >= 1) ? CE->getArg(0)\
+  \ : nullptr;\n        if (Arg0) {\n          // Try to match to any known owner,\
+  \ or infer owner from Arg0.\n          // Prefer direct inference:\n          const\
+  \ ValueDecl *DirectOwner = nullptr;\n          const Expr *E0 = Arg0->IgnoreParenImpCasts();\n\
+  \          if (const auto *DRE = dyn_cast<DeclRefExpr>(E0)) {\n            DirectOwner\
+  \ = DRE->getDecl();\n          } else {\n            DirectOwner = SAGenTestChecker::getRootBaseDeclFromMember(E0);\n\
+  \          }\n\n          if (DirectOwner) {\n            OwnerRecord &Rec = OM[DirectOwner];\n\
+  \            Rec.FreeLocs.push_back(CE->getExprLoc());\n          } else {\n   \
+  \         // Otherwise, try to match any existing owner by root-compare.\n     \
+  \       for (auto &P : OM) {\n              if (SAGenTestChecker::exprRootsToOwner(Arg0,\
+  \ P.first)) {\n                P.second.FreeLocs.push_back(CE->getExprLoc());\n\
+  \              }\n            }\n          }\n        }\n      }\n\n      return\
+  \ true;\n    }\n  } Scanner(SM, OwnerMap);\n\n  Scanner.TraverseStmt(const_cast<Stmt\
+  \ *>(Body));\n\n  // After scan: find owners that have worker + wait + kfree after\
+  \ wait.\n  for (const auto &Entry : OwnerMap) {\n    const ValueDecl *Owner = Entry.first;\n\
+  \    const OwnerRecord &Rec = Entry.second;\n\n    if (!Rec.WorkerFD)\n      continue;\n\
+  \n    if (Rec.WaitLocs.empty() || Rec.FreeLocs.empty())\n      continue;\n\n   \
+  \ // At least one kfree after some wait.\n    bool HasAfter = false;\n    for (auto\
+  \ FL : Rec.FreeLocs) {\n      for (auto WL : Rec.WaitLocs) {\n        if (occursAfter(FL,\
+  \ WL, SM)) {\n          HasAfter = true;\n          break;\n        }\n      }\n\
+  \      if (HasAfter) break;\n    }\n\n    if (!HasAfter)\n      continue;\n\n  \
+  \  // Mark worker as risky.\n    RiskyWorkers.insert(Rec.WorkerFD);\n\n    // If\
+  \ already analyzed worker body, maybe report now.\n    auto It = WorkerInfoMap.find(Rec.WorkerFD);\n\
+  \    if (It != WorkerInfoMap.end()) {\n      maybeReport(Rec.WorkerFD, Mgr, BR,\
+  \ It->second);\n    }\n  }\n}\n\nvoid SAGenTestChecker::maybeReport(const FunctionDecl\
+  \ *WorkerFD,\n                                   AnalysisManager &Mgr, BugReporter\
+  \ &BR,\n                                   const WorkerBodyInfo &Info) const {\n\
+  \  if (!WorkerFD)\n    return;\n\n  if (!RiskyWorkers.count(WorkerFD))\n    return;\n\
+  \n  if (!Info.HasUseOrFree)\n    return;\n\n  if (Info.HasCompletionDone)\n    return;\n\
+  \n  // Report: Worker may use/free context after submitter timeout; missing completion_done()\n\
+  \  const Stmt *S = Info.FirstUseOrFreeStmt ? Info.FirstUseOrFreeStmt\n         \
+  \                                 : WorkerFD->getBody();\n  AnalysisDeclContext\
+  \ *ADC = Mgr.getAnalysisDeclContext(WorkerFD);\n  PathDiagnosticLocation Loc =\n\
+  \      PathDiagnosticLocation::createBegin(S, BR.getSourceManager(), ADC);\n\n \
+  \ BR.EmitBasicReport(\n      WorkerFD, this,\n      \"Worker may use/free context\
+  \ after submitter timeout\",\n      \"Concurrency\",\n      \"Missing completion_done()\
+  \ check in workqueue worker; submitter may free \"\n      \"the context after wait_for_completion_timeout.\"\
+  ,\n      Loc);\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr,\n                                        BugReporter &BR) const {\n  const\
+  \ auto *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD || !FD->hasBody())\n    return;\n\
+  \n  // Analyze as worker to collect info (if it is a worker).\n  analyzeWorkerBody(FD,\
+  \ Mgr, BR);\n\n  // Analyze as submitter to find risky workers.\n  analyzeSubmitterBody(FD,\
+  \ Mgr, BR);\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects missing completion_done() guard in workqueue worker when submitter\
+  \ may free context after wait_for_completion_timeout\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ncrypto: qat - resolve race condition during AER recovery\n\
+  \nDuring the PCI AER system's error recovery process, the kernel driver\nmay encounter\
+  \ a race condition with freeing the reset_data structure's\nmemory. If the device\
+  \ restart will take more than 10 seconds the function\nscheduling that restart will\
+  \ exit due to a timeout, and the reset_data\nstructure will be freed. However, this\
+  \ data structure is used for\ncompletion notification after the restart is completed,\
+  \ which leads\nto a UAF bug.\n\nThis results in a KFENCE bug notice.\n\n  BUG: KFENCE:\
+  \ use-after-free read in adf_device_reset_worker+0x38/0xa0 [intel_qat]\n  Use-after-free\
+  \ read at 0x00000000bc56fddf (in kfence-#142):\n  adf_device_reset_worker+0x38/0xa0\
+  \ [intel_qat]\n  process_one_work+0x173/0x340\n\nTo resolve this race condition,\
+  \ the memory associated to the container\nof the work_struct is freed on the worker\
+  \ if the timeout expired,\notherwise on the function that schedules the worker.\n\
+  The timeout detection can be done by checking if the caller is\nstill waiting for\
+  \ completion or not by using completion_done() function.\n\nFixes: d8cba25d2c68\
+  \ (\"crypto: qat - Intel(R) QAT driver framework\")\nCc: <stable@vger.kernel.org>\n\
+  Signed-off-by: Damian Muszynski <damian.muszynski@intel.com>\nReviewed-by: Giovanni\
+  \ Cabiddu <giovanni.cabiddu@intel.com>\nSigned-off-by: Herbert Xu <herbert@gondor.apana.org.au>\n\
+  \n## Buggy Code\n\n```c\n// Function: adf_device_reset_worker in drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  static void adf_device_reset_worker(struct work_struct *work)\n{\n\tstruct adf_reset_dev_data\
+  \ *reset_data =\n\t\t  container_of(work, struct adf_reset_dev_data, reset_work);\n\
+  \tstruct adf_accel_dev *accel_dev = reset_data->accel_dev;\n\tunsigned long wait_jiffies\
+  \ = msecs_to_jiffies(10000);\n\tstruct adf_sriov_dev_data sriov_data;\n\n\tadf_dev_restarting_notify(accel_dev);\n\
+  \tif (adf_dev_restart(accel_dev)) {\n\t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n\t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n\t\t\tkfree(reset_data);\n\
+  \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\n\");\n\t\treturn;\n\
+  \t}\n\n\tsriov_data.accel_dev = accel_dev;\n\tinit_completion(&sriov_data.compl);\n\
+  \tINIT_WORK(&sriov_data.sriov_work, adf_device_sriov_worker);\n\tqueue_work(device_sriov_wq,\
+  \ &sriov_data.sriov_work);\n\tif (wait_for_completion_timeout(&sriov_data.compl,\
+  \ wait_jiffies))\n\t\tadf_pf2vf_notify_restarted(accel_dev);\n\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\n\t/* The dev is back\
+  \ alive. Notify the caller if in sync mode */\n\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n\
+  \t\tcomplete(&reset_data->compl);\n\telse\n\t\tkfree(reset_data);\n}\n```\n\n```c\n\
+  // Function: adf_slot_reset in drivers/crypto/intel/qat/qat_common/adf_aer.c\nstatic\
+  \ pci_ers_result_t adf_slot_reset(struct pci_dev *pdev)\n{\n\tstruct adf_accel_dev\
+  \ *accel_dev = adf_devmgr_pci_to_accel_dev(pdev);\n\tint res = 0;\n\n\tif (!accel_dev)\
+  \ {\n\t\tpr_err(\"QAT: Can't find acceleration device\\n\");\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\
+  \t}\n\n\tif (!pdev->is_busmaster)\n\t\tpci_set_master(pdev);\n\tpci_restore_state(pdev);\n\
+  \tpci_save_state(pdev);\n\tres = adf_dev_up(accel_dev, false);\n\tif (res && res\
+  \ != -EALREADY)\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\n\tadf_reenable_sriov(accel_dev);\n\
+  \tadf_pf2vf_notify_restarted(accel_dev);\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\treturn PCI_ERS_RESULT_RECOVERED;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/crypto/intel/qat/qat_common/adf_aer.c\
+  \ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\nindex 3597e7605a14..9da2278bd5b7\
+  \ 100644\n--- a/drivers/crypto/intel/qat/qat_common/adf_aer.c\n+++ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  @@ -130,7 +130,8 @@ static void adf_device_reset_worker(struct work_struct *work)\n\
+  \ \tif (adf_dev_restart(accel_dev)) {\n \t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n \t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n-\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n+\t\tif (reset_data->mode\
+  \ == ADF_DEV_RESET_ASYNC ||\n+\t\t    completion_done(&reset_data->compl))\n \t\t\
+  \tkfree(reset_data);\n \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\\
+  n\");\n \t\treturn;\n@@ -146,11 +147,19 @@ static void adf_device_reset_worker(struct\
+  \ work_struct *work)\n \tadf_dev_restarted_notify(accel_dev);\n \tclear_bit(ADF_STATUS_RESTARTING,\
+  \ &accel_dev->status);\n \n-\t/* The dev is back alive. Notify the caller if in\
+  \ sync mode */\n-\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n-\t\tcomplete(&reset_data->compl);\n\
+  -\telse\n+\t/*\n+\t * The dev is back alive. Notify the caller if in sync mode\n\
+  +\t *\n+\t * If device restart will take a more time than expected,\n+\t * the schedule_reset()\
+  \ function can timeout and exit. This can be\n+\t * detected by calling the completion_done()\
+  \ function. In this case\n+\t * the reset_data structure needs to be freed here.\n\
+  +\t */\n+\tif (reset_data->mode == ADF_DEV_RESET_ASYNC ||\n+\t    completion_done(&reset_data->compl))\n\
+  \ \t\tkfree(reset_data);\n+\telse\n+\t\tcomplete(&reset_data->compl);\n }\n \n static\
+  \ int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n@@ -183,8 +192,9\
+  \ @@ static int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n \t\
+  \t\tdev_err(&GET_DEV(accel_dev),\n \t\t\t\t\"Reset device timeout expired\\n\");\n\
+  \ \t\t\tret = -EFAULT;\n+\t\t} else {\n+\t\t\tkfree(reset_data);\n \t\t}\n-\t\t\
+  kfree(reset_data);\n \t\treturn ret;\n \t}\n \treturn 0;\n```\n"
+pattern: "## Bug Pattern\n\nFreeing the context structure of a queued work item in\
+  \ the caller on timeout while the worker still assumes the structure is valid and\
+  \ uses it (e.g., to call complete() or to free it). The lifetime of the shared reset/request\
+  \ struct is not coordinated between the submitter and the worker, leading to a use-after-free\
+  \ when the worker dereferences or frees memory already freed by the caller.\n\n\
+  Typical pattern:\n\n- Caller:\n  struct ctx { struct work_struct work; struct completion\
+  \ done; ... } *c = kzalloc(...);\n  init_completion(&c->done);\n  INIT_WORK(&c->work,\
+  \ worker);\n  queue_work(wq, &c->work);\n  if (!wait_for_completion_timeout(&c->done,\
+  \ t))\n      kfree(c);  // timeout frees context\n\n- Worker:\n  struct ctx *c =\
+  \ container_of(work, struct ctx, work);\n  ... do work ...\n  complete(&c->done);\
+  \        // or kfree(c) in async mode\n  // uses c after caller may have freed it\
+  \ on timeout\n\nMissing check like completion_done(&c->done) to decide who owns\
+  \ freeing after a timeout causes UAF."
+plan: "Plan for a CSA checker: Detect freeing of a queued-work context on timeout\
+  \ while worker still uses/frees it without completion_done check (potential UAF/double-free)\n\
+  \n1) Program state customization\n- Do not use path-sensitive program state. This\
+  \ pattern can be detected reliably with an AST-body pass plus light cross-function\
+  \ bookkeeping.\n- Maintain lightweight checker-level caches:\n  - DenseMap<const\
+  \ FunctionDecl*, WorkerBodyInfo> WorkerInfoMap:\n    - hasCompletionDone: bool\n\
+  \    - hasUseOrFree: bool (true if calls complete/complete_all or kfree)\n    -\
+  \ firstUseOrFreeLoc: SourceLocation (for reporting)\n  - DenseSet<const FunctionDecl*>\
+  \ RiskyWorkers: worker functions referenced by callers that queue work and may free\
+  \ the context after wait_for_completion_timeout (timeout branch).\n  - Optional:\
+  \ DenseMap<const FunctionDecl*, std::string> WorkerNameMap for user-friendly messages.\n\
+  \n2) Callback choices and implementation details\n\n- checkASTCodeBody(const Decl\
+  \ *D, AnalysisManager &Mgr, BugReporter &BR)\n  Perform all the analysis in this\
+  \ callback in two roles:\n  A) For caller (submitter) functions: discover \u201C\
+  at-risk\u201D worker callbacks.\n  B) For worker functions: precompute whether they\
+  \ contain completion_done and whether they use/free the context.\n\n  2.A) Submitter-side\
+  \ scan to find risky worker callbacks\n  - Preconditions: Only handle FunctionDecl\
+  \ with hasBody().\n  - Traverse the function body once (simple recursive walk over\
+  \ Stmts and Exprs) and collect:\n    - INIT_WORK-like calls:\n      - Identify CallExpr\
+  \ callee by name among: \"INIT_WORK\", \"__INIT_WORK\", \"INIT_WORK_ONSTACK\", \"\
+  init_work\" (include a few kernel variants).\n      - Get first argument (addr-of\
+  \ work field): expect UnaryOperator '&' applied to MemberExpr referencing a field\
+  \ whose name contains \"work\" (e.g., \"work\", \"reset_work\").\n      - Extract\
+  \ the \u201Cowner\u201D base Expr from the MemberExpr (IgnoreParenImpCasts). If\
+  \ it is a DeclRefExpr or a MemberExpr whose base is DeclRefExpr, record the owner\
+  \ Decl (VarDecl/ParmVarDecl) as OwnerDecl.\n      - Get second argument (worker\
+  \ function pointer). If it is a DeclRefExpr to a FunctionDecl, record OwnerDecl\
+  \ -> WorkerDecl in a local map OwnerToWorker.\n    - wait_for_completion_timeout\
+  \ calls:\n      - Identify CallExpr callee name: \"wait_for_completion_timeout\"\
+  .\n      - First arg should be a pointer to a completion. Extract base owner Decl\
+  \ from first arg similarly (expect UnaryOperator '&' applied to MemberExpr).\n \
+  \     - Record a vector WaitSites[OwnerDecl].push_back(SourceLocation).\n    - kfree\
+  \ calls:\n      - Identify CallExpr callee name: \"kfree\" (include \"kvfree\" as\
+  \ variant).\n      - First arg expression (IgnoreParenImpCasts) should ideally reference\
+  \ the same owner Decl from above. If it is a DeclRefExpr or MemberExpr rooted at\
+  \ the same owner Decl, record FreeSites[OwnerDecl].push_back(SourceLocation).\n\
+  \  - After the scan:\n    - For each OwnerDecl that has a recorded WorkerDecl:\n\
+  \      - If it also has at least one wait_for_completion_timeout site and at least\
+  \ one kfree site, and the kfree location is after the wait call (compare SourceManager\
+  \ locations), consider the submitter frees context after timeout.\n      - If the\
+  \ function contains an if-condition or logical negation around wait_for_completion_timeout,\
+  \ you do not need to fully interpret it. The existence of both the wait and a subsequent\
+  \ kfree(owner) is sufficient to consider the pattern at risk (heuristic, reduces\
+  \ complexity).\n      - For each such OwnerDecl, add the associated WorkerDecl to\
+  \ RiskyWorkers.\n      - If WorkerInfoMap already has an entry for that WorkerDecl\
+  \ with hasUseOrFree = true and hasCompletionDone = false, issue a report now (see\
+  \ reporting below).\n  \n  2.B) Worker-side scan to see if completion_done is checked\
+  \ and if the context is used/freed\n  - If D is a FunctionDecl with a body, collect:\n\
+  \    - hasCompletionDone: whether the function body contains a CallExpr whose callee\
+  \ name is \"completion_done\".\n    - hasUseOrFree: whether there exists a CallExpr\
+  \ with callee name in {\"kfree\", \"kvfree\", \"complete\", \"complete_all\"}.\n\
+  \      - If yes, record the first such CallExpr\u2019s SourceLocation as firstUseOrFreeLoc\
+  \ for diagnostic pointing.\n    - Store WorkerBodyInfo into WorkerInfoMap[D].\n\
+  \    - If D is already in RiskyWorkers and hasUseOrFree is true and hasCompletionDone\
+  \ is false, emit a report at firstUseOrFreeLoc.\n\n- Helper logic used in checkASTCodeBody\n\
+  \  - getOwnerDeclFromAddrOfMember(Expr* E):\n    - E should be the expression for\
+  \ \"&owner->field\".\n    - Strip ImplicitCasts/ParenCasts.\n    - Expect UnaryOperator\
+  \ Kind == UO_AddrOf. Take its subExpr.\n    - Expect MemberExpr. Take its base expression,\
+  \ strip casts/parentheses.\n    - If base is DeclRefExpr, return cast<VarDecl/ParmVarDecl>(getDecl())\
+  \ as owner key.\n    - If base is a MemberExpr chain that ultimately roots at a\
+  \ DeclRefExpr, return that root Decl as owner key.\n    - If not recognizable, return\
+  \ null and skip.\n  - occursAfter(SourceLocation A, SourceLocation B, SourceManager\
+  \ &SM):\n    - Compare SM.isBeforeInTranslationUnit(B, A) to check if A is textually\
+  \ after B.\n  - isCalleeNamed(CallExpr* CE, StringRef Name):\n    - If FunctionDecl\
+  \ *FD = CE->getDirectCallee(), compare FD->getNameAsString() with Name.\n    - For\
+  \ macros that expand to functions, getDirectCallee still generally works on the\
+  \ expanded call.\n\n3) Reporting\n- When conditions hold (worker is in RiskyWorkers,\
+  \ hasUseOrFree is true, and hasCompletionDone is false), create a report:\n  - Use\
+  \ BasicBugReport with a concise message:\n    - \"Worker may use/free context after\
+  \ submitter timeout; missing completion_done() check\"\n  - Emit the report at firstUseOrFreeLoc\
+  \ inside the worker function.\n  - Optionally include a note or description to hint\
+  \ the fix: \"Guard complete()/kfree() with completion_done() to coordinate ownership\
+  \ after timeout.\"\n\n4) Notes and simplifications\n- This checker uses a robust\
+  \ heuristic:\n  - It links submitter\u2019s owner pointer between INIT_WORK(&owner->work,\
+  \ worker), wait_for_completion_timeout(&owner->...), and kfree(owner).\n  - It marks\
+  \ the associated worker as risky without path-sensitive return-value analysis.\n\
+  - We do not require a full dominance check in the worker: the presence of any completion_done()\
+  \ call in the worker function is treated as safe enough; otherwise, any call to\
+  \ complete()/kfree() in that worker is flagged when the worker is at risk.\n- Function\
+  \ and member names to detect:\n  - Worker init: \"INIT_WORK\", \"__INIT_WORK\",\
+  \ \"INIT_WORK_ONSTACK\", \"init_work\". The first argument\u2019s member name should\
+  \ contain \"work\".\n  - Wait with timeout: \"wait_for_completion_timeout\". First\
+  \ argument is \"&owner->...\".\n  - Worker usage/free: \"complete\", \"complete_all\"\
+  , \"kfree\", \"kvfree\".\n  - Safety check: \"completion_done\".\n- The checker\
+  \ only relies on checkASTCodeBody (simplest and sufficient). No need for path-sensitive\
+  \ callbacks or custom program state.\n"
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/Stmt.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"llvm/ADT/DenseMap.h\"\n#include\
+  \ \"llvm/ADT/DenseSet.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include <utility>\n\
+  \nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// No\
+  \ custom program states needed for this checker.\nnamespace {\n\nstruct WorkerBodyInfo\
+  \ {\n  bool HasCompletionDone = false;\n  bool HasUseOrFree = false; // complete()/complete_all()/kfree()/kvfree()\n\
+  \  const Stmt *FirstUseOrFreeStmt = nullptr; // for reporting location\n};\n\n//\
+  \ The checker scans AST bodies and correlates submitter and worker functions.\n\
+  class SAGenTestChecker : public Checker<check::ASTCodeBody> {\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\n  // Cache of worker function analysis results.\n  mutable llvm::DenseMap<const\
+  \ FunctionDecl *, WorkerBodyInfo> WorkerInfoMap;\n\n  // Set of worker functions\
+  \ that are \"at risk\" due to submitter pattern\n  // (wait_for_completion_timeout\
+  \ + kfree of the same context).\n  mutable llvm::DenseSet<const FunctionDecl *>\
+  \ RiskyWorkers;\n\npublic:\n  SAGenTestChecker()\n      : BT(new BugType(this, \"\
+  Worker may use/free context after submitter timeout\",\n                       \"\
+  Concurrency\")) {}\n\n  void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr,\n\
+  \                        BugReporter &BR) const;\n\nprivate:\n  // Helpers\n  static\
+  \ const FunctionDecl *getDirectCallee(const CallExpr *CE) {\n    if (!CE) return\
+  \ nullptr;\n    return CE->getDirectCallee();\n  }\n\n  static bool isCallNamed(const\
+  \ CallExpr *CE, StringRef Name) {\n    if (!CE) return false;\n    if (const FunctionDecl\
+  \ *FD = getDirectCallee(CE)) {\n      return FD->getName() == Name;\n    }\n   \
+  \ return false;\n  }\n\n  static const FunctionDecl *getFunctionDeclFromExpr(const\
+  \ Expr *E) {\n    if (!E) return nullptr;\n    E = E->IgnoreParenImpCasts();\n \
+  \   if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n      if (const auto *FD\
+  \ = dyn_cast<FunctionDecl>(DRE->getDecl()))\n        return FD;\n    }\n    return\
+  \ nullptr;\n  }\n\n  // Return the root ValueDecl for expressions like:\n  //  \
+  \ - owner\n  //   - owner->field\n  //   - (&owner->field)\n  //   - (owner).field\n\
+  \  static const ValueDecl *getRootBaseDeclFromMember(const Expr *E) {\n    if (!E)\
+  \ return nullptr;\n    E = E->IgnoreParenImpCasts();\n\n    if (const auto *UO =\
+  \ dyn_cast<UnaryOperator>(E)) {\n      if (UO->getOpcode() == UO_AddrOf || UO->getOpcode()\
+  \ == UO_Deref)\n        return getRootBaseDeclFromMember(UO->getSubExpr());\n  \
+  \  }\n\n    if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n      const Expr *Base\
+  \ = ME->getBase();\n      if (!Base) return nullptr;\n      return getRootBaseDeclFromMember(Base);\n\
+  \    }\n\n    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n      return DRE->getDecl();\n\
+  \    }\n\n    return nullptr;\n  }\n\n  // Get owner decl from an expression like\
+  \ &owner->field or &owner.field.\n  static const ValueDecl *getOwnerDeclFromAddrOfMember(const\
+  \ Expr *E) {\n    if (!E) return nullptr;\n    E = E->IgnoreParenImpCasts();\n \
+  \   const UnaryOperator *UO = dyn_cast<UnaryOperator>(E);\n    if (!UO || UO->getOpcode()\
+  \ != UO_AddrOf)\n      return nullptr;\n\n    const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();\n\
+  \    const MemberExpr *ME = dyn_cast<MemberExpr>(Sub);\n    if (!ME)\n      return\
+  \ nullptr;\n\n    // Optional: ensure the member name looks like a work field when\
+  \ used for INIT_WORK\n    return getRootBaseDeclFromMember(ME);\n  }\n\n  // Does\
+  \ expr E ultimately refer to the same root decl as Owner?\n  static bool exprRootsToOwner(const\
+  \ Expr *E, const ValueDecl *Owner) {\n    if (!E || !Owner) return false;\n    const\
+  \ ValueDecl *VD = nullptr;\n\n    E = E->IgnoreParenImpCasts();\n    if (const auto\
+  \ *UO = dyn_cast<UnaryOperator>(E)) {\n      if (UO->getOpcode() == UO_AddrOf ||\
+  \ UO->getOpcode() == UO_Deref)\n        return exprRootsToOwner(UO->getSubExpr(),\
+  \ Owner);\n    }\n\n    if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n      VD\
+  \ = getRootBaseDeclFromMember(ME);\n    } else if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n      VD = DRE->getDecl();\n    } else {\n      VD = getRootBaseDeclFromMember(E);\n\
+  \    }\n\n    return VD && VD == Owner;\n  }\n\n  static bool occursAfter(SourceLocation\
+  \ A, SourceLocation B,\n                          const SourceManager &SM) {\n \
+  \   if (A.isInvalid() || B.isInvalid())\n      return false;\n    // True if B is\
+  \ before A => A occurs after B.\n    return SM.isBeforeInTranslationUnit(B, A);\n\
+  \  }\n\n  void analyzeWorkerBody(const FunctionDecl *FD, AnalysisManager &Mgr,\n\
+  \                         BugReporter &BR) const;\n\n  void analyzeSubmitterBody(const\
+  \ FunctionDecl *FD, AnalysisManager &Mgr,\n                            BugReporter\
+  \ &BR) const;\n\n  void maybeReport(const FunctionDecl *WorkerFD, AnalysisManager\
+  \ &Mgr,\n                   BugReporter &BR, const WorkerBodyInfo &Info) const;\n\
+  };\n\n// Scan a function body as a worker: does it call completion_done? does it\n\
+  // call complete()/complete_all()/kfree()/kvfree()?\nvoid SAGenTestChecker::analyzeWorkerBody(const\
+  \ FunctionDecl *FD,\n                                         AnalysisManager &Mgr,\n\
+  \                                         BugReporter &BR) const {\n  if (!FD ||\
+  \ !FD->hasBody())\n    return;\n\n  auto It = WorkerInfoMap.find(FD);\n  if (It\
+  \ != WorkerInfoMap.end()) {\n    // Already analyzed\n    return;\n  }\n\n  WorkerBodyInfo\
+  \ Info;\n\n  const Stmt *Body = FD->getBody();\n\n  class WorkerScanner : public\
+  \ RecursiveASTVisitor<WorkerScanner> {\n  public:\n    WorkerBodyInfo &I;\n    WorkerScanner(WorkerBodyInfo\
+  \ &InfoRef) : I(InfoRef) {}\n    bool VisitCallExpr(CallExpr *CE) {\n      if (!CE)\
+  \ return true;\n\n      if (const FunctionDecl *Callee = CE->getDirectCallee())\
+  \ {\n        StringRef Name = Callee->getName();\n        if (Name == \"completion_done\"\
+  ) {\n          I.HasCompletionDone = true;\n        } else if (Name == \"complete\"\
+  \ || Name == \"complete_all\" ||\n                   Name == \"kfree\" || Name ==\
+  \ \"kvfree\") {\n          if (!I.HasUseOrFree) {\n            I.HasUseOrFree =\
+  \ true;\n            I.FirstUseOrFreeStmt = CE;\n          }\n        }\n      }\n\
+  \      return true;\n    }\n  } Scanner(Info);\n\n  Scanner.TraverseStmt(const_cast<Stmt\
+  \ *>(Body));\n\n  WorkerInfoMap[FD] = Info;\n\n  // If this worker is marked risky,\
+  \ maybe report now.\n  if (RiskyWorkers.count(FD)) {\n    maybeReport(FD, Mgr, BR,\
+  \ Info);\n  }\n}\n\n// Scan a function that schedules workers and waits with timeout,\
+  \ then frees\n// the context. If that pattern is found, mark the associated worker\
+  \ function\n// as risky.\nvoid SAGenTestChecker::analyzeSubmitterBody(const FunctionDecl\
+  \ *FD,\n                                            AnalysisManager &Mgr,\n    \
+  \                                        BugReporter &BR) const {\n  if (!FD ||\
+  \ !FD->hasBody())\n    return;\n\n  const Stmt *Body = FD->getBody();\n  const SourceManager\
+  \ &SM = BR.getSourceManager();\n\n  struct OwnerRecord {\n    const FunctionDecl\
+  \ *WorkerFD = nullptr; // from INIT_WORK or similar\n    llvm::SmallVector<SourceLocation,\
+  \ 4> WaitLocs;\n    llvm::SmallVector<SourceLocation, 4> FreeLocs;\n    // Store\
+  \ which field name was used in INIT_WORK first arg; used to ensure it's a work field\n\
+  \    bool IsWorkLike = false;\n  };\n\n  llvm::DenseMap<const ValueDecl *, OwnerRecord>\
+  \ OwnerMap;\n\n  class SubmitterScanner : public RecursiveASTVisitor<SubmitterScanner>\
+  \ {\n  public:\n    const SourceManager &SM;\n    llvm::DenseMap<const ValueDecl\
+  \ *, OwnerRecord> &OM;\n    SubmitterScanner(const SourceManager &SMgr,\n      \
+  \               llvm::DenseMap<const ValueDecl *, OwnerRecord> &OwnerM)\n      \
+  \  : SM(SMgr), OM(OwnerM) {}\n\n    bool VisitCallExpr(CallExpr *CE) {\n      if\
+  \ (!CE) return true;\n\n      const FunctionDecl *Callee = CE->getDirectCallee();\n\
+  \      if (!Callee) return true;\n\n      StringRef Name = Callee->getName();\n\n\
+  \      // Detect INIT_WORK-like: first arg should be &owner->work, second is worker\n\
+  \      if (Name == \"INIT_WORK\" || Name == \"__INIT_WORK\" ||\n          Name ==\
+  \ \"INIT_WORK_ONSTACK\" || Name == \"init_work\") {\n\n        const Expr *Arg0\
+  \ = (CE->getNumArgs() >= 1) ? CE->getArg(0) : nullptr;\n        const Expr *Arg1\
+  \ = (CE->getNumArgs() >= 2) ? CE->getArg(1) : nullptr;\n        if (!Arg0 || !Arg1)\n\
+  \          return true;\n\n        // Check Arg0 is &owner->work-like\n        const\
+  \ Expr *A0 = Arg0->IgnoreParenImpCasts();\n        const UnaryOperator *UO = dyn_cast<UnaryOperator>(A0);\n\
+  \        if (!UO || UO->getOpcode() != UO_AddrOf)\n          return true;\n\n  \
+  \      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();\n        const\
+  \ MemberExpr *ME = dyn_cast<MemberExpr>(Sub);\n        if (!ME)\n          return\
+  \ true;\n\n        bool IsWorkLike = false;\n        if (const ValueDecl *MD = ME->getMemberDecl())\
+  \ {\n          StringRef FieldName = MD->getName();\n          if (FieldName.contains(\"\
+  work\"))\n            IsWorkLike = true;\n        }\n\n        const ValueDecl *Owner\
+  \ = SAGenTestChecker::getRootBaseDeclFromMember(ME);\n        if (!Owner)\n    \
+  \      return true;\n\n        const FunctionDecl *WorkerFD =\n            SAGenTestChecker::getFunctionDeclFromExpr(Arg1);\n\
+  \        // Record even if worker is null (keep owner for later events)\n      \
+  \  OwnerRecord &Rec = OM[Owner];\n        if (WorkerFD)\n          Rec.WorkerFD\
+  \ = WorkerFD;\n        Rec.IsWorkLike |= IsWorkLike;\n      }\n\n      // Detect\
+  \ wait_for_completion_timeout(&owner->compl, ...)\n      if (Name == \"wait_for_completion_timeout\"\
+  ) {\n        const Expr *Arg0 = (CE->getNumArgs() >= 1) ? CE->getArg(0) : nullptr;\n\
+  \        if (Arg0) {\n          const ValueDecl *Owner =\n              SAGenTestChecker::getOwnerDeclFromAddrOfMember(Arg0);\n\
+  \          if (Owner) {\n            OwnerRecord &Rec = OM[Owner];\n           \
+  \ Rec.WaitLocs.push_back(CE->getExprLoc());\n          }\n        }\n      }\n\n\
+  \      // Detect kfree(owner) or kvfree(owner)\n      if (Name == \"kfree\" || Name\
+  \ == \"kvfree\") {\n        const Expr *Arg0 = (CE->getNumArgs() >= 1) ? CE->getArg(0)\
+  \ : nullptr;\n        if (Arg0) {\n          // Try to match to any known owner,\
+  \ or infer owner from Arg0.\n          // Prefer direct inference:\n          const\
+  \ ValueDecl *DirectOwner = nullptr;\n          const Expr *E0 = Arg0->IgnoreParenImpCasts();\n\
+  \          if (const auto *DRE = dyn_cast<DeclRefExpr>(E0)) {\n            DirectOwner\
+  \ = DRE->getDecl();\n          } else {\n            DirectOwner = SAGenTestChecker::getRootBaseDeclFromMember(E0);\n\
+  \          }\n\n          if (DirectOwner) {\n            OwnerRecord &Rec = OM[DirectOwner];\n\
+  \            Rec.FreeLocs.push_back(CE->getExprLoc());\n          } else {\n   \
+  \         // Otherwise, try to match any existing owner by root-compare.\n     \
+  \       for (auto &P : OM) {\n              if (SAGenTestChecker::exprRootsToOwner(Arg0,\
+  \ P.first)) {\n                P.second.FreeLocs.push_back(CE->getExprLoc());\n\
+  \              }\n            }\n          }\n        }\n      }\n\n      return\
+  \ true;\n    }\n  } Scanner(SM, OwnerMap);\n\n  Scanner.TraverseStmt(const_cast<Stmt\
+  \ *>(Body));\n\n  // After scan: find owners that have worker + wait + kfree after\
+  \ wait.\n  for (const auto &Entry : OwnerMap) {\n    const ValueDecl *Owner = Entry.first;\n\
+  \    const OwnerRecord &Rec = Entry.second;\n\n    if (!Rec.WorkerFD)\n      continue;\n\
+  \n    if (Rec.WaitLocs.empty() || Rec.FreeLocs.empty())\n      continue;\n\n   \
+  \ // At least one kfree after some wait.\n    bool HasAfter = false;\n    for (auto\
+  \ FL : Rec.FreeLocs) {\n      for (auto WL : Rec.WaitLocs) {\n        if (occursAfter(FL,\
+  \ WL, SM)) {\n          HasAfter = true;\n          break;\n        }\n      }\n\
+  \      if (HasAfter) break;\n    }\n\n    if (!HasAfter)\n      continue;\n\n  \
+  \  // Mark worker as risky.\n    RiskyWorkers.insert(Rec.WorkerFD);\n\n    // If\
+  \ already analyzed worker body, maybe report now.\n    auto It = WorkerInfoMap.find(Rec.WorkerFD);\n\
+  \    if (It != WorkerInfoMap.end()) {\n      maybeReport(Rec.WorkerFD, Mgr, BR,\
+  \ It->second);\n    }\n  }\n}\n\nvoid SAGenTestChecker::maybeReport(const FunctionDecl\
+  \ *WorkerFD,\n                                   AnalysisManager &Mgr, BugReporter\
+  \ &BR,\n                                   const WorkerBodyInfo &Info) const {\n\
+  \  if (!WorkerFD)\n    return;\n\n  if (!RiskyWorkers.count(WorkerFD))\n    return;\n\
+  \n  if (!Info.HasUseOrFree)\n    return;\n\n  if (Info.HasCompletionDone)\n    return;\n\
+  \n  // Report: Worker may use/free context after submitter timeout; missing completion_done()\n\
+  \  const Stmt *S = Info.FirstUseOrFreeStmt ? Info.FirstUseOrFreeStmt\n         \
+  \                                 : WorkerFD->getBody();\n  AnalysisDeclContext\
+  \ *ADC = Mgr.getAnalysisDeclContext(WorkerFD);\n  PathDiagnosticLocation Loc =\n\
+  \      PathDiagnosticLocation::createBegin(S, BR.getSourceManager(), ADC);\n\n \
+  \ BR.EmitBasicReport(\n      WorkerFD, this,\n      \"Worker may use/free context\
+  \ after submitter timeout\",\n      \"Concurrency\",\n      \"Missing completion_done()\
+  \ check in workqueue worker; submitter may free \"\n      \"the context after wait_for_completion_timeout.\"\
+  ,\n      Loc);\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr,\n                                        BugReporter &BR) const {\n  const\
+  \ auto *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD || !FD->hasBody())\n    return;\n\
+  \n  // Analyze as worker to collect info (if it is a worker).\n  analyzeWorkerBody(FD,\
+  \ Mgr, BR);\n\n  // Analyze as submitter to find risky workers.\n  analyzeSubmitterBody(FD,\
+  \ Mgr, BR);\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects missing completion_done() guard in workqueue worker when submitter\
+  \ may free context after wait_for_completion_timeout\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

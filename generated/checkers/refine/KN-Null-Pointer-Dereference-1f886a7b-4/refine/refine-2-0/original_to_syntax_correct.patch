@@ -1,0 +1,203 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -46,6 +46,11 @@   // Extract the base pointer symbol that is being dereferenced by statement S.
+   SymbolRef getDereferencedBaseSymbol(const Stmt *S, SVal Loc, CheckerContext &C) const;
+
++  // Helpers to analyze branch conditions and strip wrappers.
++  const Expr *stripParensCastsAndBuiltinExpect(const Expr *E) const;
++  SymbolRef getPointerSymbolFromExpr(const Expr *E, CheckerContext &C) const;
++  bool isNullPtrConstant(const Expr *E, CheckerContext &C) const;
++
+   void reportBug(CheckerContext &C, const Stmt *S) const;
+ };
+
+@@ -98,6 +103,83 @@   return nullptr;
+ }
+
++// Strip wrappers commonly seen in kernel boolean expressions:
++// - Parentheses and implicit casts
++// - __builtin_expect(...) introduced by likely()/unlikely() macros
++const Expr *SAGenTestChecker::stripParensCastsAndBuiltinExpect(const Expr *E) const {
++  if (!E)
++    return E;
++
++  E = E->IgnoreParenImpCasts();
++
++  // Unwrap any number of nested __builtin_expect(...) layers.
++  while (true) {
++    E = E->IgnoreParenImpCasts();
++    const auto *CE = dyn_cast<CallExpr>(E);
++    if (!CE)
++      break;
++
++    const FunctionDecl *FD = CE->getDirectCallee();
++    if (!FD)
++      break;
++
++    IdentifierInfo *II = FD->getIdentifier();
++    if (!II)
++      break;
++
++    // Match by name to avoid extra includes; GCC/Clang both use __builtin_expect.
++    if (II->getName().equals("__builtin_expect")) {
++      if (CE->getNumArgs() > 0) {
++        E = CE->getArg(0)->IgnoreParenImpCasts();
++        continue; // Keep unwrapping if nested
++      }
++    }
++    break;
++  }
++
++  return E;
++}
++
++// Try to extract the SymbolRef of a pointer expression used in a condition.
++// Handles chains like !!ptr or !!!ptr by peeling UO_LNot down to the base expr.
++SymbolRef SAGenTestChecker::getPointerSymbolFromExpr(const Expr *E, CheckerContext &C) const {
++  if (!E)
++    return nullptr;
++
++  ProgramStateRef State = C.getState();
++  const LocationContext *LCtx = C.getLocationContext();
++
++  E = stripParensCastsAndBuiltinExpect(E);
++
++  // Peel chains of logical not (!! or more).
++  while (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    if (UO->getOpcode() == UO_LNot)
++      E = UO->getSubExpr()->IgnoreParenImpCasts();
++    else
++      break;
++  }
++
++  // Obtain the symbol the analyzer associates with the expression.
++  SVal SV = State->getSVal(E, LCtx);
++  if (SymbolRef Sym = SV.getAsSymbol())
++    return Sym;
++
++  if (const MemRegion *MR = SV.getAsRegion()) {
++    MR = MR->getBaseRegion();
++    if (const auto *SR = dyn_cast<SymbolicRegion>(MR))
++      return SR->getSymbol();
++  }
++
++  return nullptr;
++}
++
++bool SAGenTestChecker::isNullPtrConstant(const Expr *E, CheckerContext &C) const {
++  if (!E)
++    return false;
++  return E->IgnoreParenImpCasts()->isNullPointerConstant(C.getASTContext(),
++                                                         Expr::NPC_ValueDependentIsNull);
++}
++
+ void SAGenTestChecker::reportBug(CheckerContext &C, const Stmt *S) const {
+   ExplodedNode *N = C.generateNonFatalErrorNode();
+   if (!N)
+@@ -115,9 +197,13 @@   if (!OriginExpr)
+     return;
+
+-  // Only track devm_kzalloc results.
+-  if (!ExprHasName(OriginExpr, "devm_kzalloc", C))
+-    return;
++  // Only track direct calls to devm_kzalloc (use callee identifier, not text).
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    if (!ID->getName().equals("devm_kzalloc"))
++      return;
++  } else {
++    return;
++  }
+
+   ProgramStateRef State = C.getState();
+   SVal Ret = Call.getReturnValue();
+@@ -129,54 +215,56 @@
+ void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+   const Expr *CondE = dyn_cast_or_null<Expr>(Condition);
+-  if (!CondE) {
+-    return;
+-  }
++  if (!CondE)
++    return;
+
+   ProgramStateRef State = C.getState();
+   const LocationContext *LCtx = C.getLocationContext();
++  (void)LCtx;
++
+   SymbolRef TargetSym = nullptr;
+
+-  // Handle: if (!ptr)
+-  if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {
++  // First try to unwrap builtins/paren/casts to the "real" condition.
++  const Expr *CoreE = stripParensCastsAndBuiltinExpect(CondE);
++
++  // Handle: if (!ptr) / if (!!ptr) / if (ptr)
++  if (const auto *UO = dyn_cast<UnaryOperator>(CoreE)) {
+     if (UO->getOpcode() == UO_LNot) {
+-      const Expr *SubE = UO->getSubExpr();
+-      if (SubE) {
+-        SVal SV = State->getSVal(SubE, LCtx);
+-        TargetSym = SV.getAsSymbol();
+-      }
+-    }
+-  }
++      // Get underlying pointer symbol even for chains of UO_LNot.
++      TargetSym = getPointerSymbolFromExpr(UO, C);
++    }
++  }
++
+   // Handle: if (ptr == NULL) or if (ptr != NULL)
+-  else if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {
+-    BinaryOperator::Opcode Op = BO->getOpcode();
+-    if (Op == BO_EQ || Op == BO_NE) {
+-      const Expr *LHS = BO->getLHS();
+-      const Expr *RHS = BO->getRHS();
+-      if (LHS && RHS) {
+-        bool LHSIsNull = LHS->IgnoreParenImpCasts()->isNullPointerConstant(C.getASTContext(),
+-                                         Expr::NPC_ValueDependentIsNull);
+-        bool RHSIsNull = RHS->IgnoreParenImpCasts()->isNullPointerConstant(C.getASTContext(),
+-                                         Expr::NPC_ValueDependentIsNull);
+-        const Expr *PtrExpr = nullptr;
+-        if (LHSIsNull && !RHSIsNull)
+-          PtrExpr = RHS;
+-        else if (RHSIsNull && !LHSIsNull)
+-          PtrExpr = LHS;
+-
+-        if (PtrExpr) {
+-          SVal SV = State->getSVal(PtrExpr, LCtx);
+-          TargetSym = SV.getAsSymbol();
++  if (!TargetSym) {
++    if (const auto *BO = dyn_cast<BinaryOperator>(CoreE)) {
++      BinaryOperator::Opcode Op = BO->getOpcode();
++      if (Op == BO_EQ || Op == BO_NE) {
++        const Expr *LHS = BO->getLHS();
++        const Expr *RHS = BO->getRHS();
++        if (LHS && RHS) {
++          bool LHSIsNull = isNullPtrConstant(LHS, C);
++          bool RHSIsNull = isNullPtrConstant(RHS, C);
++          const Expr *PtrExpr = nullptr;
++          if (LHSIsNull && !RHSIsNull)
++            PtrExpr = RHS;
++          else if (RHSIsNull && !LHSIsNull)
++            PtrExpr = LHS;
++
++          if (PtrExpr)
++            TargetSym = getPointerSymbolFromExpr(PtrExpr, C);
+         }
+       }
+     }
+   }
+-  // Handle: if (ptr)
+-  else {
+-    SVal SV = State->getSVal(CondE, LCtx);
+-    TargetSym = SV.getAsSymbol();
+-  }
+-
++
++  // Handle: if (ptr) and likely/unlikely-wrapped truthiness checks.
++  if (!TargetSym) {
++    TargetSym = getPointerSymbolFromExpr(CoreE, C);
++  }
++
++  // If the condition clearly references our tracked pointer in a nullness check,
++  // consider it "checked" and remove it from the unchecked set.
+   if (TargetSym && State->contains<UncheckedDevmPtrSyms>(TargetSym)) {
+     State = State->remove<UncheckedDevmPtrSyms>(TargetSym);
+     C.addTransition(State);

@@ -1,0 +1,295 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 9462f4ca56e7d2430fdb6dcc8498244acbfc4489
+commit_type: UAF
+index: 4
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Expr.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track whether gsm->tx_lock\
+  \ is currently held.\nREGISTER_TRAIT_WITH_PROGRAMSTATE(TxLockHeld, bool)\n\nnamespace\
+  \ {\n\nclass SAGenTestChecker\n  : public Checker<\n        check::BeginFunction,\n\
+  \        check::EndFunction,\n        check::PreCall,\n        check::PostCall>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Missing tx_lock on list free\", \"Concurrency\")) {}\n\
+  \n      void checkBeginFunction(CheckerContext &C) const;\n      void checkEndFunction(const\
+  \ ReturnStmt *RS, CheckerContext &C) const;\n      void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n\n   private:\n      // Helpers\n      static bool\
+  \ callNameIs(const CallEvent &Call, CheckerContext &C, StringRef Name);\n      static\
+  \ bool isFreeLike(const CallEvent &Call, CheckerContext &C);\n      static bool\
+  \ argIsTxLock(const CallEvent &Call, unsigned ArgIdx, CheckerContext &C);\n    \
+  \  static bool exprContainsTxList(const Stmt *S, CheckerContext &C);\n      static\
+  \ bool forIteratesTxLists(const ForStmt *F, CheckerContext &C);\n};\n\nvoid SAGenTestChecker::checkBeginFunction(CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  // At function entry,\
+  \ we assume tx_lock is not held.\n  State = State->set<TxLockHeld>(false);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  // Defensively reset; analysis engine will discard state anyway\
+  \ at function end.\n  ProgramStateRef State = C.getState();\n  State = State->set<TxLockHeld>(false);\n\
+  \  C.addTransition(State);\n}\n\nbool SAGenTestChecker::callNameIs(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name) {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  return ExprHasName(Origin, Name, C);\n}\n\n\
+  bool SAGenTestChecker::argIsTxLock(const CallEvent &Call, unsigned ArgIdx, CheckerContext\
+  \ &C) {\n  if (ArgIdx >= Call.getNumArgs())\n    return false;\n  const Expr *ArgE\
+  \ = Call.getArgExpr(ArgIdx);\n  if (!ArgE)\n    return false;\n  // Match textual\
+  \ usage of the designated lock\n  return ExprHasName(ArgE, \"tx_lock\", C);\n}\n\
+  \nbool SAGenTestChecker::isFreeLike(const CallEvent &Call, CheckerContext &C) {\n\
+  \  // We consider kfree/kvfree/vfree as free-like in kernel code.\n  return callNameIs(Call,\
+  \ C, \"kfree\") ||\n         callNameIs(Call, C, \"kvfree\") ||\n         callNameIs(Call,\
+  \ C, \"vfree\");\n}\n\nbool SAGenTestChecker::exprContainsTxList(const Stmt *S,\
+  \ CheckerContext &C) {\n  if (!S)\n    return false;\n\n  if (const auto *E = dyn_cast<Expr>(S))\
+  \ {\n    if (ExprHasName(E, \"tx_ctrl_list\", C))\n      return true;\n    if (ExprHasName(E,\
+  \ \"tx_data_list\", C))\n      return true;\n  }\n\n  // Fallback: try to find a\
+  \ MemberExpr among children and check its text.\n  if (const auto *ME = findSpecificTypeInChildren<MemberExpr>(S))\
+  \ {\n    const Expr *MEE = dyn_cast<Expr>(const_cast<MemberExpr*>(ME));\n    if\
+  \ (MEE) {\n      if (ExprHasName(MEE, \"tx_ctrl_list\", C))\n        return true;\n\
+  \      if (ExprHasName(MEE, \"tx_data_list\", C))\n        return true;\n    }\n\
+  \  }\n  return false;\n}\n\nbool SAGenTestChecker::forIteratesTxLists(const ForStmt\
+  \ *F, CheckerContext &C) {\n  if (!F)\n    return false;\n\n  // list_for_each_entry_safe\
+  \ expands to a for-loop where the condition\n  // typically compares against the\
+  \ 'head' which will reference &gsm->tx_*_list.\n  if (exprContainsTxList(F->getInit(),\
+  \ C))\n    return true;\n  if (exprContainsTxList(F->getCond(), C))\n    return\
+  \ true;\n  if (exprContainsTxList(F->getInc(), C))\n    return true;\n\n  return\
+  \ false;\n}\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Detect spin_lock*\
+  \ acquisitions on gsm->tx_lock\n  if (callNameIs(Call, C, \"spin_lock\") ||\n  \
+  \    callNameIs(Call, C, \"spin_lock_irqsave\") ||\n      callNameIs(Call, C, \"\
+  spin_lock_bh\") ||\n      callNameIs(Call, C, \"spin_lock_irq\")) {\n    if (argIsTxLock(Call,\
+  \ 0, C)) {\n      State = State->set<TxLockHeld>(true);\n      C.addTransition(State);\n\
+  \      return;\n    }\n  }\n\n  // Detect spin_unlock* releases on gsm->tx_lock\n\
+  \  if (callNameIs(Call, C, \"spin_unlock\") ||\n      callNameIs(Call, C, \"spin_unlock_irqrestore\"\
+  ) ||\n      callNameIs(Call, C, \"spin_unlock_bh\") ||\n      callNameIs(Call, C,\
+  \ \"spin_unlock_irq\")) {\n    if (argIsTxLock(Call, 0, C)) {\n      State = State->set<TxLockHeld>(false);\n\
+  \      C.addTransition(State);\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isFreeLike(Call, C))\n   \
+  \ return;\n\n  const Stmt *S = Call.getOriginExpr();\n  if (!S)\n    return;\n\n\
+  \  // Ensure this kfree/kvfree/vfree is inside a list_for_each_entry_safe over tx_*_list\n\
+  \  const ForStmt *EnclosingFor = findSpecificTypeInParents<ForStmt>(S, C);\n  if\
+  \ (!EnclosingFor)\n    return;\n\n  if (!forIteratesTxLists(EnclosingFor, C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  bool Held = State->get<TxLockHeld>();\n\
+  \  if (Held)\n    return;\n\n  // Report: free of tx_*_list node without holding\
+  \ tx_lock\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\
+  \n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"Freeing tx_*_list\
+  \ entries without holding tx_lock (possible UAF).\", N);\n  R->addRange(Call.getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\n} // end anonymous namespace\n\nextern \"C\"\
+  \ void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects freeing tx_*_list entries without\
+  \ holding gsm->tx_lock in loops\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ntty: n_gsm: Fix use-after-free in gsm_cleanup_mux\n\
+  \nBUG: KASAN: slab-use-after-free in gsm_cleanup_mux+0x77b/0x7b0\ndrivers/tty/n_gsm.c:3160\
+  \ [n_gsm]\nRead of size 8 at addr ffff88815fe99c00 by task poc/3379\nCPU: 0 UID:\
+  \ 0 PID: 3379 Comm: poc Not tainted 6.11.0+ #56\nHardware name: VMware, Inc. VMware\
+  \ Virtual Platform/440BX\nDesktop Reference Platform, BIOS 6.00 11/12/2020\nCall\
+  \ Trace:\n <TASK>\n gsm_cleanup_mux+0x77b/0x7b0 drivers/tty/n_gsm.c:3160 [n_gsm]\n\
+  \ __pfx_gsm_cleanup_mux+0x10/0x10 drivers/tty/n_gsm.c:3124 [n_gsm]\n __pfx_sched_clock_cpu+0x10/0x10\
+  \ kernel/sched/clock.c:389\n update_load_avg+0x1c1/0x27b0 kernel/sched/fair.c:4500\n\
+  \ __pfx_min_vruntime_cb_rotate+0x10/0x10 kernel/sched/fair.c:846\n __rb_insert_augmented+0x492/0xbf0\
+  \ lib/rbtree.c:161\n gsmld_ioctl+0x395/0x1450 drivers/tty/n_gsm.c:3408 [n_gsm]\n\
+  \ _raw_spin_lock_irqsave+0x92/0xf0 arch/x86/include/asm/atomic.h:107\n __pfx_gsmld_ioctl+0x10/0x10\
+  \ drivers/tty/n_gsm.c:3822 [n_gsm]\n ktime_get+0x5e/0x140 kernel/time/timekeeping.c:195\n\
+  \ ldsem_down_read+0x94/0x4e0 arch/x86/include/asm/atomic64_64.h:79\n __pfx_ldsem_down_read+0x10/0x10\
+  \ drivers/tty/tty_ldsem.c:338\n __pfx_do_vfs_ioctl+0x10/0x10 fs/ioctl.c:805\n tty_ioctl+0x643/0x1100\
+  \ drivers/tty/tty_io.c:2818\n\nAllocated by task 65:\n gsm_data_alloc.constprop.0+0x27/0x190\
+  \ drivers/tty/n_gsm.c:926 [n_gsm]\n gsm_send+0x2c/0x580 drivers/tty/n_gsm.c:819\
+  \ [n_gsm]\n gsm1_receive+0x547/0xad0 drivers/tty/n_gsm.c:3038 [n_gsm]\n gsmld_receive_buf+0x176/0x280\
+  \ drivers/tty/n_gsm.c:3609 [n_gsm]\n tty_ldisc_receive_buf+0x101/0x1e0 drivers/tty/tty_buffer.c:391\n\
+  \ tty_port_default_receive_buf+0x61/0xa0 drivers/tty/tty_port.c:39\n flush_to_ldisc+0x1b0/0x750\
+  \ drivers/tty/tty_buffer.c:445\n process_scheduled_works+0x2b0/0x10d0 kernel/workqueue.c:3229\n\
+  \ worker_thread+0x3dc/0x950 kernel/workqueue.c:3391\n kthread+0x2a3/0x370 kernel/kthread.c:389\n\
+  \ ret_from_fork+0x2d/0x70 arch/x86/kernel/process.c:147\n ret_from_fork_asm+0x1a/0x30\
+  \ arch/x86/entry/entry_64.S:257\n\nFreed by task 3367:\n kfree+0x126/0x420 mm/slub.c:4580\n\
+  \ gsm_cleanup_mux+0x36c/0x7b0 drivers/tty/n_gsm.c:3160 [n_gsm]\n gsmld_ioctl+0x395/0x1450\
+  \ drivers/tty/n_gsm.c:3408 [n_gsm]\n tty_ioctl+0x643/0x1100 drivers/tty/tty_io.c:2818\n\
+  \n[Analysis]\ngsm_msg on the tx_ctrl_list or tx_data_list of gsm_mux\ncan be freed\
+  \ by multi threads through ioctl,which leads\nto the occurrence of uaf. Protect\
+  \ it by gsm tx lock.\n\nSigned-off-by: Longlong Xia <xialonglong@kylinos.cn>\nCc:\
+  \ stable <stable@kernel.org>\nSuggested-by: Jiri Slaby <jirislaby@kernel.org>\n\
+  Link: https://lore.kernel.org/r/20240926130213.531959-1-xialonglong@kylinos.cn\n\
+  Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>\n\n## Buggy Code\n\
+  \n```c\n// Function: gsm_cleanup_mux in drivers/tty/n_gsm.c\nstatic void gsm_cleanup_mux(struct\
+  \ gsm_mux *gsm, bool disc)\n{\n\tint i;\n\tstruct gsm_dlci *dlci;\n\tstruct gsm_msg\
+  \ *txq, *ntxq;\n\n\tgsm->dead = true;\n\tmutex_lock(&gsm->mutex);\n\n\tdlci = gsm->dlci[0];\n\
+  \tif (dlci) {\n\t\tif (disc && dlci->state != DLCI_CLOSED) {\n\t\t\tgsm_dlci_begin_close(dlci);\n\
+  \t\t\twait_event(gsm->event, dlci->state == DLCI_CLOSED);\n\t\t}\n\t\tdlci->dead\
+  \ = true;\n\t}\n\n\t/* Finish outstanding timers, making sure they are done */\n\
+  \tdel_timer_sync(&gsm->kick_timer);\n\tdel_timer_sync(&gsm->t2_timer);\n\tdel_timer_sync(&gsm->ka_timer);\n\
+  \n\t/* Finish writing to ldisc */\n\tflush_work(&gsm->tx_work);\n\n\t/* Free up\
+  \ any link layer users and finally the control channel */\n\tif (gsm->has_devices)\
+  \ {\n\t\tgsm_unregister_devices(gsm_tty_driver, gsm->num);\n\t\tgsm->has_devices\
+  \ = false;\n\t}\n\tfor (i = NUM_DLCI - 1; i >= 0; i--)\n\t\tif (gsm->dlci[i])\n\t\
+  \t\tgsm_dlci_release(gsm->dlci[i]);\n\tmutex_unlock(&gsm->mutex);\n\t/* Now wipe\
+  \ the queues */\n\ttty_ldisc_flush(gsm->tty);\n\tlist_for_each_entry_safe(txq, ntxq,\
+  \ &gsm->tx_ctrl_list, list)\n\t\tkfree(txq);\n\tINIT_LIST_HEAD(&gsm->tx_ctrl_list);\n\
+  \tlist_for_each_entry_safe(txq, ntxq, &gsm->tx_data_list, list)\n\t\tkfree(txq);\n\
+  \tINIT_LIST_HEAD(&gsm->tx_data_list);\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff\
+  \ --git a/drivers/tty/n_gsm.c b/drivers/tty/n_gsm.c\nindex 5d37a0984916..252849910588\
+  \ 100644\n--- a/drivers/tty/n_gsm.c\n+++ b/drivers/tty/n_gsm.c\n@@ -3157,6 +3157,8\
+  \ @@ static void gsm_cleanup_mux(struct gsm_mux *gsm, bool disc)\n \tmutex_unlock(&gsm->mutex);\n\
+  \ \t/* Now wipe the queues */\n \ttty_ldisc_flush(gsm->tty);\n+\n+\tguard(spinlock_irqsave)(&gsm->tx_lock);\n\
+  \ \tlist_for_each_entry_safe(txq, ntxq, &gsm->tx_ctrl_list, list)\n \t\tkfree(txq);\n\
+  \ \tINIT_LIST_HEAD(&gsm->tx_ctrl_list);\n```\n"
+pattern: "## Bug Pattern\n\nFreeing or iterating over elements of a shared list without\
+  \ holding the list\u2019s designated lock (here, a spinlock) in a teardown/cleanup\
+  \ path. Specifically:\n- The tx_ctrl_list/tx_data_list are protected by gsm->tx_lock,\
+  \ but gsm_cleanup_mux traversed and kfree\u2019d their entries after releasing gsm->mutex\
+  \ and without taking gsm->tx_lock.\n- Concurrent threads (e.g., via ioctl or work)\
+  \ can simultaneously access/remove the same list nodes, causing race conditions\
+  \ and use-after-free.\n- Using list_for_each_entry_safe does not replace proper\
+  \ synchronization; the correct spinlock must be held when manipulating the shared\
+  \ lists."
+plan: "1) Program state customizations\n\n- REGISTER_TRAIT_WITH_PROGRAMSTATE(TxLockHeld,\
+  \ bool)\n  - A single boolean in the path-sensitive state that tracks whether gsm->tx_lock\
+  \ is currently held in the analyzed function.\n  - Initialize to false at function-entry,\
+  \ and update it on spin_lock*/spin_unlock* calls (including when they originate\
+  \ from guard(spinlock_irqsave)).\n  - This is intentionally simple and specific\
+  \ to the target pattern to keep the checker robust and low-noise.\n\n2) Callback\
+  \ functions and how to implement them\n\nStep A. Track gsm->tx_lock acquisitions/releases\n\
+  - Callback: checkBeginFunction(Ctx)\n  - Set TxLockHeld = false at the start of\
+  \ each function.\n\n- Callback: checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C)\n  - Goal: detect lock/unlock of gsm->tx_lock robustly, even when invoked\
+  \ via macros or guard(spinlock_irqsave).\n  - How:\n    - Retrieve callee name via\
+  \ Call.getCalleeIdentifier()->getName().\n    - If callee name is one of:\n    \
+  \  - spin_lock, spin_lock_irqsave, spin_lock_bh, spin_lock_irq\n        - Check\
+  \ Call.getNumArgs() >= 1.\n        - Use ExprHasName(Call.getArgExpr(0), \"tx_lock\"\
+  , C). If true, set TxLockHeld = true.\n      - spin_unlock, spin_unlock_irqrestore,\
+  \ spin_unlock_bh, spin_unlock_irq\n        - Check Call.getNumArgs() >= 1.\n   \
+  \     - Use ExprHasName(Call.getArgExpr(0), \"tx_lock\", C). If true, set TxLockHeld\
+  \ = false.\n  - Rationale:\n    - guard(spinlock_irqsave) expands to code that calls\
+  \ spin_lock_irqsave(...), so the above is enough to catch lock acquisitions even\
+  \ when written as guard(...).\n\n- Callback: checkEndFunction(const ReturnStmt *RS,\
+  \ CheckerContext &Ctx)\n  - Optionally reset TxLockHeld = false (defensive; not\
+  \ strictly necessary as function end will drop state).\n\nStep B. Detect freeing\
+  \ while iterating a protected tx list without holding tx_lock\n- Core idea: kfree(txq)\
+  \ inside a list_for_each_entry_safe loop that is iterating gsm->tx_ctrl_list or\
+  \ gsm->tx_data_list must be protected by gsm->tx_lock.\n- We detect this at the\
+  \ kfree call site by walking up to the enclosing ForStmt (macro expands to a for-loop)\
+  \ and then confirming the loop header references tx_ctrl_list or tx_data_list.\n\
+  \n- Helper (local checker utility):\n  - bool isKfree(const CallEvent &Call)\n \
+  \   - Return true if callee identifier name equals \"kfree\".\n  - bool forIteratesTxLists(const\
+  \ ForStmt *F, CheckerContext &C)\n    - Inspect F\u2019s init/cond/inc subexpressions.\n\
+  \    - For each of these three expressions:\n      - Use findSpecificTypeInChildren<MemberExpr>(Expr)\
+  \ to obtain a MemberExpr M (if any).\n      - If M is found, check:\n        - M->getMemberNameInfo().getAsString()\
+  \ equals \"tx_ctrl_list\" or \"tx_data_list\".\n        - If member name retrieval\
+  \ is not straightforward (due to macro expansions), fallback to ExprHasName(cast<Expr>(M),\
+  \ \"tx_ctrl_list\", C) or ExprHasName(cast<Expr>(M), \"tx_data_list\", C).\n   \
+  \   - If any of the three contains either tx_ctrl_list or tx_data_list, return true.\n\
+  \    - Return false otherwise.\n\n- Callback: checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C)\n  - If !isKfree(Call) return.\n  - Find the current statement\
+  \ S of the call: const Stmt *S = Call.getOriginExpr() (or Call.getStmt()).\n  -\
+  \ Ascend to the nearest ForStmt via findSpecificTypeInParents<ForStmt>(S, C).\n\
+  \    - If no enclosing ForStmt, return (we only warn for frees inside list_for_each\
+  \ loops).\n  - If forIteratesTxLists(For, C) is false, return.\n  - Read TxLockHeld\
+  \ from program state:\n    - If TxLockHeld is true, return.\n    - If TxLockHeld\
+  \ is false:\n      - Report a bug: generateNonFatalErrorNode and emit a PathSensitiveBugReport.\n\
+  \      - Message: \"Freeing tx_*_list entries without holding tx_lock (possible\
+  \ UAF).\"\n      - Optionally, add a note pointing to the ForStmt location indicating\
+  \ the list iteration without lock.\n\nStep C. Optional robustness (kept simple)\n\
+  - Also consider kvfree/vfree if you want broader coverage:\n  - Extend isKfree()\
+  \ to accept {\"kfree\", \"kvfree\", \"vfree\"}.\n- No alias tracking needed; we\
+  \ only rely on textual match \"tx_lock\" for lock calls and \"tx_ctrl_list\"/\"\
+  tx_data_list\" for list iteration.\n\n3) Notes on using provided utilities\n- ExprHasName:\n\
+  \  - Use on Call.getArgExpr(0) to detect \"tx_lock\".\n  - Use on MemberExpr (cast\
+  \ to Expr) to detect \"tx_ctrl_list\"/\"tx_data_list\".\n- findSpecificTypeInParents:\n\
+  \  - Use to locate the enclosing ForStmt of a kfree call.\n- findSpecificTypeInChildren:\n\
+  \  - Use to find a MemberExpr under ForStmt->getInit(), ->getCond(), ->getInc().\n\
+  \n4) Reporting\n- When TxLockHeld == false and kfree is inside a tx list iteration\
+  \ loop:\n  - Use generateNonFatalErrorNode to get a node.\n  - Emit a std::make_unique<PathSensitiveBugReport>(BugType,\
+  \ \"Freeing tx_*_list entries without holding tx_lock (possible UAF).\", ErrNode).\n\
+  - Keep message short and clear as requested.\n\n5) Why this catches the target bug\n\
+  - The original bug iterates and frees tx_ctrl_list/tx_data_list after releasing\
+  \ gsm->mutex and without holding gsm->tx_lock, enabling concurrent list manipulation\
+  \ and UAFs.\n- This checker precisely flags kfree inside list_for_each_entry_safe\
+  \ over those lists when gsm->tx_lock was not previously acquired (either by spin_lock*\
+  \ or by guard(spinlock_irqsave), which we observe via the underlying spin_lock*\
+  \ call after macro expansion).\n- list_for_each_entry_safe does not replace locking;\
+  \ the checker ensures the designated spinlock is in place during such teardown frees."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Expr.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track whether gsm->tx_lock\
+  \ is currently held.\nREGISTER_TRAIT_WITH_PROGRAMSTATE(TxLockHeld, bool)\n\nnamespace\
+  \ {\n\nclass SAGenTestChecker\n  : public Checker<\n        check::BeginFunction,\n\
+  \        check::EndFunction,\n        check::PreCall,\n        check::PostCall>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Missing tx_lock on list free\", \"Concurrency\")) {}\n\
+  \n      void checkBeginFunction(CheckerContext &C) const;\n      void checkEndFunction(const\
+  \ ReturnStmt *RS, CheckerContext &C) const;\n      void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n\n   private:\n      // Helpers\n      static bool\
+  \ callNameIs(const CallEvent &Call, CheckerContext &C, StringRef Name);\n      static\
+  \ bool isFreeLike(const CallEvent &Call, CheckerContext &C);\n      static bool\
+  \ argIsTxLock(const CallEvent &Call, unsigned ArgIdx, CheckerContext &C);\n    \
+  \  static bool exprContainsTxList(const Stmt *S, CheckerContext &C);\n      static\
+  \ bool forIteratesTxLists(const ForStmt *F, CheckerContext &C);\n};\n\nvoid SAGenTestChecker::checkBeginFunction(CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  // At function entry,\
+  \ we assume tx_lock is not held.\n  State = State->set<TxLockHeld>(false);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  // Defensively reset; analysis engine will discard state anyway\
+  \ at function end.\n  ProgramStateRef State = C.getState();\n  State = State->set<TxLockHeld>(false);\n\
+  \  C.addTransition(State);\n}\n\nbool SAGenTestChecker::callNameIs(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name) {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  return ExprHasName(Origin, Name, C);\n}\n\n\
+  bool SAGenTestChecker::argIsTxLock(const CallEvent &Call, unsigned ArgIdx, CheckerContext\
+  \ &C) {\n  if (ArgIdx >= Call.getNumArgs())\n    return false;\n  const Expr *ArgE\
+  \ = Call.getArgExpr(ArgIdx);\n  if (!ArgE)\n    return false;\n  // Match textual\
+  \ usage of the designated lock\n  return ExprHasName(ArgE, \"tx_lock\", C);\n}\n\
+  \nbool SAGenTestChecker::isFreeLike(const CallEvent &Call, CheckerContext &C) {\n\
+  \  // We consider kfree/kvfree/vfree as free-like in kernel code.\n  return callNameIs(Call,\
+  \ C, \"kfree\") ||\n         callNameIs(Call, C, \"kvfree\") ||\n         callNameIs(Call,\
+  \ C, \"vfree\");\n}\n\nbool SAGenTestChecker::exprContainsTxList(const Stmt *S,\
+  \ CheckerContext &C) {\n  if (!S)\n    return false;\n\n  if (const auto *E = dyn_cast<Expr>(S))\
+  \ {\n    if (ExprHasName(E, \"tx_ctrl_list\", C))\n      return true;\n    if (ExprHasName(E,\
+  \ \"tx_data_list\", C))\n      return true;\n  }\n\n  // Fallback: try to find a\
+  \ MemberExpr among children and check its text.\n  if (const auto *ME = findSpecificTypeInChildren<MemberExpr>(S))\
+  \ {\n    const Expr *MEE = dyn_cast<Expr>(const_cast<MemberExpr*>(ME));\n    if\
+  \ (MEE) {\n      if (ExprHasName(MEE, \"tx_ctrl_list\", C))\n        return true;\n\
+  \      if (ExprHasName(MEE, \"tx_data_list\", C))\n        return true;\n    }\n\
+  \  }\n  return false;\n}\n\nbool SAGenTestChecker::forIteratesTxLists(const ForStmt\
+  \ *F, CheckerContext &C) {\n  if (!F)\n    return false;\n\n  // list_for_each_entry_safe\
+  \ expands to a for-loop where the condition\n  // typically compares against the\
+  \ 'head' which will reference &gsm->tx_*_list.\n  if (exprContainsTxList(F->getInit(),\
+  \ C))\n    return true;\n  if (exprContainsTxList(F->getCond(), C))\n    return\
+  \ true;\n  if (exprContainsTxList(F->getInc(), C))\n    return true;\n\n  return\
+  \ false;\n}\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Detect spin_lock*\
+  \ acquisitions on gsm->tx_lock\n  if (callNameIs(Call, C, \"spin_lock\") ||\n  \
+  \    callNameIs(Call, C, \"spin_lock_irqsave\") ||\n      callNameIs(Call, C, \"\
+  spin_lock_bh\") ||\n      callNameIs(Call, C, \"spin_lock_irq\")) {\n    if (argIsTxLock(Call,\
+  \ 0, C)) {\n      State = State->set<TxLockHeld>(true);\n      C.addTransition(State);\n\
+  \      return;\n    }\n  }\n\n  // Detect spin_unlock* releases on gsm->tx_lock\n\
+  \  if (callNameIs(Call, C, \"spin_unlock\") ||\n      callNameIs(Call, C, \"spin_unlock_irqrestore\"\
+  ) ||\n      callNameIs(Call, C, \"spin_unlock_bh\") ||\n      callNameIs(Call, C,\
+  \ \"spin_unlock_irq\")) {\n    if (argIsTxLock(Call, 0, C)) {\n      State = State->set<TxLockHeld>(false);\n\
+  \      C.addTransition(State);\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isFreeLike(Call, C))\n   \
+  \ return;\n\n  const Stmt *S = Call.getOriginExpr();\n  if (!S)\n    return;\n\n\
+  \  // Ensure this kfree/kvfree/vfree is inside a list_for_each_entry_safe over tx_*_list\n\
+  \  const ForStmt *EnclosingFor = findSpecificTypeInParents<ForStmt>(S, C);\n  if\
+  \ (!EnclosingFor)\n    return;\n\n  if (!forIteratesTxLists(EnclosingFor, C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  bool Held = State->get<TxLockHeld>();\n\
+  \  if (Held)\n    return;\n\n  // Report: free of tx_*_list node without holding\
+  \ tx_lock\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\
+  \n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"Freeing tx_*_list\
+  \ entries without holding tx_lock (possible UAF).\", N);\n  R->addRange(Call.getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\n} // end anonymous namespace\n\nextern \"C\"\
+  \ void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects freeing tx_*_list entries without\
+  \ holding gsm->tx_lock in loops\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

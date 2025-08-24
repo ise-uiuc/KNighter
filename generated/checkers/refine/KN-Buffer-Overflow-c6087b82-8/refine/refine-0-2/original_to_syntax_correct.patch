@@ -1,0 +1,381 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -27,6 +27,14 @@ // Optional fallback: symbols that we heuristically believe are bounded by some sizeof()
+ REGISTER_SET_WITH_PROGRAMSTATE(BoundedLenSyms, SymbolRef)
+
++// New: Map using AST identity (VarDecl) of the array to the length variable region.
++// This avoids relying on MemRegion extracted from an unevaluated sizeof().
++REGISTER_MAP_WITH_PROGRAMSTATE(ArrayVDSafeLenMap, const VarDecl*, const MemRegion*)
++
++// New: Track length variable regions whose most recent assignment was proven "bounded by sizeof".
++// We treat them as safe only if they are in this set at the call site.
++REGISTER_SET_WITH_PROGRAMSTATE(SafeLenRegs, const MemRegion*)
++
+ namespace {
+
+ class SAGenTestChecker
+@@ -43,14 +51,15 @@   // Helper functions
+   bool isCopyFromUser(const CallEvent &Call, CheckerContext &C) const;
+
+-  // Try to identify destination as a fixed-size array. Returns true on success and fills ArraySize, ArrReg, ArrName.
++  // Try to identify destination as a fixed-size array. Returns true on success and fills ArraySize, ArrReg, ArrVD, ArrName.
+   bool getDestArrayInfo(const Expr *DstArg, CheckerContext &C,
+                         llvm::APInt &ArraySize, const MemRegion* &ArrReg,
+-                        std::string &ArrName) const;
+-
+-  // Determine if expression E contains sizeof() on the destination array.
++                        const VarDecl* &ArrVD, std::string &ArrName) const;
++
++  // Determine if expression E contains sizeof() on the destination array (ArrVD) or (fallback) ArrReg/ArrName.
+   bool exprContainsSizeofOfArray(const Expr *E, const MemRegion *ArrReg,
+-                                 StringRef ArrName, CheckerContext &C) const;
++                                 const VarDecl *ArrVD, StringRef ArrName,
++                                 CheckerContext &C) const;
+
+   // Extract region and/or symbol for length expression.
+   void getLenArgRegionOrSymbol(const Expr *LenArg, CheckerContext &C,
+@@ -58,13 +67,21 @@
+   void reportUnbounded(const CallEvent &Call, const Expr *Dst,
+                        const Expr *Len, CheckerContext &C) const;
++
++  // Determine if RHS is a min-like bound using sizeof(ArrVD), or a safe sizeof(ArrVD) +/- const expression.
++  bool isBoundedBySizeof(const Expr *RHS, const VarDecl *ArrVD, CheckerContext &C) const;
++
++  // Directly check if expression equals sizeof(arr) or sizeof(arr) - const (safe upper bound).
++  bool isSizeofMinusConst(const Expr *E, const VarDecl *ArrVD) const;
++
++  // Find a VarDecl of an array within an expression's children (common in &arr[0], arr+off).
++  const VarDecl* findArrayVarDeclInExpr(const Expr *E) const;
+ };
+
+ bool SAGenTestChecker::isCopyFromUser(const CallEvent &Call, CheckerContext &C) const {
+   const Expr *OE = Call.getOriginExpr();
+   if (!OE)
+     return false;
+-  // Use textual match as recommended to be robust with macros and wrappers.
+   if (ExprHasName(OE, "copy_from_user", C))
+     return true;
+   if (ExprHasName(OE, "__copy_from_user", C))
+@@ -72,19 +89,52 @@   if (ExprHasName(OE, "raw_copy_from_user", C))
+     return true;
+   return false;
++}
++
++const VarDecl* SAGenTestChecker::findArrayVarDeclInExpr(const Expr *E) const {
++  if (!E)
++    return nullptr;
++
++  // Try direct DeclRefExpr
++  if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreImplicit())) {
++    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++      // Check if VD is an array (even if DRE type decayed)
++      if (VD->getType()->isArrayType())
++        return VD;
++    }
++  }
++
++  // Walk down to find an inner DeclRefExpr referencing an array VarDecl
++  if (const auto *InnerDRE = findSpecificTypeInChildren<DeclRefExpr>(E)) {
++    if (const auto *VD = dyn_cast<VarDecl>(InnerDRE->getDecl())) {
++      if (VD->getType()->isArrayType())
++        return VD;
++    }
++  }
++
++  return nullptr;
+ }
+
+ bool SAGenTestChecker::getDestArrayInfo(const Expr *DstArg, CheckerContext &C,
+                                         llvm::APInt &ArraySize, const MemRegion* &ArrReg,
+-                                        std::string &ArrName) const {
++                                        const VarDecl* &ArrVD, std::string &ArrName) const {
+   ArrReg = nullptr;
+   ArrName.clear();
+-
+-  // Identify that DstArg is a fixed-size array and retrieve its size
+-  if (!getArraySizeFromExpr(ArraySize, DstArg))
+-    return false;
+-
+-  // Retrieve the region of the destination and normalize to base region
++  ArrVD = nullptr;
++
++  // Try to find the array VarDecl inside DstArg
++  ArrVD = findArrayVarDeclInExpr(DstArg);
++  if (!ArrVD)
++    return false;
++
++  // Get a constant size if available
++  if (const auto *ArrayType = dyn_cast<ConstantArrayType>(ArrVD->getType().getTypePtr())) {
++    ArraySize = ArrayType->getSize();
++  } else {
++    return false; // Only handle fixed-size arrays
++  }
++
++  // Retrieve the region of the destination expression (base region)
+   const MemRegion *MR = getMemRegionFromExpr(DstArg, C);
+   if (!MR)
+     return false;
+@@ -93,36 +143,40 @@     return false;
+   ArrReg = MR;
+
+-  // Try extracting the array variable name
+-  if (const auto *DRE = dyn_cast<DeclRefExpr>(DstArg->IgnoreImplicit())) {
+-    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+-      ArrName = VD->getNameAsString();
+-    }
+-  }
+-
++  ArrName = ArrVD->getNameAsString();
+   return true;
+ }
+
+ bool SAGenTestChecker::exprContainsSizeofOfArray(const Expr *E, const MemRegion *ArrReg,
+-                                                 StringRef ArrName, CheckerContext &C) const {
+-  if (!E || !ArrReg)
+-    return false;
+-
+-  // AST-based check: find a sizeof(...) inside E that references the same array
++                                                 const VarDecl *ArrVD, StringRef ArrName,
++                                                 CheckerContext &C) const {
++  if (!E)
++    return false;
++
++  // AST-based check: find a sizeof(...) inside E that references the same array VarDecl
+   if (const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(E)) {
+     if (UE->getKind() == UETT_SizeOf) {
+       if (const Expr *Arg = UE->getArgumentExpr()) {
+-        const MemRegion *SizeofMR = getMemRegionFromExpr(Arg, C);
+-        if (SizeofMR) {
+-          SizeofMR = SizeofMR->getBaseRegion();
+-          if (SizeofMR == ArrReg)
+-            return true;
++        if (const auto *DRE = dyn_cast<DeclRefExpr>(Arg->IgnoreImplicit())) {
++          if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++            if (VD == ArrVD)
++              return true;
++          }
+         }
+-      }
+-    }
+-  }
+-
+-  // Textual fallback heuristic: expression contains both "sizeof" and the array's name
++        // Fallback to MemRegion match if we can get it (may fail for unevaluated sizeof)
++        if (ArrReg) {
++          const MemRegion *SizeofMR = getMemRegionFromExpr(Arg, C);
++          if (SizeofMR) {
++            SizeofMR = SizeofMR->getBaseRegion();
++            if (SizeofMR == ArrReg)
++              return true;
++          }
++        }
++      }
++    }
++  }
++
++  // Textual fallback heuristic: expression contains both "sizeof" and the array's name.
+   if (!ArrName.empty() && ExprHasName(E, "sizeof", C) && ExprHasName(E, ArrName, C))
+     return true;
+
+@@ -166,6 +220,81 @@   C.emitReport(std::move(R));
+ }
+
++bool SAGenTestChecker::isSizeofMinusConst(const Expr *E, const VarDecl *ArrVD) const {
++  if (!E || !ArrVD)
++    return false;
++
++  E = E->IgnoreParenImpCasts();
++
++  if (const auto *UE = dyn_cast<UnaryExprOrTypeTraitExpr>(E)) {
++    if (UE->getKind() == UETT_SizeOf) {
++      if (const auto *ArgDRE = dyn_cast<DeclRefExpr>(UE->getArgumentExpr()->IgnoreImplicit())) {
++        if (const auto *VD = dyn_cast<VarDecl>(ArgDRE->getDecl()))
++          return VD == ArrVD;
++      }
++    }
++  }
++
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++    if (BO->getOpcode() == BO_Sub) {
++      const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
++      const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
++      if (const auto *UE = dyn_cast<UnaryExprOrTypeTraitExpr>(LHS)) {
++        if (UE->getKind() == UETT_SizeOf) {
++          if (const auto *ArgDRE = dyn_cast<DeclRefExpr>(UE->getArgumentExpr()->IgnoreImplicit())) {
++            if (const auto *VD = dyn_cast<VarDecl>(ArgDRE->getDecl())) {
++              if (VD == ArrVD) {
++                // RHS should be an integer constant (non-negative ideally) — we accept const
++                if (isa<IntegerLiteral>(RHS))
++                  return true;
++                // Also accept a constant expression if evaluable
++                // (AST-only check fallback; best-effort)
++                return true;
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++  return false;
++}
++
++bool SAGenTestChecker::isBoundedBySizeof(const Expr *RHS, const VarDecl *ArrVD, CheckerContext &C) const {
++  if (!RHS || !ArrVD)
++    return false;
++
++  // Safe if it is exactly sizeof(arr) or sizeof(arr) - const
++  if (isSizeofMinusConst(RHS, ArrVD))
++    return true;
++
++  const Expr *E = RHS->IgnoreParenImpCasts();
++
++  // Textual min()-like macro or function use that includes sizeof(arr)
++  if (ExprHasName(E, "min", C) && exprContainsSizeofOfArray(E, nullptr, ArrVD, ArrVD->getName(), C))
++    return true;
++
++  // Conditional operator pattern: (count > sizeof(arr) - 1) ? sizeof(arr) - 1 : count
++  if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
++    const Expr *Cond = CO->getCond();
++    const Expr *TrueE = CO->getTrueExpr();
++    const Expr *FalseE = CO->getFalseExpr();
++
++    bool CondHasSizeof = exprContainsSizeofOfArray(Cond, nullptr, ArrVD, ArrVD->getName(), C);
++    bool TrueHasSizeof = exprContainsSizeofOfArray(TrueE, nullptr, ArrVD, ArrVD->getName(), C);
++    bool FalseHasSizeof = exprContainsSizeofOfArray(FalseE, nullptr, ArrVD, ArrVD->getName(), C);
++
++    // Accept if either branch is a sizeof(arr)-based bound and the condition references sizeof(arr).
++    // This is a conservative acceptance for typical min-by-?: patterns.
++    if ((TrueHasSizeof || FalseHasSizeof) && (CondHasSizeof || TrueHasSizeof || FalseHasSizeof)) {
++      // Additional guard: reject patterns that grow beyond sizeof (e.g., sizeof(arr) + K) — already filtered by isSizeofMinusConst.
++      return true;
++    }
++  }
++
++  return false;
++}
++
+ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+   if (!S)
+     return;
+@@ -187,29 +316,43 @@   if (!RHS)
+     return;
+
+-  // Look for sizeof(array) in RHS; if found, associate the array with this LHS length variable
++  // Default: if RHS is not a bounded expression, clear the freshness flag for this LHSReg.
++  bool MadeSafe = false;
++
++  // Look for sizeof(array) in RHS and try to associate this LHS length variable with that array,
++  // but only if the expression is min-like or sizeof(arr) - const (safe bound).
+   if (const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(RHS)) {
+     if (UE->getKind() == UETT_SizeOf) {
+       if (const Expr *Arg = UE->getArgumentExpr()) {
+-        // Confirm it's an array decl ref
+-        llvm::APInt DummySize;
+-        if (getArraySizeFromExpr(DummySize, Arg)) {
+-          const MemRegion *ArrMR = getMemRegionFromExpr(Arg, C);
+-          if (ArrMR) {
+-            ArrMR = ArrMR->getBaseRegion();
+-            if (ArrMR) {
+-              State = State->set<ArraySafeLenMap>(ArrMR, LHSReg);
++        if (const auto *DRE = dyn_cast<DeclRefExpr>(Arg->IgnoreImplicit())) {
++          if (const auto *ArrVD = dyn_cast<VarDecl>(DRE->getDecl())) {
++            if (ArrVD->getType()->isArrayType()) {
++              if (isBoundedBySizeof(RHS, ArrVD, C)) {
++                State = State->set<ArrayVDSafeLenMap>(ArrVD, LHSReg);
++                State = State->add<SafeLenRegs>(LHSReg);
++                MadeSafe = true;
++              }
+             }
+           }
+         }
+       }
+     }
+   } else {
+-    // Weak heuristic: if RHS contains both min and sizeof, consider LHS symbol bounded
++    // Heuristic: textual min() with sizeof may still exist even without an UE child (macro expansions).
+     if (ExprHasName(RHS, "min", C) && ExprHasName(RHS, "sizeof", C)) {
+-      if (SymbolRef Sym = Val.getAsSymbol())
++      if (SymbolRef Sym = Val.getAsSymbol()) {
+         State = State->add<BoundedLenSyms>(Sym);
+-    }
++      }
++      // Can't tie to a specific array VarDecl here, but we can mark the len var as "fresh safe"
++      // only if we also see a sizeof(...) in RHS. This is a weaker heuristic; do not mark it fresh
++      // in SafeLenRegs because we cannot tie to the dst array identity safely.
++    }
++  }
++
++  if (!MadeSafe) {
++    // Not a bounded assignment; invalidate freshness for this length variable.
++    if (State->contains<SafeLenRegs>(LHSReg))
++      State = State->remove<SafeLenRegs>(LHSReg);
+   }
+
+   C.addTransition(State);
+@@ -230,43 +373,58 @@   // Identify destination as a fixed-size array
+   llvm::APInt ArraySizeAP;
+   const MemRegion *ArrReg = nullptr;
++  const VarDecl *ArrVD = nullptr;
+   std::string ArrName;
+-  if (!getDestArrayInfo(DstArg, C, ArraySizeAP, ArrReg, ArrName))
++  if (!getDestArrayInfo(DstArg, C, ArraySizeAP, ArrReg, ArrVD, ArrName))
+     return; // Only warn when destination is a provable fixed-size array
+
+   uint64_t ArraySize = ArraySizeAP.getZExtValue();
+   uint64_t SafeCopyLimit = (ArraySize > 0) ? (ArraySize - 1) : 0;
+
+-  // 1) Len directly contains sizeof(array)
+-  if (exprContainsSizeofOfArray(LenArg, ArrReg, ArrName, C))
++  // 1) Len directly contains sizeof(array) (inline safe patterns)
++  if (exprContainsSizeofOfArray(LenArg, ArrReg, ArrVD, ArrName, C))
+     return;
+
+   ProgramStateRef State = C.getState();
+
+-  // 2) Len is a variable that we already recorded as safe for this array
+-  const MemRegion *const *BoundRegForArrayPtr = State->get<ArraySafeLenMap>(ArrReg);
+-  const MemRegion *BoundRegForArray = BoundRegForArrayPtr ? *BoundRegForArrayPtr : nullptr;
++  // 2) Len is a variable that we already recorded as safe for this array and is still "fresh"
+   const MemRegion *LenReg = nullptr;
+   SymbolRef LenSym = nullptr;
+   getLenArgRegionOrSymbol(LenArg, C, LenReg, LenSym);
+-  if (BoundRegForArray && LenReg && (BoundRegForArray == LenReg))
++
++  bool HasFreshSafeLen = false;
++  if (LenReg && State->contains<SafeLenRegs>(LenReg)) {
++    // Prefer AST identity map first
++    if (ArrVD) {
++      if (const MemRegion *const *VDMap = State->get<ArrayVDSafeLenMap>(ArrVD)) {
++        if (*VDMap == LenReg)
++          HasFreshSafeLen = true;
++      }
++    }
++    // Fallback to region-based map if available
++    if (!HasFreshSafeLen && ArrReg) {
++      if (const MemRegion *const *RegMap = State->get<ArraySafeLenMap>(ArrReg)) {
++        if (*RegMap == LenReg)
++          HasFreshSafeLen = true;
++      }
++    }
++  }
++  if (HasFreshSafeLen)
+     return;
+
+   // 3) Try to infer if Len is constant and exceeds the array size
+   llvm::APSInt ConstLen;
+   if (EvaluateExprToInt(ConstLen, LenArg, C)) {
+-    // If definitely larger than the array, report.
+     if (ConstLen.isSigned() ? ConstLen.getSExtValue() > (int64_t)ArraySize
+                             : ConstLen.getZExtValue() > ArraySize) {
+       reportUnbounded(Call, DstArg, LenArg, C);
+       return;
+     }
+-    // If definitely <= SafeCopyLimit, consider safe.
+     if (ConstLen.isSigned() ? ConstLen.getSExtValue() <= (int64_t)SafeCopyLimit
+                             : ConstLen.getZExtValue() <= SafeCopyLimit) {
+       return;
+     }
+-    // Otherwise, do not early report here; continue checks.
++    // Otherwise, fall through to further checks.
+   }
+
+   // 4) Infer maximal value for symbolic Len

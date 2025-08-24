@@ -1,0 +1,2 @@
+- Decision: NotABug
+- Reason: The code correctly bounds the user-controlled length before copying into the fixed-size buffer and ensures NUL-termination. Specifically, len = min(count, sizeof(buf) - 1) guarantees 0 <= len <= 31 for buf[32], copy_from_user(buf, user_buf, len) copies at most 31 bytes, and buf[len] = '\0' safely NUL-terminates within the buffer. This matches the recommended safe pattern and does not fit the target bug pattern of an unchecked copy_from_user leading to overflow.

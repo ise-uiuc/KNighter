@@ -1,0 +1,4 @@
+- Decision: NotABug
+- Reason: The reported loop iterates i from 0 to NUM_NF_READINGS-1 (typically 6). The code indexes several arrays with i, including h[i], ah->nf_regs[i], and ath9k_hw_get_nf_limits(ah, chan)->cal[i]. In ath9k, these arrays are defined with size NUM_NF_READINGS (to cover three primary chains and three extension-channel readings in HT40), not 3. Additionally, for non-HT40 channels the code explicitly skips indices >= AR5416_MAX_CHAINS (i >= 3) via:
+  - if ((i >= AR5416_MAX_CHAINS) && !IS_CHAN_HT40(chan)) continue;
+This prevents any access beyond the first three entries when only primary chains are relevant. For HT40 channels, arrays are sized for 6 entries, so accessing indices 3–5 is valid. Therefore, there is no mismatched macro/array-size condition and no out-of-bounds access. This does not match the target bug pattern and is not a real bug.

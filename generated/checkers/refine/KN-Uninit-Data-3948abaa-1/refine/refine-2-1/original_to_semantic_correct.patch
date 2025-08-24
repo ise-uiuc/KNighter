@@ -1,0 +1,223 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -43,6 +43,10 @@ REGISTER_MAP_WITH_PROGRAMSTATE(InitPrefixMap, const MemRegion*, uint64_t)
+ // Counts the number of distinct write operations observed into the region (heuristic for structured init).
+ REGISTER_MAP_WITH_PROGRAMSTATE(WriteCountMap, const MemRegion*, unsigned)
++// Tracks the last write length as a symbol for the destination buffer (e.g., memcpy_fromio/memcpy when non-constant).
++REGISTER_MAP_WITH_PROGRAMSTATE(LastWriteLenSymMap, const MemRegion*, SymbolRef)
++// Tracks the last write destination offset (in bytes) from the base region.
++REGISTER_MAP_WITH_PROGRAMSTATE(LastWriteOffsetMap, const MemRegion*, uint64_t)
+
+ // Utility function declarations (provided externally in the prompt)
+ template <typename T>
+@@ -99,6 +103,10 @@       bool getRegionOffsetAndBase(const MemRegion *R, const MemRegion *&Base, uint64_t &ByteOffset) const;
+       uint64_t getTypeSizeInBytes(QualType T, ASTContext &ASTC) const;
+       void noteWriteCallWithLen(const CallEvent &Call, CheckerContext &C, unsigned PtrArgIdx, unsigned LenArgIdx) const;
++
++      // Additional helpers for symbol-based suppression
++      void recordSymbolicWrite(const MemRegion *DstR, SymbolRef LenSym, uint64_t Offset, CheckerContext &C) const;
++      bool suppressDueToLastWriteSymbol(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
+ };
+
+ const MemRegion *SAGenTestChecker::canonical(ProgramStateRef State, const MemRegion *R) const {
+@@ -140,6 +148,9 @@   // Clear observed write/initialized-prefix tracking.
+   State = State->remove<InitPrefixMap>(Canon);
+   State = State->remove<WriteCountMap>(Canon);
++  // Clear last-write symbol-based info.
++  State = State->remove<LastWriteLenSymMap>(Canon);
++  State = State->remove<LastWriteOffsetMap>(Canon);
+   return State;
+ }
+
+@@ -209,6 +220,11 @@   // Clear producer symbols
+   State = State->remove<ProducerLenSymMap>(DstReg);
+   State = State->remove<ProducerStatusSymMap>(DstReg);
++
++  // Reset last-write symbol tracking to avoid stale matches.
++  State = State->remove<LastWriteLenSymMap>(DstReg);
++  State = State->remove<LastWriteOffsetMap>(DstReg);
++
+   C.addTransition(State);
+ }
+
+@@ -308,21 +324,24 @@ bool SAGenTestChecker::getRegionOffsetAndBase(const MemRegion *R, const MemRegion *&Base, uint64_t &ByteOffset) const {
+   if (!R)
+     return false;
+-  const auto *SR = dyn_cast<SubRegion>(R);
+-  if (!SR)
+-    return false;
+-  std::optional<RegionOffset> RO = SR->getAsOffset();
+-  if (!RO.has_value())
+-    return false;
+-  Base = RO->getRegion();
+-  int64_t BitOff = RO->getOffset();
+-  if (BitOff < 0)
+-    return false;
+-  ByteOffset = (uint64_t)BitOff / 8;
+-  // Ignore bitfield writes (non-byte-aligned)
+-  if ((uint64_t)BitOff % 8 != 0)
+-    return false;
+-  return true;
++  if (const auto *SR = dyn_cast<SubRegion>(R)) {
++    std::optional<RegionOffset> RO = SR->getAsOffset();
++    if (!RO.has_value())
++      return false;
++    Base = RO->getRegion();
++    int64_t BitOff = RO->getOffset();
++    if (BitOff < 0)
++      return false;
++    ByteOffset = (uint64_t)BitOff / 8;
++    // Ignore bitfield writes (non-byte-aligned)
++    if ((uint64_t)BitOff % 8 != 0)
++      return false;
++    return true;
++  }
++  // If it's not a SubRegion, treat it as base with zero offset.
++  Base = R->getBaseRegion();
++  ByteOffset = 0;
++  return Base != nullptr;
+ }
+
+ // Record that [Offset, Offset+Len) bytes in the base region have been written,
+@@ -359,6 +378,10 @@   unsigned NewCnt = OldCnt ? (*OldCnt + 1) : 1u;
+   State = State->set<WriteCountMap>(CanonBase, NewCnt);
+
++  // This concrete-length write supersedes any symbolic last-write info.
++  State = State->remove<LastWriteLenSymMap>(CanonBase);
++  State = State->remove<LastWriteOffsetMap>(CanonBase);
++
+   C.addTransition(State);
+ }
+
+@@ -387,26 +410,67 @@   markBytesWrittenToRegion(StoreR, SizeBytes, C);
+ }
+
+-// Note a write-by-call pattern like memcpy/memmove where len is provided explicitly.
++// Record symbolic writes for functions like memcpy/memmove/memcpy_fromio/copy_from_user when len is non-constant.
++void SAGenTestChecker::recordSymbolicWrite(const MemRegion *DstR, SymbolRef LenSym, uint64_t Offset, CheckerContext &C) const {
++  if (!DstR || !LenSym)
++    return;
++
++  ProgramStateRef State = C.getState();
++  const MemRegion *Base = nullptr;
++  uint64_t Off = 0;
++  if (!getRegionOffsetAndBase(DstR, Base, Off))
++    return;
++
++  const MemRegion *CanonBase = canonical(State, Base ? Base->getBaseRegion() : nullptr);
++  if (!CanonBase)
++    return;
++
++  const unsigned *Kind = State->get<AllocKindMap>(CanonBase);
++  if (!Kind || *Kind != 2)
++    return;
++
++  // Increment write count
++  const unsigned *OldCnt = State->get<WriteCountMap>(CanonBase);
++  unsigned NewCnt = OldCnt ? (*OldCnt + 1) : 1u;
++  State = State->set<WriteCountMap>(CanonBase, NewCnt);
++
++  // Set last write symbol and offset.
++  State = State->set<LastWriteLenSymMap>(CanonBase, LenSym);
++  State = State->set<LastWriteOffsetMap>(CanonBase, Off);
++
++  C.addTransition(State);
++}
++
++// Note a write-by-call pattern like memcpy/memmove/memcpy_fromio/copy_from_user where len is provided explicitly.
+ void SAGenTestChecker::noteWriteCallWithLen(const CallEvent &Call, CheckerContext &C, unsigned PtrArgIdx, unsigned LenArgIdx) const {
+   SVal DstSV = Call.getArgSVal(PtrArgIdx);
+   const MemRegion *DstR = DstSV.getAsRegion();
+   if (!DstR)
+     return;
+
++  // Try constant evaluation first.
+   const Expr *LenE = Call.getArgExpr(LenArgIdx);
+-  if (!LenE)
+-    return;
+-
+-  llvm::APSInt EvalRes;
+-  if (!EvaluateExprToInt(EvalRes, LenE, C))
+-    return;
+-
+-  uint64_t Len = EvalRes.getZExtValue();
+-  if (Len == 0)
+-    return;
+-
+-  markBytesWrittenToRegion(DstR, Len, C);
++  bool Recorded = false;
++  if (LenE) {
++    llvm::APSInt EvalRes;
++    if (EvaluateExprToInt(EvalRes, LenE, C)) {
++      uint64_t Len = EvalRes.getZExtValue();
++      if (Len != 0) {
++        markBytesWrittenToRegion(DstR, Len, C);
++        Recorded = true;
++      }
++    }
++  }
++
++  if (Recorded)
++    return;
++
++  // Fall back to symbol-based recording.
++  SVal LenSV = Call.getArgSVal(LenArgIdx);
++  if (SymbolRef LenSym = LenSV.getAsSymbol()) {
++    // Offset is computed by recordSymbolicWrite.
++    recordSymbolicWrite(DstR, LenSym, /*Offset*/0, C);
++  }
+ }
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -461,6 +525,18 @@   // Treat memcpy/memmove as generic initialization of destination (not zeroed).
+   if (callNamed(Call, C, "memcpy") || callNamed(Call, C, "memmove")) {
+     // memcpy(dst, src, len)
++    noteWriteCallWithLen(Call, C, /*PtrArgIdx=*/0, /*LenArgIdx=*/2);
++    return;
++  }
++
++  // Model memcpy_fromio(dst, src_io, len) as destination initialization.
++  if (callNamed(Call, C, "memcpy_fromio")) {
++    noteWriteCallWithLen(Call, C, /*PtrArgIdx=*/0, /*LenArgIdx=*/2);
++    return;
++  }
++
++  // Model copy_from_user(dst, src, len) as destination initialization.
++  if (callNamed(Call, C, "copy_from_user")) {
+     noteWriteCallWithLen(Call, C, /*PtrArgIdx=*/0, /*LenArgIdx=*/2);
+     return;
+   }
+@@ -504,6 +580,26 @@   }
+ }
+
++// Suppress false positives when the last write into the buffer used the same length symbol as copy_to_user and started at offset 0.
++bool SAGenTestChecker::suppressDueToLastWriteSymbol(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const {
++  ProgramStateRef State = C.getState();
++
++  const SymbolRef *LastLenSymP = State->get<LastWriteLenSymMap>(FromReg);
++  const uint64_t *LastOffP = State->get<LastWriteOffsetMap>(FromReg);
++  if (!LastLenSymP || !*LastLenSymP || !LastOffP)
++    return false;
++
++  if (*LastOffP != 0)
++    return false; // Only trust writes that start at base offset 0.
++
++  SVal CopyLenV = CopyToUserCall.getArgSVal(2);
++  SymbolRef CopyLenSym = CopyLenV.getAsSymbol();
++  if (!CopyLenSym)
++    return false;
++
++  return (CopyLenSym == *LastLenSymP);
++}
++
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+   if (!callNamed(Call, C, "copy_to_user"))
+     return;
+@@ -529,6 +625,10 @@
+   // Recognize and suppress false positives when a known producer initialized exactly the copied bytes.
+   if (isFalsePositiveDueToProducer(Call, C, FromReg))
++    return;
++
++  // Suppress when the most recent write into the source buffer used exactly the same length symbol from offset 0.
++  if (suppressDueToLastWriteSymbol(Call, C, FromReg))
+     return;
+
+   // Evaluate the length if possible.

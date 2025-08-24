@@ -1,0 +1,140 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -46,7 +46,18 @@   // Extract the base pointer symbol that is being dereferenced by statement S.
+   SymbolRef getDereferencedBaseSymbol(const Stmt *S, SVal Loc, CheckerContext &C) const;
+
++  // Query if a tracked symbol is definitely non-null under current constraints.
++  bool isDefinitelyNonNull(SymbolRef Sym, CheckerContext &C) const;
++
++  // Report helper.
+   void reportBug(CheckerContext &C, const Stmt *S) const;
++
++  // Utility: check if the call is devm_kzalloc precisely.
++  static bool isDevmKzalloc(const CallEvent &Call) {
++    if (const IdentifierInfo *ID = Call.getCalleeIdentifier())
++      return ID->getName() == "devm_kzalloc";
++    return false;
++  }
+ };
+
+ SymbolRef SAGenTestChecker::getDereferencedBaseSymbol(const Stmt *S, SVal Loc,
+@@ -98,6 +109,28 @@   return nullptr;
+ }
+
++bool SAGenTestChecker::isDefinitelyNonNull(SymbolRef Sym, CheckerContext &C) const {
++  if (!Sym)
++    return false;
++
++  ProgramStateRef State = C.getState();
++  SValBuilder &SB = C.getSValBuilder();
++
++  // Build (Sym == NULL) using a null pointer of type void*.
++  DefinedOrUnknownSVal EqNull =
++      SB.evalEQ(State, SB.makeSymbolVal(Sym),
++                SB.makeZeroVal(C.getASTContext().VoidPtrTy));
++
++  if (EqNull.isUnknown())
++    return false;
++
++  ProgramStateRef StateIsNull = State->assume(EqNull, true);
++  ProgramStateRef StateIsNonNull = State->assume(EqNull, false);
++
++  // If only the non-null state is feasible, it's definitely non-null.
++  return (StateIsNonNull && !StateIsNull);
++}
++
+ void SAGenTestChecker::reportBug(CheckerContext &C, const Stmt *S) const {
+   ExplodedNode *N = C.generateNonFatalErrorNode();
+   if (!N)
+@@ -115,8 +148,8 @@   if (!OriginExpr)
+     return;
+
+-  // Only track devm_kzalloc results.
+-  if (!ExprHasName(OriginExpr, "devm_kzalloc", C))
++  // Only track devm_kzalloc results by exact callee name.
++  if (!isDevmKzalloc(Call))
+     return;
+
+   ProgramStateRef State = C.getState();
+@@ -128,59 +161,12 @@ }
+
+ void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+-  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);
+-  if (!CondE) {
+-    return;
+-  }
+-
+-  ProgramStateRef State = C.getState();
+-  const LocationContext *LCtx = C.getLocationContext();
+-  SymbolRef TargetSym = nullptr;
+-
+-  // Handle: if (!ptr)
+-  if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {
+-    if (UO->getOpcode() == UO_LNot) {
+-      const Expr *SubE = UO->getSubExpr();
+-      if (SubE) {
+-        SVal SV = State->getSVal(SubE, LCtx);
+-        TargetSym = SV.getAsSymbol();
+-      }
+-    }
+-  }
+-  // Handle: if (ptr == NULL) or if (ptr != NULL)
+-  else if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {
+-    BinaryOperator::Opcode Op = BO->getOpcode();
+-    if (Op == BO_EQ || Op == BO_NE) {
+-      const Expr *LHS = BO->getLHS();
+-      const Expr *RHS = BO->getRHS();
+-      if (LHS && RHS) {
+-        bool LHSIsNull = LHS->IgnoreParenImpCasts()->isNullPointerConstant(C.getASTContext(),
+-                                         Expr::NPC_ValueDependentIsNull);
+-        bool RHSIsNull = RHS->IgnoreParenImpCasts()->isNullPointerConstant(C.getASTContext(),
+-                                         Expr::NPC_ValueDependentIsNull);
+-        const Expr *PtrExpr = nullptr;
+-        if (LHSIsNull && !RHSIsNull)
+-          PtrExpr = RHS;
+-        else if (RHSIsNull && !LHSIsNull)
+-          PtrExpr = LHS;
+-
+-        if (PtrExpr) {
+-          SVal SV = State->getSVal(PtrExpr, LCtx);
+-          TargetSym = SV.getAsSymbol();
+-        }
+-      }
+-    }
+-  }
+-  // Handle: if (ptr)
+-  else {
+-    SVal SV = State->getSVal(CondE, LCtx);
+-    TargetSym = SV.getAsSymbol();
+-  }
+-
+-  if (TargetSym && State->contains<UncheckedDevmPtrSyms>(TargetSym)) {
+-    State = State->remove<UncheckedDevmPtrSyms>(TargetSym);
+-    C.addTransition(State);
+-  }
++  // Intentionally no-op.
++  // We rely on the core constraint engine and a constraint query at dereference
++  // time to differentiate true positives from guarded dereferences, which avoids
++  // state-erasure regressions when pointers are checked in unrelated branches.
++  (void)Condition;
++  (void)C;
+ }
+
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+@@ -189,9 +175,16 @@     return;
+
+   ProgramStateRef State = C.getState();
+-  if (State->contains<UncheckedDevmPtrSyms>(BaseSym)) {
+-    reportBug(C, S);
+-  }
++  if (!State->contains<UncheckedDevmPtrSyms>(BaseSym))
++    return;
++
++  // Eliminate false positives: if the symbol is definitely non-null on this path,
++  // do not report.
++  if (isDefinitelyNonNull(BaseSym, C))
++    return;
++
++  // Otherwise, it is still possibly NULL on this path and has not been guarded.
++  reportBug(C, S);
+ }
+
+ } // end anonymous namespace

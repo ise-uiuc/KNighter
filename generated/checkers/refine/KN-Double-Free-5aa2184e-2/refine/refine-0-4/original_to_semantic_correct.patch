@@ -1,0 +1,212 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -20,6 +20,8 @@ #include "clang/Lex/Lexer.h"
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/SmallPtrSet.h"
++#include <memory>
+
+ using namespace clang;
+ using namespace ento;
+@@ -107,7 +109,6 @@             FirstAllocLoc[CanonFD] = CurLoc;
+           } else {
+             const SourceManager &SM = C.getSourceManager();
+-            // Keep the earliest source location in TU order.
+             if (SM.isBeforeInTranslationUnit(CurLoc, It->second))
+               It->second = CurLoc;
+           }
+@@ -127,7 +128,6 @@           "devm_kmalloc", "devm_kzalloc", "devm_kcalloc", "__kmalloc"
+       };
+
+-      // Prefer direct callee name if available.
+       if (const FunctionDecl *FD = CE->getDirectCallee()) {
+         StringRef Name = FD->getName();
+         for (const char *N : AllocNames)
+@@ -152,11 +152,15 @@   void buildPerFunctionInfo(const FunctionDecl *FD, CheckerContext &C) const;
+
+   bool isAllocatorCall(const CallEvent &Call, CheckerContext &C) const;
+-  bool isFreeLikeCall(const CallEvent &Call, CheckerContext &C) const;
++
++  // Identify free-like functions and which parameter indices are the freed pointers.
++  bool getFreeLikeParamIndices(const CallEvent &Call,
++                               llvm::SmallVectorImpl<unsigned> &Idxs) const;
+
+   // Returns true if the reported scenario is a false positive and should be suppressed.
+-  bool isFalsePositive(const MemberExpr *FreedME, const CallEvent &Call,
+-                       const LabelStmt *EnclosingLabel, CheckerContext &C) const;
++  bool isFalsePositive(const Expr *FreedArgE, const MemberExpr *FreedME,
++                       const CallEvent &Call, const LabelStmt *EnclosingLabel,
++                       CheckerContext &C) const;
+
+   // Gating heuristic: return the ParmVarDecl if the base of a MemberExpr resolves directly to a function parameter.
+   const ParmVarDecl *getDirectBaseParam(const Expr *BaseE) const;
+@@ -201,9 +205,10 @@ }
+
+ bool SAGenTestChecker::isAllocatorCall(const CallEvent &Call, CheckerContext &C) const {
+-  const Expr *E = Call.getOriginExpr();
+-  if (!E)
++  const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
++  if (!FD)
+     return false;
++  StringRef Name = FD->getName();
+
+   static const char *Names[] = {
+       "kmalloc", "kzalloc", "kcalloc", "kvzalloc", "kvmalloc", "krealloc",
+@@ -211,23 +216,31 @@       "devm_kmalloc", "devm_kzalloc", "devm_kcalloc", "__kmalloc"
+   };
+   for (const char *N : Names) {
+-    if (ExprHasName(E, N, C))
++    if (Name.equals(N))
+       return true;
+   }
+   return false;
+ }
+
+-bool SAGenTestChecker::isFreeLikeCall(const CallEvent &Call, CheckerContext &C) const {
+-  const Expr *E = Call.getOriginExpr();
+-  if (!E)
++bool SAGenTestChecker::getFreeLikeParamIndices(const CallEvent &Call,
++                                               llvm::SmallVectorImpl<unsigned> &Idxs) const {
++  Idxs.clear();
++  const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(Call.getDecl());
++  if (!FD)
+     return false;
+
+-  static const char *Names[] = {"kfree", "kvfree", "vfree"};
+-  for (const char *N : Names) {
+-    if (ExprHasName(E, N, C))
+-      return true;
+-  }
+-  return false;
++  StringRef Name = FD->getName();
++  // Exact matches only; avoid substring matches like "devm_kfree" triggering "kfree".
++  if (Name.equals("kfree") || Name.equals("kvfree") || Name.equals("vfree")) {
++    if (Call.getNumArgs() >= 1)
++      Idxs.push_back(0);
++  } else if (Name.equals("devm_kfree")) {
++    if (Call.getNumArgs() >= 2)
++      Idxs.push_back(1); // freed pointer is the second argument
++  } else {
++    return false;
++  }
++  return !Idxs.empty();
+ }
+
+ void SAGenTestChecker::checkBeginFunction(CheckerContext &C) const {
+@@ -317,23 +330,28 @@   return nullptr;
+ }
+
+-bool SAGenTestChecker::isFalsePositive(const MemberExpr *FreedME,
++bool SAGenTestChecker::isFalsePositive(const Expr *FreedArgE,
++                                       const MemberExpr *FreedME,
+                                        const CallEvent &Call,
+                                        const LabelStmt *EnclosingLabel,
+                                        CheckerContext &C) const {
+   // 1) If the argument is definitely the literal NULL at this point, kfree(NULL) is a no-op.
+-  SVal ArgVal = C.getSVal(Call.getArgExpr(0));
+-  if (ArgVal.isZeroConstant())
+-    return true;
++  if (FreedArgE) {
++    SVal ArgVal = C.getSVal(FreedArgE);
++    if (ArgVal.isZeroConstant())
++      return true;
++  }
+
+   // 2) If this function path-sensitively owns the region (or its base), don't warn on this path.
+-  const MemRegion *FreedReg = getMemRegionFromExpr(Call.getArgExpr(0), C);
+-  if (FreedReg) {
+-    const MemRegion *Base = FreedReg->getBaseRegion();
+-    ProgramStateRef State = C.getState();
+-    if (State->contains<OwnedRegionSet>(FreedReg) ||
+-        (Base && State->contains<OwnedRegionSet>(Base))) {
+-      return true;
++  if (FreedArgE) {
++    const MemRegion *FreedReg = getMemRegionFromExpr(FreedArgE, C);
++    if (FreedReg) {
++      const MemRegion *Base = FreedReg->getBaseRegion();
++      ProgramStateRef State = C.getState();
++      if (State->contains<OwnedRegionSet>(FreedReg) ||
++          (Base && State->contains<OwnedRegionSet>(Base))) {
++        return true;
++      }
+     }
+   }
+
+@@ -360,8 +378,6 @@             bool AnyBefore = false;
+             for (const GotoStmt *GS : Gotos) {
+               SourceLocation GLoc = GS->getGotoLoc();
+-              // If a goto appears before the allocator assignment, there exists
+-              // a path to the label prior to ownership -> potential bug.
+               if (SM.isBeforeInTranslationUnit(GLoc, AllocLoc)) {
+                 AnyBefore = true;
+                 break;
+@@ -393,30 +409,10 @@ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+-  if (!isFreeLikeCall(Call, C))
+-    return;
+-
+-  if (Call.getNumArgs() < 1)
+-    return;
+-
+-  const Expr *ArgE = Call.getArgExpr(0);
+-  if (!ArgE)
+-    return;
+-
+-  // Only consider freeing a struct/union field like mt->fc.
+-  const Expr *Stripped = ArgE->IgnoreParenImpCasts();
+-  const auto *FreedME = dyn_cast<MemberExpr>(Stripped);
+-  if (!FreedME)
+-    return;
+-
+-  // New gating: Only warn when the freed field belongs directly to a function parameter.
+-  // This matches the target buggy pattern (e.g., mt->fc) and suppresses common cleanup of local/private state (e.g., priv->...).
+-  const Expr *BaseE = FreedME->getBase();
+-  const ParmVarDecl *BaseParam = getDirectBaseParam(BaseE);
+-  if (!BaseParam)
+-    return;
+-
+-  // Determine if the call is under a label with multiple incoming gotos.
++  llvm::SmallVector<unsigned, 4> FreeIdxs;
++  if (!getFreeLikeParamIndices(Call, FreeIdxs))
++    return;
++
+   const Expr *Origin = Call.getOriginExpr();
+   if (!Origin)
+     return;
+@@ -441,11 +437,33 @@   if (Count < 2)
+     return;
+
+-  // Suppress known false positives.
+-  if (isFalsePositive(FreedME, Call, EnclosingLabel, C))
+-    return;
+-
+-  reportFreeUnownedInSharedLabel(Call, C);
++  // Check each freed argument.
++  for (unsigned ArgIndex : FreeIdxs) {
++    const Expr *ArgE = Call.getArgExpr(ArgIndex);
++    if (!ArgE)
++      continue;
++
++    // Only consider freeing a struct/union field like mt->fc.
++    const Expr *Stripped = ArgE->IgnoreParenImpCasts();
++    const auto *FreedME = dyn_cast<MemberExpr>(Stripped);
++    if (!FreedME)
++      continue;
++
++    // New gating: Only warn when the freed field belongs directly to a function parameter.
++    // This matches the target buggy pattern (e.g., mt->fc) and suppresses cleanup of local/private state.
++    const Expr *BaseE = FreedME->getBase();
++    const ParmVarDecl *BaseParam = getDirectBaseParam(BaseE);
++    if (!BaseParam)
++      continue;
++
++    // Suppress known false positives.
++    if (isFalsePositive(ArgE, FreedME, Call, EnclosingLabel, C))
++      continue;
++
++    reportFreeUnownedInSharedLabel(Call, C);
++    // One report per call site is sufficient.
++    return;
++  }
+ }
+
+ } // end anonymous namespace

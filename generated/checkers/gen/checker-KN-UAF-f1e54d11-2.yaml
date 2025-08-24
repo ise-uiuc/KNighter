@@ -1,0 +1,1004 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: f1e54d11b210b53d418ff1476c6b58a2f434dfc0
+commit_type: UAF
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/Support/raw_ostream.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\n// Program state maps\n// - PtrAliasMap:\
+  \ tracks aliasing between pointer-holding regions (LHS region -> RHS root region)\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)\n\
+  // - DstCarrierMap: marks that a metadata_dst pointer has been used as a dst carrier\
+  \ (&p->dst passed to dst APIs)\nREGISTER_MAP_WITH_PROGRAMSTATE(DstCarrierMap, const\
+  \ MemRegion*, bool)\n// - DstHoldCountMap: best-effort counter of dst_hold/dst_release\
+  \ per pointer region\nREGISTER_MAP_WITH_PROGRAMSTATE(DstHoldCountMap, const MemRegion*,\
+  \ unsigned)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PostCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Freeing refcounted metadata_dst directly\", \"Reference\
+  \ counting\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n\n   private:\n\n      // Helper: follow alias map to get a canonical\
+  \ root region\n      const MemRegion *getRootRegion(const MemRegion *R, ProgramStateRef\
+  \ State) const {\n        if (!R) return nullptr;\n        const MemRegion *Cur\
+  \ = R->getBaseRegion();\n        // Follow aliases until fixed point (with a hard\
+  \ iteration cap to prevent cycles)\n        for (unsigned i = 0; i < 16; ++i) {\n\
+  \          const MemRegion *const *Next = State->get<PtrAliasMap>(Cur);\n      \
+  \    if (!Next)\n            break;\n          const MemRegion *NextBase = (*Next)\
+  \ ? (*Next)->getBaseRegion() : nullptr;\n          if (!NextBase || NextBase ==\
+  \ Cur)\n            break;\n          Cur = NextBase;\n        }\n        return\
+  \ Cur;\n      }\n\n      // Helper: check if Arg is of form &X->dst or &X.dst, and\
+  \ return base X in OutBaseExpr\n      bool isMemberAddrOfDst(const Expr *Arg, const\
+  \ Expr *&OutBaseExpr) const {\n        OutBaseExpr = nullptr;\n        if (!Arg)\n\
+  \          return false;\n        const Expr *E = Arg->IgnoreParenCasts();\n   \
+  \     const auto *UO = dyn_cast<UnaryOperator>(E);\n        if (!UO || UO->getOpcode()\
+  \ != UO_AddrOf)\n          return false;\n\n        const Expr *Sub = UO->getSubExpr();\n\
+  \        if (!Sub)\n          return false;\n        Sub = Sub->IgnoreParenCasts();\n\
+  \n        const auto *ME = dyn_cast<MemberExpr>(Sub);\n        if (!ME)\n      \
+  \    return false;\n\n        const ValueDecl *VD = ME->getMemberDecl();\n     \
+  \   if (!VD || !VD->getIdentifier())\n          return false;\n\n        if (VD->getName()\
+  \ != \"dst\")\n          return false;\n\n        OutBaseExpr = ME->getBase();\n\
+  \        return OutBaseExpr != nullptr;\n      }\n\n      // Helper: get pointee\
+  \ region from an expression using provided utility\n      const MemRegion *getRegionFromExprPointee(const\
+  \ Expr *E, CheckerContext &C) const {\n        if (!E) return nullptr;\n       \
+  \ const MemRegion *MR = getMemRegionFromExpr(E, C);\n        if (!MR) return nullptr;\n\
+  \        return MR->getBaseRegion();\n      }\n\n      // Helper: robust callee-name\
+  \ check using provided utility\n      bool isCallNamed(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef Name) const {\n        const Expr *Origin = Call.getOriginExpr();\n\
+  \        if (!Origin) return false;\n        return ExprHasName(Origin, Name, C);\n\
+  \      }\n\n      void reportFreeOfDstCarrier(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n        ExplodedNode *N = C.generateNonFatalErrorNode();\n      \
+  \  if (!N) return;\n        auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \            *BT, \"Freeing metadata_dst directly; use dst_release(&p->dst)\", N);\n\
+  \        R->addRange(Call.getSourceRange());\n        C.emitReport(std::move(R));\n\
+  \      }\n};\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin) return;\n\n  // Recognize core dst APIs\n  bool IsDstHold = isCallNamed(Call,\
+  \ C, \"dst_hold\");\n  bool IsDstRelease = isCallNamed(Call, C, \"dst_release\"\
+  );\n  bool IsSkbDstSet = isCallNamed(Call, C, \"skb_dst_set\");\n\n  bool IsMetaDstFree\
+  \ = isCallNamed(Call, C, \"metadata_dst_free\");\n  bool IsKfree = isCallNamed(Call,\
+  \ C, \"kfree\");\n\n  // dst_hold/dst_release: argument 0 is &p->dst\n  if (IsDstHold\
+  \ || IsDstRelease) {\n    if (Call.getNumArgs() >= 1) {\n      const Expr *BaseExpr\
+  \ = nullptr;\n      if (isMemberAddrOfDst(Call.getArgExpr(0), BaseExpr)) {\n   \
+  \     const MemRegion *MR = getRegionFromExprPointee(BaseExpr, C);\n        if (MR)\
+  \ {\n          const MemRegion *Root = getRootRegion(MR, State);\n          if (Root)\
+  \ {\n            // Mark as carrier\n            State = State->set<DstCarrierMap>(Root,\
+  \ true);\n            // Update hold count\n            unsigned Count = 0;\n  \
+  \          if (const unsigned *PC = State->get<DstHoldCountMap>(Root))\n       \
+  \       Count = *PC;\n            if (IsDstHold) {\n              State = State->set<DstHoldCountMap>(Root,\
+  \ Count + 1);\n            } else { // IsDstRelease\n              if (Count > 0)\n\
+  \                State = State->set<DstHoldCountMap>(Root, Count - 1);\n       \
+  \       else\n                State = State->set<DstHoldCountMap>(Root, 0u);\n \
+  \           }\n          }\n        }\n      }\n    }\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // skb_dst_set(skb, &p->dst) : argument 1\n  if (IsSkbDstSet)\
+  \ {\n    if (Call.getNumArgs() >= 2) {\n      const Expr *BaseExpr = nullptr;\n\
+  \      if (isMemberAddrOfDst(Call.getArgExpr(1), BaseExpr)) {\n        const MemRegion\
+  \ *MR = getRegionFromExprPointee(BaseExpr, C);\n        if (MR) {\n          const\
+  \ MemRegion *Root = getRootRegion(MR, State);\n          if (Root) {\n         \
+  \   State = State->set<DstCarrierMap>(Root, true);\n          }\n        }\n   \
+  \   }\n    }\n    C.addTransition(State);\n    return;\n  }\n\n  // metadata_dst_free(p)\
+  \ or kfree(p) : check if p is a known dst-carrier\n  if (IsMetaDstFree || IsKfree)\
+  \ {\n    if (Call.getNumArgs() >= 1) {\n      const Expr *ArgE = Call.getArgExpr(0);\n\
+  \      const MemRegion *MR = getRegionFromExprPointee(ArgE, C);\n      if (MR) {\n\
+  \        const MemRegion *Root = getRootRegion(MR, State);\n        if (Root) {\n\
+  \          const bool *IsCarrier = State->get<DstCarrierMap>(Root);\n          if\
+  \ (IsCarrier && *IsCarrier) {\n            reportFreeOfDstCarrier(Call, C);\n  \
+  \          return;\n          }\n        }\n      }\n\n      // Fallback heuristic\
+  \ to catch the shown buggy code (macsec md_dst):\n      // If the expression clearly\
+  \ refers to \"md_dst\" or \"metadata_dst\",\n      // warn as direct free is unsafe;\
+  \ the correct API is dst_release(&p->dst).\n      if (ArgE && (ExprHasName(ArgE,\
+  \ \"md_dst\", C) || ExprHasName(ArgE, \"metadata_dst\", C))) {\n        reportFreeOfDstCarrier(Call,\
+  \ C);\n        return;\n      }\n    }\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  // Default transition\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  const MemRegion\
+  \ *RHSReg = Val.getAsRegion();\n  if (RHSReg) {\n    RHSReg = RHSReg->getBaseRegion();\n\
+  \    if (RHSReg) {\n      const MemRegion *RootRHS = getRootRegion(RHSReg, State);\n\
+  \      if (!RootRHS) RootRHS = RHSReg;\n      // Record alias both ways to improve\
+  \ canonicalization\n      State = State->set<PtrAliasMap>(LHSReg, RootRHS);\n  \
+  \    State = State->set<PtrAliasMap>(RootRHS, LHSReg);\n    }\n  }\n\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing metadata_dst directly instead of dropping reference via\
+  \ dst_release\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nmacsec: Fix use-after-free while sending the offloading\
+  \ packet\n\nKASAN reports the following UAF. The metadata_dst, which is used to\n\
+  store the SCI value for macsec offload, is already freed by\nmetadata_dst_free()\
+  \ in macsec_free_netdev(), while driver still use it\nfor sending the packet.\n\n\
+  To fix this issue, dst_release() is used instead to release\nmetadata_dst. So it\
+  \ is not freed instantly in macsec_free_netdev() if\nstill referenced by skb.\n\n\
+  \ BUG: KASAN: slab-use-after-free in mlx5e_xmit+0x1e8f/0x4190 [mlx5_core]\n Read\
+  \ of size 2 at addr ffff88813e42e038 by task kworker/7:2/714\n [...]\n Workqueue:\
+  \ mld mld_ifc_work\n Call Trace:\n  <TASK>\n  dump_stack_lvl+0x51/0x60\n  print_report+0xc1/0x600\n\
+  \  kasan_report+0xab/0xe0\n  mlx5e_xmit+0x1e8f/0x4190 [mlx5_core]\n  dev_hard_start_xmit+0x120/0x530\n\
+  \  sch_direct_xmit+0x149/0x11e0\n  __qdisc_run+0x3ad/0x1730\n  __dev_queue_xmit+0x1196/0x2ed0\n\
+  \  vlan_dev_hard_start_xmit+0x32e/0x510 [8021q]\n  dev_hard_start_xmit+0x120/0x530\n\
+  \  __dev_queue_xmit+0x14a7/0x2ed0\n  macsec_start_xmit+0x13e9/0x2340\n  dev_hard_start_xmit+0x120/0x530\n\
+  \  __dev_queue_xmit+0x14a7/0x2ed0\n  ip6_finish_output2+0x923/0x1a70\n  ip6_finish_output+0x2d7/0x970\n\
+  \  ip6_output+0x1ce/0x3a0\n  NF_HOOK.constprop.0+0x15f/0x190\n  mld_sendpack+0x59a/0xbd0\n\
+  \  mld_ifc_work+0x48a/0xa80\n  process_one_work+0x5aa/0xe50\n  worker_thread+0x79c/0x1290\n\
+  \  kthread+0x28f/0x350\n  ret_from_fork+0x2d/0x70\n  ret_from_fork_asm+0x11/0x20\n\
+  \  </TASK>\n\n Allocated by task 3922:\n  kasan_save_stack+0x20/0x40\n  kasan_save_track+0x10/0x30\n\
+  \  __kasan_kmalloc+0x77/0x90\n  __kmalloc_noprof+0x188/0x400\n  metadata_dst_alloc+0x1f/0x4e0\n\
+  \  macsec_newlink+0x914/0x1410\n  __rtnl_newlink+0xe08/0x15b0\n  rtnl_newlink+0x5f/0x90\n\
+  \  rtnetlink_rcv_msg+0x667/0xa80\n  netlink_rcv_skb+0x12c/0x360\n  netlink_unicast+0x551/0x770\n\
+  \  netlink_sendmsg+0x72d/0xbd0\n  __sock_sendmsg+0xc5/0x190\n  ____sys_sendmsg+0x52e/0x6a0\n\
+  \  ___sys_sendmsg+0xeb/0x170\n  __sys_sendmsg+0xb5/0x140\n  do_syscall_64+0x4c/0x100\n\
+  \  entry_SYSCALL_64_after_hwframe+0x4b/0x53\n\n Freed by task 4011:\n  kasan_save_stack+0x20/0x40\n\
+  \  kasan_save_track+0x10/0x30\n  kasan_save_free_info+0x37/0x50\n  poison_slab_object+0x10c/0x190\n\
+  \  __kasan_slab_free+0x11/0x30\n  kfree+0xe0/0x290\n  macsec_free_netdev+0x3f/0x140\n\
+  \  netdev_run_todo+0x450/0xc70\n  rtnetlink_rcv_msg+0x66f/0xa80\n  netlink_rcv_skb+0x12c/0x360\n\
+  \  netlink_unicast+0x551/0x770\n  netlink_sendmsg+0x72d/0xbd0\n  __sock_sendmsg+0xc5/0x190\n\
+  \  ____sys_sendmsg+0x52e/0x6a0\n  ___sys_sendmsg+0xeb/0x170\n  __sys_sendmsg+0xb5/0x140\n\
+  \  do_syscall_64+0x4c/0x100\n  entry_SYSCALL_64_after_hwframe+0x4b/0x53\n\nFixes:\
+  \ 0a28bfd4971f (\"net/macsec: Add MACsec skb_metadata_dst Tx Data path support\"\
+  )\nSigned-off-by: Jianbo Liu <jianbol@nvidia.com>\nReviewed-by: Patrisious Haddad\
+  \ <phaddad@nvidia.com>\nReviewed-by: Chris Mi <cmi@nvidia.com>\nSigned-off-by: Tariq\
+  \ Toukan <tariqt@nvidia.com>\nReviewed-by: Simon Horman <horms@kernel.org>\nReviewed-by:\
+  \ Sabrina Dubroca <sd@queasysnail.net>\nLink: https://patch.msgid.link/20241021100309.234125-1-tariqt@nvidia.com\n\
+  Signed-off-by: Jakub Kicinski <kuba@kernel.org>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ macsec_upd_rxsc in drivers/net/macsec.c\nstatic int macsec_upd_rxsc(struct sk_buff\
+  \ *skb, struct genl_info *info)\n{\n\tstruct nlattr **attrs = info->attrs;\n\tstruct\
+  \ net_device *dev;\n\tstruct macsec_secy *secy;\n\tstruct macsec_rx_sc *rx_sc;\n\
+  \tstruct nlattr *tb_rxsc[MACSEC_RXSC_ATTR_MAX + 1];\n\tunsigned int prev_n_rx_sc;\n\
+  \tbool was_active;\n\tint ret;\n\n\tif (!attrs[MACSEC_ATTR_IFINDEX])\n\t\treturn\
+  \ -EINVAL;\n\n\tif (parse_rxsc_config(attrs, tb_rxsc))\n\t\treturn -EINVAL;\n\n\t\
+  if (!validate_add_rxsc(tb_rxsc))\n\t\treturn -EINVAL;\n\n\trtnl_lock();\n\trx_sc\
+  \ = get_rxsc_from_nl(genl_info_net(info), attrs, tb_rxsc, &dev, &secy);\n\tif (IS_ERR(rx_sc))\
+  \ {\n\t\trtnl_unlock();\n\t\treturn PTR_ERR(rx_sc);\n\t}\n\n\twas_active = rx_sc->active;\n\
+  \tprev_n_rx_sc = secy->n_rx_sc;\n\tif (tb_rxsc[MACSEC_RXSC_ATTR_ACTIVE]) {\n\t\t\
+  bool new = !!nla_get_u8(tb_rxsc[MACSEC_RXSC_ATTR_ACTIVE]);\n\n\t\tif (rx_sc->active\
+  \ != new)\n\t\t\tsecy->n_rx_sc += new ? 1 : -1;\n\n\t\trx_sc->active = new;\n\t\
+  }\n\n\t/* If h/w offloading is available, propagate to the device */\n\tif (macsec_is_offloaded(netdev_priv(dev)))\
+  \ {\n\t\tconst struct macsec_ops *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops\
+  \ = macsec_get_ops(netdev_priv(dev), &ctx);\n\t\tif (!ops) {\n\t\t\tret = -EOPNOTSUPP;\n\
+  \t\t\tgoto cleanup;\n\t\t}\n\n\t\tctx.rx_sc = rx_sc;\n\t\tctx.secy = secy;\n\n\t\
+  \tret = macsec_offload(ops->mdo_upd_rxsc, &ctx);\n\t\tif (ret)\n\t\t\tgoto cleanup;\n\
+  \t}\n\n\trtnl_unlock();\n\n\treturn 0;\n\ncleanup:\n\tsecy->n_rx_sc = prev_n_rx_sc;\n\
+  \trx_sc->active = was_active;\n\trtnl_unlock();\n\treturn ret;\n}\n\nstatic bool\
+  \ macsec_is_configured(struct macsec_dev *macsec)\n{\n\tstruct macsec_secy *secy\
+  \ = &macsec->secy;\n\tstruct macsec_tx_sc *tx_sc = &secy->tx_sc;\n\tint i;\n\n\t\
+  if (secy->rx_sc)\n\t\treturn true;\n\n\tfor (i = 0; i < MACSEC_NUM_AN; i++)\n\t\t\
+  if (tx_sc->sa[i])\n\t\t\treturn true;\n\n\treturn false;\n}\n\nstatic bool macsec_needs_tx_tag(struct\
+  \ macsec_dev *macsec,\n\t\t\t\tconst struct macsec_ops *ops)\n{\n\treturn macsec->offload\
+  \ == MACSEC_OFFLOAD_PHY &&\n\t\tops->mdo_insert_tx_tag;\n}\n\nstatic void macsec_set_head_tail_room(struct\
+  \ net_device *dev)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\tstruct\
+  \ net_device *real_dev = macsec->real_dev;\n\tint needed_headroom, needed_tailroom;\n\
+  \tconst struct macsec_ops *ops;\n\n\tops = macsec_get_ops(macsec, NULL);\n\tif (ops)\
+  \ {\n\t\tneeded_headroom = ops->needed_headroom;\n\t\tneeded_tailroom = ops->needed_tailroom;\n\
+  \t} else {\n\t\tneeded_headroom = MACSEC_NEEDED_HEADROOM;\n\t\tneeded_tailroom =\
+  \ MACSEC_NEEDED_TAILROOM;\n\t}\n\n\tdev->needed_headroom = real_dev->needed_headroom\
+  \ + needed_headroom;\n\tdev->needed_tailroom = real_dev->needed_tailroom + needed_tailroom;\n\
+  }\n\nstatic int macsec_update_offload(struct net_device *dev, enum macsec_offload\
+  \ offload)\n{\n\tenum macsec_offload prev_offload;\n\tconst struct macsec_ops *ops;\n\
+  \tstruct macsec_context ctx;\n\tstruct macsec_dev *macsec;\n\tint ret = 0;\n\n\t\
+  macsec = macsec_priv(dev);\n\n\t/* Check if the offloading mode is supported by\
+  \ the underlying layers */\n\tif (offload != MACSEC_OFFLOAD_OFF &&\n\t    !macsec_check_offload(offload,\
+  \ macsec))\n\t\treturn -EOPNOTSUPP;\n\n\t/* Check if the net device is busy. */\n\
+  \tif (netif_running(dev))\n\t\treturn -EBUSY;\n\n\t/* Check if the device already\
+  \ has rules configured: we do not support\n\t * rules migration.\n\t */\n\tif (macsec_is_configured(macsec))\n\
+  \t\treturn -EBUSY;\n\n\tprev_offload = macsec->offload;\n\n\tops = __macsec_get_ops(offload\
+  \ == MACSEC_OFFLOAD_OFF ? prev_offload : offload,\n\t\t\t       macsec, &ctx);\n\
+  \tif (!ops)\n\t\treturn -EOPNOTSUPP;\n\n\tmacsec->offload = offload;\n\n\tctx.secy\
+  \ = &macsec->secy;\n\tret = offload == MACSEC_OFFLOAD_OFF ? macsec_offload(ops->mdo_del_secy,\
+  \ &ctx)\n\t\t\t\t\t    : macsec_offload(ops->mdo_add_secy, &ctx);\n\tif (ret) {\n\
+  \t\tmacsec->offload = prev_offload;\n\t\treturn ret;\n\t}\n\n\tmacsec_set_head_tail_room(dev);\n\
+  \tmacsec->insert_tx_tag = macsec_needs_tx_tag(macsec, ops);\n\n\treturn ret;\n}\n\
+  \nstatic int macsec_upd_offload(struct sk_buff *skb, struct genl_info *info)\n{\n\
+  \tstruct nlattr *tb_offload[MACSEC_OFFLOAD_ATTR_MAX + 1];\n\tstruct nlattr **attrs\
+  \ = info->attrs;\n\tenum macsec_offload offload;\n\tstruct macsec_dev *macsec;\n\
+  \tstruct net_device *dev;\n\tint ret = 0;\n\n\tif (!attrs[MACSEC_ATTR_IFINDEX])\n\
+  \t\treturn -EINVAL;\n\n\tif (!attrs[MACSEC_ATTR_OFFLOAD])\n\t\treturn -EINVAL;\n\
+  \n\tif (nla_parse_nested_deprecated(tb_offload, MACSEC_OFFLOAD_ATTR_MAX,\n\t\t\t\
+  \t\tattrs[MACSEC_ATTR_OFFLOAD],\n\t\t\t\t\tmacsec_genl_offload_policy, NULL))\n\t\
+  \treturn -EINVAL;\n\n\trtnl_lock();\n\n\tdev = get_dev_from_nl(genl_info_net(info),\
+  \ attrs);\n\tif (IS_ERR(dev)) {\n\t\tret = PTR_ERR(dev);\n\t\tgoto out;\n\t}\n\t\
+  macsec = macsec_priv(dev);\n\n\tif (!tb_offload[MACSEC_OFFLOAD_ATTR_TYPE]) {\n\t\
+  \tret = -EINVAL;\n\t\tgoto out;\n\t}\n\n\toffload = nla_get_u8(tb_offload[MACSEC_OFFLOAD_ATTR_TYPE]);\n\
+  \n\tif (macsec->offload != offload)\n\t\tret = macsec_update_offload(dev, offload);\n\
+  out:\n\trtnl_unlock();\n\treturn ret;\n}\n\nstatic void get_tx_sa_stats(struct net_device\
+  \ *dev, int an,\n\t\t\t    struct macsec_tx_sa *tx_sa,\n\t\t\t    struct macsec_tx_sa_stats\
+  \ *sum)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\tint cpu;\n\n\t/*\
+  \ If h/w offloading is available, propagate to the device */\n\tif (macsec_is_offloaded(macsec))\
+  \ {\n\t\tconst struct macsec_ops *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops\
+  \ = macsec_get_ops(macsec, &ctx);\n\t\tif (ops) {\n\t\t\tctx.sa.assoc_num = an;\n\
+  \t\t\tctx.sa.tx_sa = tx_sa;\n\t\t\tctx.stats.tx_sa_stats = sum;\n\t\t\tctx.secy\
+  \ = &macsec_priv(dev)->secy;\n\t\t\tmacsec_offload(ops->mdo_get_tx_sa_stats, &ctx);\n\
+  \t\t}\n\t\treturn;\n\t}\n\n\tfor_each_possible_cpu(cpu) {\n\t\tconst struct macsec_tx_sa_stats\
+  \ *stats =\n\t\t\tper_cpu_ptr(tx_sa->stats, cpu);\n\n\t\tsum->OutPktsProtected +=\
+  \ stats->OutPktsProtected;\n\t\tsum->OutPktsEncrypted += stats->OutPktsEncrypted;\n\
+  \t}\n}\n\nstatic int copy_tx_sa_stats(struct sk_buff *skb, struct macsec_tx_sa_stats\
+  \ *sum)\n{\n\tif (nla_put_u32(skb, MACSEC_SA_STATS_ATTR_OUT_PKTS_PROTECTED,\n\t\t\
+  \tsum->OutPktsProtected) ||\n\t    nla_put_u32(skb, MACSEC_SA_STATS_ATTR_OUT_PKTS_ENCRYPTED,\n\
+  \t\t\tsum->OutPktsEncrypted))\n\t\treturn -EMSGSIZE;\n\n\treturn 0;\n}\n\nstatic\
+  \ void get_rx_sa_stats(struct net_device *dev,\n\t\t\t    struct macsec_rx_sc *rx_sc,\
+  \ int an,\n\t\t\t    struct macsec_rx_sa *rx_sa,\n\t\t\t    struct macsec_rx_sa_stats\
+  \ *sum)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\tint cpu;\n\n\t/*\
+  \ If h/w offloading is available, propagate to the device */\n\tif (macsec_is_offloaded(macsec))\
+  \ {\n\t\tconst struct macsec_ops *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops\
+  \ = macsec_get_ops(macsec, &ctx);\n\t\tif (ops) {\n\t\t\tctx.sa.assoc_num = an;\n\
+  \t\t\tctx.sa.rx_sa = rx_sa;\n\t\t\tctx.stats.rx_sa_stats = sum;\n\t\t\tctx.secy\
+  \ = &macsec_priv(dev)->secy;\n\t\t\tctx.rx_sc = rx_sc;\n\t\t\tmacsec_offload(ops->mdo_get_rx_sa_stats,\
+  \ &ctx);\n\t\t}\n\t\treturn;\n\t}\n\n\tfor_each_possible_cpu(cpu) {\n\t\tconst struct\
+  \ macsec_rx_sa_stats *stats =\n\t\t\tper_cpu_ptr(rx_sa->stats, cpu);\n\n\t\tsum->InPktsOK\
+  \         += stats->InPktsOK;\n\t\tsum->InPktsInvalid    += stats->InPktsInvalid;\n\
+  \t\tsum->InPktsNotValid   += stats->InPktsNotValid;\n\t\tsum->InPktsNotUsingSA +=\
+  \ stats->InPktsNotUsingSA;\n\t\tsum->InPktsUnusedSA   += stats->InPktsUnusedSA;\n\
+  \t}\n}\n\nstatic int copy_rx_sa_stats(struct sk_buff *skb,\n\t\t\t    struct macsec_rx_sa_stats\
+  \ *sum)\n{\n\tif (nla_put_u32(skb, MACSEC_SA_STATS_ATTR_IN_PKTS_OK, sum->InPktsOK)\
+  \ ||\n\t    nla_put_u32(skb, MACSEC_SA_STATS_ATTR_IN_PKTS_INVALID,\n\t\t\tsum->InPktsInvalid)\
+  \ ||\n\t    nla_put_u32(skb, MACSEC_SA_STATS_ATTR_IN_PKTS_NOT_VALID,\n\t\t\tsum->InPktsNotValid)\
+  \ ||\n\t    nla_put_u32(skb, MACSEC_SA_STATS_ATTR_IN_PKTS_NOT_USING_SA,\n\t\t\t\
+  sum->InPktsNotUsingSA) ||\n\t    nla_put_u32(skb, MACSEC_SA_STATS_ATTR_IN_PKTS_UNUSED_SA,\n\
+  \t\t\tsum->InPktsUnusedSA))\n\t\treturn -EMSGSIZE;\n\n\treturn 0;\n}\n\nstatic void\
+  \ get_rx_sc_stats(struct net_device *dev,\n\t\t\t    struct macsec_rx_sc *rx_sc,\n\
+  \t\t\t    struct macsec_rx_sc_stats *sum)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\
+  \tint cpu;\n\n\t/* If h/w offloading is available, propagate to the device */\n\t\
+  if (macsec_is_offloaded(macsec)) {\n\t\tconst struct macsec_ops *ops;\n\t\tstruct\
+  \ macsec_context ctx;\n\n\t\tops = macsec_get_ops(macsec, &ctx);\n\t\tif (ops) {\n\
+  \t\t\tctx.stats.rx_sc_stats = sum;\n\t\t\tctx.secy = &macsec_priv(dev)->secy;\n\t\
+  \t\tctx.rx_sc = rx_sc;\n\t\t\tmacsec_offload(ops->mdo_get_rx_sc_stats, &ctx);\n\t\
+  \t}\n\t\treturn;\n\t}\n\n\tfor_each_possible_cpu(cpu) {\n\t\tconst struct pcpu_rx_sc_stats\
+  \ *stats;\n\t\tstruct macsec_rx_sc_stats tmp;\n\t\tunsigned int start;\n\n\t\tstats\
+  \ = per_cpu_ptr(rx_sc->stats, cpu);\n\t\tdo {\n\t\t\tstart = u64_stats_fetch_begin(&stats->syncp);\n\
+  \t\t\tmemcpy(&tmp, &stats->stats, sizeof(tmp));\n\t\t} while (u64_stats_fetch_retry(&stats->syncp,\
+  \ start));\n\n\t\tsum->InOctetsValidated += tmp.InOctetsValidated;\n\t\tsum->InOctetsDecrypted\
+  \ += tmp.InOctetsDecrypted;\n\t\tsum->InPktsUnchecked   += tmp.InPktsUnchecked;\n\
+  \t\tsum->InPktsDelayed     += tmp.InPktsDelayed;\n\t\tsum->InPktsOK          +=\
+  \ tmp.InPktsOK;\n\t\tsum->InPktsInvalid     += tmp.InPktsInvalid;\n\t\tsum->InPktsLate\
+  \        += tmp.InPktsLate;\n\t\tsum->InPktsNotValid    += tmp.InPktsNotValid;\n\
+  \t\tsum->InPktsNotUsingSA  += tmp.InPktsNotUsingSA;\n\t\tsum->InPktsUnusedSA   \
+  \ += tmp.InPktsUnusedSA;\n\t}\n}\n\nstatic int copy_rx_sc_stats(struct sk_buff *skb,\
+  \ struct macsec_rx_sc_stats *sum)\n{\n\tif (nla_put_u64_64bit(skb, MACSEC_RXSC_STATS_ATTR_IN_OCTETS_VALIDATED,\n\
+  \t\t\t      sum->InOctetsValidated,\n\t\t\t      MACSEC_RXSC_STATS_ATTR_PAD) ||\n\
+  \t    nla_put_u64_64bit(skb, MACSEC_RXSC_STATS_ATTR_IN_OCTETS_DECRYPTED,\n\t\t\t\
+  \      sum->InOctetsDecrypted,\n\t\t\t      MACSEC_RXSC_STATS_ATTR_PAD) ||\n\t \
+  \   nla_put_u64_64bit(skb, MACSEC_RXSC_STATS_ATTR_IN_PKTS_UNCHECKED,\n\t\t\t   \
+  \   sum->InPktsUnchecked,\n\t\t\t      MACSEC_RXSC_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb,\
+  \ MACSEC_RXSC_STATS_ATTR_IN_PKTS_DELAYED,\n\t\t\t      sum->InPktsDelayed,\n\t\t\
+  \t      MACSEC_RXSC_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb, MACSEC_RXSC_STATS_ATTR_IN_PKTS_OK,\n\
+  \t\t\t      sum->InPktsOK,\n\t\t\t      MACSEC_RXSC_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb,\
+  \ MACSEC_RXSC_STATS_ATTR_IN_PKTS_INVALID,\n\t\t\t      sum->InPktsInvalid,\n\t\t\
+  \t      MACSEC_RXSC_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb, MACSEC_RXSC_STATS_ATTR_IN_PKTS_LATE,\n\
+  \t\t\t      sum->InPktsLate,\n\t\t\t      MACSEC_RXSC_STATS_ATTR_PAD) ||\n\t   \
+  \ nla_put_u64_64bit(skb, MACSEC_RXSC_STATS_ATTR_IN_PKTS_NOT_VALID,\n\t\t\t     \
+  \ sum->InPktsNotValid,\n\t\t\t      MACSEC_RXSC_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb,\
+  \ MACSEC_RXSC_STATS_ATTR_IN_PKTS_NOT_USING_SA,\n\t\t\t      sum->InPktsNotUsingSA,\n\
+  \t\t\t      MACSEC_RXSC_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb, MACSEC_RXSC_STATS_ATTR_IN_PKTS_UNUSED_SA,\n\
+  \t\t\t      sum->InPktsUnusedSA,\n\t\t\t      MACSEC_RXSC_STATS_ATTR_PAD))\n\t\t\
+  return -EMSGSIZE;\n\n\treturn 0;\n}\n\nstatic void get_tx_sc_stats(struct net_device\
+  \ *dev,\n\t\t\t    struct macsec_tx_sc_stats *sum)\n{\n\tstruct macsec_dev *macsec\
+  \ = macsec_priv(dev);\n\tint cpu;\n\n\t/* If h/w offloading is available, propagate\
+  \ to the device */\n\tif (macsec_is_offloaded(macsec)) {\n\t\tconst struct macsec_ops\
+  \ *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops = macsec_get_ops(macsec, &ctx);\n\
+  \t\tif (ops) {\n\t\t\tctx.stats.tx_sc_stats = sum;\n\t\t\tctx.secy = &macsec_priv(dev)->secy;\n\
+  \t\t\tmacsec_offload(ops->mdo_get_tx_sc_stats, &ctx);\n\t\t}\n\t\treturn;\n\t}\n\
+  \n\tfor_each_possible_cpu(cpu) {\n\t\tconst struct pcpu_tx_sc_stats *stats;\n\t\t\
+  struct macsec_tx_sc_stats tmp;\n\t\tunsigned int start;\n\n\t\tstats = per_cpu_ptr(macsec_priv(dev)->secy.tx_sc.stats,\
+  \ cpu);\n\t\tdo {\n\t\t\tstart = u64_stats_fetch_begin(&stats->syncp);\n\t\t\tmemcpy(&tmp,\
+  \ &stats->stats, sizeof(tmp));\n\t\t} while (u64_stats_fetch_retry(&stats->syncp,\
+  \ start));\n\n\t\tsum->OutPktsProtected   += tmp.OutPktsProtected;\n\t\tsum->OutPktsEncrypted\
+  \   += tmp.OutPktsEncrypted;\n\t\tsum->OutOctetsProtected += tmp.OutOctetsProtected;\n\
+  \t\tsum->OutOctetsEncrypted += tmp.OutOctetsEncrypted;\n\t}\n}\n\nstatic int copy_tx_sc_stats(struct\
+  \ sk_buff *skb, struct macsec_tx_sc_stats *sum)\n{\n\tif (nla_put_u64_64bit(skb,\
+  \ MACSEC_TXSC_STATS_ATTR_OUT_PKTS_PROTECTED,\n\t\t\t      sum->OutPktsProtected,\n\
+  \t\t\t      MACSEC_TXSC_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb, MACSEC_TXSC_STATS_ATTR_OUT_PKTS_ENCRYPTED,\n\
+  \t\t\t      sum->OutPktsEncrypted,\n\t\t\t      MACSEC_TXSC_STATS_ATTR_PAD) ||\n\
+  \t    nla_put_u64_64bit(skb, MACSEC_TXSC_STATS_ATTR_OUT_OCTETS_PROTECTED,\n\t\t\t\
+  \      sum->OutOctetsProtected,\n\t\t\t      MACSEC_TXSC_STATS_ATTR_PAD) ||\n\t\
+  \    nla_put_u64_64bit(skb, MACSEC_TXSC_STATS_ATTR_OUT_OCTETS_ENCRYPTED,\n\t\t\t\
+  \      sum->OutOctetsEncrypted,\n\t\t\t      MACSEC_TXSC_STATS_ATTR_PAD))\n\t\t\
+  return -EMSGSIZE;\n\n\treturn 0;\n}\n\nstatic void get_secy_stats(struct net_device\
+  \ *dev, struct macsec_dev_stats *sum)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\
+  \tint cpu;\n\n\t/* If h/w offloading is available, propagate to the device */\n\t\
+  if (macsec_is_offloaded(macsec)) {\n\t\tconst struct macsec_ops *ops;\n\t\tstruct\
+  \ macsec_context ctx;\n\n\t\tops = macsec_get_ops(macsec, &ctx);\n\t\tif (ops) {\n\
+  \t\t\tctx.stats.dev_stats = sum;\n\t\t\tctx.secy = &macsec_priv(dev)->secy;\n\t\t\
+  \tmacsec_offload(ops->mdo_get_dev_stats, &ctx);\n\t\t}\n\t\treturn;\n\t}\n\n\tfor_each_possible_cpu(cpu)\
+  \ {\n\t\tconst struct pcpu_secy_stats *stats;\n\t\tstruct macsec_dev_stats tmp;\n\
+  \t\tunsigned int start;\n\n\t\tstats = per_cpu_ptr(macsec_priv(dev)->stats, cpu);\n\
+  \t\tdo {\n\t\t\tstart = u64_stats_fetch_begin(&stats->syncp);\n\t\t\tmemcpy(&tmp,\
+  \ &stats->stats, sizeof(tmp));\n\t\t} while (u64_stats_fetch_retry(&stats->syncp,\
+  \ start));\n\n\t\tsum->OutPktsUntagged  += tmp.OutPktsUntagged;\n\t\tsum->InPktsUntagged\
+  \   += tmp.InPktsUntagged;\n\t\tsum->OutPktsTooLong   += tmp.OutPktsTooLong;\n\t\
+  \tsum->InPktsNoTag      += tmp.InPktsNoTag;\n\t\tsum->InPktsBadTag     += tmp.InPktsBadTag;\n\
+  \t\tsum->InPktsUnknownSCI += tmp.InPktsUnknownSCI;\n\t\tsum->InPktsNoSCI      +=\
+  \ tmp.InPktsNoSCI;\n\t\tsum->InPktsOverrun    += tmp.InPktsOverrun;\n\t}\n}\n\n\
+  static int copy_secy_stats(struct sk_buff *skb, struct macsec_dev_stats *sum)\n\
+  {\n\tif (nla_put_u64_64bit(skb, MACSEC_SECY_STATS_ATTR_OUT_PKTS_UNTAGGED,\n\t\t\t\
+  \      sum->OutPktsUntagged,\n\t\t\t      MACSEC_SECY_STATS_ATTR_PAD) ||\n\t   \
+  \ nla_put_u64_64bit(skb, MACSEC_SECY_STATS_ATTR_IN_PKTS_UNTAGGED,\n\t\t\t      sum->InPktsUntagged,\n\
+  \t\t\t      MACSEC_SECY_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb, MACSEC_SECY_STATS_ATTR_OUT_PKTS_TOO_LONG,\n\
+  \t\t\t      sum->OutPktsTooLong,\n\t\t\t      MACSEC_SECY_STATS_ATTR_PAD) ||\n\t\
+  \    nla_put_u64_64bit(skb, MACSEC_SECY_STATS_ATTR_IN_PKTS_NO_TAG,\n\t\t\t     \
+  \ sum->InPktsNoTag,\n\t\t\t      MACSEC_SECY_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb,\
+  \ MACSEC_SECY_STATS_ATTR_IN_PKTS_BAD_TAG,\n\t\t\t      sum->InPktsBadTag,\n\t\t\t\
+  \      MACSEC_SECY_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb, MACSEC_SECY_STATS_ATTR_IN_PKTS_UNKNOWN_SCI,\n\
+  \t\t\t      sum->InPktsUnknownSCI,\n\t\t\t      MACSEC_SECY_STATS_ATTR_PAD) ||\n\
+  \t    nla_put_u64_64bit(skb, MACSEC_SECY_STATS_ATTR_IN_PKTS_NO_SCI,\n\t\t\t    \
+  \  sum->InPktsNoSCI,\n\t\t\t      MACSEC_SECY_STATS_ATTR_PAD) ||\n\t    nla_put_u64_64bit(skb,\
+  \ MACSEC_SECY_STATS_ATTR_IN_PKTS_OVERRUN,\n\t\t\t      sum->InPktsOverrun,\n\t\t\
+  \t      MACSEC_SECY_STATS_ATTR_PAD))\n\t\treturn -EMSGSIZE;\n\n\treturn 0;\n}\n\n\
+  static int nla_put_secy(struct macsec_secy *secy, struct sk_buff *skb)\n{\n\tstruct\
+  \ macsec_tx_sc *tx_sc = &secy->tx_sc;\n\tstruct nlattr *secy_nest = nla_nest_start_noflag(skb,\n\
+  \t\t\t\t\t\t\t MACSEC_ATTR_SECY);\n\tu64 csid;\n\n\tif (!secy_nest)\n\t\treturn\
+  \ 1;\n\n\tswitch (secy->key_len) {\n\tcase MACSEC_GCM_AES_128_SAK_LEN:\n\t\tcsid\
+  \ = secy->xpn ? MACSEC_CIPHER_ID_GCM_AES_XPN_128 : MACSEC_DEFAULT_CIPHER_ID;\n\t\
+  \tbreak;\n\tcase MACSEC_GCM_AES_256_SAK_LEN:\n\t\tcsid = secy->xpn ? MACSEC_CIPHER_ID_GCM_AES_XPN_256\
+  \ : MACSEC_CIPHER_ID_GCM_AES_256;\n\t\tbreak;\n\tdefault:\n\t\tgoto cancel;\n\t\
+  }\n\n\tif (nla_put_sci(skb, MACSEC_SECY_ATTR_SCI, secy->sci,\n\t\t\tMACSEC_SECY_ATTR_PAD)\
+  \ ||\n\t    nla_put_u64_64bit(skb, MACSEC_SECY_ATTR_CIPHER_SUITE,\n\t\t\t      csid,\
+  \ MACSEC_SECY_ATTR_PAD) ||\n\t    nla_put_u8(skb, MACSEC_SECY_ATTR_ICV_LEN, secy->icv_len)\
+  \ ||\n\t    nla_put_u8(skb, MACSEC_SECY_ATTR_OPER, secy->operational) ||\n\t   \
+  \ nla_put_u8(skb, MACSEC_SECY_ATTR_PROTECT, secy->protect_frames) ||\n\t    nla_put_u8(skb,\
+  \ MACSEC_SECY_ATTR_REPLAY, secy->replay_protect) ||\n\t    nla_put_u8(skb, MACSEC_SECY_ATTR_VALIDATE,\
+  \ secy->validate_frames) ||\n\t    nla_put_u8(skb, MACSEC_SECY_ATTR_ENCRYPT, tx_sc->encrypt)\
+  \ ||\n\t    nla_put_u8(skb, MACSEC_SECY_ATTR_INC_SCI, tx_sc->send_sci) ||\n\t  \
+  \  nla_put_u8(skb, MACSEC_SECY_ATTR_ES, tx_sc->end_station) ||\n\t    nla_put_u8(skb,\
+  \ MACSEC_SECY_ATTR_SCB, tx_sc->scb) ||\n\t    nla_put_u8(skb, MACSEC_SECY_ATTR_ENCODING_SA,\
+  \ tx_sc->encoding_sa))\n\t\tgoto cancel;\n\n\tif (secy->replay_protect) {\n\t\t\
+  if (nla_put_u32(skb, MACSEC_SECY_ATTR_WINDOW, secy->replay_window))\n\t\t\tgoto\
+  \ cancel;\n\t}\n\n\tnla_nest_end(skb, secy_nest);\n\treturn 0;\n\ncancel:\n\tnla_nest_cancel(skb,\
+  \ secy_nest);\n\treturn 1;\n}\n\nstatic noinline_for_stack int\ndump_secy(struct\
+  \ macsec_secy *secy, struct net_device *dev,\n\t  struct sk_buff *skb, struct netlink_callback\
+  \ *cb)\n{\n\tstruct macsec_tx_sc_stats tx_sc_stats = {0, };\n\tstruct macsec_tx_sa_stats\
+  \ tx_sa_stats = {0, };\n\tstruct macsec_rx_sc_stats rx_sc_stats = {0, };\n\tstruct\
+  \ macsec_rx_sa_stats rx_sa_stats = {0, };\n\tstruct macsec_dev *macsec = netdev_priv(dev);\n\
+  \tstruct macsec_dev_stats dev_stats = {0, };\n\tstruct macsec_tx_sc *tx_sc = &secy->tx_sc;\n\
+  \tstruct nlattr *txsa_list, *rxsc_list;\n\tstruct macsec_rx_sc *rx_sc;\n\tstruct\
+  \ nlattr *attr;\n\tvoid *hdr;\n\tint i, j;\n\n\thdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid,\
+  \ cb->nlh->nlmsg_seq,\n\t\t\t  &macsec_fam, NLM_F_MULTI, MACSEC_CMD_GET_TXSC);\n\
+  \tif (!hdr)\n\t\treturn -EMSGSIZE;\n\n\tgenl_dump_check_consistent(cb, hdr);\n\n\
+  \tif (nla_put_u32(skb, MACSEC_ATTR_IFINDEX, dev->ifindex))\n\t\tgoto nla_put_failure;\n\
+  \n\tattr = nla_nest_start_noflag(skb, MACSEC_ATTR_OFFLOAD);\n\tif (!attr)\n\t\t\
+  goto nla_put_failure;\n\tif (nla_put_u8(skb, MACSEC_OFFLOAD_ATTR_TYPE, macsec->offload))\n\
+  \t\tgoto nla_put_failure;\n\tnla_nest_end(skb, attr);\n\n\tif (nla_put_secy(secy,\
+  \ skb))\n\t\tgoto nla_put_failure;\n\n\tattr = nla_nest_start_noflag(skb, MACSEC_ATTR_TXSC_STATS);\n\
+  \tif (!attr)\n\t\tgoto nla_put_failure;\n\n\tget_tx_sc_stats(dev, &tx_sc_stats);\n\
+  \tif (copy_tx_sc_stats(skb, &tx_sc_stats)) {\n\t\tnla_nest_cancel(skb, attr);\n\t\
+  \tgoto nla_put_failure;\n\t}\n\tnla_nest_end(skb, attr);\n\n\tattr = nla_nest_start_noflag(skb,\
+  \ MACSEC_ATTR_SECY_STATS);\n\tif (!attr)\n\t\tgoto nla_put_failure;\n\tget_secy_stats(dev,\
+  \ &dev_stats);\n\tif (copy_secy_stats(skb, &dev_stats)) {\n\t\tnla_nest_cancel(skb,\
+  \ attr);\n\t\tgoto nla_put_failure;\n\t}\n\tnla_nest_end(skb, attr);\n\n\ttxsa_list\
+  \ = nla_nest_start_noflag(skb, MACSEC_ATTR_TXSA_LIST);\n\tif (!txsa_list)\n\t\t\
+  goto nla_put_failure;\n\tfor (i = 0, j = 1; i < MACSEC_NUM_AN; i++) {\n\t\tstruct\
+  \ macsec_tx_sa *tx_sa = rtnl_dereference(tx_sc->sa[i]);\n\t\tstruct nlattr *txsa_nest;\n\
+  \t\tu64 pn;\n\t\tint pn_len;\n\n\t\tif (!tx_sa)\n\t\t\tcontinue;\n\n\t\ttxsa_nest\
+  \ = nla_nest_start_noflag(skb, j++);\n\t\tif (!txsa_nest) {\n\t\t\tnla_nest_cancel(skb,\
+  \ txsa_list);\n\t\t\tgoto nla_put_failure;\n\t\t}\n\n\t\tattr = nla_nest_start_noflag(skb,\
+  \ MACSEC_SA_ATTR_STATS);\n\t\tif (!attr) {\n\t\t\tnla_nest_cancel(skb, txsa_nest);\n\
+  \t\t\tnla_nest_cancel(skb, txsa_list);\n\t\t\tgoto nla_put_failure;\n\t\t}\n\t\t\
+  memset(&tx_sa_stats, 0, sizeof(tx_sa_stats));\n\t\tget_tx_sa_stats(dev, i, tx_sa,\
+  \ &tx_sa_stats);\n\t\tif (copy_tx_sa_stats(skb, &tx_sa_stats)) {\n\t\t\tnla_nest_cancel(skb,\
+  \ attr);\n\t\t\tnla_nest_cancel(skb, txsa_nest);\n\t\t\tnla_nest_cancel(skb, txsa_list);\n\
+  \t\t\tgoto nla_put_failure;\n\t\t}\n\t\tnla_nest_end(skb, attr);\n\n\t\tif (secy->xpn)\
+  \ {\n\t\t\tpn = tx_sa->next_pn;\n\t\t\tpn_len = MACSEC_XPN_PN_LEN;\n\t\t} else {\n\
+  \t\t\tpn = tx_sa->next_pn_halves.lower;\n\t\t\tpn_len = MACSEC_DEFAULT_PN_LEN;\n\
+  \t\t}\n\n\t\tif (nla_put_u8(skb, MACSEC_SA_ATTR_AN, i) ||\n\t\t    nla_put(skb,\
+  \ MACSEC_SA_ATTR_PN, pn_len, &pn) ||\n\t\t    nla_put(skb, MACSEC_SA_ATTR_KEYID,\
+  \ MACSEC_KEYID_LEN, tx_sa->key.id) ||\n\t\t    (secy->xpn && nla_put_ssci(skb, MACSEC_SA_ATTR_SSCI,\
+  \ tx_sa->ssci)) ||\n\t\t    nla_put_u8(skb, MACSEC_SA_ATTR_ACTIVE, tx_sa->active))\
+  \ {\n\t\t\tnla_nest_cancel(skb, txsa_nest);\n\t\t\tnla_nest_cancel(skb, txsa_list);\n\
+  \t\t\tgoto nla_put_failure;\n\t\t}\n\n\t\tnla_nest_end(skb, txsa_nest);\n\t}\n\t\
+  nla_nest_end(skb, txsa_list);\n\n\trxsc_list = nla_nest_start_noflag(skb, MACSEC_ATTR_RXSC_LIST);\n\
+  \tif (!rxsc_list)\n\t\tgoto nla_put_failure;\n\n\tj = 1;\n\tfor_each_rxsc_rtnl(secy,\
+  \ rx_sc) {\n\t\tint k;\n\t\tstruct nlattr *rxsa_list;\n\t\tstruct nlattr *rxsc_nest\
+  \ = nla_nest_start_noflag(skb, j++);\n\n\t\tif (!rxsc_nest) {\n\t\t\tnla_nest_cancel(skb,\
+  \ rxsc_list);\n\t\t\tgoto nla_put_failure;\n\t\t}\n\n\t\tif (nla_put_u8(skb, MACSEC_RXSC_ATTR_ACTIVE,\
+  \ rx_sc->active) ||\n\t\t    nla_put_sci(skb, MACSEC_RXSC_ATTR_SCI, rx_sc->sci,\n\
+  \t\t\t\tMACSEC_RXSC_ATTR_PAD)) {\n\t\t\tnla_nest_cancel(skb, rxsc_nest);\n\t\t\t\
+  nla_nest_cancel(skb, rxsc_list);\n\t\t\tgoto nla_put_failure;\n\t\t}\n\n\t\tattr\
+  \ = nla_nest_start_noflag(skb, MACSEC_RXSC_ATTR_STATS);\n\t\tif (!attr) {\n\t\t\t\
+  nla_nest_cancel(skb, rxsc_nest);\n\t\t\tnla_nest_cancel(skb, rxsc_list);\n\t\t\t\
+  goto nla_put_failure;\n\t\t}\n\t\tmemset(&rx_sc_stats, 0, sizeof(rx_sc_stats));\n\
+  \t\tget_rx_sc_stats(dev, rx_sc, &rx_sc_stats);\n\t\tif (copy_rx_sc_stats(skb, &rx_sc_stats))\
+  \ {\n\t\t\tnla_nest_cancel(skb, attr);\n\t\t\tnla_nest_cancel(skb, rxsc_nest);\n\
+  \t\t\tnla_nest_cancel(skb, rxsc_list);\n\t\t\tgoto nla_put_failure;\n\t\t}\n\t\t\
+  nla_nest_end(skb, attr);\n\n\t\trxsa_list = nla_nest_start_noflag(skb,\n\t\t\t\t\
+  \t\t  MACSEC_RXSC_ATTR_SA_LIST);\n\t\tif (!rxsa_list) {\n\t\t\tnla_nest_cancel(skb,\
+  \ rxsc_nest);\n\t\t\tnla_nest_cancel(skb, rxsc_list);\n\t\t\tgoto nla_put_failure;\n\
+  \t\t}\n\n\t\tfor (i = 0, k = 1; i < MACSEC_NUM_AN; i++) {\n\t\t\tstruct macsec_rx_sa\
+  \ *rx_sa = rtnl_dereference(rx_sc->sa[i]);\n\t\t\tstruct nlattr *rxsa_nest;\n\t\t\
+  \tu64 pn;\n\t\t\tint pn_len;\n\n\t\t\tif (!rx_sa)\n\t\t\t\tcontinue;\n\n\t\t\trxsa_nest\
+  \ = nla_nest_start_noflag(skb, k++);\n\t\t\tif (!rxsa_nest) {\n\t\t\t\tnla_nest_cancel(skb,\
+  \ rxsa_list);\n\t\t\t\tnla_nest_cancel(skb, rxsc_nest);\n\t\t\t\tnla_nest_cancel(skb,\
+  \ rxsc_list);\n\t\t\t\tgoto nla_put_failure;\n\t\t\t}\n\n\t\t\tattr = nla_nest_start_noflag(skb,\n\
+  \t\t\t\t\t\t     MACSEC_SA_ATTR_STATS);\n\t\t\tif (!attr) {\n\t\t\t\tnla_nest_cancel(skb,\
+  \ rxsa_list);\n\t\t\t\tnla_nest_cancel(skb, rxsc_nest);\n\t\t\t\tnla_nest_cancel(skb,\
+  \ rxsc_list);\n\t\t\t\tgoto nla_put_failure;\n\t\t\t}\n\t\t\tmemset(&rx_sa_stats,\
+  \ 0, sizeof(rx_sa_stats));\n\t\t\tget_rx_sa_stats(dev, rx_sc, i, rx_sa, &rx_sa_stats);\n\
+  \t\t\tif (copy_rx_sa_stats(skb, &rx_sa_stats)) {\n\t\t\t\tnla_nest_cancel(skb, attr);\n\
+  \t\t\t\tnla_nest_cancel(skb, rxsa_list);\n\t\t\t\tnla_nest_cancel(skb, rxsc_nest);\n\
+  \t\t\t\tnla_nest_cancel(skb, rxsc_list);\n\t\t\t\tgoto nla_put_failure;\n\t\t\t\
+  }\n\t\t\tnla_nest_end(skb, attr);\n\n\t\t\tif (secy->xpn) {\n\t\t\t\tpn = rx_sa->next_pn;\n\
+  \t\t\t\tpn_len = MACSEC_XPN_PN_LEN;\n\t\t\t} else {\n\t\t\t\tpn = rx_sa->next_pn_halves.lower;\n\
+  \t\t\t\tpn_len = MACSEC_DEFAULT_PN_LEN;\n\t\t\t}\n\n\t\t\tif (nla_put_u8(skb, MACSEC_SA_ATTR_AN,\
+  \ i) ||\n\t\t\t    nla_put(skb, MACSEC_SA_ATTR_PN, pn_len, &pn) ||\n\t\t\t    nla_put(skb,\
+  \ MACSEC_SA_ATTR_KEYID, MACSEC_KEYID_LEN, rx_sa->key.id) ||\n\t\t\t    (secy->xpn\
+  \ && nla_put_ssci(skb, MACSEC_SA_ATTR_SSCI, rx_sa->ssci)) ||\n\t\t\t    nla_put_u8(skb,\
+  \ MACSEC_SA_ATTR_ACTIVE, rx_sa->active)) {\n\t\t\t\tnla_nest_cancel(skb, rxsa_nest);\n\
+  \t\t\t\tnla_nest_cancel(skb, rxsc_nest);\n\t\t\t\tnla_nest_cancel(skb, rxsc_list);\n\
+  \t\t\t\tgoto nla_put_failure;\n\t\t\t}\n\t\t\tnla_nest_end(skb, rxsa_nest);\n\t\t\
+  }\n\n\t\tnla_nest_end(skb, rxsa_list);\n\t\tnla_nest_end(skb, rxsc_nest);\n\t}\n\
+  \n\tnla_nest_end(skb, rxsc_list);\n\n\tgenlmsg_end(skb, hdr);\n\n\treturn 0;\n\n\
+  nla_put_failure:\n\tgenlmsg_cancel(skb, hdr);\n\treturn -EMSGSIZE;\n}\n\nstatic\
+  \ int macsec_generation = 1; /* protected by RTNL */\n\nstatic int macsec_dump_txsc(struct\
+  \ sk_buff *skb, struct netlink_callback *cb)\n{\n\tstruct net *net = sock_net(skb->sk);\n\
+  \tstruct net_device *dev;\n\tint dev_idx, d;\n\n\tdev_idx = cb->args[0];\n\n\td\
+  \ = 0;\n\trtnl_lock();\n\n\tcb->seq = macsec_generation;\n\n\tfor_each_netdev(net,\
+  \ dev) {\n\t\tstruct macsec_secy *secy;\n\n\t\tif (d < dev_idx)\n\t\t\tgoto next;\n\
+  \n\t\tif (!netif_is_macsec(dev))\n\t\t\tgoto next;\n\n\t\tsecy = &macsec_priv(dev)->secy;\n\
+  \t\tif (dump_secy(secy, dev, skb, cb) < 0)\n\t\t\tgoto done;\nnext:\n\t\td++;\n\t\
+  }\n\ndone:\n\trtnl_unlock();\n\tcb->args[0] = d;\n\treturn skb->len;\n}\n\nstatic\
+  \ const struct genl_small_ops macsec_genl_ops[] = {\n\t{\n\t\t.cmd = MACSEC_CMD_GET_TXSC,\n\
+  \t\t.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.dumpit\
+  \ = macsec_dump_txsc,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_ADD_RXSC,\n\t\t.validate\
+  \ = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit = macsec_add_rxsc,\n\
+  \t\t.flags = GENL_ADMIN_PERM,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_DEL_RXSC,\n\t\t\
+  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit = macsec_del_rxsc,\n\
+  \t\t.flags = GENL_ADMIN_PERM,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_UPD_RXSC,\n\t\t\
+  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit = macsec_upd_rxsc,\n\
+  \t\t.flags = GENL_ADMIN_PERM,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_ADD_TXSA,\n\t\t\
+  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit = macsec_add_txsa,\n\
+  \t\t.flags = GENL_ADMIN_PERM,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_DEL_TXSA,\n\t\t\
+  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit = macsec_del_txsa,\n\
+  \t\t.flags = GENL_ADMIN_PERM,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_UPD_TXSA,\n\t\t\
+  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit = macsec_upd_txsa,\n\
+  \t\t.flags = GENL_ADMIN_PERM,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_ADD_RXSA,\n\t\t\
+  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit = macsec_add_rxsa,\n\
+  \t\t.flags = GENL_ADMIN_PERM,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_DEL_RXSA,\n\t\t\
+  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit = macsec_del_rxsa,\n\
+  \t\t.flags = GENL_ADMIN_PERM,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_UPD_RXSA,\n\t\t\
+  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit = macsec_upd_rxsa,\n\
+  \t\t.flags = GENL_ADMIN_PERM,\n\t},\n\t{\n\t\t.cmd = MACSEC_CMD_UPD_OFFLOAD,\n\t\
+  \t.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,\n\t\t.doit =\
+  \ macsec_upd_offload,\n\t\t.flags = GENL_ADMIN_PERM,\n\t},\n};\n\nstatic struct\
+  \ genl_family macsec_fam __ro_after_init = {\n\t.name\t\t= MACSEC_GENL_NAME,\n\t\
+  .hdrsize\t= 0,\n\t.version\t= MACSEC_GENL_VERSION,\n\t.maxattr\t= MACSEC_ATTR_MAX,\n\
+  \t.policy = macsec_genl_policy,\n\t.netnsok\t= true,\n\t.module\t\t= THIS_MODULE,\n\
+  \t.small_ops\t= macsec_genl_ops,\n\t.n_small_ops\t= ARRAY_SIZE(macsec_genl_ops),\n\
+  \t.resv_start_op\t= MACSEC_CMD_UPD_OFFLOAD + 1,\n};\n\nstatic struct sk_buff *macsec_insert_tx_tag(struct\
+  \ sk_buff *skb,\n\t\t\t\t\t    struct net_device *dev)\n{\n\tstruct macsec_dev *macsec\
+  \ = macsec_priv(dev);\n\tconst struct macsec_ops *ops;\n\tstruct phy_device *phydev;\n\
+  \tstruct macsec_context ctx;\n\tint skb_final_len;\n\tint err;\n\n\tops = macsec_get_ops(macsec,\
+  \ &ctx);\n\tskb_final_len = skb->len - ETH_HLEN + ops->needed_headroom +\n\t\tops->needed_tailroom;\n\
+  \tif (unlikely(skb_final_len > macsec->real_dev->mtu)) {\n\t\terr = -EINVAL;\n\t\
+  \tgoto cleanup;\n\t}\n\n\tphydev = macsec->real_dev->phydev;\n\n\terr = skb_ensure_writable_head_tail(skb,\
+  \ dev);\n\tif (unlikely(err < 0))\n\t\tgoto cleanup;\n\n\terr = ops->mdo_insert_tx_tag(phydev,\
+  \ skb);\n\tif (unlikely(err))\n\t\tgoto cleanup;\n\n\treturn skb;\ncleanup:\n\t\
+  kfree_skb(skb);\n\treturn ERR_PTR(err);\n}\n\nstatic netdev_tx_t macsec_start_xmit(struct\
+  \ sk_buff *skb,\n\t\t\t\t     struct net_device *dev)\n{\n\tstruct macsec_dev *macsec\
+  \ = netdev_priv(dev);\n\tstruct macsec_secy *secy = &macsec->secy;\n\tstruct pcpu_secy_stats\
+  \ *secy_stats;\n\tint ret, len;\n\n\tif (macsec_is_offloaded(netdev_priv(dev)))\
+  \ {\n\t\tstruct metadata_dst *md_dst = secy->tx_sc.md_dst;\n\n\t\tskb_dst_drop(skb);\n\
+  \t\tdst_hold(&md_dst->dst);\n\t\tskb_dst_set(skb, &md_dst->dst);\n\n\t\tif (macsec->insert_tx_tag)\
+  \ {\n\t\t\tskb = macsec_insert_tx_tag(skb, dev);\n\t\t\tif (IS_ERR(skb)) {\n\t\t\
+  \t\tDEV_STATS_INC(dev, tx_dropped);\n\t\t\t\treturn NETDEV_TX_OK;\n\t\t\t}\n\t\t\
+  }\n\n\t\tskb->dev = macsec->real_dev;\n\t\treturn dev_queue_xmit(skb);\n\t}\n\n\t\
+  /* 10.5 */\n\tif (!secy->protect_frames) {\n\t\tsecy_stats = this_cpu_ptr(macsec->stats);\n\
+  \t\tu64_stats_update_begin(&secy_stats->syncp);\n\t\tsecy_stats->stats.OutPktsUntagged++;\n\
+  \t\tu64_stats_update_end(&secy_stats->syncp);\n\t\tskb->dev = macsec->real_dev;\n\
+  \t\tlen = skb->len;\n\t\tret = dev_queue_xmit(skb);\n\t\tcount_tx(dev, ret, len);\n\
+  \t\treturn ret;\n\t}\n\n\tif (!secy->operational) {\n\t\tkfree_skb(skb);\n\t\tDEV_STATS_INC(dev,\
+  \ tx_dropped);\n\t\treturn NETDEV_TX_OK;\n\t}\n\n\tlen = skb->len;\n\tskb = macsec_encrypt(skb,\
+  \ dev);\n\tif (IS_ERR(skb)) {\n\t\tif (PTR_ERR(skb) != -EINPROGRESS)\n\t\t\tDEV_STATS_INC(dev,\
+  \ tx_dropped);\n\t\treturn NETDEV_TX_OK;\n\t}\n\n\tmacsec_count_tx(skb, &macsec->secy.tx_sc,\
+  \ macsec_skb_cb(skb)->tx_sa);\n\n\tmacsec_encrypt_finish(skb, dev);\n\tret = dev_queue_xmit(skb);\n\
+  \tcount_tx(dev, ret, len);\n\treturn ret;\n}\n\n#define MACSEC_FEATURES \\\n\t(NETIF_F_SG\
+  \ | NETIF_F_HIGHDMA | NETIF_F_FRAGLIST)\n\nstatic int macsec_dev_init(struct net_device\
+  \ *dev)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\tstruct net_device\
+  \ *real_dev = macsec->real_dev;\n\tint err;\n\n\terr = gro_cells_init(&macsec->gro_cells,\
+  \ dev);\n\tif (err)\n\t\treturn err;\n\n\tdev->features = real_dev->features & MACSEC_FEATURES;\n\
+  \tdev->features |= NETIF_F_GSO_SOFTWARE;\n\tdev->lltx = true;\n\tdev->pcpu_stat_type\
+  \ = NETDEV_PCPU_STAT_TSTATS;\n\n\tmacsec_set_head_tail_room(dev);\n\n\tif (is_zero_ether_addr(dev->dev_addr))\n\
+  \t\teth_hw_addr_inherit(dev, real_dev);\n\tif (is_zero_ether_addr(dev->broadcast))\n\
+  \t\tmemcpy(dev->broadcast, real_dev->broadcast, dev->addr_len);\n\n\t/* Get macsec's\
+  \ reference to real_dev */\n\tnetdev_hold(real_dev, &macsec->dev_tracker, GFP_KERNEL);\n\
+  \n\treturn 0;\n}\n\nstatic void macsec_dev_uninit(struct net_device *dev)\n{\n\t\
+  struct macsec_dev *macsec = macsec_priv(dev);\n\n\tgro_cells_destroy(&macsec->gro_cells);\n\
+  }\n\nstatic netdev_features_t macsec_fix_features(struct net_device *dev,\n\t\t\t\
+  \t\t     netdev_features_t features)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\
+  \tstruct net_device *real_dev = macsec->real_dev;\n\n\tfeatures &= (real_dev->features\
+  \ & MACSEC_FEATURES) |\n\t\t    NETIF_F_GSO_SOFTWARE | NETIF_F_SOFT_FEATURES;\n\n\
+  \treturn features;\n}\n\nstatic int macsec_dev_open(struct net_device *dev)\n{\n\
+  \tstruct macsec_dev *macsec = macsec_priv(dev);\n\tstruct net_device *real_dev =\
+  \ macsec->real_dev;\n\tint err;\n\n\terr = dev_uc_add(real_dev, dev->dev_addr);\n\
+  \tif (err < 0)\n\t\treturn err;\n\n\tif (dev->flags & IFF_ALLMULTI) {\n\t\terr =\
+  \ dev_set_allmulti(real_dev, 1);\n\t\tif (err < 0)\n\t\t\tgoto del_unicast;\n\t\
+  }\n\n\tif (dev->flags & IFF_PROMISC) {\n\t\terr = dev_set_promiscuity(real_dev,\
+  \ 1);\n\t\tif (err < 0)\n\t\t\tgoto clear_allmulti;\n\t}\n\n\t/* If h/w offloading\
+  \ is available, propagate to the device */\n\tif (macsec_is_offloaded(macsec)) {\n\
+  \t\tconst struct macsec_ops *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops = macsec_get_ops(netdev_priv(dev),\
+  \ &ctx);\n\t\tif (!ops) {\n\t\t\terr = -EOPNOTSUPP;\n\t\t\tgoto clear_allmulti;\n\
+  \t\t}\n\n\t\tctx.secy = &macsec->secy;\n\t\terr = macsec_offload(ops->mdo_dev_open,\
+  \ &ctx);\n\t\tif (err)\n\t\t\tgoto clear_allmulti;\n\t}\n\n\tif (netif_carrier_ok(real_dev))\n\
+  \t\tnetif_carrier_on(dev);\n\n\treturn 0;\nclear_allmulti:\n\tif (dev->flags & IFF_ALLMULTI)\n\
+  \t\tdev_set_allmulti(real_dev, -1);\ndel_unicast:\n\tdev_uc_del(real_dev, dev->dev_addr);\n\
+  \tnetif_carrier_off(dev);\n\treturn err;\n}\n\nstatic int macsec_dev_stop(struct\
+  \ net_device *dev)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\tstruct\
+  \ net_device *real_dev = macsec->real_dev;\n\n\tnetif_carrier_off(dev);\n\n\t/*\
+  \ If h/w offloading is available, propagate to the device */\n\tif (macsec_is_offloaded(macsec))\
+  \ {\n\t\tconst struct macsec_ops *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops\
+  \ = macsec_get_ops(macsec, &ctx);\n\t\tif (ops) {\n\t\t\tctx.secy = &macsec->secy;\n\
+  \t\t\tmacsec_offload(ops->mdo_dev_stop, &ctx);\n\t\t}\n\t}\n\n\tdev_mc_unsync(real_dev,\
+  \ dev);\n\tdev_uc_unsync(real_dev, dev);\n\n\tif (dev->flags & IFF_ALLMULTI)\n\t\
+  \tdev_set_allmulti(real_dev, -1);\n\n\tif (dev->flags & IFF_PROMISC)\n\t\tdev_set_promiscuity(real_dev,\
+  \ -1);\n\n\tdev_uc_del(real_dev, dev->dev_addr);\n\n\treturn 0;\n}\n\nstatic void\
+  \ macsec_dev_change_rx_flags(struct net_device *dev, int change)\n{\n\tstruct net_device\
+  \ *real_dev = macsec_priv(dev)->real_dev;\n\n\tif (!(dev->flags & IFF_UP))\n\t\t\
+  return;\n\n\tif (change & IFF_ALLMULTI)\n\t\tdev_set_allmulti(real_dev, dev->flags\
+  \ & IFF_ALLMULTI ? 1 : -1);\n\n\tif (change & IFF_PROMISC)\n\t\tdev_set_promiscuity(real_dev,\n\
+  \t\t\t\t    dev->flags & IFF_PROMISC ? 1 : -1);\n}\n\nstatic void macsec_dev_set_rx_mode(struct\
+  \ net_device *dev)\n{\n\tstruct net_device *real_dev = macsec_priv(dev)->real_dev;\n\
+  \n\tdev_mc_sync(real_dev, dev);\n\tdev_uc_sync(real_dev, dev);\n}\n\nstatic int\
+  \ macsec_set_mac_address(struct net_device *dev, void *p)\n{\n\tstruct macsec_dev\
+  \ *macsec = macsec_priv(dev);\n\tstruct net_device *real_dev = macsec->real_dev;\n\
+  \tstruct sockaddr *addr = p;\n\tu8  old_addr[ETH_ALEN];\n\tint err;\n\n\tif (!is_valid_ether_addr(addr->sa_data))\n\
+  \t\treturn -EADDRNOTAVAIL;\n\n\tif (dev->flags & IFF_UP) {\n\t\terr = dev_uc_add(real_dev,\
+  \ addr->sa_data);\n\t\tif (err < 0)\n\t\t\treturn err;\n\t}\n\n\tether_addr_copy(old_addr,\
+  \ dev->dev_addr);\n\teth_hw_addr_set(dev, addr->sa_data);\n\n\t/* If h/w offloading\
+  \ is available, propagate to the device */\n\tif (macsec_is_offloaded(macsec)) {\n\
+  \t\tconst struct macsec_ops *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops = macsec_get_ops(macsec,\
+  \ &ctx);\n\t\tif (!ops) {\n\t\t\terr = -EOPNOTSUPP;\n\t\t\tgoto restore_old_addr;\n\
+  \t\t}\n\n\t\tctx.secy = &macsec->secy;\n\t\terr = macsec_offload(ops->mdo_upd_secy,\
+  \ &ctx);\n\t\tif (err)\n\t\t\tgoto restore_old_addr;\n\t}\n\n\tif (dev->flags &\
+  \ IFF_UP)\n\t\tdev_uc_del(real_dev, old_addr);\n\n\treturn 0;\n\nrestore_old_addr:\n\
+  \tif (dev->flags & IFF_UP)\n\t\tdev_uc_del(real_dev, addr->sa_data);\n\n\teth_hw_addr_set(dev,\
+  \ old_addr);\n\n\treturn err;\n}\n\nstatic int macsec_change_mtu(struct net_device\
+  \ *dev, int new_mtu)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\tunsigned\
+  \ int extra = macsec->secy.icv_len + macsec_extra_len(true);\n\n\tif (macsec->real_dev->mtu\
+  \ - extra < new_mtu)\n\t\treturn -ERANGE;\n\n\tWRITE_ONCE(dev->mtu, new_mtu);\n\n\
+  \treturn 0;\n}\n\nstatic void macsec_get_stats64(struct net_device *dev,\n\t\t\t\
+  \       struct rtnl_link_stats64 *s)\n{\n\tif (!dev->tstats)\n\t\treturn;\n\n\t\
+  dev_fetch_sw_netstats(s, dev->tstats);\n\n\ts->rx_dropped = DEV_STATS_READ(dev,\
+  \ rx_dropped);\n\ts->tx_dropped = DEV_STATS_READ(dev, tx_dropped);\n\ts->rx_errors\
+  \ = DEV_STATS_READ(dev, rx_errors);\n}\n\nstatic int macsec_get_iflink(const struct\
+  \ net_device *dev)\n{\n\treturn READ_ONCE(macsec_priv(dev)->real_dev->ifindex);\n\
+  }\n\nstatic const struct net_device_ops macsec_netdev_ops = {\n\t.ndo_init\t\t=\
+  \ macsec_dev_init,\n\t.ndo_uninit\t\t= macsec_dev_uninit,\n\t.ndo_open\t\t= macsec_dev_open,\n\
+  \t.ndo_stop\t\t= macsec_dev_stop,\n\t.ndo_fix_features\t= macsec_fix_features,\n\
+  \t.ndo_change_mtu\t\t= macsec_change_mtu,\n\t.ndo_set_rx_mode\t= macsec_dev_set_rx_mode,\n\
+  \t.ndo_change_rx_flags\t= macsec_dev_change_rx_flags,\n\t.ndo_set_mac_address\t\
+  = macsec_set_mac_address,\n\t.ndo_start_xmit\t\t= macsec_start_xmit,\n\t.ndo_get_stats64\t\
+  = macsec_get_stats64,\n\t.ndo_get_iflink\t\t= macsec_get_iflink,\n};\n\nstatic const\
+  \ struct device_type macsec_type = {\n\t.name = \"macsec\",\n};\n\nstatic const\
+  \ struct nla_policy macsec_rtnl_policy[IFLA_MACSEC_MAX + 1] = {\n\t[IFLA_MACSEC_SCI]\
+  \ = { .type = NLA_U64 },\n\t[IFLA_MACSEC_PORT] = { .type = NLA_U16 },\n\t[IFLA_MACSEC_ICV_LEN]\
+  \ = { .type = NLA_U8 },\n\t[IFLA_MACSEC_CIPHER_SUITE] = { .type = NLA_U64 },\n\t\
+  [IFLA_MACSEC_WINDOW] = { .type = NLA_U32 },\n\t[IFLA_MACSEC_ENCODING_SA] = { .type\
+  \ = NLA_U8 },\n\t[IFLA_MACSEC_ENCRYPT] = { .type = NLA_U8 },\n\t[IFLA_MACSEC_PROTECT]\
+  \ = { .type = NLA_U8 },\n\t[IFLA_MACSEC_INC_SCI] = { .type = NLA_U8 },\n\t[IFLA_MACSEC_ES]\
+  \ = { .type = NLA_U8 },\n\t[IFLA_MACSEC_SCB] = { .type = NLA_U8 },\n\t[IFLA_MACSEC_REPLAY_PROTECT]\
+  \ = { .type = NLA_U8 },\n\t[IFLA_MACSEC_VALIDATION] = { .type = NLA_U8 },\n\t[IFLA_MACSEC_OFFLOAD]\
+  \ = { .type = NLA_U8 },\n};\n\nstatic void macsec_free_netdev(struct net_device\
+  \ *dev)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\n\tif (macsec->secy.tx_sc.md_dst)\n\
+  \t\tmetadata_dst_free(macsec->secy.tx_sc.md_dst);\n\tfree_percpu(macsec->stats);\n\
+  \tfree_percpu(macsec->secy.tx_sc.stats);\n\n\t/* Get rid of the macsec's reference\
+  \ to real_dev */\n\tnetdev_put(macsec->real_dev, &macsec->dev_tracker);\n}\n\nstatic\
+  \ void macsec_setup(struct net_device *dev)\n{\n\tether_setup(dev);\n\tdev->min_mtu\
+  \ = 0;\n\tdev->max_mtu = ETH_MAX_MTU;\n\tdev->priv_flags |= IFF_NO_QUEUE;\n\tdev->netdev_ops\
+  \ = &macsec_netdev_ops;\n\tdev->needs_free_netdev = true;\n\tdev->priv_destructor\
+  \ = macsec_free_netdev;\n\tSET_NETDEV_DEVTYPE(dev, &macsec_type);\n\n\teth_zero_addr(dev->broadcast);\n\
+  }\n\nstatic int macsec_changelink_common(struct net_device *dev,\n\t\t\t\t    struct\
+  \ nlattr *data[])\n{\n\tstruct macsec_secy *secy;\n\tstruct macsec_tx_sc *tx_sc;\n\
+  \n\tsecy = &macsec_priv(dev)->secy;\n\ttx_sc = &secy->tx_sc;\n\n\tif (data[IFLA_MACSEC_ENCODING_SA])\
+  \ {\n\t\tstruct macsec_tx_sa *tx_sa;\n\n\t\ttx_sc->encoding_sa = nla_get_u8(data[IFLA_MACSEC_ENCODING_SA]);\n\
+  \t\ttx_sa = rtnl_dereference(tx_sc->sa[tx_sc->encoding_sa]);\n\n\t\tsecy->operational\
+  \ = tx_sa && tx_sa->active;\n\t}\n\n\tif (data[IFLA_MACSEC_ENCRYPT])\n\t\ttx_sc->encrypt\
+  \ = !!nla_get_u8(data[IFLA_MACSEC_ENCRYPT]);\n\n\tif (data[IFLA_MACSEC_PROTECT])\n\
+  \t\tsecy->protect_frames = !!nla_get_u8(data[IFLA_MACSEC_PROTECT]);\n\n\tif (data[IFLA_MACSEC_INC_SCI])\n\
+  \t\ttx_sc->send_sci = !!nla_get_u8(data[IFLA_MACSEC_INC_SCI]);\n\n\tif (data[IFLA_MACSEC_ES])\n\
+  \t\ttx_sc->end_station = !!nla_get_u8(data[IFLA_MACSEC_ES]);\n\n\tif (data[IFLA_MACSEC_SCB])\n\
+  \t\ttx_sc->scb = !!nla_get_u8(data[IFLA_MACSEC_SCB]);\n\n\tif (data[IFLA_MACSEC_REPLAY_PROTECT])\n\
+  \t\tsecy->replay_protect = !!nla_get_u8(data[IFLA_MACSEC_REPLAY_PROTECT]);\n\n\t\
+  if (data[IFLA_MACSEC_VALIDATION])\n\t\tsecy->validate_frames = nla_get_u8(data[IFLA_MACSEC_VALIDATION]);\n\
+  \n\tif (data[IFLA_MACSEC_CIPHER_SUITE]) {\n\t\tswitch (nla_get_u64(data[IFLA_MACSEC_CIPHER_SUITE]))\
+  \ {\n\t\tcase MACSEC_CIPHER_ID_GCM_AES_128:\n\t\tcase MACSEC_DEFAULT_CIPHER_ID:\n\
+  \t\t\tsecy->key_len = MACSEC_GCM_AES_128_SAK_LEN;\n\t\t\tsecy->xpn = false;\n\t\t\
+  \tbreak;\n\t\tcase MACSEC_CIPHER_ID_GCM_AES_256:\n\t\t\tsecy->key_len = MACSEC_GCM_AES_256_SAK_LEN;\n\
+  \t\t\tsecy->xpn = false;\n\t\t\tbreak;\n\t\tcase MACSEC_CIPHER_ID_GCM_AES_XPN_128:\n\
+  \t\t\tsecy->key_len = MACSEC_GCM_AES_128_SAK_LEN;\n\t\t\tsecy->xpn = true;\n\t\t\
+  \tbreak;\n\t\tcase MACSEC_CIPHER_ID_GCM_AES_XPN_256:\n\t\t\tsecy->key_len = MACSEC_GCM_AES_256_SAK_LEN;\n\
+  \t\t\tsecy->xpn = true;\n\t\t\tbreak;\n\t\tdefault:\n\t\t\treturn -EINVAL;\n\t\t\
+  }\n\t}\n\n\tif (data[IFLA_MACSEC_WINDOW]) {\n\t\tsecy->replay_window = nla_get_u32(data[IFLA_MACSEC_WINDOW]);\n\
+  \n\t\t/* IEEE 802.1AEbw-2013 10.7.8 - maximum replay window\n\t\t * for XPN cipher\
+  \ suites */\n\t\tif (secy->xpn &&\n\t\t    secy->replay_window > MACSEC_XPN_MAX_REPLAY_WINDOW)\n\
+  \t\t\treturn -EINVAL;\n\t}\n\n\treturn 0;\n}\n\nstatic int macsec_changelink(struct\
+  \ net_device *dev, struct nlattr *tb[],\n\t\t\t     struct nlattr *data[],\n\t\t\
+  \t     struct netlink_ext_ack *extack)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\
+  \tbool macsec_offload_state_change = false;\n\tenum macsec_offload offload;\n\t\
+  struct macsec_tx_sc tx_sc;\n\tstruct macsec_secy secy;\n\tint ret;\n\n\tif (!data)\n\
+  \t\treturn 0;\n\n\tif (data[IFLA_MACSEC_CIPHER_SUITE] ||\n\t    data[IFLA_MACSEC_ICV_LEN]\
+  \ ||\n\t    data[IFLA_MACSEC_SCI] ||\n\t    data[IFLA_MACSEC_PORT])\n\t\treturn\
+  \ -EINVAL;\n\n\t/* Keep a copy of unmodified secy and tx_sc, in case the offload\n\
+  \t * propagation fails, to revert macsec_changelink_common.\n\t */\n\tmemcpy(&secy,\
+  \ &macsec->secy, sizeof(secy));\n\tmemcpy(&tx_sc, &macsec->secy.tx_sc, sizeof(tx_sc));\n\
+  \n\tret = macsec_changelink_common(dev, data);\n\tif (ret)\n\t\tgoto cleanup;\n\n\
+  \tif (data[IFLA_MACSEC_OFFLOAD]) {\n\t\toffload = nla_get_u8(data[IFLA_MACSEC_OFFLOAD]);\n\
+  \t\tif (macsec->offload != offload) {\n\t\t\tmacsec_offload_state_change = true;\n\
+  \t\t\tret = macsec_update_offload(dev, offload);\n\t\t\tif (ret)\n\t\t\t\tgoto cleanup;\n\
+  \t\t}\n\t}\n\n\t/* If h/w offloading is available, propagate to the device */\n\t\
+  if (!macsec_offload_state_change && macsec_is_offloaded(macsec)) {\n\t\tconst struct\
+  \ macsec_ops *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops = macsec_get_ops(netdev_priv(dev),\
+  \ &ctx);\n\t\tif (!ops) {\n\t\t\tret = -EOPNOTSUPP;\n\t\t\tgoto cleanup;\n\t\t}\n\
+  \n\t\tctx.secy = &macsec->secy;\n\t\tret = macsec_offload(ops->mdo_upd_secy, &ctx);\n\
+  \t\tif (ret)\n\t\t\tgoto cleanup;\n\t}\n\n\treturn 0;\n\ncleanup:\n\tmemcpy(&macsec->secy.tx_sc,\
+  \ &tx_sc, sizeof(tx_sc));\n\tmemcpy(&macsec->secy, &secy, sizeof(secy));\n\n\treturn\
+  \ ret;\n}\n\nstatic void macsec_del_dev(struct macsec_dev *macsec)\n{\n\tint i;\n\
+  \n\twhile (macsec->secy.rx_sc) {\n\t\tstruct macsec_rx_sc *rx_sc = rtnl_dereference(macsec->secy.rx_sc);\n\
+  \n\t\trcu_assign_pointer(macsec->secy.rx_sc, rx_sc->next);\n\t\tfree_rx_sc(rx_sc);\n\
+  \t}\n\n\tfor (i = 0; i < MACSEC_NUM_AN; i++) {\n\t\tstruct macsec_tx_sa *sa = rtnl_dereference(macsec->secy.tx_sc.sa[i]);\n\
+  \n\t\tif (sa) {\n\t\t\tRCU_INIT_POINTER(macsec->secy.tx_sc.sa[i], NULL);\n\t\t\t\
+  clear_tx_sa(sa);\n\t\t}\n\t}\n}\n\nstatic void macsec_common_dellink(struct net_device\
+  \ *dev, struct list_head *head)\n{\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\
+  \tstruct net_device *real_dev = macsec->real_dev;\n\n\t/* If h/w offloading is available,\
+  \ propagate to the device */\n\tif (macsec_is_offloaded(macsec)) {\n\t\tconst struct\
+  \ macsec_ops *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops = macsec_get_ops(netdev_priv(dev),\
+  \ &ctx);\n\t\tif (ops) {\n\t\t\tctx.secy = &macsec->secy;\n\t\t\tmacsec_offload(ops->mdo_del_secy,\
+  \ &ctx);\n\t\t}\n\t}\n\n\tunregister_netdevice_queue(dev, head);\n\tlist_del_rcu(&macsec->secys);\n\
+  \tmacsec_del_dev(macsec);\n\tnetdev_upper_dev_unlink(real_dev, dev);\n\n\tmacsec_generation++;\n\
+  }\n\nstatic void macsec_dellink(struct net_device *dev, struct list_head *head)\n\
+  {\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\tstruct net_device *real_dev\
+  \ = macsec->real_dev;\n\tstruct macsec_rxh_data *rxd = macsec_data_rtnl(real_dev);\n\
+  \n\tmacsec_common_dellink(dev, head);\n\n\tif (list_empty(&rxd->secys)) {\n\t\t\
+  netdev_rx_handler_unregister(real_dev);\n\t\tkfree(rxd);\n\t}\n}\n\nstatic int register_macsec_dev(struct\
+  \ net_device *real_dev,\n\t\t\t       struct net_device *dev)\n{\n\tstruct macsec_dev\
+  \ *macsec = macsec_priv(dev);\n\tstruct macsec_rxh_data *rxd = macsec_data_rtnl(real_dev);\n\
+  \n\tif (!rxd) {\n\t\tint err;\n\n\t\trxd = kmalloc(sizeof(*rxd), GFP_KERNEL);\n\t\
+  \tif (!rxd)\n\t\t\treturn -ENOMEM;\n\n\t\tINIT_LIST_HEAD(&rxd->secys);\n\n\t\terr\
+  \ = netdev_rx_handler_register(real_dev, macsec_handle_frame,\n\t\t\t\t\t\t rxd);\n\
+  \t\tif (err < 0) {\n\t\t\tkfree(rxd);\n\t\t\treturn err;\n\t\t}\n\t}\n\n\tlist_add_tail_rcu(&macsec->secys,\
+  \ &rxd->secys);\n\treturn 0;\n}\n\nstatic bool sci_exists(struct net_device *dev,\
+  \ sci_t sci)\n{\n\tstruct macsec_rxh_data *rxd = macsec_data_rtnl(dev);\n\tstruct\
+  \ macsec_dev *macsec;\n\n\tlist_for_each_entry(macsec, &rxd->secys, secys) {\n\t\
+  \tif (macsec->secy.sci == sci)\n\t\t\treturn true;\n\t}\n\n\treturn false;\n}\n\n\
+  static sci_t dev_to_sci(struct net_device *dev, __be16 port)\n{\n\treturn make_sci(dev->dev_addr,\
+  \ port);\n}\n\nstatic int macsec_add_dev(struct net_device *dev, sci_t sci, u8 icv_len)\n\
+  {\n\tstruct macsec_dev *macsec = macsec_priv(dev);\n\tstruct macsec_secy *secy =\
+  \ &macsec->secy;\n\n\tmacsec->stats = netdev_alloc_pcpu_stats(struct pcpu_secy_stats);\n\
+  \tif (!macsec->stats)\n\t\treturn -ENOMEM;\n\n\tsecy->tx_sc.stats = netdev_alloc_pcpu_stats(struct\
+  \ pcpu_tx_sc_stats);\n\tif (!secy->tx_sc.stats)\n\t\treturn -ENOMEM;\n\n\tsecy->tx_sc.md_dst\
+  \ = metadata_dst_alloc(0, METADATA_MACSEC, GFP_KERNEL);\n\tif (!secy->tx_sc.md_dst)\n\
+  \t\t/* macsec and secy percpu stats will be freed when unregistering\n\t\t * net_device\
+  \ in macsec_free_netdev()\n\t\t */\n\t\treturn -ENOMEM;\n\n\tif (sci == MACSEC_UNDEF_SCI)\n\
+  \t\tsci = dev_to_sci(dev, MACSEC_PORT_ES);\n\n\tsecy->netdev = dev;\n\tsecy->operational\
+  \ = true;\n\tsecy->key_len = DEFAULT_SAK_LEN;\n\tsecy->icv_len = icv_len;\n\tsecy->validate_frames\
+  \ = MACSEC_VALIDATE_DEFAULT;\n\tsecy->protect_frames = true;\n\tsecy->replay_protect\
+  \ = false;\n\tsecy->xpn = DEFAULT_XPN;\n\n\tsecy->sci = sci;\n\tsecy->tx_sc.md_dst->u.macsec_info.sci\
+  \ = sci;\n\tsecy->tx_sc.active = true;\n\tsecy->tx_sc.encoding_sa = DEFAULT_ENCODING_SA;\n\
+  \tsecy->tx_sc.encrypt = DEFAULT_ENCRYPT;\n\tsecy->tx_sc.send_sci = DEFAULT_SEND_SCI;\n\
+  \tsecy->tx_sc.end_station = false;\n\tsecy->tx_sc.scb = false;\n\n\treturn 0;\n\
+  }\n\nstatic struct lock_class_key macsec_netdev_addr_lock_key;\n\nstatic int macsec_newlink(struct\
+  \ net *net, struct net_device *dev,\n\t\t\t  struct nlattr *tb[], struct nlattr\
+  \ *data[],\n\t\t\t  struct netlink_ext_ack *extack)\n{\n\tstruct macsec_dev *macsec\
+  \ = macsec_priv(dev);\n\trx_handler_func_t *rx_handler;\n\tu8 icv_len = MACSEC_DEFAULT_ICV_LEN;\n\
+  \tstruct net_device *real_dev;\n\tint err, mtu;\n\tsci_t sci;\n\n\tif (!tb[IFLA_LINK])\n\
+  \t\treturn -EINVAL;\n\treal_dev = __dev_get_by_index(net, nla_get_u32(tb[IFLA_LINK]));\n\
+  \tif (!real_dev)\n\t\treturn -ENODEV;\n\tif (real_dev->type != ARPHRD_ETHER)\n\t\
+  \treturn -EINVAL;\n\n\tdev->priv_flags |= IFF_MACSEC;\n\n\tmacsec->real_dev = real_dev;\n\
+  \n\tif (data && data[IFLA_MACSEC_OFFLOAD])\n\t\tmacsec->offload = nla_get_offload(data[IFLA_MACSEC_OFFLOAD]);\n\
+  \telse\n\t\t/* MACsec offloading is off by default */\n\t\tmacsec->offload = MACSEC_OFFLOAD_OFF;\n\
+  \n\t/* Check if the offloading mode is supported by the underlying layers */\n\t\
+  if (macsec->offload != MACSEC_OFFLOAD_OFF &&\n\t    !macsec_check_offload(macsec->offload,\
+  \ macsec))\n\t\treturn -EOPNOTSUPP;\n\n\t/* send_sci must be set to true when transmit\
+  \ sci explicitly is set */\n\tif ((data && data[IFLA_MACSEC_SCI]) &&\n\t    (data\
+  \ && data[IFLA_MACSEC_INC_SCI])) {\n\t\tu8 send_sci = !!nla_get_u8(data[IFLA_MACSEC_INC_SCI]);\n\
+  \n\t\tif (!send_sci)\n\t\t\treturn -EINVAL;\n\t}\n\n\tif (data && data[IFLA_MACSEC_ICV_LEN])\n\
+  \t\ticv_len = nla_get_u8(data[IFLA_MACSEC_ICV_LEN]);\n\tmtu = real_dev->mtu - icv_len\
+  \ - macsec_extra_len(true);\n\tif (mtu < 0)\n\t\tdev->mtu = 0;\n\telse\n\t\tdev->mtu\
+  \ = mtu;\n\n\trx_handler = rtnl_dereference(real_dev->rx_handler);\n\tif (rx_handler\
+  \ && rx_handler != macsec_handle_frame)\n\t\treturn -EBUSY;\n\n\terr = register_netdevice(dev);\n\
+  \tif (err < 0)\n\t\treturn err;\n\n\tnetdev_lockdep_set_classes(dev);\n\tlockdep_set_class(&dev->addr_list_lock,\n\
+  \t\t\t  &macsec_netdev_addr_lock_key);\n\n\terr = netdev_upper_dev_link(real_dev,\
+  \ dev, extack);\n\tif (err < 0)\n\t\tgoto unregister;\n\n\t/* need to be already\
+  \ registered so that ->init has run and\n\t * the MAC addr is set\n\t */\n\tif (data\
+  \ && data[IFLA_MACSEC_SCI])\n\t\tsci = nla_get_sci(data[IFLA_MACSEC_SCI]);\n\telse\
+  \ if (data && data[IFLA_MACSEC_PORT])\n\t\tsci = dev_to_sci(dev, nla_get_be16(data[IFLA_MACSEC_PORT]));\n\
+  \telse\n\t\tsci = dev_to_sci(dev, MACSEC_PORT_ES);\n\n\tif (rx_handler && sci_exists(real_dev,\
+  \ sci)) {\n\t\terr = -EBUSY;\n\t\tgoto unlink;\n\t}\n\n\terr = macsec_add_dev(dev,\
+  \ sci, icv_len);\n\tif (err)\n\t\tgoto unlink;\n\n\tif (data) {\n\t\terr = macsec_changelink_common(dev,\
+  \ data);\n\t\tif (err)\n\t\t\tgoto del_dev;\n\t}\n\n\t/* If h/w offloading is available,\
+  \ propagate to the device */\n\tif (macsec_is_offloaded(macsec)) {\n\t\tconst struct\
+  \ macsec_ops *ops;\n\t\tstruct macsec_context ctx;\n\n\t\tops = macsec_get_ops(macsec,\
+  \ &ctx);\n\t\tif (ops) {\n\t\t\tctx.secy = &macsec->secy;\n\t\t\terr = macsec_offload(ops->mdo_add_secy,\
+  \ &ctx);\n\t\t\tif (err)\n\t\t\t\tgoto del_dev;\n\n\t\t\tmacsec->insert_tx_tag =\n\
+  \t\t\t\tmacsec_needs_tx_tag(macsec, ops);\n\t\t}\n\t}\n\n\terr = register_macsec_dev(real_dev,\
+  \ dev);\n\tif (err < 0)\n\t\tgoto del_dev;\n\n\tnetif_stacked_transfer_operstate(real_dev,\
+  \ dev);\n\tlinkwatch_fire_event(dev);\n\n\tmacsec_generation++;\n\n\treturn 0;\n\
+  \ndel_dev:\n\tmacsec_del_dev(macsec);\nunlink:\n\tnetdev_upper_dev_unlink(real_dev,\
+  \ dev);\nunregister:\n\tunregister_netdevice(dev);\n\treturn err;\n}\n\nstatic int\
+  \ macsec_validate_attr(struct nlattr *tb[], struct nlattr *data[],\n\t\t\t\tstruct\
+  \ netlink_ext_ack *extack)\n{\n\tu64 csid = MACSEC_DEFAULT_CIPHER_ID;\n\tu8 icv_len\
+  \ = MACSEC_DEFAULT_ICV_LEN;\n\tint flag;\n\tbool es, scb, sci;\n\n\tif (!data)\n\
+  \t\treturn 0;\n\n\tif (data[IFLA_MACSEC_CIPHER_SUITE])\n\t\tcsid = nla_get_u64(data[IFLA_MACSEC_CIPHER_SUITE]);\n\
+  \n\tif (data[IFLA_MACSEC_ICV_LEN]) {\n\t\ticv_len = nla_get_u8(data[IFLA_MACSEC_ICV_LEN]);\n\
+  \t\tif (icv_len != MACSEC_DEFAULT_ICV_LEN) {\n\t\t\tchar dummy_key[DEFAULT_SAK_LEN]\
+  \ = { 0 };\n\t\t\tstruct crypto_aead *dummy_tfm;\n\n\t\t\tdummy_tfm = macsec_alloc_tfm(dummy_key,\n\
+  \t\t\t\t\t\t     DEFAULT_SAK_LEN,\n\t\t\t\t\t\t     icv_len);\n\t\t\tif (IS_ERR(dummy_tfm))\n\
+  \t\t\t\treturn PTR_ERR(dummy_tfm);\n\t\t\tcrypto_free_aead(dummy_tfm);\n\t\t}\n\t\
+  }\n\n\tswitch (csid) {\n\tcase MACSEC_CIPHER_ID_GCM_AES_128:\n\tcase MACSEC_CIPHER_ID_GCM_AES_256:\n\
+  \tcase MACSEC_CIPHER_ID_GCM_AES_XPN_128:\n\tcase MACSEC_CIPHER_ID_GCM_AES_XPN_256:\n\
+  \tcase MACSEC_DEFAULT_CIPHER_ID:\n\t\tif (icv_len < MACSEC_MIN_ICV_LEN ||\n\t\t\
+  \    icv_len > MACSEC_STD_ICV_LEN)\n\t\t\treturn -EINVAL;\n\t\tbreak;\n\tdefault:\n\
+  \t\treturn -EINVAL;\n\t}\n\n\tif (data[IFLA_MACSEC_ENCODING_SA]) {\n\t\tif (nla_get_u8(data[IFLA_MACSEC_ENCODING_SA])\
+  \ >= MACSEC_NUM_AN)\n\t\t\treturn -EINVAL;\n\t}\n\n\tfor (flag = IFLA_MACSEC_ENCODING_SA\
+  \ + 1;\n\t     flag < IFLA_MACSEC_VALIDATION;\n\t     flag++) {\n\t\tif (data[flag])\
+  \ {\n\t\t\tif (nla_get_u8(data[flag]) > 1)\n\t\t\t\treturn -EINVAL;\n\t\t}\n\t}\n\
+  \n\tes  = data[IFLA_MACSEC_ES] ? nla_get_u8(data[IFLA_MACSEC_ES]) : false;\n\tsci\
+  \ = data[IFLA_MACSEC_INC_SCI] ? nla_get_u8(data[IFLA_MACSEC_INC_SCI]) : false;\n\
+  \tscb = data[IFLA_MACSEC_SCB] ? nla_get_u8(data[IFLA_MACSEC_SCB]) : false;\n\n\t\
+  if ((sci && (scb || es)) || (scb && es))\n\t\treturn -EINVAL;\n\n\tif (data[IFLA_MACSEC_VALIDATION]\
+  \ &&\n\t    nla_get_u8(data[IFLA_MACSEC_VALIDATION]) > MACSEC_VALIDATE_MAX)\n\t\t\
+  return -EINVAL;\n\n\tif ((data[IFLA_MACSEC_REPLAY_PROTECT] &&\n\t     nla_get_u8(data[IFLA_MACSEC_REPLAY_PROTECT]))\
+  \ &&\n\t    !data[IFLA_MACSEC_WINDOW])\n\t\treturn -EINVAL;\n\n\treturn 0;\n}\n\n\
+  static struct net *macsec_get_link_net(const struct net_device *dev)\n{\n\treturn\
+  \ dev_net(macsec_priv(dev)->real_dev);\n}\n\nstruct net_device *macsec_get_real_dev(const\
+  \ struct net_device *dev)\n{\n\treturn macsec_priv(dev)->real_dev;\n}\nEXPORT_SYMBOL_GPL(macsec_get_real_dev);\n\
+  \nbool macsec_netdev_is_offloaded(struct net_device *dev)\n{\n\treturn macsec_is_offloaded(macsec_priv(dev));\n\
+  }\nEXPORT_SYMBOL_GPL(macsec_netdev_is_offloaded);\n\nstatic size_t macsec_get_size(const\
+  \ struct net_device *dev)\n{\n\treturn  nla_total_size_64bit(8) + /* IFLA_MACSEC_SCI\
+  \ */\n\t\tnla_total_size(1) + /* IFLA_MACSEC_ICV_LEN */\n\t\tnla_total_size_64bit(8)\
+  \ + /* IFLA_MACSEC_CIPHER_SUITE */\n\t\tnla_total_size(4) + /* IFLA_MACSEC_WINDOW\
+  \ */\n\t\tnla_total_size(1) + /* IFLA_MACSEC_ENCODING_SA */\n\t\tnla_total_size(1)\
+  \ + /* IFLA_MACSEC_ENCRYPT */\n\t\tnla_total_size(1) + /* IFLA_MACSEC_PROTECT */\n\
+  \t\tnla_total_size(1) + /* IFLA_MACSEC_INC_SCI */\n\t\tnla_total_size(1) + /* IFLA_MACSEC_ES\
+  \ */\n\t\tnla_total_size(1) + /* IFLA_MACSEC_SCB */\n\t\tnla_total_size(1) + /*\
+  \ IFLA_MACSEC_REPLAY_PROTECT */\n\t\tnla_total_size(1) + /* IFLA_MACSEC_VALIDATION\
+  \ */\n\t\tnla_total_size(1) + /* IFLA_MACSEC_OFFLOAD */\n\t\t0;\n}\n\nstatic int\
+  \ macsec_fill_info(struct sk_buff *skb,\n\t\t\t    const struct net_device *dev)\n\
+  {\n\tstruct macsec_tx_sc *tx_sc;\n\tstruct macsec_dev *macsec;\n\tstruct macsec_secy\
+  \ *secy;\n\tu64 csid;\n\n\tmacsec = macsec_priv(dev);\n\tsecy = &macsec->secy;\n\
+  \ttx_sc = &secy->tx_sc;\n\n\tswitch (secy->key_len) {\n\tcase MACSEC_GCM_AES_128_SAK_LEN:\n\
+  \t\tcsid = secy->xpn ? MACSEC_CIPHER_ID_GCM_AES_XPN_128 : MACSEC_DEFAULT_CIPHER_ID;\n\
+  \t\tbreak;\n\tcase MACSEC_GCM_AES_256_SAK_LEN:\n\t\tcsid = secy->xpn ? MACSEC_CIPHER_ID_GCM_AES_XPN_256\
+  \ : MACSEC_CIPHER_ID_GCM_AES_256;\n\t\tbreak;\n\tdefault:\n\t\tgoto nla_put_failure;\n\
+  \t}\n\n\tif (nla_put_sci(skb, IFLA_MACSEC_SCI, secy->sci,\n\t\t\tIFLA_MACSEC_PAD)\
+  \ ||\n\t    nla_put_u8(skb, IFLA_MACSEC_ICV_LEN, secy->icv_len) ||\n\t    nla_put_u64_64bit(skb,\
+  \ IFLA_MACSEC_CIPHER_SUITE,\n\t\t\t      csid, IFLA_MACSEC_PAD) ||\n\t    nla_put_u8(skb,\
+  \ IFLA_MACSEC_ENCODING_SA, tx_sc->encoding_sa) ||\n\t    nla_put_u8(skb, IFLA_MACSEC_ENCRYPT,\
+  \ tx_sc->encrypt) ||\n\t    nla_put_u8(skb, IFLA_MACSEC_PROTECT, secy->protect_frames)\
+  \ ||\n\t    nla_put_u8(skb, IFLA_MACSEC_INC_SCI, tx_sc->send_sci) ||\n\t    nla_put_u8(skb,\
+  \ IFLA_MACSEC_ES, tx_sc->end_station) ||\n\t    nla_put_u8(skb, IFLA_MACSEC_SCB,\
+  \ tx_sc->scb) ||\n\t    nla_put_u8(skb, IFLA_MACSEC_REPLAY_PROTECT, secy->replay_protect)\
+  \ ||\n\t    nla_put_u8(skb, IFLA_MACSEC_VALIDATION, secy->validate_frames) ||\n\t\
+  \    nla_put_u8(skb, IFLA_MACSEC_OFFLOAD, macsec->offload) ||\n\t    0)\n\t\tgoto\
+  \ nla_put_failure;\n\n\tif (secy->replay_protect) {\n\t\tif (nla_put_u32(skb, IFLA_MACSEC_WINDOW,\
+  \ secy->replay_window))\n\t\t\tgoto nla_put_failure;\n\t}\n\n\treturn 0;\n\nnla_put_failure:\n\
+  \treturn -EMSGSIZE;\n}\n\nstatic struct rtnl_link_ops macsec_link_ops __read_mostly\
+  \ = {\n\t.kind\t\t= \"macsec\",\n\t.priv_size\t= sizeof(struct macsec_dev),\n\t\
+  .maxtype\t= IFLA_MACSEC_MAX,\n\t.policy\t\t= macsec_rtnl_policy,\n\t.setup\t\t=\
+  \ macsec_setup,\n\t.validate\t= macsec_validate_attr,\n\t.newlink\t= macsec_newlink,\n\
+  \t.changelink\t= macsec_changelink,\n\t.dellink\t= macsec_dellink,\n\t.get_size\t\
+  = macsec_get_size,\n\t.fill_info\t= macsec_fill_info,\n\t.get_link_net\t= macsec_get_link_net,\n\
+  };\n\nstatic bool is_macsec_master(struct net_device *dev)\n{\n\treturn rcu_access_pointer(dev->rx_handler)\
+  \ == macsec_handle_frame;\n}\n\nstatic int macsec_notify(struct notifier_block *this,\
+  \ unsigned long event,\n\t\t\t void *ptr)\n{\n\tstruct net_device *real_dev = netdev_notifier_info_to_dev(ptr);\n\
+  \tLIST_HEAD(head);\n\n\tif (!is_macsec_master(real_dev))\n\t\treturn NOTIFY_DONE;\n\
+  \n\tswitch (event) {\n\tcase NETDEV_DOWN:\n\tcase NETDEV_UP:\n\tcase NETDEV_CHANGE:\
+  \ {\n\t\tstruct macsec_dev *m, *n;\n\t\tstruct macsec_rxh_data *rxd;\n\n\t\trxd\
+  \ = macsec_data_rtnl(real_dev);\n\t\tlist_for_each_entry_safe(m, n, &rxd->secys,\
+  \ secys) {\n\t\t\tstruct net_device *dev = m->secy.netdev;\n\n\t\t\tnetif_stacked_transfer_operstate(real_dev,\
+  \ dev);\n\t\t}\n\t\tbreak;\n\t}\n\tcase NETDEV_UNREGISTER: {\n\t\tstruct macsec_dev\
+  \ *m, *n;\n\t\tstruct macsec_rxh_data *rxd;\n\n\t\trxd = macsec_data_rtnl(real_dev);\n\
+  \t\tlist_for_each_entry_safe(m, n, &rxd->secys, secys) {\n\t\t\tmacsec_common_dellink(m->secy.netdev,\
+  \ &head);\n\t\t}\n\n\t\tnetdev_rx_handler_unregister(real_dev);\n\t\tkfree(rxd);\n\
+  \n\t\tunregister_netdevice_many(&head);\n\t\tbreak;\n\t}\n\tcase NETDEV_CHANGEMTU:\
+  \ {\n\t\tstruct macsec_dev *m;\n\t\tstruct macsec_rxh_data *rxd;\n\n\t\trxd = macsec_data_rtnl(real_dev);\n\
+  \t\tlist_for_each_entry(m, &rxd->secys, secys) {\n\t\t\tstruct net_device *dev =\
+  \ m->secy.netdev;\n\t\t\tunsigned int mtu = real_dev->mtu - (m->secy.icv_len +\n\
+  \t\t\t\t\t\t\t    macsec_extra_len(true));\n\n\t\t\tif (dev->mtu > mtu)\n\t\t\t\t\
+  dev_set_mtu(dev, mtu);\n\t\t}\n\t}\n\t}\n\n\treturn NOTIFY_OK;\n}\n\nstatic struct\
+  \ notifier_block macsec_notifier = {\n\t.notifier_call = macsec_notify,\n};\n\n\
+  static int __init macsec_init(void)\n{\n\tint err;\n\n\tpr_info(\"MACsec IEEE 802.1AE\\\
+  n\");\n\terr = register_netdevice_notifier(&macsec_notifier);\n\tif (err)\n\t\t\
+  return err;\n\n\terr = rtnl_link_register(&macsec_link_ops);\n\tif (err)\n\t\tgoto\
+  \ notifier;\n\n\terr = genl_register_family(&macsec_fam);\n\tif (err)\n\t\tgoto\
+  \ rtnl;\n\n\treturn 0;\n\nrtnl:\n\trtnl_link_unregister(&macsec_link_ops);\nnotifier:\n\
+  \tunregister_netdevice_notifier(&macsec_notifier);\n\treturn err;\n}\n\nstatic void\
+  \ __exit macsec_exit(void)\n{\n\tgenl_unregister_family(&macsec_fam);\n\trtnl_link_unregister(&macsec_link_ops);\n\
+  \tunregister_netdevice_notifier(&macsec_notifier);\n\trcu_barrier();\n}\n\nmodule_init(macsec_init);\n\
+  module_exit(macsec_exit);\n\nMODULE_ALIAS_RTNL_LINK(\"macsec\");\nMODULE_ALIAS_GENL_FAMILY(\"\
+  macsec\");\n\nMODULE_DESCRIPTION(\"MACsec IEEE 802.1AE\");\nMODULE_LICENSE(\"GPL\
+  \ v2\");\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/net/macsec.c\
+  \ b/drivers/net/macsec.c\nindex 26034f80d4a4..ee2159282573 100644\n--- a/drivers/net/macsec.c\n\
+  +++ b/drivers/net/macsec.c\n@@ -3798,8 +3798,7 @@ static void macsec_free_netdev(struct\
+  \ net_device *dev)\n {\n \tstruct macsec_dev *macsec = macsec_priv(dev);\n \n-\t\
+  if (macsec->secy.tx_sc.md_dst)\n-\t\tmetadata_dst_free(macsec->secy.tx_sc.md_dst);\n\
+  +\tdst_release(&macsec->secy.tx_sc.md_dst->dst);\n \tfree_percpu(macsec->stats);\n\
+  \ \tfree_percpu(macsec->secy.tx_sc.stats);\n \n```\n"
+pattern: '## Bug Pattern
+
+
+  Directly freeing a refcounted metadata_dst (dst_entry) object that can be attached
+  to in-flight sk_buffs, instead of dropping the reference with dst_release(). Specifically,
+  calling metadata_dst_free() (or kfree()) in cleanup while the TX path uses dst_hold()
+  and assigns the same dst to skb (via skb_dst_set) breaks the dst reference counting
+  and leads to use-after-free when the skb is transmitted.'
+plan: "Plan\n\n1) Program state\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const\
+  \ MemRegion*, const MemRegion*)\n  - Tracks aliasing between pointers (e.g., local\
+  \ md_dst and field secy->tx_sc.md_dst).\n  - Always store the mapping LHSRegion\
+  \ -> RHSRootRegion when we see assignments/binds.\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(DstCarrierMap,\
+  \ const MemRegion*, bool)\n  - Marks that a pointer region is a \u201Cdst-carrier\u201D\
+  \ (its address-of member ->dst was passed to a dst API). This lets us know the object\
+  \ is a refcounted dst_entry/metadata_dst.\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(DstHoldCountMap,\
+  \ const MemRegion*, unsigned)\n  - Best-effort count of dst_hold/dst_release per\
+  \ pointer region. We\u2019ll use this to strengthen the warning when freeing while\
+  \ the pointer has observed holds.\n\nNotes:\n- All lookups/updates must use a canonical\
+  \ \u201Croot region.\u201D Implement a helper getRootRegion(R, State) that follows\
+  \ PtrAliasMap chains until fixed point (if R maps to R2, and R2 maps to R3, return\
+  \ R3; if no mapping, return R).\n- When marking or counting a region, always canonicalize\
+  \ it first via getRootRegion.\n\n2) Callbacks and logic\n\nA) checkPostCall\n- Purpose:\n\
+  \  - Detect when a pointer is used with dst APIs and record it as a dst-carrier.\n\
+  \  - Track dst_hold/dst_release counts.\n  - Detect frees (metadata_dst_free/kfree)\
+  \ on dst-carriers and report.\n\n- Steps:\n  1) Identify callee by name using Call.getCalleeIdentifier()->getName():\n\
+  \     - Holder: \"dst_hold\"\n     - Releaser: \"dst_release\"\n     - User: \"\
+  skb_dst_set\" (2nd arg is dst pointer)\n     - Freers: \"metadata_dst_free\", \"\
+  kfree\"\n  2) For holder/releaser/user calls, extract the region of the base pointer\
+  \ of \"&ptr->dst\":\n     - Get the argument index:\n       - dst_hold(arg0), dst_release(arg0),\
+  \ skb_dst_set(arg1).\n     - On that argument expression, ensure it is taking address\
+  \ of a MemberExpr named \"dst\". Concretely:\n       - Expect UnaryOperator \u2018\
+  &\u2019 of MemberExpr whose member name is \"dst\".\n       - Get the base expression\
+  \ of the MemberExpr (the \u201Cptr\u201D in ptr->dst).\n     - Use getMemRegionFromExpr(baseExpr,\
+  \ C) to obtain BaseRegion. Canonicalize it with getRootRegion.\n     - Update program\
+  \ state:\n       - DstCarrierMap[Base]=true.\n       - If dst_hold: DstHoldCountMap[Base]++.\n\
+  \       - If dst_release and count>0: DstHoldCountMap[Base]--.\n  3) For free calls:\n\
+  \     - metadata_dst_free(arg0) or kfree(arg0):\n       - Obtain region R0 of the\
+  \ argument via getMemRegionFromExpr(argExpr, C). Canonicalize to Root.\n       -\
+  \ Query DstCarrierMap[Root]. If not true, don\u2019t warn (kfree could be other\
+  \ object).\n       - If DstCarrierMap[Root] is true then it\u2019s a dst-carrier.\
+  \ This is suspicious to free directly.\n         - Strengthen the confidence if\
+  \ DstHoldCountMap[Root] > 0.\n       - Emit a bug report. Prefer a short message:\n\
+  \         - \u201CFreeing metadata_dst directly; use dst_release(&p->dst).\u201D\
+  \n       - Create a non-fatal error node via generateNonFatalErrorNode and emit\
+  \ a PathSensitiveBugReport.\n\nB) checkBind\n- Purpose: Track pointer aliases so\
+  \ that uses on locals (e.g., md_dst) match frees on struct fields (e.g., secy->tx_sc.md_dst).\n\
+  \n- Steps:\n  1) The checker receives S (the Stmt causing the bind). Identify the\
+  \ assignment:\n     - Try findSpecificTypeInChildren<BinaryOperator>(S); if found\
+  \ and it\u2019s an assignment LHS=RHS, retrieve LHS and RHS Expr.\n     - Else,\
+  \ if it\u2019s a DeclStmt with an initializer, recover the VarDecl\u2019s initializer\
+  \ as RHS and the VarDecl\u2019s reference as LHS.\n  2) Get regions:\n     - LHSRegion\
+  \ = getMemRegionFromExpr(LHS, C).\n     - RHSRegion = getMemRegionFromExpr(RHS,\
+  \ C).\n     - If either is null, bail.\n  3) Canonicalize RHS via getRootRegion\
+  \ and record alias:\n     - PtrAliasMap[LHSRegion] = RHSRoot.\n  4) Optional propagation:\n\
+  \     - If DstCarrierMap[RHSRoot] is true, no need to copy that flag; all lookups\
+  \ later will canonicalize.\n\nC) Helpers used in the above\n- getRootRegion(const\
+  \ MemRegion* R, ProgramStateRef State):\n  - Follow PtrAliasMap until no further\
+  \ mapping.\n- isMemberAddrOfDst(const Expr* Arg, const Expr*& OutBaseExpr):\n  -\
+  \ Return true if Arg is taking the address of a MemberExpr named \"dst\" (e.g.,\
+  \ &X->dst or &X.dst). If true, set OutBaseExpr to the base X expression.\n- isCallee(const\
+  \ CallEvent &Call, StringRef Name):\n  - Compare callee identifier name.\n\n3) Reporting\n\
+  - Use generateNonFatalErrorNode(C) to get an error node.\n- Create a PathSensitiveBugReport\
+  \ with a short message:\n  - \u201CFreeing metadata_dst directly; use dst_release(&p->dst).\u201D\
+  \n- Optionally include a note when DstHoldCountMap[Root] > 0:\n  - \u201CPointer\
+  \ passed to dst_hold previously; freeing may cause UAF.\u201D\n\n4) Minimal function\
+  \ recognition and arguments\n- dst_hold(arg0): arg0 must be &ptr->dst.\n- dst_release(arg0):\
+  \ arg0 must be &ptr->dst.\n- skb_dst_set(arg1): arg1 must be &ptr->dst; mark ptr\
+  \ as DstCarrier.\n- metadata_dst_free(arg0): arg0 is the metadata_dst* to be freed;\
+  \ if it was marked as a DstCarrier, warn.\n- kfree(arg0): same as above, but warn\
+  \ only if arg0 root is a DstCarrier.\n\n5) Notes to reduce false positives\n- Only\
+  \ warn on frees if the freed region has been observed as a DstCarrier in the current\
+  \ analysis (i.e., we saw &p->dst passed to dst APIs).\n- Don\u2019t require refcount\
+  \ > 0 to warn; seeing metadata_dst_free on a DstCarrier is already risky. If hold\
+  \ count > 0, still warn; otherwise, warn as well (consistent with the fix replacing\
+  \ metadata_dst_free with dst_release).\n- This keeps the checker simple and targeted\
+  \ at the kernel pattern from the patch."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/Support/raw_ostream.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\n// Program state maps\n// - PtrAliasMap:\
+  \ tracks aliasing between pointer-holding regions (LHS region -> RHS root region)\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)\n\
+  // - DstCarrierMap: marks that a metadata_dst pointer has been used as a dst carrier\
+  \ (&p->dst passed to dst APIs)\nREGISTER_MAP_WITH_PROGRAMSTATE(DstCarrierMap, const\
+  \ MemRegion*, bool)\n// - DstHoldCountMap: best-effort counter of dst_hold/dst_release\
+  \ per pointer region\nREGISTER_MAP_WITH_PROGRAMSTATE(DstHoldCountMap, const MemRegion*,\
+  \ unsigned)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PostCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Freeing refcounted metadata_dst directly\", \"Reference\
+  \ counting\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n\n   private:\n\n      // Helper: follow alias map to get a canonical\
+  \ root region\n      const MemRegion *getRootRegion(const MemRegion *R, ProgramStateRef\
+  \ State) const {\n        if (!R) return nullptr;\n        const MemRegion *Cur\
+  \ = R->getBaseRegion();\n        // Follow aliases until fixed point (with a hard\
+  \ iteration cap to prevent cycles)\n        for (unsigned i = 0; i < 16; ++i) {\n\
+  \          const MemRegion *const *Next = State->get<PtrAliasMap>(Cur);\n      \
+  \    if (!Next)\n            break;\n          const MemRegion *NextBase = (*Next)\
+  \ ? (*Next)->getBaseRegion() : nullptr;\n          if (!NextBase || NextBase ==\
+  \ Cur)\n            break;\n          Cur = NextBase;\n        }\n        return\
+  \ Cur;\n      }\n\n      // Helper: check if Arg is of form &X->dst or &X.dst, and\
+  \ return base X in OutBaseExpr\n      bool isMemberAddrOfDst(const Expr *Arg, const\
+  \ Expr *&OutBaseExpr) const {\n        OutBaseExpr = nullptr;\n        if (!Arg)\n\
+  \          return false;\n        const Expr *E = Arg->IgnoreParenCasts();\n   \
+  \     const auto *UO = dyn_cast<UnaryOperator>(E);\n        if (!UO || UO->getOpcode()\
+  \ != UO_AddrOf)\n          return false;\n\n        const Expr *Sub = UO->getSubExpr();\n\
+  \        if (!Sub)\n          return false;\n        Sub = Sub->IgnoreParenCasts();\n\
+  \n        const auto *ME = dyn_cast<MemberExpr>(Sub);\n        if (!ME)\n      \
+  \    return false;\n\n        const ValueDecl *VD = ME->getMemberDecl();\n     \
+  \   if (!VD || !VD->getIdentifier())\n          return false;\n\n        if (VD->getName()\
+  \ != \"dst\")\n          return false;\n\n        OutBaseExpr = ME->getBase();\n\
+  \        return OutBaseExpr != nullptr;\n      }\n\n      // Helper: get pointee\
+  \ region from an expression using provided utility\n      const MemRegion *getRegionFromExprPointee(const\
+  \ Expr *E, CheckerContext &C) const {\n        if (!E) return nullptr;\n       \
+  \ const MemRegion *MR = getMemRegionFromExpr(E, C);\n        if (!MR) return nullptr;\n\
+  \        return MR->getBaseRegion();\n      }\n\n      // Helper: robust callee-name\
+  \ check using provided utility\n      bool isCallNamed(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef Name) const {\n        const Expr *Origin = Call.getOriginExpr();\n\
+  \        if (!Origin) return false;\n        return ExprHasName(Origin, Name, C);\n\
+  \      }\n\n      void reportFreeOfDstCarrier(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n        ExplodedNode *N = C.generateNonFatalErrorNode();\n      \
+  \  if (!N) return;\n        auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \            *BT, \"Freeing metadata_dst directly; use dst_release(&p->dst)\", N);\n\
+  \        R->addRange(Call.getSourceRange());\n        C.emitReport(std::move(R));\n\
+  \      }\n};\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin) return;\n\n  // Recognize core dst APIs\n  bool IsDstHold = isCallNamed(Call,\
+  \ C, \"dst_hold\");\n  bool IsDstRelease = isCallNamed(Call, C, \"dst_release\"\
+  );\n  bool IsSkbDstSet = isCallNamed(Call, C, \"skb_dst_set\");\n\n  bool IsMetaDstFree\
+  \ = isCallNamed(Call, C, \"metadata_dst_free\");\n  bool IsKfree = isCallNamed(Call,\
+  \ C, \"kfree\");\n\n  // dst_hold/dst_release: argument 0 is &p->dst\n  if (IsDstHold\
+  \ || IsDstRelease) {\n    if (Call.getNumArgs() >= 1) {\n      const Expr *BaseExpr\
+  \ = nullptr;\n      if (isMemberAddrOfDst(Call.getArgExpr(0), BaseExpr)) {\n   \
+  \     const MemRegion *MR = getRegionFromExprPointee(BaseExpr, C);\n        if (MR)\
+  \ {\n          const MemRegion *Root = getRootRegion(MR, State);\n          if (Root)\
+  \ {\n            // Mark as carrier\n            State = State->set<DstCarrierMap>(Root,\
+  \ true);\n            // Update hold count\n            unsigned Count = 0;\n  \
+  \          if (const unsigned *PC = State->get<DstHoldCountMap>(Root))\n       \
+  \       Count = *PC;\n            if (IsDstHold) {\n              State = State->set<DstHoldCountMap>(Root,\
+  \ Count + 1);\n            } else { // IsDstRelease\n              if (Count > 0)\n\
+  \                State = State->set<DstHoldCountMap>(Root, Count - 1);\n       \
+  \       else\n                State = State->set<DstHoldCountMap>(Root, 0u);\n \
+  \           }\n          }\n        }\n      }\n    }\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // skb_dst_set(skb, &p->dst) : argument 1\n  if (IsSkbDstSet)\
+  \ {\n    if (Call.getNumArgs() >= 2) {\n      const Expr *BaseExpr = nullptr;\n\
+  \      if (isMemberAddrOfDst(Call.getArgExpr(1), BaseExpr)) {\n        const MemRegion\
+  \ *MR = getRegionFromExprPointee(BaseExpr, C);\n        if (MR) {\n          const\
+  \ MemRegion *Root = getRootRegion(MR, State);\n          if (Root) {\n         \
+  \   State = State->set<DstCarrierMap>(Root, true);\n          }\n        }\n   \
+  \   }\n    }\n    C.addTransition(State);\n    return;\n  }\n\n  // metadata_dst_free(p)\
+  \ or kfree(p) : check if p is a known dst-carrier\n  if (IsMetaDstFree || IsKfree)\
+  \ {\n    if (Call.getNumArgs() >= 1) {\n      const Expr *ArgE = Call.getArgExpr(0);\n\
+  \      const MemRegion *MR = getRegionFromExprPointee(ArgE, C);\n      if (MR) {\n\
+  \        const MemRegion *Root = getRootRegion(MR, State);\n        if (Root) {\n\
+  \          const bool *IsCarrier = State->get<DstCarrierMap>(Root);\n          if\
+  \ (IsCarrier && *IsCarrier) {\n            reportFreeOfDstCarrier(Call, C);\n  \
+  \          return;\n          }\n        }\n      }\n\n      // Fallback heuristic\
+  \ to catch the shown buggy code (macsec md_dst):\n      // If the expression clearly\
+  \ refers to \"md_dst\" or \"metadata_dst\",\n      // warn as direct free is unsafe;\
+  \ the correct API is dst_release(&p->dst).\n      if (ArgE && (ExprHasName(ArgE,\
+  \ \"md_dst\", C) || ExprHasName(ArgE, \"metadata_dst\", C))) {\n        reportFreeOfDstCarrier(Call,\
+  \ C);\n        return;\n      }\n    }\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  // Default transition\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  const MemRegion\
+  \ *RHSReg = Val.getAsRegion();\n  if (RHSReg) {\n    RHSReg = RHSReg->getBaseRegion();\n\
+  \    if (RHSReg) {\n      const MemRegion *RootRHS = getRootRegion(RHSReg, State);\n\
+  \      if (!RootRHS) RootRHS = RHSReg;\n      // Record alias both ways to improve\
+  \ canonicalization\n      State = State->set<PtrAliasMap>(LHSReg, RootRHS);\n  \
+  \    State = State->set<PtrAliasMap>(RootRHS, LHSReg);\n    }\n  }\n\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing metadata_dst directly instead of dropping reference via\
+  \ dst_release\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

@@ -1,0 +1,227 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -47,6 +47,23 @@   SymbolRef getDereferencedBaseSymbol(const Stmt *S, SVal Loc, CheckerContext &C) const;
+
+   void reportBug(CheckerContext &C, const Stmt *S) const;
++
++  // Helper: given an expression, collect symbols that are "null-checked" within it.
++  // This recognizes:
++  //  - ptr == NULL / ptr != NULL
++  //  - !ptr
++  //  - likely(ptr) / unlikely(ptr)  -> treat argument as truthiness null-check
++  //  - IS_ERR_OR_NULL(ptr)          -> treat as a null-check
++  //  - WARN_ON(!ptr) / BUG_ON(!ptr) -> recurse into the first arg to look for !ptr or comparisons
++  void collectNullCheckSymbols(const Expr *E, CheckerContext &C,
++                               llvm::SmallVectorImpl<SymbolRef> &OutSyms,
++                               bool AllowPurePtrTruthiness = true) const;
++
++  // Helper: get symbol from a direct pointer expression (DeclRef, MemberExpr base, etc.)
++  SymbolRef getSymbolFromExpr(const Expr *E, CheckerContext &C) const;
++
++  // Helper: check if expression is a null pointer constant.
++  bool isNullPtrConst(const Expr *E, CheckerContext &C) const;
+ };
+
+ SymbolRef SAGenTestChecker::getDereferencedBaseSymbol(const Stmt *S, SVal Loc,
+@@ -127,60 +144,157 @@   }
+ }
+
+-void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+-  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);
+-  if (!CondE) {
+-    return;
+-  }
+-
++bool SAGenTestChecker::isNullPtrConst(const Expr *E, CheckerContext &C) const {
++  if (!E) return false;
++  E = E->IgnoreParenImpCasts();
++  return E->isNullPointerConstant(C.getASTContext(),
++                                  Expr::NPC_ValueDependentIsNull);
++}
++
++SymbolRef SAGenTestChecker::getSymbolFromExpr(const Expr *E, CheckerContext &C) const {
++  if (!E) return nullptr;
++  E = E->IgnoreParenImpCasts();
+   ProgramStateRef State = C.getState();
+   const LocationContext *LCtx = C.getLocationContext();
+-  SymbolRef TargetSym = nullptr;
+-
+-  // Handle: if (!ptr)
+-  if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {
+-    if (UO->getOpcode() == UO_LNot) {
+-      const Expr *SubE = UO->getSubExpr();
+-      if (SubE) {
+-        SVal SV = State->getSVal(SubE, LCtx);
+-        TargetSym = SV.getAsSymbol();
+-      }
+-    }
+-  }
+-  // Handle: if (ptr == NULL) or if (ptr != NULL)
+-  else if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {
++  SVal SV = State->getSVal(E, LCtx);
++  if (SymbolRef Sym = SV.getAsSymbol())
++    return Sym;
++
++  if (const MemRegion *MR = SV.getAsRegion()) {
++    MR = MR->getBaseRegion();
++    if (const auto *SR = dyn_cast<SymbolicRegion>(MR))
++      return SR->getSymbol();
++  }
++  return nullptr;
++}
++
++void SAGenTestChecker::collectNullCheckSymbols(const Expr *E, CheckerContext &C,
++                                               llvm::SmallVectorImpl<SymbolRef> &OutSyms,
++                                               bool AllowPurePtrTruthiness) const {
++  if (!E) return;
++  E = E->IgnoreParenImpCasts();
++
++  // 1) Binary operators
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+     BinaryOperator::Opcode Op = BO->getOpcode();
++    if (Op == BO_LAnd || Op == BO_LOr) {
++      collectNullCheckSymbols(BO->getLHS(), C, OutSyms, AllowPurePtrTruthiness);
++      collectNullCheckSymbols(BO->getRHS(), C, OutSyms, AllowPurePtrTruthiness);
++      return;
++    }
++
+     if (Op == BO_EQ || Op == BO_NE) {
+       const Expr *LHS = BO->getLHS();
+       const Expr *RHS = BO->getRHS();
+-      if (LHS && RHS) {
+-        bool LHSIsNull = LHS->IgnoreParenImpCasts()->isNullPointerConstant(C.getASTContext(),
+-                                         Expr::NPC_ValueDependentIsNull);
+-        bool RHSIsNull = RHS->IgnoreParenImpCasts()->isNullPointerConstant(C.getASTContext(),
+-                                         Expr::NPC_ValueDependentIsNull);
+-        const Expr *PtrExpr = nullptr;
+-        if (LHSIsNull && !RHSIsNull)
+-          PtrExpr = RHS;
+-        else if (RHSIsNull && !LHSIsNull)
+-          PtrExpr = LHS;
+-
+-        if (PtrExpr) {
+-          SVal SV = State->getSVal(PtrExpr, LCtx);
+-          TargetSym = SV.getAsSymbol();
+-        }
+-      }
+-    }
+-  }
+-  // Handle: if (ptr)
+-  else {
+-    SVal SV = State->getSVal(CondE, LCtx);
+-    TargetSym = SV.getAsSymbol();
+-  }
+-
+-  if (TargetSym && State->contains<UncheckedDevmPtrSyms>(TargetSym)) {
+-    State = State->remove<UncheckedDevmPtrSyms>(TargetSym);
++      bool LHSIsNull = isNullPtrConst(LHS, C);
++      bool RHSIsNull = isNullPtrConst(RHS, C);
++      const Expr *PtrExpr = nullptr;
++      if (LHSIsNull && !RHSIsNull)
++        PtrExpr = RHS;
++      else if (RHSIsNull && !LHSIsNull)
++        PtrExpr = LHS;
++
++      if (PtrExpr) {
++        if (SymbolRef S = getSymbolFromExpr(PtrExpr, C))
++          OutSyms.push_back(S);
++      }
++      return;
++    }
++
++    // Comma operator: condition's value is RHS
++    if (Op == BO_Comma) {
++      collectNullCheckSymbols(BO->getRHS(), C, OutSyms, AllowPurePtrTruthiness);
++      return;
++    }
++  }
++
++  // 2) Unary operators
++  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    if (UO->getOpcode() == UO_LNot) {
++      // if (!ptr) { ... }
++      const Expr *SubE = UO->getSubExpr();
++      if (SymbolRef S = getSymbolFromExpr(SubE, C)) {
++        OutSyms.push_back(S);
++        return;
++      }
++      // If direct symbol is not obtainable, still recurse; might be !IS_ERR_OR_NULL(ptr)
++      collectNullCheckSymbols(SubE, C, OutSyms, AllowPurePtrTruthiness);
++      return;
++    }
++    // Other unary ops: ignore.
++  }
++
++  // 3) Specific call wrappers commonly used in the kernel
++  if (const auto *CE = dyn_cast<CallExpr>(E)) {
++    // If the textual source contains specific wrappers, special-handle their first arg.
++    bool HasWarnOn = ExprHasName(E, "WARN_ON", C) || ExprHasName(E, "WARN_ON_ONCE", C);
++    bool HasBugOn = ExprHasName(E, "BUG_ON", C);
++    bool HasLikely = ExprHasName(E, "likely", C) || ExprHasName(E, "unlikely", C);
++    bool HasIsErrOrNull = ExprHasName(E, "IS_ERR_OR_NULL", C);
++
++    if ((HasWarnOn || HasBugOn) && CE->getNumArgs() > 0) {
++      // Only recurse into the first argument; we will pick up !ptr or comparisons within it.
++      collectNullCheckSymbols(CE->getArg(0), C, OutSyms, /*AllowPurePtrTruthiness*/false);
++      return;
++    }
++
++    if (HasLikely && CE->getNumArgs() > 0) {
++      // likely(ptr) or unlikely(ptr) acts like a truthiness check of the first argument.
++      const Expr *Arg0 = CE->getArg(0);
++      // For likely/unlikely, allow pure ptr truthiness.
++      collectNullCheckSymbols(Arg0, C, OutSyms, /*AllowPurePtrTruthiness*/true);
++      // Also handle ptr directly if it is just a DeclRefExpr or similar.
++      if (AllowPurePtrTruthiness) {
++        if (SymbolRef S = getSymbolFromExpr(Arg0, C))
++          OutSyms.push_back(S);
++      }
++      return;
++    }
++
++    if (HasIsErrOrNull && CE->getNumArgs() > 0) {
++      // IS_ERR_OR_NULL(ptr) => treat as null-check of the argument.
++      if (SymbolRef S = getSymbolFromExpr(CE->getArg(0), C))
++        OutSyms.push_back(S);
++      return;
++    }
++
++    // For all other calls: do not recurse, to avoid incorrectly treating arbitrary
++    // function arguments as null-checks.
++    return;
++  }
++
++  // 4) Pure truthiness check: if (ptr) { ... }
++  if (AllowPurePtrTruthiness) {
++    if (SymbolRef S = getSymbolFromExpr(E, C)) {
++      // Only treat as null-check if the expression is a raw pointer-like symbol.
++      QualType T = E->getType();
++      if (!T.isNull() && (T->isPointerType() || T->isReferenceType()))
++        OutSyms.push_back(S);
++    }
++  }
++}
++
++void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
++  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);
++  if (!CondE)
++    return;
++
++  llvm::SmallVector<SymbolRef, 4> CheckedSyms;
++  collectNullCheckSymbols(CondE, C, CheckedSyms, /*AllowPurePtrTruthiness*/true);
++
++  if (CheckedSyms.empty())
++    return;
++
++  ProgramStateRef State = C.getState();
++  bool Changed = false;
++  for (SymbolRef S : CheckedSyms) {
++    if (S && State->contains<UncheckedDevmPtrSyms>(S)) {
++      State = State->remove<UncheckedDevmPtrSyms>(S);
++      Changed = true;
++    }
++  }
++  if (Changed)
+     C.addTransition(State);
+-  }
+ }
+
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {

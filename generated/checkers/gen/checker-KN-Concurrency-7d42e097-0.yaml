@@ -1,0 +1,558 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 7d42e097607c4d246d99225bf2b195b6167a210c
+commit_type: Concurrency
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include <string>\n#include <utility>\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// No custom\
+  \ program states needed for this checker.\n // If necessary\n\nnamespace {\n\nclass\
+  \ SAGenTestChecker : public Checker<check::BranchCondition> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Uncoordinated\
+  \ free after timed wait\", \"Concurrency\")) {}\n\n      void checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const;\n\n   private:\n\n      // Helpers\n\
+  \      static bool isCallNamed(const CallExpr *CE, StringRef Name, CheckerContext\
+  \ &C);\n      static const CallExpr *findCallByNameInStmt(const Stmt *S, StringRef\
+  \ Name, CheckerContext &C);\n      static bool extractBaseVarNameFromCompletionArg(const\
+  \ Expr *Arg, std::string &OutName);\n      static const IfStmt *getEnclosingIf(const\
+  \ Stmt *Condition, CheckerContext &C);\n\n      static const Stmt *getPrevSibling(const\
+  \ CompoundStmt *CS, const Stmt *S);\n      static bool findPrevWaitAssignment(const\
+  \ CompoundStmt *CS, const IfStmt *IfS,\n                                       \
+  \  const std::string &VarName,\n                                         const CallExpr\
+  \ *&OutWaitCall,\n                                         const BinaryOperator\
+  \ *&OutAssign,\n                                         const DeclStmt *&OutDecl);\n\
+  \      static bool isZeroExpr(const Expr *E, CheckerContext &C);\n      static const\
+  \ Stmt *determineTimeoutBranchForDirectCall(const IfStmt *IfS, const Stmt *CondS,\
+  \ CheckerContext &C);\n      static const Stmt *determineTimeoutBranchForVarCond(const\
+  \ IfStmt *IfS, const Expr *CondE, CheckerContext &C);\n\n      static bool branchContainsFreeOfBaseName(const\
+  \ Stmt *S, StringRef BaseName, CheckerContext &C, const CallExpr **FoundFree = nullptr);\n\
+  \      static bool stmtContainsFreeOfBaseName(const Stmt *S, StringRef BaseName,\
+  \ CheckerContext &C, const CallExpr **FoundFree = nullptr);\n      static bool compoundHasQueueWorkWithBaseNameBefore(const\
+  \ CompoundStmt *CS, const IfStmt *IfS, StringRef BaseName, CheckerContext &C);\n\
+  \      static bool subsequentStatementsContainFree(const CompoundStmt *CS, const\
+  \ IfStmt *IfS, StringRef BaseName, CheckerContext &C, const CallExpr **FoundFree\
+  \ = nullptr);\n\n      void emitReport(CheckerContext &C, StringRef Msg, const Stmt\
+  \ *LocStmt) const;\n};\n\n// ============= Helper Implementations =============\n\
+  \nbool SAGenTestChecker::isCallNamed(const CallExpr *CE, StringRef Name, CheckerContext\
+  \ &C) {\n  if (!CE) return false;\n  const Expr *Callee = CE->getCallee();\n  if\
+  \ (!Callee) return false;\n  // Use source-text based name check as suggested.\n\
+  \  return ExprHasName(Callee, Name, C);\n}\n\nconst CallExpr *SAGenTestChecker::findCallByNameInStmt(const\
+  \ Stmt *S, StringRef Name, CheckerContext &C) {\n  if (!S) return nullptr;\n  if\
+  \ (const auto *CE = dyn_cast<CallExpr>(S)) {\n    if (isCallNamed(CE, Name, C))\n\
+  \      return CE;\n  }\n  for (const Stmt *Child : S->children()) {\n    if (const\
+  \ CallExpr *Found = findCallByNameInStmt(Child, Name, C))\n      return Found;\n\
+  \  }\n  return nullptr;\n}\n\nbool SAGenTestChecker::extractBaseVarNameFromCompletionArg(const\
+  \ Expr *Arg, std::string &OutName) {\n  if (!Arg) return false;\n  const Expr *E\
+  \ = Arg->IgnoreParenImpCasts();\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_AddrOf)\n      E = UO->getSubExpr()->IgnoreParenImpCasts();\n\
+  \  }\n  if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    const Expr *Base =\
+  \ ME->getBase()->IgnoreParenImpCasts();\n    // Drill through nested MemberExpr\
+  \ if present.\n    while (const auto *InnerME = dyn_cast<MemberExpr>(Base)) {\n\
+  \      Base = InnerME->getBase()->IgnoreParenImpCasts();\n    }\n    if (const auto\
+  \ *DRE = dyn_cast<DeclRefExpr>(Base)) {\n      OutName = DRE->getDecl()->getNameAsString();\n\
+  \      return !OutName.empty();\n    }\n  }\n  // Fallback: look for a DeclRefExpr\
+  \ anywhere within Arg.\n  if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(Arg))\
+  \ {\n    OutName = DRE->getDecl()->getNameAsString();\n    return !OutName.empty();\n\
+  \  }\n  return false;\n}\n\nconst IfStmt *SAGenTestChecker::getEnclosingIf(const\
+  \ Stmt *Condition, CheckerContext &C) {\n  return findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n}\n\nconst Stmt *SAGenTestChecker::getPrevSibling(const CompoundStmt *CS,\
+  \ const Stmt *S) {\n  if (!CS || !S) return nullptr;\n  const Stmt *Prev = nullptr;\n\
+  \  for (const Stmt *Child : CS->body()) {\n    if (Child == S)\n      return Prev;\n\
+  \    Prev = Child;\n  }\n  return nullptr;\n}\n\nbool SAGenTestChecker::findPrevWaitAssignment(const\
+  \ CompoundStmt *CS, const IfStmt *IfS,\n                                       \
+  \       const std::string &VarName,\n                                          \
+  \    const CallExpr *&OutWaitCall,\n                                           \
+  \   const BinaryOperator *&OutAssign,\n                                        \
+  \      const DeclStmt *&OutDecl) {\n  OutWaitCall = nullptr;\n  OutAssign = nullptr;\n\
+  \  OutDecl = nullptr;\n  if (!CS || !IfS) return false;\n\n  const Stmt *Prev =\
+  \ getPrevSibling(CS, IfS);\n  if (!Prev) return false;\n\n  // Case 1: Declaration\
+  \ with initializer\n  if (const auto *DS = dyn_cast<DeclStmt>(Prev)) {\n    for\
+  \ (const Decl *D : DS->decls()) {\n      if (const auto *VD = dyn_cast<VarDecl>(D))\
+  \ {\n        if (VD->getName() == VarName && VD->hasInit()) {\n          if (const\
+  \ auto *CE = dyn_cast<CallExpr>(VD->getInit()->IgnoreParenImpCasts())) {\n     \
+  \       OutWaitCall = CE;\n            OutDecl = DS;\n            return true;\n\
+  \          }\n        }\n      }\n    }\n  }\n\n  // Case 2: Assignment\n  if (const\
+  \ auto *BO = dyn_cast<BinaryOperator>(Prev)) {\n    if (BO->getOpcode() == BO_Assign)\
+  \ {\n      const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n      if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(LHS)) {\n        if (DRE->getDecl()->getName()\
+  \ == VarName) {\n          if (const auto *CE = dyn_cast<CallExpr>(BO->getRHS()->IgnoreParenImpCasts()))\
+  \ {\n            OutWaitCall = CE;\n            OutAssign = BO;\n            return\
+  \ true;\n          }\n        }\n      }\n    }\n  }\n\n  return false;\n}\n\nbool\
+  \ SAGenTestChecker::isZeroExpr(const Expr *E, CheckerContext &C) {\n  if (!E) return\
+  \ false;\n  llvm::APSInt Val;\n  if (EvaluateExprToInt(Val, E->IgnoreParenImpCasts(),\
+  \ C)) {\n    return Val == 0;\n  }\n  return false;\n}\n\nconst Stmt *SAGenTestChecker::determineTimeoutBranchForDirectCall(const\
+  \ IfStmt *IfS, const Stmt *CondS, CheckerContext &C) {\n  if (!IfS || !CondS) return\
+  \ nullptr;\n  // Handle \"!wait_for_completion_timeout(...)\"\n  if (const auto\
+  \ *UO = dyn_cast<UnaryOperator>(CondS)) {\n    if (UO->getOpcode() == UO_LNot) {\n\
+  \      if (findCallByNameInStmt(UO->getSubExpr(), \"wait_for_completion_timeout\"\
+  , C)) {\n        return IfS->getThen(); // !ret -> Then is timeout\n      }\n  \
+  \  }\n  }\n  // Handle \"wait_for_completion_timeout(...)\" being used directly\n\
+  \  if (findCallByNameInStmt(CondS, \"wait_for_completion_timeout\", C)) {\n    return\
+  \ IfS->getElse(); // non-zero -> success in Then, Else is timeout\n  }\n  return\
+  \ nullptr;\n}\n\nconst Stmt *SAGenTestChecker::determineTimeoutBranchForVarCond(const\
+  \ IfStmt *IfS, const Expr *CondE, CheckerContext &C) {\n  if (!IfS || !CondE) return\
+  \ nullptr;\n  CondE = CondE->IgnoreParenImpCasts();\n\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      // if (!ret) -> Then is timeout\n\
+  \      return IfS->getThen();\n    }\n  } else if (const auto *BO = dyn_cast<BinaryOperator>(CondE))\
+  \ {\n    if (BO->getOpcode() == BO_EQ || BO->getOpcode() == BO_NE) {\n      const\
+  \ Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n      const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \      bool LHSZero = isZeroExpr(LHS, C);\n      bool RHSZero = isZeroExpr(RHS,\
+  \ C);\n      if ((BO->getOpcode() == BO_EQ) && (LHSZero ^ RHSZero)) {\n        //\
+  \ ret == 0 -> Then is timeout\n        return IfS->getThen();\n      }\n      if\
+  \ ((BO->getOpcode() == BO_NE) && (LHSZero ^ RHSZero)) {\n        // ret != 0 ->\
+  \ Else is timeout\n        return IfS->getElse();\n      }\n    }\n  } else if (isa<DeclRefExpr>(CondE))\
+  \ {\n    // if (ret) -> Else is timeout (ret == 0)\n    return IfS->getElse();\n\
+  \  }\n\n  return nullptr;\n}\n\nbool SAGenTestChecker::stmtContainsFreeOfBaseName(const\
+  \ Stmt *S, StringRef BaseName, CheckerContext &C, const CallExpr **FoundFree) {\n\
+  \  if (!S) return false;\n  if (const auto *CE = dyn_cast<CallExpr>(S)) {\n    if\
+  \ (isCallNamed(CE, \"kfree\", C) || isCallNamed(CE, \"kvfree\", C)) {\n      if\
+  \ (CE->getNumArgs() >= 1) {\n        const Expr *Arg0 = CE->getArg(0);\n       \
+  \ if (Arg0 && ExprHasName(Arg0, BaseName, C)) {\n          if (FoundFree) *FoundFree\
+  \ = CE;\n          return true;\n        }\n      }\n    }\n  }\n  for (const Stmt\
+  \ *Child : S->children()) {\n    if (stmtContainsFreeOfBaseName(Child, BaseName,\
+  \ C, FoundFree))\n      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::branchContainsFreeOfBaseName(const\
+  \ Stmt *S, StringRef BaseName, CheckerContext &C, const CallExpr **FoundFree) {\n\
+  \  return stmtContainsFreeOfBaseName(S, BaseName, C, FoundFree);\n}\n\nbool SAGenTestChecker::compoundHasQueueWorkWithBaseNameBefore(const\
+  \ CompoundStmt *CS, const IfStmt *IfS, StringRef BaseName, CheckerContext &C) {\n\
+  \  if (!CS || !IfS) return false;\n  for (const Stmt *Child : CS->body()) {\n  \
+  \  if (Child == IfS)\n      break;\n\n    // Look for queue_* calls\n    const CallExpr\
+  \ *CE = nullptr;\n    if ((CE = findCallByNameInStmt(Child, \"queue_work_on\", C))\
+  \ ||\n        (CE = findCallByNameInStmt(Child, \"queue_work\", C)) ||\n       \
+  \ (CE = findCallByNameInStmt(Child, \"queue_delayed_work_on\", C)) ||\n        (CE\
+  \ = findCallByNameInStmt(Child, \"queue_delayed_work\", C))) {\n      unsigned WorkArgIdx\
+  \ = 0;\n      // Determine the index of the \"work\" argument\n      if (ExprHasName(CE->getCallee(),\
+  \ \"queue_work_on\", C))\n        WorkArgIdx = 2;\n      else if (ExprHasName(CE->getCallee(),\
+  \ \"queue_work\", C))\n        WorkArgIdx = 1;\n      else if (ExprHasName(CE->getCallee(),\
+  \ \"queue_delayed_work_on\", C))\n        WorkArgIdx = 2;\n      else if (ExprHasName(CE->getCallee(),\
+  \ \"queue_delayed_work\", C))\n        WorkArgIdx = 1;\n\n      if (CE->getNumArgs()\
+  \ > WorkArgIdx) {\n        const Expr *WorkArg = CE->getArg(WorkArgIdx);\n     \
+  \   if (!WorkArg) continue;\n        // Check the work argument contains BaseName\
+  \ and a member named \"work\"\n        if (ExprHasName(WorkArg, BaseName, C) &&\
+  \ ExprHasName(WorkArg, \"work\", C)) {\n          return true;\n        }\n    \
+  \  }\n    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::subsequentStatementsContainFree(const\
+  \ CompoundStmt *CS, const IfStmt *IfS, StringRef BaseName, CheckerContext &C, const\
+  \ CallExpr **FoundFree) {\n  if (!CS || !IfS) return false;\n  bool FoundIf = false;\n\
+  \  for (const Stmt *Child : CS->body()) {\n    if (!FoundIf) {\n      if (Child\
+  \ == IfS)\n        FoundIf = true;\n      continue;\n    }\n    if (stmtContainsFreeOfBaseName(Child,\
+  \ BaseName, C, FoundFree))\n      return true;\n  }\n  return false;\n}\n\n// =============\
+  \ Main Callback =============\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition) return;\n\n  const\
+  \ IfStmt *IfS = getEnclosingIf(Condition, C);\n  if (!IfS) return;\n\n  // Case\
+  \ 1: Direct call to wait_for_completion_timeout in the condition\n  const CallExpr\
+  \ *DirectCall = findCallByNameInStmt(Condition, \"wait_for_completion_timeout\"\
+  , C);\n\n  std::string BaseName;\n  const Stmt *TimeoutBranch = nullptr;\n\n  if\
+  \ (DirectCall) {\n    // Extract base from first argument (&ctx->done / &ctx->compl)\n\
+  \    if (DirectCall->getNumArgs() >= 1) {\n      if (!extractBaseVarNameFromCompletionArg(DirectCall->getArg(0),\
+  \ BaseName))\n        return;\n    } else {\n      return;\n    }\n    // Determine\
+  \ timeout branch\n    TimeoutBranch = determineTimeoutBranchForDirectCall(IfS, Condition,\
+  \ C);\n    if (!TimeoutBranch) return;\n  } else {\n    // Case 2: Variable used\
+  \ in the condition\n    const DeclRefExpr *CondVar = findSpecificTypeInChildren<DeclRefExpr>(Condition);\n\
+  \    if (!CondVar) return;\n\n    std::string VarName = CondVar->getDecl()->getNameAsString();\n\
+  \    const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IfS, C);\n\
+  \    if (!CS) return;\n\n    const CallExpr *PrevWaitCall = nullptr;\n    const\
+  \ BinaryOperator *PrevAssign = nullptr;\n    const DeclStmt *PrevDecl = nullptr;\n\
+  \n    if (!findPrevWaitAssignment(CS, IfS, VarName, PrevWaitCall, PrevAssign, PrevDecl))\n\
+  \      return;\n\n    if (!PrevWaitCall || !isCallNamed(PrevWaitCall, \"wait_for_completion_timeout\"\
+  , C))\n      return;\n\n    if (PrevWaitCall->getNumArgs() >= 1) {\n      if (!extractBaseVarNameFromCompletionArg(PrevWaitCall->getArg(0),\
+  \ BaseName))\n        return;\n    } else {\n      return;\n    }\n\n    // Determine\
+  \ timeout branch based on the condition expression\n    const Expr *CondE = dyn_cast<Expr>(Condition);\n\
+  \    if (!CondE) return;\n    TimeoutBranch = determineTimeoutBranchForVarCond(IfS,\
+  \ CondE, C);\n    if (!TimeoutBranch) return;\n  }\n\n  // Reduce FPs: confirm earlier\
+  \ queue_work(..., &BaseName->work/*...*/)\n  const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IfS,\
+  \ C);\n  if (!CS) return;\n  if (!compoundHasQueueWorkWithBaseNameBefore(CS, IfS,\
+  \ BaseName, C))\n    return;\n\n  // Identify success branch\n  const Stmt *SuccessBranch\
+  \ = (TimeoutBranch == IfS->getThen()) ? IfS->getElse() : IfS->getThen();\n\n  //\
+  \ Scan for frees\n  const CallExpr *FreeCETimeout = nullptr;\n  const CallExpr *FreeCESuccess\
+  \ = nullptr;\n  const CallExpr *FreeCEAfter = nullptr;\n\n  bool FreeInTimeout =\
+  \ TimeoutBranch ? branchContainsFreeOfBaseName(TimeoutBranch, BaseName, C, &FreeCETimeout)\
+  \ : false;\n  bool FreeInSuccess = SuccessBranch ? branchContainsFreeOfBaseName(SuccessBranch,\
+  \ BaseName, C, &FreeCESuccess) : false;\n  bool FreeAfterIf   = subsequentStatementsContainFree(CS,\
+  \ IfS, BaseName, C, &FreeCEAfter);\n\n  // Reporting logic\n  if (FreeInTimeout\
+  \ && FreeInSuccess) {\n    emitReport(C, \"Freeing work context in both timeout\
+  \ and success paths\", FreeCETimeout ? static_cast<const Stmt*>(FreeCETimeout) :\
+  \ static_cast<const Stmt*>(IfS));\n  } else if (FreeInTimeout) {\n    emitReport(C,\
+  \ \"Freeing work context on timeout after wait_for_completion_timeout()\", FreeCETimeout\
+  \ ? static_cast<const Stmt*>(FreeCETimeout) : static_cast<const Stmt*>(IfS));\n\
+  \  } else if (FreeAfterIf) {\n    emitReport(C, \"Unconditional free of work context\
+  \ after timed wait\", FreeCEAfter ? static_cast<const Stmt*>(FreeCEAfter) : static_cast<const\
+  \ Stmt*>(IfS));\n  }\n}\n\nvoid SAGenTestChecker::emitReport(CheckerContext &C,\
+  \ StringRef Msg, const Stmt *LocStmt) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg,\
+  \ N);\n  if (LocStmt)\n    R->addRange(LocStmt->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing a workqueue context on timeout after wait_for_completion_timeout(),\
+  \ which races with the worker\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ncrypto: qat - resolve race condition during AER recovery\n\
+  \nDuring the PCI AER system's error recovery process, the kernel driver\nmay encounter\
+  \ a race condition with freeing the reset_data structure's\nmemory. If the device\
+  \ restart will take more than 10 seconds the function\nscheduling that restart will\
+  \ exit due to a timeout, and the reset_data\nstructure will be freed. However, this\
+  \ data structure is used for\ncompletion notification after the restart is completed,\
+  \ which leads\nto a UAF bug.\n\nThis results in a KFENCE bug notice.\n\n  BUG: KFENCE:\
+  \ use-after-free read in adf_device_reset_worker+0x38/0xa0 [intel_qat]\n  Use-after-free\
+  \ read at 0x00000000bc56fddf (in kfence-#142):\n  adf_device_reset_worker+0x38/0xa0\
+  \ [intel_qat]\n  process_one_work+0x173/0x340\n\nTo resolve this race condition,\
+  \ the memory associated to the container\nof the work_struct is freed on the worker\
+  \ if the timeout expired,\notherwise on the function that schedules the worker.\n\
+  The timeout detection can be done by checking if the caller is\nstill waiting for\
+  \ completion or not by using completion_done() function.\n\nFixes: d8cba25d2c68\
+  \ (\"crypto: qat - Intel(R) QAT driver framework\")\nCc: <stable@vger.kernel.org>\n\
+  Signed-off-by: Damian Muszynski <damian.muszynski@intel.com>\nReviewed-by: Giovanni\
+  \ Cabiddu <giovanni.cabiddu@intel.com>\nSigned-off-by: Herbert Xu <herbert@gondor.apana.org.au>\n\
+  \n## Buggy Code\n\n```c\n// Function: adf_device_reset_worker in drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  static void adf_device_reset_worker(struct work_struct *work)\n{\n\tstruct adf_reset_dev_data\
+  \ *reset_data =\n\t\t  container_of(work, struct adf_reset_dev_data, reset_work);\n\
+  \tstruct adf_accel_dev *accel_dev = reset_data->accel_dev;\n\tunsigned long wait_jiffies\
+  \ = msecs_to_jiffies(10000);\n\tstruct adf_sriov_dev_data sriov_data;\n\n\tadf_dev_restarting_notify(accel_dev);\n\
+  \tif (adf_dev_restart(accel_dev)) {\n\t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n\t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n\t\t\tkfree(reset_data);\n\
+  \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\n\");\n\t\treturn;\n\
+  \t}\n\n\tsriov_data.accel_dev = accel_dev;\n\tinit_completion(&sriov_data.compl);\n\
+  \tINIT_WORK(&sriov_data.sriov_work, adf_device_sriov_worker);\n\tqueue_work(device_sriov_wq,\
+  \ &sriov_data.sriov_work);\n\tif (wait_for_completion_timeout(&sriov_data.compl,\
+  \ wait_jiffies))\n\t\tadf_pf2vf_notify_restarted(accel_dev);\n\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\n\t/* The dev is back\
+  \ alive. Notify the caller if in sync mode */\n\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n\
+  \t\tcomplete(&reset_data->compl);\n\telse\n\t\tkfree(reset_data);\n}\n```\n\n```c\n\
+  // Function: adf_slot_reset in drivers/crypto/intel/qat/qat_common/adf_aer.c\nstatic\
+  \ pci_ers_result_t adf_slot_reset(struct pci_dev *pdev)\n{\n\tstruct adf_accel_dev\
+  \ *accel_dev = adf_devmgr_pci_to_accel_dev(pdev);\n\tint res = 0;\n\n\tif (!accel_dev)\
+  \ {\n\t\tpr_err(\"QAT: Can't find acceleration device\\n\");\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\
+  \t}\n\n\tif (!pdev->is_busmaster)\n\t\tpci_set_master(pdev);\n\tpci_restore_state(pdev);\n\
+  \tpci_save_state(pdev);\n\tres = adf_dev_up(accel_dev, false);\n\tif (res && res\
+  \ != -EALREADY)\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\n\tadf_reenable_sriov(accel_dev);\n\
+  \tadf_pf2vf_notify_restarted(accel_dev);\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\treturn PCI_ERS_RESULT_RECOVERED;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/crypto/intel/qat/qat_common/adf_aer.c\
+  \ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\nindex 3597e7605a14..9da2278bd5b7\
+  \ 100644\n--- a/drivers/crypto/intel/qat/qat_common/adf_aer.c\n+++ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  @@ -130,7 +130,8 @@ static void adf_device_reset_worker(struct work_struct *work)\n\
+  \ \tif (adf_dev_restart(accel_dev)) {\n \t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n \t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n-\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n+\t\tif (reset_data->mode\
+  \ == ADF_DEV_RESET_ASYNC ||\n+\t\t    completion_done(&reset_data->compl))\n \t\t\
+  \tkfree(reset_data);\n \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\\
+  n\");\n \t\treturn;\n@@ -146,11 +147,19 @@ static void adf_device_reset_worker(struct\
+  \ work_struct *work)\n \tadf_dev_restarted_notify(accel_dev);\n \tclear_bit(ADF_STATUS_RESTARTING,\
+  \ &accel_dev->status);\n \n-\t/* The dev is back alive. Notify the caller if in\
+  \ sync mode */\n-\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n-\t\tcomplete(&reset_data->compl);\n\
+  -\telse\n+\t/*\n+\t * The dev is back alive. Notify the caller if in sync mode\n\
+  +\t *\n+\t * If device restart will take a more time than expected,\n+\t * the schedule_reset()\
+  \ function can timeout and exit. This can be\n+\t * detected by calling the completion_done()\
+  \ function. In this case\n+\t * the reset_data structure needs to be freed here.\n\
+  +\t */\n+\tif (reset_data->mode == ADF_DEV_RESET_ASYNC ||\n+\t    completion_done(&reset_data->compl))\n\
+  \ \t\tkfree(reset_data);\n+\telse\n+\t\tcomplete(&reset_data->compl);\n }\n \n static\
+  \ int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n@@ -183,8 +192,9\
+  \ @@ static int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n \t\
+  \t\tdev_err(&GET_DEV(accel_dev),\n \t\t\t\t\"Reset device timeout expired\\n\");\n\
+  \ \t\t\tret = -EFAULT;\n+\t\t} else {\n+\t\t\tkfree(reset_data);\n \t\t}\n-\t\t\
+  kfree(reset_data);\n \t\treturn ret;\n \t}\n \treturn 0;\n```\n"
+pattern: "## Bug Pattern\n\nUncoordinated lifetime management of a workqueue context\
+  \ that is shared between the caller and the worker when using wait_for_completion_timeout():\n\
+  \n- The caller allocates a context (container of work_struct), queues the work,\
+  \ and waits on a completion with a timeout.\n- On timeout, the caller frees the\
+  \ context unconditionally, while the worker still holds and later dereferences the\
+  \ same context (e.g., to call complete() or to free it), leading to use-after-free/double-free.\n\
+  \nCharacteristic code pattern:\n\n- Caller:\n  - ctx = kmalloc(...);\n  - queue_work(...,\
+  \ &ctx->work);\n  - if (!wait_for_completion_timeout(&ctx->done, timeout)) {\n \
+  \     kfree(ctx);  // BUG: worker still owns/uses ctx\n    } else {\n      kfree(ctx);\n\
+  \    }\n\n- Worker:\n  - ctx = container_of(work, typeof(*ctx), work);\n  - ...\
+  \ uses ctx ...\n  - complete(&ctx->done);\n  - possibly kfree(ctx) for async mode.\n\
+  \nFix pattern: Only free the context on the side that \u201Cowns\u201D it at that\
+  \ moment\u2014use completion_done(&ctx->done) in the worker to detect caller timeout\
+  \ and free there, and in the caller free only when completion succeeded."
+plan: "Plan\n\n1. Program state customization\n- No custom program state is strictly\
+  \ necessary. We can detect this pattern locally by inspecting the AST around the\
+  \ if-condition that tests the result of wait_for_completion_timeout() and scanning\
+  \ the corresponding branches/siblings. This keeps the checker simple and robust.\n\
+  \n2. Callback functions and detailed implementation steps\n\n2.1 check::BranchCondition\n\
+  Goal: Detect if-statements that branch on the result of wait_for_completion_timeout(),\
+  \ find the associated \u201Cwork context\u201D container, confirm that it was queued\
+  \ via queue_work(..., &ctx->work), and then detect kfree(ctx) in the timeout path\
+  \ or unconditional kfree(ctx) after the if.\n\nSteps:\nA. Identify a target if-statement\n\
+  - Given the Stmt* Condition:\n  - Find the enclosing IfStmt using findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C). If none, return.\n  - Determine whether the condition:\n    1) Directly calls\
+  \ wait_for_completion_timeout(), or\n    2) Tests a variable that was assigned the\
+  \ result of wait_for_completion_timeout() just before the if.\n\nB. Case 1: Direct\
+  \ call in the condition\n- Find the CallExpr under the condition using findSpecificTypeInChildren<CallExpr>(Condition).\n\
+  - Check the callee name equals \"wait_for_completion_timeout\".\n- Extract the first\
+  \ argument (completion pointer), which should look like &ctx->done or &ctx->compl:\n\
+  \  - Expect a UnaryOperator '&' whose subexpr is a MemberExpr.\n  - From the MemberExpr\
+  \ base, extract the container \u201Cbase variable\u201D name (e.g., reset_data)\
+  \ via:\n    - If base is a DeclRefExpr, use getDecl()->getNameAsString().\n    -\
+  \ If base is another MemberExpr (e.g., foo->bar), get the top-most DeclRefExpr name.\
+  \ Fall back to using ExprHasName with the DeclRefExpr name on later checks.\n  -\
+  \ Save BaseName string for matching kfree arguments.\n\n- Determine which branch\
+  \ corresponds to the timeout path:\n  - If the condition is UnaryOperator \u2018\
+  !\u2019 applied to the CallExpr, then Then-branch is the timeout path.\n  - Else\
+  \ (no leading \u2018!\u2019), the Else-branch is the timeout path (because non-zero\
+  \ = completed; zero = timeout).\n\nC. Case 2: Variable used in the condition (ret-pattern)\n\
+  - The condition might be:\n  - if (!ret), if (ret == 0), if (ret != 0), if (ret)\
+  \ etc.\n- Extract DeclRefExpr from the condition using findSpecificTypeInChildren<DeclRefExpr>(Condition)\
+  \ to obtain VarName.\n- Find the previous sibling statement of the IfStmt in its\
+  \ parent CompoundStmt:\n  - Use findSpecificTypeInParents<CompoundStmt>(IfStmt,\
+  \ C) to get the block.\n  - Iterate statements in the CompoundStmt to locate the\
+  \ IfStmt and identify its immediate predecessor.\n  - Check if the previous statement\
+  \ assigns VarName = wait_for_completion_timeout(&ctx->done, ...):\n    - Find an\
+  \ assignment with a CallExpr on the RHS to \"wait_for_completion_timeout\".\n  \
+  \  - Extract BaseName as in Case 1 from the RHS first argument.\n- Determine which\
+  \ branch is timeout based on the exact condition:\n  - if (!ret) or if (ret == 0):\
+  \ Then-branch is timeout.\n  - if (ret) or if (ret != 0): Else-branch is timeout.\n\
+  \nD. Confirm the \u201Cwork context\u201D was queued earlier\n- Reduce false positives\
+  \ by checking that, before this IfStmt in the same CompoundStmt (scan earlier siblings),\
+  \ there is a call to a queue_work-like function that uses the same BaseName for\
+  \ the work argument:\n  - Look for calls named:\n    - \"queue_work\", \"queue_work_on\"\
+  , \"queue_delayed_work\", \"queue_delayed_work_on\".\n  - For each candidate CallExpr,\
+  \ get the \u201Cwork\u201D argument (2nd param for queue_work, etc.) and check if\
+  \ it contains \"&BaseName->work\" (or any MemberExpr whose base contains BaseName\
+  \ and whose member contains \"work\"). Use ExprHasName on the argument with BaseName\
+  \ and \"work\".\n- If no evidence of queue_work with &BaseName->work found, you\
+  \ may bail out to avoid FPs.\n\nE. Search for kfree(ctx) in the timeout path\n-\
+  \ Identify the timeout branch Stmt* (Then or Else) and recursively scan it for calls\
+  \ to \"kfree\" or \"kvfree\" whose first argument references BaseName:\n  - Implement\
+  \ a small recursive walker (DFS) over the branch subtree to find CallExpr.\n  -\
+  \ For each CallExpr with callee \"kfree\" or \"kvfree\", check if its first argument\
+  \ ExprHasName(arg, BaseName, C). If yes, mark FreeInTimeout = true.\n- Also scan\
+  \ the non-timeout branch and mark FreeInSuccess if a matching kfree(ctx) is found.\n\
+  - Additionally, detect unconditional free after the if:\n  - From the parent CompoundStmt,\
+  \ iterate the statements following the IfStmt; recursively scan them for kfree/kvfree\
+  \ with BaseName. If found, mark FreeAfterIf = true.\n\nF. Report conditions\n- If\
+  \ FreeInTimeout && FreeInSuccess:\n  - Report: \"Freeing work context in both timeout\
+  \ and success paths\"\n- Else if FreeInTimeout:\n  - Report: \"Freeing work context\
+  \ on timeout after wait_for_completion_timeout()\"\n- Else if FreeAfterIf:\n  -\
+  \ Report: \"Unconditional free of work context after timed wait\"\n- Only report\
+  \ if step D confirmed a prior queue_work on the same BaseName; otherwise, skip.\n\
+  \nG. Emitting the report\n- Create a BugType once (e.g., \"Uncoordinated free after\
+  \ timed wait\").\n- Use generateNonFatalErrorNode() and emit a PathSensitiveBugReport\
+  \ with a short message (as above). Use the kfree CallExpr location or the IfStmt\
+  \ as the report location for clarity.\n\n2.2 Optional: check::PostCall (only if\
+  \ you want to support more forms)\n- Not required by the core plan, but you can\
+  \ additionally record a simple map from variable symbols to BaseName when you see\
+  \ assignments \"ret = wait_for_completion_timeout(&BaseName->done, ...)\" so that\
+  \ in BranchCondition you don\u2019t need to find the previous sibling assignment.\
+  \ This is optional and increases complexity. The core plan works with AST-local\
+  \ scanning in BranchCondition.\n\n3. Helper functions you will write inside the\
+  \ checker\n- bool isCallNamed(const CallExpr *CE, StringRef Name)\n  - Match callee\
+  \ identifier name.\n- bool extractBaseVarNameFromCompletionArg(const Expr *Arg,\
+  \ std::string &OutName)\n  - Expect &ME; get MemberExpr ME; then extract DeclRefExpr\
+  \ base name.\n- bool branchContainsFreeOfBaseName(const Stmt *S, StringRef BaseName,\
+  \ CheckerContext &C)\n  - Recursively walk S; if CallExpr to kfree/kvfree with argument\
+  \ ExprHasName(arg, BaseName, C), return true.\n- bool compoundHasQueueWorkWithBaseNameBefore(const\
+  \ CompoundStmt *CS, const IfStmt *IfS, StringRef BaseName, CheckerContext &C)\n\
+  \  - Iterate statements before IfS; recursively search for CallExpr to queue_* and\
+  \ check second argument contains both BaseName and \"work\".\n\n4. Notes and simplifications\n\
+  - This checker is intentionally local (AST-based) and does not rely on path-sensitive\
+  \ program state. It focuses on the typical kernel pattern:\n  - queue_work(...,\
+  \ &ctx->work);\n  - wait_for_completion_timeout(&ctx->done, ...);\n  - kfree(ctx)\
+  \ in timeout branch or unconditionally after the if.\n- Member names for the completion\
+  \ can be \"compl\"/\"done\"; the checker does not rely on the exact member name\u2014\
+  only that it sees &BaseName->(any member) and correlates BaseName across queue_work,\
+  \ wait_for_completion_timeout, and kfree.\n- Free functions checked: \"kfree\",\
+  \ \"kvfree\". You can extend with \"vfree\" if desired.\n- The report messages should\
+  \ be short and clear, per Suggestions.\n\n5. Summary of minimal callbacks used\n\
+  - check::BranchCondition: Main logic to detect the pattern, correlate BaseName,\
+  \ confirm prior queue_work, and find kfree in timeout/success/after-if positions."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include <string>\n#include <utility>\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// No custom\
+  \ program states needed for this checker.\n // If necessary\n\nnamespace {\n\nclass\
+  \ SAGenTestChecker : public Checker<check::BranchCondition> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Uncoordinated\
+  \ free after timed wait\", \"Concurrency\")) {}\n\n      void checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const;\n\n   private:\n\n      // Helpers\n\
+  \      static bool isCallNamed(const CallExpr *CE, StringRef Name, CheckerContext\
+  \ &C);\n      static const CallExpr *findCallByNameInStmt(const Stmt *S, StringRef\
+  \ Name, CheckerContext &C);\n      static bool extractBaseVarNameFromCompletionArg(const\
+  \ Expr *Arg, std::string &OutName);\n      static const IfStmt *getEnclosingIf(const\
+  \ Stmt *Condition, CheckerContext &C);\n\n      static const Stmt *getPrevSibling(const\
+  \ CompoundStmt *CS, const Stmt *S);\n      static bool findPrevWaitAssignment(const\
+  \ CompoundStmt *CS, const IfStmt *IfS,\n                                       \
+  \  const std::string &VarName,\n                                         const CallExpr\
+  \ *&OutWaitCall,\n                                         const BinaryOperator\
+  \ *&OutAssign,\n                                         const DeclStmt *&OutDecl);\n\
+  \      static bool isZeroExpr(const Expr *E, CheckerContext &C);\n      static const\
+  \ Stmt *determineTimeoutBranchForDirectCall(const IfStmt *IfS, const Stmt *CondS,\
+  \ CheckerContext &C);\n      static const Stmt *determineTimeoutBranchForVarCond(const\
+  \ IfStmt *IfS, const Expr *CondE, CheckerContext &C);\n\n      static bool branchContainsFreeOfBaseName(const\
+  \ Stmt *S, StringRef BaseName, CheckerContext &C, const CallExpr **FoundFree = nullptr);\n\
+  \      static bool stmtContainsFreeOfBaseName(const Stmt *S, StringRef BaseName,\
+  \ CheckerContext &C, const CallExpr **FoundFree = nullptr);\n      static bool compoundHasQueueWorkWithBaseNameBefore(const\
+  \ CompoundStmt *CS, const IfStmt *IfS, StringRef BaseName, CheckerContext &C);\n\
+  \      static bool subsequentStatementsContainFree(const CompoundStmt *CS, const\
+  \ IfStmt *IfS, StringRef BaseName, CheckerContext &C, const CallExpr **FoundFree\
+  \ = nullptr);\n\n      void emitReport(CheckerContext &C, StringRef Msg, const Stmt\
+  \ *LocStmt) const;\n};\n\n// ============= Helper Implementations =============\n\
+  \nbool SAGenTestChecker::isCallNamed(const CallExpr *CE, StringRef Name, CheckerContext\
+  \ &C) {\n  if (!CE) return false;\n  const Expr *Callee = CE->getCallee();\n  if\
+  \ (!Callee) return false;\n  // Use source-text based name check as suggested.\n\
+  \  return ExprHasName(Callee, Name, C);\n}\n\nconst CallExpr *SAGenTestChecker::findCallByNameInStmt(const\
+  \ Stmt *S, StringRef Name, CheckerContext &C) {\n  if (!S) return nullptr;\n  if\
+  \ (const auto *CE = dyn_cast<CallExpr>(S)) {\n    if (isCallNamed(CE, Name, C))\n\
+  \      return CE;\n  }\n  for (const Stmt *Child : S->children()) {\n    if (const\
+  \ CallExpr *Found = findCallByNameInStmt(Child, Name, C))\n      return Found;\n\
+  \  }\n  return nullptr;\n}\n\nbool SAGenTestChecker::extractBaseVarNameFromCompletionArg(const\
+  \ Expr *Arg, std::string &OutName) {\n  if (!Arg) return false;\n  const Expr *E\
+  \ = Arg->IgnoreParenImpCasts();\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_AddrOf)\n      E = UO->getSubExpr()->IgnoreParenImpCasts();\n\
+  \  }\n  if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    const Expr *Base =\
+  \ ME->getBase()->IgnoreParenImpCasts();\n    // Drill through nested MemberExpr\
+  \ if present.\n    while (const auto *InnerME = dyn_cast<MemberExpr>(Base)) {\n\
+  \      Base = InnerME->getBase()->IgnoreParenImpCasts();\n    }\n    if (const auto\
+  \ *DRE = dyn_cast<DeclRefExpr>(Base)) {\n      OutName = DRE->getDecl()->getNameAsString();\n\
+  \      return !OutName.empty();\n    }\n  }\n  // Fallback: look for a DeclRefExpr\
+  \ anywhere within Arg.\n  if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(Arg))\
+  \ {\n    OutName = DRE->getDecl()->getNameAsString();\n    return !OutName.empty();\n\
+  \  }\n  return false;\n}\n\nconst IfStmt *SAGenTestChecker::getEnclosingIf(const\
+  \ Stmt *Condition, CheckerContext &C) {\n  return findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n}\n\nconst Stmt *SAGenTestChecker::getPrevSibling(const CompoundStmt *CS,\
+  \ const Stmt *S) {\n  if (!CS || !S) return nullptr;\n  const Stmt *Prev = nullptr;\n\
+  \  for (const Stmt *Child : CS->body()) {\n    if (Child == S)\n      return Prev;\n\
+  \    Prev = Child;\n  }\n  return nullptr;\n}\n\nbool SAGenTestChecker::findPrevWaitAssignment(const\
+  \ CompoundStmt *CS, const IfStmt *IfS,\n                                       \
+  \       const std::string &VarName,\n                                          \
+  \    const CallExpr *&OutWaitCall,\n                                           \
+  \   const BinaryOperator *&OutAssign,\n                                        \
+  \      const DeclStmt *&OutDecl) {\n  OutWaitCall = nullptr;\n  OutAssign = nullptr;\n\
+  \  OutDecl = nullptr;\n  if (!CS || !IfS) return false;\n\n  const Stmt *Prev =\
+  \ getPrevSibling(CS, IfS);\n  if (!Prev) return false;\n\n  // Case 1: Declaration\
+  \ with initializer\n  if (const auto *DS = dyn_cast<DeclStmt>(Prev)) {\n    for\
+  \ (const Decl *D : DS->decls()) {\n      if (const auto *VD = dyn_cast<VarDecl>(D))\
+  \ {\n        if (VD->getName() == VarName && VD->hasInit()) {\n          if (const\
+  \ auto *CE = dyn_cast<CallExpr>(VD->getInit()->IgnoreParenImpCasts())) {\n     \
+  \       OutWaitCall = CE;\n            OutDecl = DS;\n            return true;\n\
+  \          }\n        }\n      }\n    }\n  }\n\n  // Case 2: Assignment\n  if (const\
+  \ auto *BO = dyn_cast<BinaryOperator>(Prev)) {\n    if (BO->getOpcode() == BO_Assign)\
+  \ {\n      const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n      if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(LHS)) {\n        if (DRE->getDecl()->getName()\
+  \ == VarName) {\n          if (const auto *CE = dyn_cast<CallExpr>(BO->getRHS()->IgnoreParenImpCasts()))\
+  \ {\n            OutWaitCall = CE;\n            OutAssign = BO;\n            return\
+  \ true;\n          }\n        }\n      }\n    }\n  }\n\n  return false;\n}\n\nbool\
+  \ SAGenTestChecker::isZeroExpr(const Expr *E, CheckerContext &C) {\n  if (!E) return\
+  \ false;\n  llvm::APSInt Val;\n  if (EvaluateExprToInt(Val, E->IgnoreParenImpCasts(),\
+  \ C)) {\n    return Val == 0;\n  }\n  return false;\n}\n\nconst Stmt *SAGenTestChecker::determineTimeoutBranchForDirectCall(const\
+  \ IfStmt *IfS, const Stmt *CondS, CheckerContext &C) {\n  if (!IfS || !CondS) return\
+  \ nullptr;\n  // Handle \"!wait_for_completion_timeout(...)\"\n  if (const auto\
+  \ *UO = dyn_cast<UnaryOperator>(CondS)) {\n    if (UO->getOpcode() == UO_LNot) {\n\
+  \      if (findCallByNameInStmt(UO->getSubExpr(), \"wait_for_completion_timeout\"\
+  , C)) {\n        return IfS->getThen(); // !ret -> Then is timeout\n      }\n  \
+  \  }\n  }\n  // Handle \"wait_for_completion_timeout(...)\" being used directly\n\
+  \  if (findCallByNameInStmt(CondS, \"wait_for_completion_timeout\", C)) {\n    return\
+  \ IfS->getElse(); // non-zero -> success in Then, Else is timeout\n  }\n  return\
+  \ nullptr;\n}\n\nconst Stmt *SAGenTestChecker::determineTimeoutBranchForVarCond(const\
+  \ IfStmt *IfS, const Expr *CondE, CheckerContext &C) {\n  if (!IfS || !CondE) return\
+  \ nullptr;\n  CondE = CondE->IgnoreParenImpCasts();\n\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      // if (!ret) -> Then is timeout\n\
+  \      return IfS->getThen();\n    }\n  } else if (const auto *BO = dyn_cast<BinaryOperator>(CondE))\
+  \ {\n    if (BO->getOpcode() == BO_EQ || BO->getOpcode() == BO_NE) {\n      const\
+  \ Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n      const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \      bool LHSZero = isZeroExpr(LHS, C);\n      bool RHSZero = isZeroExpr(RHS,\
+  \ C);\n      if ((BO->getOpcode() == BO_EQ) && (LHSZero ^ RHSZero)) {\n        //\
+  \ ret == 0 -> Then is timeout\n        return IfS->getThen();\n      }\n      if\
+  \ ((BO->getOpcode() == BO_NE) && (LHSZero ^ RHSZero)) {\n        // ret != 0 ->\
+  \ Else is timeout\n        return IfS->getElse();\n      }\n    }\n  } else if (isa<DeclRefExpr>(CondE))\
+  \ {\n    // if (ret) -> Else is timeout (ret == 0)\n    return IfS->getElse();\n\
+  \  }\n\n  return nullptr;\n}\n\nbool SAGenTestChecker::stmtContainsFreeOfBaseName(const\
+  \ Stmt *S, StringRef BaseName, CheckerContext &C, const CallExpr **FoundFree) {\n\
+  \  if (!S) return false;\n  if (const auto *CE = dyn_cast<CallExpr>(S)) {\n    if\
+  \ (isCallNamed(CE, \"kfree\", C) || isCallNamed(CE, \"kvfree\", C)) {\n      if\
+  \ (CE->getNumArgs() >= 1) {\n        const Expr *Arg0 = CE->getArg(0);\n       \
+  \ if (Arg0 && ExprHasName(Arg0, BaseName, C)) {\n          if (FoundFree) *FoundFree\
+  \ = CE;\n          return true;\n        }\n      }\n    }\n  }\n  for (const Stmt\
+  \ *Child : S->children()) {\n    if (stmtContainsFreeOfBaseName(Child, BaseName,\
+  \ C, FoundFree))\n      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::branchContainsFreeOfBaseName(const\
+  \ Stmt *S, StringRef BaseName, CheckerContext &C, const CallExpr **FoundFree) {\n\
+  \  return stmtContainsFreeOfBaseName(S, BaseName, C, FoundFree);\n}\n\nbool SAGenTestChecker::compoundHasQueueWorkWithBaseNameBefore(const\
+  \ CompoundStmt *CS, const IfStmt *IfS, StringRef BaseName, CheckerContext &C) {\n\
+  \  if (!CS || !IfS) return false;\n  for (const Stmt *Child : CS->body()) {\n  \
+  \  if (Child == IfS)\n      break;\n\n    // Look for queue_* calls\n    const CallExpr\
+  \ *CE = nullptr;\n    if ((CE = findCallByNameInStmt(Child, \"queue_work_on\", C))\
+  \ ||\n        (CE = findCallByNameInStmt(Child, \"queue_work\", C)) ||\n       \
+  \ (CE = findCallByNameInStmt(Child, \"queue_delayed_work_on\", C)) ||\n        (CE\
+  \ = findCallByNameInStmt(Child, \"queue_delayed_work\", C))) {\n      unsigned WorkArgIdx\
+  \ = 0;\n      // Determine the index of the \"work\" argument\n      if (ExprHasName(CE->getCallee(),\
+  \ \"queue_work_on\", C))\n        WorkArgIdx = 2;\n      else if (ExprHasName(CE->getCallee(),\
+  \ \"queue_work\", C))\n        WorkArgIdx = 1;\n      else if (ExprHasName(CE->getCallee(),\
+  \ \"queue_delayed_work_on\", C))\n        WorkArgIdx = 2;\n      else if (ExprHasName(CE->getCallee(),\
+  \ \"queue_delayed_work\", C))\n        WorkArgIdx = 1;\n\n      if (CE->getNumArgs()\
+  \ > WorkArgIdx) {\n        const Expr *WorkArg = CE->getArg(WorkArgIdx);\n     \
+  \   if (!WorkArg) continue;\n        // Check the work argument contains BaseName\
+  \ and a member named \"work\"\n        if (ExprHasName(WorkArg, BaseName, C) &&\
+  \ ExprHasName(WorkArg, \"work\", C)) {\n          return true;\n        }\n    \
+  \  }\n    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::subsequentStatementsContainFree(const\
+  \ CompoundStmt *CS, const IfStmt *IfS, StringRef BaseName, CheckerContext &C, const\
+  \ CallExpr **FoundFree) {\n  if (!CS || !IfS) return false;\n  bool FoundIf = false;\n\
+  \  for (const Stmt *Child : CS->body()) {\n    if (!FoundIf) {\n      if (Child\
+  \ == IfS)\n        FoundIf = true;\n      continue;\n    }\n    if (stmtContainsFreeOfBaseName(Child,\
+  \ BaseName, C, FoundFree))\n      return true;\n  }\n  return false;\n}\n\n// =============\
+  \ Main Callback =============\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition) return;\n\n  const\
+  \ IfStmt *IfS = getEnclosingIf(Condition, C);\n  if (!IfS) return;\n\n  // Case\
+  \ 1: Direct call to wait_for_completion_timeout in the condition\n  const CallExpr\
+  \ *DirectCall = findCallByNameInStmt(Condition, \"wait_for_completion_timeout\"\
+  , C);\n\n  std::string BaseName;\n  const Stmt *TimeoutBranch = nullptr;\n\n  if\
+  \ (DirectCall) {\n    // Extract base from first argument (&ctx->done / &ctx->compl)\n\
+  \    if (DirectCall->getNumArgs() >= 1) {\n      if (!extractBaseVarNameFromCompletionArg(DirectCall->getArg(0),\
+  \ BaseName))\n        return;\n    } else {\n      return;\n    }\n    // Determine\
+  \ timeout branch\n    TimeoutBranch = determineTimeoutBranchForDirectCall(IfS, Condition,\
+  \ C);\n    if (!TimeoutBranch) return;\n  } else {\n    // Case 2: Variable used\
+  \ in the condition\n    const DeclRefExpr *CondVar = findSpecificTypeInChildren<DeclRefExpr>(Condition);\n\
+  \    if (!CondVar) return;\n\n    std::string VarName = CondVar->getDecl()->getNameAsString();\n\
+  \    const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IfS, C);\n\
+  \    if (!CS) return;\n\n    const CallExpr *PrevWaitCall = nullptr;\n    const\
+  \ BinaryOperator *PrevAssign = nullptr;\n    const DeclStmt *PrevDecl = nullptr;\n\
+  \n    if (!findPrevWaitAssignment(CS, IfS, VarName, PrevWaitCall, PrevAssign, PrevDecl))\n\
+  \      return;\n\n    if (!PrevWaitCall || !isCallNamed(PrevWaitCall, \"wait_for_completion_timeout\"\
+  , C))\n      return;\n\n    if (PrevWaitCall->getNumArgs() >= 1) {\n      if (!extractBaseVarNameFromCompletionArg(PrevWaitCall->getArg(0),\
+  \ BaseName))\n        return;\n    } else {\n      return;\n    }\n\n    // Determine\
+  \ timeout branch based on the condition expression\n    const Expr *CondE = dyn_cast<Expr>(Condition);\n\
+  \    if (!CondE) return;\n    TimeoutBranch = determineTimeoutBranchForVarCond(IfS,\
+  \ CondE, C);\n    if (!TimeoutBranch) return;\n  }\n\n  // Reduce FPs: confirm earlier\
+  \ queue_work(..., &BaseName->work/*...*/)\n  const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IfS,\
+  \ C);\n  if (!CS) return;\n  if (!compoundHasQueueWorkWithBaseNameBefore(CS, IfS,\
+  \ BaseName, C))\n    return;\n\n  // Identify success branch\n  const Stmt *SuccessBranch\
+  \ = (TimeoutBranch == IfS->getThen()) ? IfS->getElse() : IfS->getThen();\n\n  //\
+  \ Scan for frees\n  const CallExpr *FreeCETimeout = nullptr;\n  const CallExpr *FreeCESuccess\
+  \ = nullptr;\n  const CallExpr *FreeCEAfter = nullptr;\n\n  bool FreeInTimeout =\
+  \ TimeoutBranch ? branchContainsFreeOfBaseName(TimeoutBranch, BaseName, C, &FreeCETimeout)\
+  \ : false;\n  bool FreeInSuccess = SuccessBranch ? branchContainsFreeOfBaseName(SuccessBranch,\
+  \ BaseName, C, &FreeCESuccess) : false;\n  bool FreeAfterIf   = subsequentStatementsContainFree(CS,\
+  \ IfS, BaseName, C, &FreeCEAfter);\n\n  // Reporting logic\n  if (FreeInTimeout\
+  \ && FreeInSuccess) {\n    emitReport(C, \"Freeing work context in both timeout\
+  \ and success paths\", FreeCETimeout ? static_cast<const Stmt*>(FreeCETimeout) :\
+  \ static_cast<const Stmt*>(IfS));\n  } else if (FreeInTimeout) {\n    emitReport(C,\
+  \ \"Freeing work context on timeout after wait_for_completion_timeout()\", FreeCETimeout\
+  \ ? static_cast<const Stmt*>(FreeCETimeout) : static_cast<const Stmt*>(IfS));\n\
+  \  } else if (FreeAfterIf) {\n    emitReport(C, \"Unconditional free of work context\
+  \ after timed wait\", FreeCEAfter ? static_cast<const Stmt*>(FreeCEAfter) : static_cast<const\
+  \ Stmt*>(IfS));\n  }\n}\n\nvoid SAGenTestChecker::emitReport(CheckerContext &C,\
+  \ StringRef Msg, const Stmt *LocStmt) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg,\
+  \ N);\n  if (LocStmt)\n    R->addRange(LocStmt->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing a workqueue context on timeout after wait_for_completion_timeout(),\
+  \ which races with the worker\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

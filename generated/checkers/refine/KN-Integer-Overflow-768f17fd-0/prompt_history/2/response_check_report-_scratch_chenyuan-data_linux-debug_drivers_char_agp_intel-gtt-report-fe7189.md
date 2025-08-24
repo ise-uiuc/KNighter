@@ -1,0 +1,7 @@
+- Decision: NotABug
+- Reason: The flagged code assigns a shifted 32-bit value to a potentially wider type:
+  - *mappable_end = intel_private.gtt_mappable_entries << PAGE_SHIFT;
+  - Here, gtt_mappable_entries is a 32-bit count of pages; PAGE_SHIFT is typically 12 (or up to 16 on some arches), so the expression is evaluated in 32-bit. The report claims a 32→64-bit widening after the shift could lose bits.
+  - For truncation to occur, the 32-bit shift result would need to exceed 0xffffffff. With PAGE_SHIFT=12, that requires gtt_mappable_entries >= 2^20 (1,048,576), i.e., a mappable size > 4 GiB. This is not feasible for the AGP-era Intel GTT hardware this driver targets; typical apertures are <= 1 GiB (and often 128–512 MiB), so the shifted byte size remains well within 32-bit.
+  - On 32-bit architectures, resource_size_t is 32-bit anyway; on 64-bit, even though resource_size_t is 64-bit, the 32-bit shift result still exactly represents the required value (no high bits to lose).
+  - Thus, while the expression matches the syntactic pattern (32-bit shift then assignment to a wider type), there is no realistic scenario where overflow/truncation occurs before the assignment. No upstream fix is necessary to change behavior here, and the reported case does not demonstrate the harmful root cause described by the target bug pattern.

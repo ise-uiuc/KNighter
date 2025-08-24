@@ -1,0 +1,471 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 27834971f616c5e154423c578fa95e0444444ce1
+commit_type: Memory-Leak
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n//================ Program\
+  \ State Customization ================\n\n// Maps the return symbol of set_memory_decrypted(...)\
+  \ to the pointer's MemRegion passed in arg0.\nREGISTER_MAP_WITH_PROGRAMSTATE(SetDecryptRetSymToPtrRegion,\
+  \ SymbolRef, const MemRegion*)\n// Tracks when an integer variable holds the return\
+  \ value of set_memory_decrypted(...).\nREGISTER_MAP_WITH_PROGRAMSTATE(VarRegionToPtrRegion,\
+  \ const MemRegion*, const MemRegion*)\n// Maps the symbolic condition of an if-statement\
+  \ to the pointer\u2019s MemRegion used in set_memory_decrypted(...).\nREGISTER_MAP_WITH_PROGRAMSTATE(CondSymToPtrRegion,\
+  \ SymbolRef, const MemRegion*)\n// Records condition polarity: whether \"condition\
+  \ is true\" means failure of set_memory_decrypted(...).\nREGISTER_MAP_WITH_PROGRAMSTATE(CondSymTrueMeansFailure,\
+  \ SymbolRef, bool)\n// Set of pointer regions that are known to be in failed decryption\
+  \ transition on the current path.\nREGISTER_MAP_WITH_PROGRAMSTATE(FailedDecryptRegionSet,\
+  \ const MemRegion*, bool)\n\nnamespace {\nclass SAGenTestChecker\n  : public Checker<\n\
+  \        check::PostCall,\n        check::Bind,\n        check::BranchCondition,\n\
+  \        eval::Assume,\n        check::PreCall> {\n\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\npublic:\n  SAGenTestChecker()\n      : BT(std::make_unique<BugType>(this,\n\
+  \             \"Freeing pages after set_memory_decrypted() failure\",\n        \
+  \     \"Memory Management\")) {}\n\n  // Callbacks\n  void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const;\n  void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n  ProgramStateRef evalAssume(ProgramStateRef State,\
+  \ SVal Cond,\n                             bool Assumption) const;\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  bool isAttrTransitionFn(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  bool isPageFreeFn(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\n  const MemRegion *getPtrRegionFromExprLoose(const\
+  \ Expr *E,\n                                             CheckerContext &C) const;\n\
+  \n  const Expr *unwrapCondition(const Expr *E, CheckerContext &C) const;\n\n  //\
+  \ Analyze condition for pointer region and polarity:\n  // - Returns true on success\
+  \ and sets OutPtr and TrueMeansFailure.\n  bool analyzeConditionForPtrAndPolarity(const\
+  \ Expr *CondE,\n                                         CheckerContext &C,\n  \
+  \                                       const MemRegion *&OutPtr,\n            \
+  \                             bool &TrueMeansFailure) const;\n\n  // Small helpers\n\
+  \  bool isZeroInteger(const Expr *E, CheckerContext &C) const;\n  bool callExprIsAttrTransition(const\
+  \ Expr *E, CheckerContext &C) const;\n};\n\n//================ Helper Implementations\
+  \ ================\n\nbool SAGenTestChecker::isAttrTransitionFn(const CallEvent\
+  \ &Call,\n                                          CheckerContext &C) const {\n\
+  \  const Expr *OriginExpr = Call.getOriginExpr();\n  if (!OriginExpr)\n    return\
+  \ false;\n  // Use ExprHasName for robust callee matching\n  if (ExprHasName(OriginExpr,\
+  \ \"set_memory_decrypted\", C))\n    return true;\n  return false;\n}\n\nbool SAGenTestChecker::isPageFreeFn(const\
+  \ CallEvent &Call,\n                                    CheckerContext &C) const\
+  \ {\n  const Expr *OriginExpr = Call.getOriginExpr();\n  if (!OriginExpr)\n    return\
+  \ false;\n  // Focus on free_pages_exact for this checker (extendable)\n  if (ExprHasName(OriginExpr,\
+  \ \"free_pages_exact\", C))\n    return true;\n  return false;\n}\n\nconst MemRegion\
+  \ *SAGenTestChecker::getPtrRegionFromExprLoose(const Expr *E,\n                \
+  \                                             CheckerContext &C) const {\n  if (!E)\n\
+  \    return nullptr;\n\n  // First, try directly\n  if (const MemRegion *MR = getMemRegionFromExpr(E,\
+  \ C)) {\n    return MR->getBaseRegion();\n  }\n\n  // If that fails (due to casts\
+  \ like (unsigned long)addr), try to find a DeclRefExpr child.\n  if (const DeclRefExpr\
+  \ *DRE = findSpecificTypeInChildren<DeclRefExpr>(E)) {\n    if (const MemRegion\
+  \ *MR = getMemRegionFromExpr(DRE, C)) {\n      return MR->getBaseRegion();\n   \
+  \ }\n  }\n\n  return nullptr;\n}\n\nconst Expr *SAGenTestChecker::unwrapCondition(const\
+  \ Expr *E,\n                                              CheckerContext &C) const\
+  \ {\n  if (!E)\n    return nullptr;\n  E = E->IgnoreParenImpCasts();\n\n  // Unwrap\
+  \ likely/unlikely/__builtin_expect(foo, ...)\n  if (const auto *CE = dyn_cast<CallExpr>(E))\
+  \ {\n    const Expr *CalleeE = CE->getCallee();\n    if (CalleeE &&\n        (ExprHasName(CalleeE,\
+  \ \"__builtin_expect\", C) ||\n         ExprHasName(E, \"likely\", C) ||\n     \
+  \    ExprHasName(E, \"unlikely\", C))) {\n      if (CE->getNumArgs() > 0) {\n  \
+  \      return unwrapCondition(CE->getArg(0), C);\n      }\n    }\n  }\n\n  return\
+  \ E;\n}\n\nbool SAGenTestChecker::isZeroInteger(const Expr *E, CheckerContext &C)\
+  \ const {\n  if (!E)\n    return false;\n  llvm::APSInt Res;\n  if (EvaluateExprToInt(Res,\
+  \ E, C)) {\n    return Res == 0;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::callExprIsAttrTransition(const\
+  \ Expr *E,\n                                                CheckerContext &C) const\
+  \ {\n  if (!E)\n    return false;\n  const CallExpr *CE = dyn_cast<CallExpr>(E);\n\
+  \  if (!CE)\n    return false;\n  // Use source text matching via ExprHasName\n\
+  \  return ExprHasName(CE, \"set_memory_decrypted\", C);\n}\n\nbool SAGenTestChecker::analyzeConditionForPtrAndPolarity(const\
+  \ Expr *CondE,\n                                                         CheckerContext\
+  \ &C,\n                                                         const MemRegion\
+  \ *&OutPtr,\n                                                         bool &TrueMeansFailure)\
+  \ const {\n  OutPtr = nullptr;\n  TrueMeansFailure = true; // default conservative\n\
+  \n  if (!CondE)\n    return false;\n\n  const Expr *E = unwrapCondition(CondE, C);\n\
+  \  if (!E)\n    return false;\n\n  // 1) Handle negation: !X\n  if (const auto *UO\
+  \ = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode() == UO_LNot) {\n     \
+  \ const Expr *Sub = unwrapCondition(UO->getSubExpr(), C);\n      if (!Sub)\n   \
+  \     return false;\n\n      // !set_memory_decrypted(...)\n      if (callExprIsAttrTransition(Sub,\
+  \ C)) {\n        const auto *CE = dyn_cast<CallExpr>(Sub);\n        if (!CE || CE->getNumArgs()\
+  \ < 1)\n          return false;\n        OutPtr = getPtrRegionFromExprLoose(CE->getArg(0),\
+  \ C);\n        if (!OutPtr)\n          return false;\n        TrueMeansFailure =\
+  \ false; // !call: true => success; false => failure\n        return true;\n   \
+  \   }\n\n      // !ret  (variable holding return of set_memory_decrypted)\n    \
+  \  if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(Sub)) {\n     \
+  \   const MemRegion *VarR = getMemRegionFromExpr(DRE, C);\n        if (!VarR)\n\
+  \          return false;\n        VarR = VarR->getBaseRegion();\n        if (!VarR)\n\
+  \          return false;\n        ProgramStateRef State = C.getState();\n      \
+  \  if (const MemRegion *PtrR = State->get<VarRegionToPtrRegion>(VarR)) {\n     \
+  \     OutPtr = PtrR;\n          TrueMeansFailure = false;\n          return true;\n\
+  \        }\n      }\n      return false;\n    }\n  }\n\n  // 2) Handle equality/inequality\
+  \ with zero: X == 0, X != 0\n  if (const auto *BO = dyn_cast<BinaryOperator>(E))\
+  \ {\n    BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op == BO_EQ || Op\
+  \ == BO_NE) {\n      const Expr *LHS = unwrapCondition(BO->getLHS(), C);\n     \
+  \ const Expr *RHS = unwrapCondition(BO->getRHS(), C);\n\n      // Identify zero\
+  \ side and expression side\n      const Expr *ExprSide = nullptr;\n      if (isZeroInteger(LHS,\
+  \ C) && RHS)\n        ExprSide = RHS;\n      else if (isZeroInteger(RHS, C) && LHS)\n\
+  \        ExprSide = LHS;\n\n      if (ExprSide) {\n        // set_memory_decrypted(...)\
+  \ ==/!= 0\n        if (callExprIsAttrTransition(ExprSide, C)) {\n          const\
+  \ auto *CE = dyn_cast<CallExpr>(ExprSide);\n          if (!CE || CE->getNumArgs()\
+  \ < 1)\n            return false;\n          OutPtr = getPtrRegionFromExprLoose(CE->getArg(0),\
+  \ C);\n          if (!OutPtr)\n            return false;\n          TrueMeansFailure\
+  \ = (Op == BO_NE); // call != 0 => failure when true\n          return true;\n \
+  \       }\n\n        // ret ==/!= 0\n        if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(ExprSide))\
+  \ {\n          const MemRegion *VarR = getMemRegionFromExpr(DRE, C);\n         \
+  \ if (!VarR)\n            return false;\n          VarR = VarR->getBaseRegion();\n\
+  \          if (!VarR)\n            return false;\n          ProgramStateRef State\
+  \ = C.getState();\n          if (const MemRegion *PtrR = State->get<VarRegionToPtrRegion>(VarR))\
+  \ {\n            OutPtr = PtrR;\n            TrueMeansFailure = (Op == BO_NE);\n\
+  \            return true;\n          }\n        }\n      }\n    }\n  }\n\n  // 3)\
+  \ Direct call: if (set_memory_decrypted(...))\n  if (callExprIsAttrTransition(E,\
+  \ C)) {\n    const auto *CE = dyn_cast<CallExpr>(E);\n    if (!CE || CE->getNumArgs()\
+  \ < 1)\n      return false;\n    OutPtr = getPtrRegionFromExprLoose(CE->getArg(0),\
+  \ C);\n    if (!OutPtr)\n      return false;\n    TrueMeansFailure = true; // if\
+  \ (call) => failure when true\n    return true;\n  }\n\n  // 4) Variable alone:\
+  \ if (ret)\n  if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(E))\
+  \ {\n    const MemRegion *VarR = getMemRegionFromExpr(DRE, C);\n    if (VarR) {\n\
+  \      VarR = VarR->getBaseRegion();\n      if (VarR) {\n        ProgramStateRef\
+  \ State = C.getState();\n        if (const MemRegion *PtrR = State->get<VarRegionToPtrRegion>(VarR))\
+  \ {\n          OutPtr = PtrR;\n          TrueMeansFailure = true; // if (ret) =>\
+  \ failure when true\n          return true;\n        }\n      }\n    }\n  }\n\n\
+  \  return false;\n}\n\n//================ Core Callbacks ================\n\nvoid\
+  \ SAGenTestChecker::checkPostCall(const CallEvent &Call,\n                     \
+  \                CheckerContext &C) const {\n  if (!isAttrTransitionFn(Call, C))\n\
+  \    return;\n\n  // Extract the pointer region from arg0 (may be wrapped in casts).\n\
+  \  const Expr *Arg0E = Call.getArgExpr(0);\n  const MemRegion *PtrR = getPtrRegionFromExprLoose(Arg0E,\
+  \ C);\n  if (!PtrR)\n    return;\n\n  // Get the return symbol of set_memory_decrypted(...)\n\
+  \  SVal RetVal = Call.getReturnValue();\n  SymbolRef RetSym = RetVal.getAsSymbol();\n\
+  \  if (!RetSym)\n    return;\n\n  ProgramStateRef State = C.getState();\n  State\
+  \ = State->set<SetDecryptRetSymToPtrRegion>(RetSym, PtrR);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,\n     \
+  \                            CheckerContext &C) const {\n  // If we bind ret = (symbol\
+  \ from set_memory_decrypted(...)), track that\n  const MemRegion *LHSReg = Loc.getAsRegion();\n\
+  \  if (!LHSReg)\n    return;\n  LHSReg = LHSReg->getBaseRegion();\n  if (!LHSReg)\n\
+  \    return;\n\n  SymbolRef Sym = Val.getAsSymbol();\n  if (!Sym)\n    return;\n\
+  \n  ProgramStateRef State = C.getState();\n  if (const MemRegion *PtrR = State->get<SetDecryptRetSymToPtrRegion>(Sym))\
+  \ {\n    State = State->set<VarRegionToPtrRegion>(LHSReg, PtrR);\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const Stmt *Condition,\n\
+  \                                            CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE) {\n    C.addTransition(State);\n    return;\n  }\n\n  const MemRegion\
+  \ *PtrR = nullptr;\n  bool TrueMeansFailure = true;\n\n  if (!analyzeConditionForPtrAndPolarity(CondE,\
+  \ C, PtrR, TrueMeansFailure)) {\n    C.addTransition(State);\n    return;\n  }\n\
+  \n  // Map the symbolic condition to pointer region and polarity\n  SVal CondVal\
+  \ = State->getSVal(CondE, C.getLocationContext());\n  SymbolRef CondSym = CondVal.getAsSymbol();\n\
+  \  if (!CondSym) {\n    C.addTransition(State);\n    return;\n  }\n\n  State = State->set<CondSymToPtrRegion>(CondSym,\
+  \ PtrR);\n  State = State->set<CondSymTrueMeansFailure>(CondSym, TrueMeansFailure);\n\
+  \  C.addTransition(State);\n}\n\nProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef\
+  \ State, SVal Cond,\n                                             bool Assumption)\
+  \ const {\n  SymbolRef CondSym = Cond.getAsSymbol();\n  if (!CondSym)\n    return\
+  \ State;\n\n  const MemRegion *PtrR = State->get<CondSymToPtrRegion>(CondSym);\n\
+  \  if (!PtrR)\n    return State;\n\n  const bool *TMFPtr = State->get<CondSymTrueMeansFailure>(CondSym);\n\
+  \  bool TrueMeansFailure = TMFPtr ? *TMFPtr : true;\n\n  // If assumption matches\
+  \ polarity, then we are on \"failure\" path.\n  if (Assumption == TrueMeansFailure)\
+  \ {\n    State = State->set<FailedDecryptRegionSet>(PtrR, true);\n  } else {\n \
+  \   State = State->remove<FailedDecryptRegionSet>(PtrR);\n  }\n\n  return State;\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call,\n              \
+  \                      CheckerContext &C) const {\n  if (!isPageFreeFn(Call, C))\n\
+  \    return;\n\n  const Expr *Arg0E = Call.getArgExpr(0);\n  const MemRegion *FreeR\
+  \ = getPtrRegionFromExprLoose(Arg0E, C);\n  if (!FreeR)\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n  const bool *Failed = State->get<FailedDecryptRegionSet>(FreeR);\n\
+  \  if (Failed && *Failed) {\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    if (!N)\n      return;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \        *BT, \"Freeing pages after set_memory_decrypted() failure\", N);\n    R->addRange(Call.getSourceRange());\n\
+  \    C.emitReport(std::move(R));\n  }\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects freeing of pages after set_memory_decrypted()\
+  \ failure\", \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nvirt: tdx-guest: Just leak decrypted memory on unrecoverable\
+  \ errors\n\nIn CoCo VMs it is possible for the untrusted host to cause\nset_memory_decrypted()\
+  \ to fail such that an error is returned\nand the resulting memory is shared. Callers\
+  \ need to take care\nto handle these errors to avoid returning decrypted (shared)\n\
+  memory to the page allocator, which could lead to functional\nor security issues.\n\
+  \nLeak the decrypted memory when set_memory_decrypted() fails,\nand don't need to\
+  \ print an error since set_memory_decrypted()\nwill call WARN_ONCE().\n\nFixes:\
+  \ f4738f56d1dc (\"virt: tdx-guest: Add Quote generation support using TSM_REPORTS\"\
+  )\nSigned-off-by: Li RongQing <lirongqing@baidu.com>\nSigned-off-by: Dave Hansen\
+  \ <dave.hansen@linux.intel.com>\nSigned-off-by: Ingo Molnar <mingo@kernel.org>\n\
+  Reviewed-by: Rick Edgecombe <rick.p.edgecombe@intel.com>\nReviewed-by: Kirill A.\
+  \ Shutemov <kirill.shutemov@linux.intel.com>\nCc: stable@vger.kernel.org\nLink:\
+  \ https://lore.kernel.org/all/20240619111801.25630-1-lirongqing%40baidu.com\n\n\
+  ## Buggy Code\n\n```c\n// Function: alloc_quote_buf in drivers/virt/coco/tdx-guest/tdx-guest.c\n\
+  static void *alloc_quote_buf(void)\n{\n\tsize_t len = PAGE_ALIGN(GET_QUOTE_BUF_SIZE);\n\
+  \tunsigned int count = len >> PAGE_SHIFT;\n\tvoid *addr;\n\n\taddr = alloc_pages_exact(len,\
+  \ GFP_KERNEL | __GFP_ZERO);\n\tif (!addr)\n\t\treturn NULL;\n\n\tif (set_memory_decrypted((unsigned\
+  \ long)addr, count)) {\n\t\tfree_pages_exact(addr, len);\n\t\treturn NULL;\n\t}\n\
+  \n\treturn addr;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/virt/coco/tdx-guest/tdx-guest.c\
+  \ b/drivers/virt/coco/tdx-guest/tdx-guest.c\nindex d7db6c824e13..224e7dde9cde 100644\n\
+  --- a/drivers/virt/coco/tdx-guest/tdx-guest.c\n+++ b/drivers/virt/coco/tdx-guest/tdx-guest.c\n\
+  @@ -124,10 +124,8 @@ static void *alloc_quote_buf(void)\n \tif (!addr)\n \t\treturn\
+  \ NULL;\n \n-\tif (set_memory_decrypted((unsigned long)addr, count)) {\n-\t\tfree_pages_exact(addr,\
+  \ len);\n+\tif (set_memory_decrypted((unsigned long)addr, count))\n \t\treturn NULL;\n\
+  -\t}\n \n \treturn addr;\n }\n```\n"
+pattern: "## Bug Pattern\n\nFreeing pages after a failed set_memory_decrypted() (or\
+  \ similar memory attribute transition) under the assumption that failure means \u201C\
+  no state change.\u201D\n\nExample:\n```\naddr = alloc_pages_exact(len, GFP_KERNEL|__GFP_ZERO);\n\
+  if (set_memory_decrypted((unsigned long)addr, count)) {\n    free_pages_exact(addr,\
+  \ len);  // BUG: may return decrypted/shared pages to allocator\n    return NULL;\n\
+  }\n```\n\nIn CoCo guests, set_memory_decrypted() can fail while leaving pages decrypted/shared.\
+  \ Returning such pages to the allocator can cause security/functional issues. The\
+  \ correct handling is to leak/quarantine the pages on failure, not free them."
+plan: "1) Program state customization\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(SetDecryptRetSymToPtrRegion,\
+  \ SymbolRef, const MemRegion*)\n  - Maps the return symbol of set_memory_decrypted(...)\
+  \ to the pointer\u2019s MemRegion passed in arg0.\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(VarRegionToPtrRegion,\
+  \ const MemRegion*, const MemRegion*)\n  - Tracks when an integer variable (e.g.,\
+  \ ret) holds the return value of set_memory_decrypted(...), so we can later resolve\
+  \ conditions like if (ret).\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(CondSymToPtrRegion,\
+  \ SymbolRef, const MemRegion*)\n  - Maps the symbolic condition of an if-statement\
+  \ to the pointer\u2019s MemRegion that was passed to set_memory_decrypted(...).\n\
+  \n- REGISTER_MAP_WITH_PROGRAMSTATE(CondSymTrueMeansFailure, SymbolRef, bool)\n \
+  \ - Records the condition polarity: whether \u201Ccondition is true\u201D means\
+  \ the set_memory_decrypted(...) call failed.\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(FailedDecryptRegionSet,\
+  \ const MemRegion*, bool)\n  - Set of pointer regions that are known to be in \u201C\
+  failed decryption transition\u201D state on the current path. Any free on a region\
+  \ in this set is a bug.\n\n\n2) Helper detection utilities (internal to the checker)\n\
+  \n- bool isAttrTransitionFn(const CallEvent &Call)\n  - Return true if callee name\
+  \ is \u201Cset_memory_decrypted\u201D (optionally extendable to \u201Cset_memory_shared\u201D\
+  , etc.).\n\n- bool isPageFreeFn(const CallEvent &Call)\n  - Return true if callee\
+  \ is a page-freeing API that accepts the original pointer (e.g., \u201Cfree_pages_exact\u201D\
+  ; optionally \u201Cvfree\u201D, \u201Ckvfree\u201D if needed).\n\n- const MemRegion*\
+  \ getPtrRegionFromExprLoose(const Expr *E, CheckerContext &C)\n  - Robustly recover\
+  \ the pointer region from E:\n    - First try getMemRegionFromExpr(E, C).\n    -\
+  \ If that fails (e.g., due to casts like (unsigned long)addr), search for the DeclRefExpr\
+  \ child via findSpecificTypeInChildren<DeclRefExpr>(E) and then call getMemRegionFromExpr\
+  \ on that DRE.\n\n- Analyze condition polarity helper:\n  - Given the branch condition\
+  \ Stmt* Cond:\n    - Unwrap common wrappers: parentheses/implicit casts; also handle\
+  \ __builtin_expect/likely/unlikely by grabbing the first argument if the callee\
+  \ name matches (\u201C__builtin_expect\u201D, \u201Clikely\u201D, \u201Cunlikely\u201D\
+  ) using ExprHasName on the callee text.\n    - Detect forms:\n      - Direct: set_memory_decrypted(...)\
+  \ -> TrueMeansFailure = true\n      - Negated: !set_memory_decrypted(...) -> TrueMeansFailure\
+  \ = false\n      - Compare to 0: set_memory_decrypted(...) == 0 -> false; != 0 ->\
+  \ true\n      - Variable: ret -> true; !ret -> false; ret == 0 -> false; ret !=\
+  \ 0 -> true\n    - Use EvaluateExprToInt on the non-call/non-ret side to check if\
+  \ it is a zero integer.\n    - If none matches, default TrueMeansFailure = true\
+  \ (conservative).\n\n\n3) checkPostCall (record return symbol and pointer argument\
+  \ for set_memory_decrypted)\n\n- If isAttrTransitionFn(Call):\n  - Extract the pointer\
+  \ region R from arg0 using getPtrRegionFromExprLoose(Call.getArgExpr(0), C).\n \
+  \ - Obtain the return SVal SV = Call.getReturnValue(). If SV has a SymbolRef S,\
+  \ record:\n    - State = State->set(SetDecryptRetSymToPtrRegion, S, R).\n  - Do\
+  \ not mark any failure/success here; that is decided when the value is used in a\
+  \ condition.\n\n\n4) checkBind (connect \u201Cret = set_memory_decrypted(...)\u201D\
+  \ to pointer region)\n\n- When binding Loc = Val:\n  - If Val has a SymbolRef S\
+  \ and SetDecryptRetSymToPtrRegion contains S -> Rptr,\n    - If Loc refers to a\
+  \ variable\u2019s MemRegion Rvar (e.g., the int ret variable),\n      - State =\
+  \ State->set(VarRegionToPtrRegion, Rvar, Rptr).\n  - This makes future conditions\
+  \ on \u201Cret\u201D resolvable back to the pointer region.\n\n\n5) checkBranchCondition\
+  \ (identify conditions and set polarity mapping)\n\n- Let Cond be the Condition\
+  \ Stmt.\n- Goal: map the symbolic condition to the pointer region plus polarity.\n\
+  - Steps:\n  - Try Case A: Condition contains a CallExpr to set_memory_decrypted(...):\n\
+  \    - Find that CallExpr (findSpecificTypeInChildren<CallExpr>(Cond)) and verify\
+  \ with isAttrTransitionFn by callee name.\n    - Extract pointer region Rptr from\
+  \ its arg0 via getPtrRegionFromExprLoose.\n    - Compute TrueMeansFailure by analyzing\
+  \ the shape of Cond (direct/negated/==0/!=0) as described in \u201CAnalyze condition\
+  \ polarity\u201D.\n  - Else Case B: Condition is about a result variable (DeclRefExpr):\n\
+  \    - Find DeclRefExpr in Cond (findSpecificTypeInChildren<DeclRefExpr>(Cond)).\n\
+  \    - Get its MemRegion Rvar.\n    - If VarRegionToPtrRegion contains Rvar -> Rptr,\
+  \ then compute TrueMeansFailure similarly (direct/negated/==0/!=0).\n  - If Rptr\
+  \ is identified:\n    - Obtain the symbolic condition SVal of Cond using C.getSVal(Cond)\
+  \ and extract its SymbolRef S.\n    - Record in state:\n      - CondSymToPtrRegion[S]\
+  \ = Rptr\n      - CondSymTrueMeansFailure[S] = TrueMeansFailure\n\n\n6) evalAssume\
+  \ (mark failure path based on the branch decision)\n\n- Input: State, Cond SVal,\
+  \ Assumption (true/false).\n- If Cond has a SymbolRef S and CondSymToPtrRegion contains\
+  \ S -> Rptr:\n  - Read TrueMeansFailure = CondSymTrueMeansFailure[S].\n  - If Assumption\
+  \ == TrueMeansFailure:\n    - This is the \u201Cfailure\u201D branch (set_memory_decrypted()\
+  \ returned non-zero).\n    - State = State->set(FailedDecryptRegionSet, Rptr, true)\n\
+  \  - Else:\n    - This is the \u201Csuccess\u201D branch; optionally clear:\n  \
+  \    - State = State->remove(FailedDecryptRegionSet, Rptr)  // be conservative\n\
+  - Return updated State.\n\n\n7) checkPreCall (report freeing of decrypted/shared\
+  \ pages on failure path)\n\n- If isPageFreeFn(Call):\n  - Extract the pointer argument\u2019\
+  s region Rfree from arg0 via getPtrRegionFromExprLoose.\n  - If FailedDecryptRegionSet\
+  \ contains Rfree:\n    - Generate a non-fatal error node and emit a PathSensitiveBugReport:\n\
+  \      - Short message: \u201CFreeing pages after set_memory_decrypted() failure.\u201D\
+  \n      - Provide the CallExpr to free_pages_exact (or the freeing API) as the report\
+  \ location.\n\n\n8) Notes and simplifications\n\n- Focus on \u201Cset_memory_decrypted\u201D\
+  \ as the attribute transition function. The design allows easy extension to others\
+  \ by updating isAttrTransitionFn.\n- Focus on \u201Cfree_pages_exact\u201D (and\
+  \ optionally add \u201Cvfree\u201D, \u201Ckvfree\u201D if needed) as freeing APIs\
+  \ via isPageFreeFn.\n- The polarity analysis covers the common cases:\n  - if (call)\
+  \ / if (!call)\n  - if (call == 0) / if (call != 0)\n  - if (ret) / if (!ret)\n\
+  \  - if (ret == 0) / if (ret != 0)\n  - It also unwraps likely/unlikely/__builtin_expect\
+  \ by inspecting the first argument.\n- Use the provided helpers: findSpecificTypeInChildren,\
+  \ EvaluateExprToInt, getMemRegionFromExpr, ExprHasName, getMemRegionFromExpr, and\
+  \ CheckerContext::getSVal on the Condition to retrieve the condition symbol.\n-\
+  \ No need to aggressively clean up maps; path-sensitivity keeps states separate.\
+  \ Optionally remove CondSym* mappings after evalAssume if desired."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n//================ Program\
+  \ State Customization ================\n\n// Maps the return symbol of set_memory_decrypted(...)\
+  \ to the pointer's MemRegion passed in arg0.\nREGISTER_MAP_WITH_PROGRAMSTATE(SetDecryptRetSymToPtrRegion,\
+  \ SymbolRef, const MemRegion*)\n// Tracks when an integer variable holds the return\
+  \ value of set_memory_decrypted(...).\nREGISTER_MAP_WITH_PROGRAMSTATE(VarRegionToPtrRegion,\
+  \ const MemRegion*, const MemRegion*)\n// Maps the symbolic condition of an if-statement\
+  \ to the pointer\u2019s MemRegion used in set_memory_decrypted(...).\nREGISTER_MAP_WITH_PROGRAMSTATE(CondSymToPtrRegion,\
+  \ SymbolRef, const MemRegion*)\n// Records condition polarity: whether \"condition\
+  \ is true\" means failure of set_memory_decrypted(...).\nREGISTER_MAP_WITH_PROGRAMSTATE(CondSymTrueMeansFailure,\
+  \ SymbolRef, bool)\n// Set of pointer regions that are known to be in failed decryption\
+  \ transition on the current path.\nREGISTER_MAP_WITH_PROGRAMSTATE(FailedDecryptRegionSet,\
+  \ const MemRegion*, bool)\n\nnamespace {\nclass SAGenTestChecker\n  : public Checker<\n\
+  \        check::PostCall,\n        check::Bind,\n        check::BranchCondition,\n\
+  \        eval::Assume,\n        check::PreCall> {\n\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\npublic:\n  SAGenTestChecker()\n      : BT(std::make_unique<BugType>(this,\n\
+  \             \"Freeing pages after set_memory_decrypted() failure\",\n        \
+  \     \"Memory Management\")) {}\n\n  // Callbacks\n  void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const;\n  void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n  ProgramStateRef evalAssume(ProgramStateRef State,\
+  \ SVal Cond,\n                             bool Assumption) const;\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  bool isAttrTransitionFn(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  bool isPageFreeFn(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\n  const MemRegion *getPtrRegionFromExprLoose(const\
+  \ Expr *E,\n                                             CheckerContext &C) const;\n\
+  \n  const Expr *unwrapCondition(const Expr *E, CheckerContext &C) const;\n\n  //\
+  \ Analyze condition for pointer region and polarity:\n  // - Returns true on success\
+  \ and sets OutPtr and TrueMeansFailure.\n  bool analyzeConditionForPtrAndPolarity(const\
+  \ Expr *CondE,\n                                         CheckerContext &C,\n  \
+  \                                       const MemRegion *&OutPtr,\n            \
+  \                             bool &TrueMeansFailure) const;\n\n  // Small helpers\n\
+  \  bool isZeroInteger(const Expr *E, CheckerContext &C) const;\n  bool callExprIsAttrTransition(const\
+  \ Expr *E, CheckerContext &C) const;\n};\n\n//================ Helper Implementations\
+  \ ================\n\nbool SAGenTestChecker::isAttrTransitionFn(const CallEvent\
+  \ &Call,\n                                          CheckerContext &C) const {\n\
+  \  const Expr *OriginExpr = Call.getOriginExpr();\n  if (!OriginExpr)\n    return\
+  \ false;\n  // Use ExprHasName for robust callee matching\n  if (ExprHasName(OriginExpr,\
+  \ \"set_memory_decrypted\", C))\n    return true;\n  return false;\n}\n\nbool SAGenTestChecker::isPageFreeFn(const\
+  \ CallEvent &Call,\n                                    CheckerContext &C) const\
+  \ {\n  const Expr *OriginExpr = Call.getOriginExpr();\n  if (!OriginExpr)\n    return\
+  \ false;\n  // Focus on free_pages_exact for this checker (extendable)\n  if (ExprHasName(OriginExpr,\
+  \ \"free_pages_exact\", C))\n    return true;\n  return false;\n}\n\nconst MemRegion\
+  \ *SAGenTestChecker::getPtrRegionFromExprLoose(const Expr *E,\n                \
+  \                                             CheckerContext &C) const {\n  if (!E)\n\
+  \    return nullptr;\n\n  // First, try directly\n  if (const MemRegion *MR = getMemRegionFromExpr(E,\
+  \ C)) {\n    return MR->getBaseRegion();\n  }\n\n  // If that fails (due to casts\
+  \ like (unsigned long)addr), try to find a DeclRefExpr child.\n  if (const DeclRefExpr\
+  \ *DRE = findSpecificTypeInChildren<DeclRefExpr>(E)) {\n    if (const MemRegion\
+  \ *MR = getMemRegionFromExpr(DRE, C)) {\n      return MR->getBaseRegion();\n   \
+  \ }\n  }\n\n  return nullptr;\n}\n\nconst Expr *SAGenTestChecker::unwrapCondition(const\
+  \ Expr *E,\n                                              CheckerContext &C) const\
+  \ {\n  if (!E)\n    return nullptr;\n  E = E->IgnoreParenImpCasts();\n\n  // Unwrap\
+  \ likely/unlikely/__builtin_expect(foo, ...)\n  if (const auto *CE = dyn_cast<CallExpr>(E))\
+  \ {\n    const Expr *CalleeE = CE->getCallee();\n    if (CalleeE &&\n        (ExprHasName(CalleeE,\
+  \ \"__builtin_expect\", C) ||\n         ExprHasName(E, \"likely\", C) ||\n     \
+  \    ExprHasName(E, \"unlikely\", C))) {\n      if (CE->getNumArgs() > 0) {\n  \
+  \      return unwrapCondition(CE->getArg(0), C);\n      }\n    }\n  }\n\n  return\
+  \ E;\n}\n\nbool SAGenTestChecker::isZeroInteger(const Expr *E, CheckerContext &C)\
+  \ const {\n  if (!E)\n    return false;\n  llvm::APSInt Res;\n  if (EvaluateExprToInt(Res,\
+  \ E, C)) {\n    return Res == 0;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::callExprIsAttrTransition(const\
+  \ Expr *E,\n                                                CheckerContext &C) const\
+  \ {\n  if (!E)\n    return false;\n  const CallExpr *CE = dyn_cast<CallExpr>(E);\n\
+  \  if (!CE)\n    return false;\n  // Use source text matching via ExprHasName\n\
+  \  return ExprHasName(CE, \"set_memory_decrypted\", C);\n}\n\nbool SAGenTestChecker::analyzeConditionForPtrAndPolarity(const\
+  \ Expr *CondE,\n                                                         CheckerContext\
+  \ &C,\n                                                         const MemRegion\
+  \ *&OutPtr,\n                                                         bool &TrueMeansFailure)\
+  \ const {\n  OutPtr = nullptr;\n  TrueMeansFailure = true; // default conservative\n\
+  \n  if (!CondE)\n    return false;\n\n  const Expr *E = unwrapCondition(CondE, C);\n\
+  \  if (!E)\n    return false;\n\n  // 1) Handle negation: !X\n  if (const auto *UO\
+  \ = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode() == UO_LNot) {\n     \
+  \ const Expr *Sub = unwrapCondition(UO->getSubExpr(), C);\n      if (!Sub)\n   \
+  \     return false;\n\n      // !set_memory_decrypted(...)\n      if (callExprIsAttrTransition(Sub,\
+  \ C)) {\n        const auto *CE = dyn_cast<CallExpr>(Sub);\n        if (!CE || CE->getNumArgs()\
+  \ < 1)\n          return false;\n        OutPtr = getPtrRegionFromExprLoose(CE->getArg(0),\
+  \ C);\n        if (!OutPtr)\n          return false;\n        TrueMeansFailure =\
+  \ false; // !call: true => success; false => failure\n        return true;\n   \
+  \   }\n\n      // !ret  (variable holding return of set_memory_decrypted)\n    \
+  \  if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(Sub)) {\n     \
+  \   const MemRegion *VarR = getMemRegionFromExpr(DRE, C);\n        if (!VarR)\n\
+  \          return false;\n        VarR = VarR->getBaseRegion();\n        if (!VarR)\n\
+  \          return false;\n        ProgramStateRef State = C.getState();\n      \
+  \  if (const MemRegion *const *PtrRP =\n                State->get<VarRegionToPtrRegion>(VarR))\
+  \ {\n          OutPtr = *PtrRP;\n          TrueMeansFailure = false;\n         \
+  \ return true;\n        }\n      }\n      return false;\n    }\n  }\n\n  // 2) Handle\
+  \ equality/inequality with zero: X == 0, X != 0\n  if (const auto *BO = dyn_cast<BinaryOperator>(E))\
+  \ {\n    BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op == BO_EQ || Op\
+  \ == BO_NE) {\n      const Expr *LHS = unwrapCondition(BO->getLHS(), C);\n     \
+  \ const Expr *RHS = unwrapCondition(BO->getRHS(), C);\n\n      // Identify zero\
+  \ side and expression side\n      const Expr *ExprSide = nullptr;\n      if (isZeroInteger(LHS,\
+  \ C) && RHS)\n        ExprSide = RHS;\n      else if (isZeroInteger(RHS, C) && LHS)\n\
+  \        ExprSide = LHS;\n\n      if (ExprSide) {\n        // set_memory_decrypted(...)\
+  \ ==/!= 0\n        if (callExprIsAttrTransition(ExprSide, C)) {\n          const\
+  \ auto *CE = dyn_cast<CallExpr>(ExprSide);\n          if (!CE || CE->getNumArgs()\
+  \ < 1)\n            return false;\n          OutPtr = getPtrRegionFromExprLoose(CE->getArg(0),\
+  \ C);\n          if (!OutPtr)\n            return false;\n          TrueMeansFailure\
+  \ = (Op == BO_NE); // call != 0 => failure when true\n          return true;\n \
+  \       }\n\n        // ret ==/!= 0\n        if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(ExprSide))\
+  \ {\n          const MemRegion *VarR = getMemRegionFromExpr(DRE, C);\n         \
+  \ if (!VarR)\n            return false;\n          VarR = VarR->getBaseRegion();\n\
+  \          if (!VarR)\n            return false;\n          ProgramStateRef State\
+  \ = C.getState();\n          if (const MemRegion *const *PtrRP =\n             \
+  \     State->get<VarRegionToPtrRegion>(VarR)) {\n            OutPtr = *PtrRP;\n\
+  \            TrueMeansFailure = (Op == BO_NE);\n            return true;\n     \
+  \     }\n        }\n      }\n    }\n  }\n\n  // 3) Direct call: if (set_memory_decrypted(...))\n\
+  \  if (callExprIsAttrTransition(E, C)) {\n    const auto *CE = dyn_cast<CallExpr>(E);\n\
+  \    if (!CE || CE->getNumArgs() < 1)\n      return false;\n    OutPtr = getPtrRegionFromExprLoose(CE->getArg(0),\
+  \ C);\n    if (!OutPtr)\n      return false;\n    TrueMeansFailure = true; // if\
+  \ (call) => failure when true\n    return true;\n  }\n\n  // 4) Variable alone:\
+  \ if (ret)\n  if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(E))\
+  \ {\n    const MemRegion *VarR = getMemRegionFromExpr(DRE, C);\n    if (VarR) {\n\
+  \      VarR = VarR->getBaseRegion();\n      if (VarR) {\n        ProgramStateRef\
+  \ State = C.getState();\n        if (const MemRegion *const *PtrRP =\n         \
+  \       State->get<VarRegionToPtrRegion>(VarR)) {\n          OutPtr = *PtrRP;\n\
+  \          TrueMeansFailure = true; // if (ret) => failure when true\n         \
+  \ return true;\n        }\n      }\n    }\n  }\n\n  return false;\n}\n\n//================\
+  \ Core Callbacks ================\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call,\n                                     CheckerContext &C) const\
+  \ {\n  if (!isAttrTransitionFn(Call, C))\n    return;\n\n  // Extract the pointer\
+  \ region from arg0 (may be wrapped in casts).\n  const Expr *Arg0E = Call.getArgExpr(0);\n\
+  \  const MemRegion *PtrR = getPtrRegionFromExprLoose(Arg0E, C);\n  if (!PtrR)\n\
+  \    return;\n\n  // Get the return symbol of set_memory_decrypted(...)\n  SVal\
+  \ RetVal = Call.getReturnValue();\n  SymbolRef RetSym = RetVal.getAsSymbol();\n\
+  \  if (!RetSym)\n    return;\n\n  ProgramStateRef State = C.getState();\n  State\
+  \ = State->set<SetDecryptRetSymToPtrRegion>(RetSym, PtrR);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,\n     \
+  \                            CheckerContext &C) const {\n  // If we bind ret = (symbol\
+  \ from set_memory_decrypted(...)), track that\n  const MemRegion *LHSReg = Loc.getAsRegion();\n\
+  \  if (!LHSReg)\n    return;\n  LHSReg = LHSReg->getBaseRegion();\n  if (!LHSReg)\n\
+  \    return;\n\n  SymbolRef Sym = Val.getAsSymbol();\n  if (!Sym)\n    return;\n\
+  \n  ProgramStateRef State = C.getState();\n  if (const MemRegion *const *PtrRP =\n\
+  \          State->get<SetDecryptRetSymToPtrRegion>(Sym)) {\n    State = State->set<VarRegionToPtrRegion>(LHSReg,\
+  \ *PtrRP);\n    C.addTransition(State);\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition,\n                                            CheckerContext &C)\
+  \ const {\n  ProgramStateRef State = C.getState();\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE) {\n    C.addTransition(State);\n    return;\n  }\n\n  const MemRegion\
+  \ *PtrR = nullptr;\n  bool TrueMeansFailure = true;\n\n  if (!analyzeConditionForPtrAndPolarity(CondE,\
+  \ C, PtrR, TrueMeansFailure)) {\n    C.addTransition(State);\n    return;\n  }\n\
+  \n  // Map the symbolic condition to pointer region and polarity\n  SVal CondVal\
+  \ = State->getSVal(CondE, C.getLocationContext());\n  SymbolRef CondSym = CondVal.getAsSymbol();\n\
+  \  if (!CondSym) {\n    C.addTransition(State);\n    return;\n  }\n\n  State = State->set<CondSymToPtrRegion>(CondSym,\
+  \ PtrR);\n  State = State->set<CondSymTrueMeansFailure>(CondSym, TrueMeansFailure);\n\
+  \  C.addTransition(State);\n}\n\nProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef\
+  \ State, SVal Cond,\n                                             bool Assumption)\
+  \ const {\n  SymbolRef CondSym = Cond.getAsSymbol();\n  if (!CondSym)\n    return\
+  \ State;\n\n  const MemRegion *const *PtrRP = State->get<CondSymToPtrRegion>(CondSym);\n\
+  \  if (!PtrRP)\n    return State;\n  const MemRegion *PtrR = *PtrRP;\n\n  const\
+  \ bool *TMFPtr = State->get<CondSymTrueMeansFailure>(CondSym);\n  bool TrueMeansFailure\
+  \ = TMFPtr ? *TMFPtr : true;\n\n  // If assumption matches polarity, then we are\
+  \ on \"failure\" path.\n  if (Assumption == TrueMeansFailure) {\n    State = State->set<FailedDecryptRegionSet>(PtrR,\
+  \ true);\n  } else {\n    State = State->remove<FailedDecryptRegionSet>(PtrR);\n\
+  \  }\n\n  return State;\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call,\n                                    CheckerContext &C) const {\n  if (!isPageFreeFn(Call,\
+  \ C))\n    return;\n\n  const Expr *Arg0E = Call.getArgExpr(0);\n  const MemRegion\
+  \ *FreeR = getPtrRegionFromExprLoose(Arg0E, C);\n  if (!FreeR)\n    return;\n\n\
+  \  ProgramStateRef State = C.getState();\n  const bool *Failed = State->get<FailedDecryptRegionSet>(FreeR);\n\
+  \  if (Failed && *Failed) {\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    if (!N)\n      return;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \        *BT, \"Freeing pages after set_memory_decrypted() failure\", N);\n    R->addRange(Call.getSourceRange());\n\
+  \    C.emitReport(std::move(R));\n  }\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects freeing of pages after set_memory_decrypted()\
+  \ failure\", \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

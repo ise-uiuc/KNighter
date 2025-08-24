@@ -1,0 +1,120 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -61,9 +61,10 @@               std::vector<LabelInfo> &Labels,
+               std::vector<GotoInfo> &Gotos,
+               std::vector<FreeSite> &Frees,
+-              std::vector<AssignInfo> &Assigns)
++              std::vector<AssignInfo> &Assigns,
++              std::vector<SourceLocation> &Returns)
+       : Ctx(Ctx), SM(Ctx.getSourceManager()), Labels(Labels), Gotos(Gotos),
+-        Frees(Frees), Assigns(Assigns) {}
++        Frees(Frees), Assigns(Assigns), Returns(Returns) {}
+
+   bool VisitLabelStmt(LabelStmt *L) {
+     LabelInfo Info;
+@@ -136,6 +137,11 @@     return true;
+   }
+
++  bool VisitReturnStmt(ReturnStmt *RS) {
++    Returns.push_back(getExpansionLocSafe(RS->getReturnLoc()));
++    return true;
++  }
++
+ private:
+   ASTContext &Ctx;
+   const SourceManager &SM;
+@@ -143,6 +149,7 @@   std::vector<GotoInfo> &Gotos;
+   std::vector<FreeSite> &Frees;
+   std::vector<AssignInfo> &Assigns;
++  std::vector<SourceLocation> &Returns;
+
+   SourceLocation getExpansionLocSafe(SourceLocation L) const {
+     if (L.isInvalid())
+@@ -248,10 +255,37 @@       }
+
+       static bool isSelfCleanupJump(const GotoInfo &GR, const FreeSite &FS) {
+-        // A restart candidate must not be a goto back to the same cleanup label.
+-        // Such a jump cannot form a retry loop and can cause false positives,
+-        // e.g. "bail: ... goto out;" which is unrelated to retrying.
++        // A goto straight to the same cleanup label is not a restart.
+         return GR.Target && FS.CleanupLabel && (GR.Target == FS.CleanupLabel);
++      }
++
++      static bool hasReturnBarrierBetween(const SourceManager &SM,
++                                          SourceLocation FreeLoc,
++                                          SourceLocation GoLoc,
++                                          const std::vector<SourceLocation> &Returns) {
++        for (const auto &RLoc : Returns) {
++          if (strictlyBetween(SM, RLoc, FreeLoc, GoLoc))
++            return true;
++        }
++        return false;
++      }
++
++      static bool isFalsePositiveLayout(const SourceManager &SM,
++                                        SourceLocation FreeLoc,
++                                        const GotoInfo &GR,
++                                        const std::vector<SourceLocation> &Returns,
++                                        const FreeSite &FS) {
++        // Filter 1: Goto to the same cleanup label is not a restart.
++        if (isSelfCleanupJump(GR, FS))
++          return true;
++
++        // Filter 2: If a return lies between the free and the backward goto,
++        //           then the goto cannot be reached from the cleanup path,
++        //           i.e., this is not a retry/replay scenario.
++        if (hasReturnBarrierBetween(SM, FreeLoc, GR.Loc, Returns))
++          return true;
++
++        return false;
+       }
+
+       void detectAndReport(const FunctionDecl *FD,
+@@ -259,6 +293,7 @@                            const std::vector<GotoInfo> &Gotos,
+                            const std::vector<FreeSite> &Frees,
+                            const std::vector<AssignInfo> &Assigns,
++                           const std::vector<SourceLocation> &Returns,
+                            BugReporter &BR, ASTContext &AC) const;
+ };
+
+@@ -275,11 +310,12 @@   std::vector<GotoInfo> Gotos;
+   std::vector<FreeSite> Frees;
+   std::vector<AssignInfo> Assigns;
+-
+-  BodyScanner Scanner(Ctx, Labels, Gotos, Frees, Assigns);
++  std::vector<SourceLocation> Returns;
++
++  BodyScanner Scanner(Ctx, Labels, Gotos, Frees, Assigns, Returns);
+   Scanner.TraverseStmt(const_cast<Stmt *>(Body));
+
+-  detectAndReport(FD, Labels, Gotos, Frees, Assigns, BR, Ctx);
++  detectAndReport(FD, Labels, Gotos, Frees, Assigns, Returns, BR, Ctx);
+ }
+
+ void SAGenTestChecker::detectAndReport(const FunctionDecl *FD,
+@@ -287,6 +323,7 @@                                        const std::vector<GotoInfo> &Gotos,
+                                        const std::vector<FreeSite> &Frees,
+                                        const std::vector<AssignInfo> &Assigns,
++                                       const std::vector<SourceLocation> &Returns,
+                                        BugReporter &BR, ASTContext &AC) const {
+   const SourceManager &SM = AC.getSourceManager();
+
+@@ -312,10 +349,6 @@       if (!GR.Target)
+         continue;
+
+-      // Important: don't treat a goto to the same cleanup label as a restart.
+-      if (isSelfCleanupJump(GR, FS))
+-        continue;
+-
+       SourceLocation GoLoc = GR.Loc;
+       SourceLocation TargetLoc = getLabelLoc(GR.Target);
+       if (GoLoc.isInvalid() || TargetLoc.isInvalid())
+@@ -323,6 +356,11 @@
+       // Must be: free ... goto restart_label; where restart_label is before free.
+       if (!(before(SM, FreeLoc, GoLoc) && before(SM, TargetLoc, FreeLoc)))
++        continue;
++
++      // Reduce false positives: discard gotos that are either to the same cleanup
++      // label, or blocked by a return between free and goto.
++      if (isFalsePositiveLayout(SM, FreeLoc, GR, Returns, FS))
+         continue;
+
+       // Safety check 1: reset to NULL between free and retry goto

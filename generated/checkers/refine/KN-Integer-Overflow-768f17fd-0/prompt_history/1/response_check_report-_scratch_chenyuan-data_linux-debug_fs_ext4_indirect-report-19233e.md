@@ -1,0 +1,11 @@
+- Decision: NotABug
+- Reason:
+  - The flagged line computes double_blocks as (1 << (ptrs_bits * 2)) and assigns it to a const long. Although the shift is performed in 32-bit int, the result is guaranteed to fit within 32 bits for all valid ext4 configurations:
+    - ptrs = EXT4_ADDR_PER_BLOCK(sb) = blocksize/4
+    - ptrs_bits = log2(ptrs)
+    - ext4 blocksize ranges up to 64 KiB on supported architectures, so max ptrs = 16384 and max ptrs_bits = 14
+    - Therefore, (ptrs_bits * 2) ≤ 28, and 1 << 28 = 268,435,456, which fits in 32-bit int without overflow.
+  - The target bug pattern requires a 32-bit shift whose result exceeds 32-bit and is only widened to 64-bit after the shift, causing truncation. Here:
+    - The destination is long (not u64), and more importantly, the shifted value never exceeds 32 bits, so no truncation occurs.
+    - The code explicitly avoids the risky triple-indirect count (which would be 1 << (ptrs_bits * 3) and can exceed 32 bits) by using a different comparison form, as noted in the comment, further confirming intentional, safe handling.
+  - Thus, this does not match the target bug pattern and is not a real bug.

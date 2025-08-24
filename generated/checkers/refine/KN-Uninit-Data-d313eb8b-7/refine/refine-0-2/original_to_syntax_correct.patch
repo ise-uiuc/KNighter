@@ -1,0 +1,146 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -79,6 +79,12 @@       void markZeroCleared(ProgramStateRef &State, const VarDecl *VD) const;
+       void markPartiallyInit(ProgramStateRef &State, const VarDecl *VD) const;
+
++      // Additional helpers to eliminate false positives and strengthen matching
++      static bool calleeNameIs(const CallEvent &Call, StringRef Name);
++      static bool isBraceZeroInitializedVar(const VarDecl *VD);
++      static bool isExplicitZeroInitExpr(const Expr *E);
++      static bool isFalsePositive(const VarDecl *VD, CheckerContext &C);
++
+       void reportLeak(const CallEvent &Call, CheckerContext &C) const;
+ };
+
+@@ -159,13 +165,15 @@   return false;
+ }
+
++bool SAGenTestChecker::calleeNameIs(const CallEvent &Call, StringRef Name) {
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier())
++    return ID->getName() == Name;
++  return false;
++}
++
+ bool SAGenTestChecker::isNetlinkExportCall(const CallEvent &Call, unsigned &LenIdx, unsigned &DataIdx, CheckerContext &C) {
+-  const Expr *OriginExpr = Call.getOriginExpr();
+-  if (!OriginExpr)
+-    return false;
+-
+-  // Explicitly match known netlink export helpers we care about
+-  if (ExprHasName(OriginExpr, "nla_put_64bit", C)) {
++  // Prefer identifier-based matching; fall back to source text as a last resort.
++  if (calleeNameIs(Call, "nla_put_64bit") || ExprHasName(Call.getOriginExpr(), "nla_put_64bit", C)) {
+     // nla_put_64bit(skb, attrtype, len, data, padtype)
+     if (Call.getNumArgs() >= 4) {
+       LenIdx = 2;
+@@ -174,7 +182,7 @@     }
+     return false;
+   }
+-  if (ExprHasName(OriginExpr, "nla_put", C)) {
++  if (calleeNameIs(Call, "nla_put") || ExprHasName(Call.getOriginExpr(), "nla_put", C)) {
+     // nla_put(skb, attrtype, len, data)
+     if (Call.getNumArgs() >= 4) {
+       LenIdx = 2;
+@@ -188,12 +196,8 @@ }
+
+ SAGenTestChecker::ZeroKind SAGenTestChecker::getZeroingKind(const CallEvent &Call, unsigned &PtrIdx, unsigned &LenIdx, CheckerContext &C) {
+-  const Expr *OriginExpr = Call.getOriginExpr();
+-  if (!OriginExpr)
+-    return ZK_None;
+-
+   // memset(ptr, 0, len)
+-  if (ExprHasName(OriginExpr, "memset", C)) {
++  if (calleeNameIs(Call, "memset") || ExprHasName(Call.getOriginExpr(), "memset", C)) {
+     if (Call.getNumArgs() >= 3) {
+       PtrIdx = 0;
+       LenIdx = 2;
+@@ -203,7 +207,7 @@   }
+
+   // memzero_explicit(ptr, len)
+-  if (ExprHasName(OriginExpr, "memzero_explicit", C)) {
++  if (calleeNameIs(Call, "memzero_explicit") || ExprHasName(Call.getOriginExpr(), "memzero_explicit", C)) {
+     if (Call.getNumArgs() >= 2) {
+       PtrIdx = 0;
+       LenIdx = 1;
+@@ -213,7 +217,7 @@   }
+
+   // bzero(ptr, len)
+-  if (ExprHasName(OriginExpr, "bzero", C)) {
++  if (calleeNameIs(Call, "bzero") || ExprHasName(Call.getOriginExpr(), "bzero", C)) {
+     if (Call.getNumArgs() >= 2) {
+       PtrIdx = 0;
+       LenIdx = 1;
+@@ -309,6 +313,42 @@   State = State->set<PartiallyInitAgg>(VD, 1);
+ }
+
++bool SAGenTestChecker::isExplicitZeroInitExpr(const Expr *E) {
++  if (!E) return false;
++  E = E->IgnoreParenImpCasts();
++  if (const auto *ILE = dyn_cast<InitListExpr>(E))
++    return isZeroBraceInit(ILE);
++  if (const auto *IL = dyn_cast<IntegerLiteral>(E))
++    return IL->getValue().isZero();
++  return false;
++}
++
++bool SAGenTestChecker::isBraceZeroInitializedVar(const VarDecl *VD) {
++  if (!VD) return false;
++  if (!VD->hasInit()) return false;
++  const Expr *Init = VD->getInit();
++  if (!Init) return false;
++  const Expr *I = Init->IgnoreImplicit();
++  if (const auto *ILE = dyn_cast<InitListExpr>(I))
++    return isZeroBraceInit(ILE);
++  // Very defensive: accept a single explicit 0 initializer
++  return isExplicitZeroInitExpr(I);
++}
++
++bool SAGenTestChecker::isFalsePositive(const VarDecl *VD, CheckerContext &C) {
++  // If the var was brace-zero-initialized ("{}" or "{0}"), it's fully zeroed,
++  // including padding. Exporting it is safe.
++  if (isBraceZeroInitializedVar(VD))
++    return true;
++
++  // Path-sensitive knowledge: if we've already marked it zero-cleared (via memset, etc.), it's safe.
++  ProgramStateRef State = C.getState();
++  if (State->contains<ZeroCleared>(VD))
++    return true;
++
++  return false;
++}
++
+ /************ Checker Callbacks ************/
+
+ void SAGenTestChecker::checkPostStmt(const DeclStmt *DS, CheckerContext &C) const {
+@@ -336,8 +376,14 @@
+     const Expr *I = Init->IgnoreImplicit();
+     const auto *ILE = dyn_cast<InitListExpr>(I);
+-    if (!ILE)
+-      continue;
++    if (!ILE) {
++      // If not an init-list, still record if it's equivalent to zero-init.
++      if (isExplicitZeroInitExpr(I)) {
++        ProgramStateRef NewState = State->add<ZeroCleared>(VD);
++        if (NewState != State) { State = NewState; Changed = true; }
++      }
++      continue;
++    }
+
+     // If zero-brace init, mark cleared regardless of padding.
+     if (isZeroBraceInit(ILE)) {
+@@ -416,13 +462,14 @@   if (!hasImplicitPadding(VD->getType(), C.getASTContext()))
+     return;
+
++  // Eliminate false positives where the aggregate is brace-zero-initialized
++  // (or otherwise known zeroed).
++  if (isFalsePositive(VD, C))
++    return;
++
+   ProgramStateRef State = C.getState();
+
+-  // If explicitly zero-cleared, it's safe
+-  if (State->contains<ZeroCleared>(VD))
+-    return;
+-
+-  // Warn only if we have evidence of risky partial init via init-list
++  // Warn only if we have evidence of risky partial init via init-list.
+   if (!State->get<PartiallyInitAgg>(VD))
+     return;

@@ -1,0 +1,360 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: aec8e6bf839101784f3ef037dcdb9432c3f32343
+commit_type: UAF
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state: track resource pointer state.\n// 0 = OpenOrUnknown (default /\
+  \ not tracked)\n// 1 = Closed (freed/released but not set to NULL)\n// 2 = Nullified\
+  \ (explicitly set to NULL after close)\nREGISTER_MAP_WITH_PROGRAMSTATE(ResourceStateMap,\
+  \ const MemRegion *, unsigned)\n// Program state: track aliasing, mapping alias\
+  \ region -> root region.\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion\
+  \ *, const MemRegion *)\n\nnamespace {\n\nenum ResState : unsigned {\n  OpenOrUnknown\
+  \ = 0,\n  Closed = 1,\n  Nullified = 2\n};\n\nclass SAGenTestChecker\n    : public\
+  \ Checker<\n          check::PreCall,\n          check::PostCall,\n          check::Bind>\
+  \ {\n  mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n \
+  \     : BT(new BugType(this, \"Double close / use-after-free (not nullified)\",\n\
+  \                       \"Resource Handling\")) {}\n\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  static bool isCloseLike(const\
+  \ CallEvent &Call, CheckerContext &C);\n  static const MemRegion *getRootAlias(const\
+  \ MemRegion *R, ProgramStateRef State);\n  static ProgramStateRef setAlias(ProgramStateRef\
+  \ State, const MemRegion *Alias,\n                                  const MemRegion\
+  \ *Target);\n  static ProgramStateRef setResState(ProgramStateRef State, const MemRegion\
+  \ *R,\n                                     unsigned NewState);\n  static unsigned\
+  \ getResState(ProgramStateRef State, const MemRegion *R);\n  static bool isNullSVal(SVal\
+  \ V);\n  static bool isNonNullPointerish(SVal V, ASTContext &ACtx);\n};\n\nbool\
+  \ SAGenTestChecker::isCloseLike(const CallEvent &Call, CheckerContext &C) {\n  const\
+  \ Expr *OE = Call.getOriginExpr();\n  if (!OE)\n    return false;\n\n  // Use source-text-based\
+  \ name check for robustness.\n  // Known close-like functions for file pointers\
+  \ in kernel/user space.\n  if (ExprHasName(OE, \"fput\", C))\n    return true;\n\
+  \  if (ExprHasName(OE, \"filp_close\", C))\n    return true;\n  if (ExprHasName(OE,\
+  \ \"fclose\", C))\n    return true;\n\n  // Optionally extend if needed.\n  return\
+  \ false;\n}\n\nconst MemRegion *SAGenTestChecker::getRootAlias(const MemRegion *R,\
+  \ ProgramStateRef State) {\n  if (!R)\n    return nullptr;\n  const MemRegion *Cur\
+  \ = R->getBaseRegion();\n  // Follow alias chain with a simple loop guard.\n  for\
+  \ (unsigned i = 0; i < 8; ++i) {\n    if (!Cur)\n      break;\n    if (const MemRegion\
+  \ *Next = State->get<PtrAliasMap>(Cur)) {\n      const MemRegion *NextBase = Next->getBaseRegion();\n\
+  \      if (!NextBase || NextBase == Cur)\n        break;\n      Cur = NextBase;\n\
+  \      continue;\n    }\n    break;\n  }\n  return Cur;\n}\n\nProgramStateRef SAGenTestChecker::setAlias(ProgramStateRef\
+  \ State, const MemRegion *Alias,\n                                           const\
+  \ MemRegion *Target) {\n  if (!State || !Alias || !Target)\n    return State;\n\
+  \  const MemRegion *AliasB = Alias->getBaseRegion();\n  const MemRegion *TargetB\
+  \ = getRootAlias(Target->getBaseRegion(), State);\n  if (!AliasB || !TargetB)\n\
+  \    return State;\n  State = State->set<PtrAliasMap>(AliasB, TargetB);\n  // Also\
+  \ set reverse alias (symmetric) to strengthen tracking.\n  State = State->set<PtrAliasMap>(TargetB,\
+  \ AliasB);\n  return State;\n}\n\nProgramStateRef SAGenTestChecker::setResState(ProgramStateRef\
+  \ State, const MemRegion *R,\n                                              unsigned\
+  \ NewState) {\n  if (!State || !R)\n    return State;\n  const MemRegion *Root =\
+  \ getRootAlias(R, State);\n  if (!Root)\n    return State;\n\n  if (NewState ==\
+  \ OpenOrUnknown) {\n    // Clearing state when overwritten with new non-null value.\n\
+  \    State = State->remove<ResourceStateMap>(Root);\n  } else {\n    State = State->set<ResourceStateMap>(Root,\
+  \ NewState);\n  }\n  return State;\n}\n\nunsigned SAGenTestChecker::getResState(ProgramStateRef\
+  \ State, const MemRegion *R) {\n  if (!State || !R)\n    return OpenOrUnknown;\n\
+  \  const MemRegion *Root = getRootAlias(R, State);\n  if (!Root)\n    return OpenOrUnknown;\n\
+  \  if (const unsigned *S = State->get<ResourceStateMap>(Root))\n    return *S;\n\
+  \  return OpenOrUnknown;\n}\n\nbool SAGenTestChecker::isNullSVal(SVal V) {\n  if\
+  \ (auto L = V.getAs<Loc>()) {\n    if (auto CI = L->getAs<loc::ConcreteInt>()) {\n\
+  \      return CI->getValue().isZero();\n    }\n  }\n  if (auto CI = V.getAs<nonloc::ConcreteInt>())\
+  \ {\n    return CI->getValue().isZero();\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isNonNullPointerish(SVal\
+  \ V, ASTContext &ACtx) {\n  // Heuristic: if we have a region or a non-zero concrete\
+  \ int as pointer.\n  if (V.getAsRegion())\n    return true;\n\n  if (auto L = V.getAs<Loc>())\
+  \ {\n    if (auto CI = L->getAs<loc::ConcreteInt>()) {\n      return !CI->getValue().isZero();\n\
+  \    }\n    // Unknown pointer value: can't assert non-null.\n    return false;\n\
+  \  }\n\n  // For typed ints used as pointers, avoid guessing.\n  return false;\n\
+  }\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (!isCloseLike(Call, C))\n    return;\n\n  ProgramStateRef State\
+  \ = C.getState();\n  if (!State)\n    return;\n\n  if (Call.getNumArgs() < 1)\n\
+  \    return;\n\n  // Arg0 should be the file pointer being closed.\n  SVal Arg0\
+  \ = Call.getArgSVal(0);\n  const MemRegion *MR = Arg0.getAsRegion();\n  if (!MR)\
+  \ {\n    // As a fallback, try extracting region from the expression directly.\n\
+  \    if (const Expr *AE = Call.getArgExpr(0)) {\n      MR = getMemRegionFromExpr(AE,\
+  \ C);\n    }\n  }\n  if (!MR)\n    return;\n\n  MR = MR->getBaseRegion();\n  if\
+  \ (!MR)\n    return;\n\n  // Mark as Closed after successful close-like call.\n\
+  \  State = setResState(State, MR, Closed);\n  C.addTransition(State);\n}\n\nvoid\
+  \ SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  if (!isCloseLike(Call, C))\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  if (!State)\n    return;\n\n  if (Call.getNumArgs() < 1)\n    return;\n\n  SVal\
+  \ Arg0 = Call.getArgSVal(0);\n  const MemRegion *MR = Arg0.getAsRegion();\n  if\
+  \ (!MR) {\n    if (const Expr *AE = Call.getArgExpr(0)) {\n      MR = getMemRegionFromExpr(AE,\
+  \ C);\n    }\n  }\n  if (!MR)\n    return;\n\n  MR = MR->getBaseRegion();\n  if\
+  \ (!MR)\n    return;\n\n  unsigned RS = getResState(State, MR);\n  if (RS == Closed)\
+  \ {\n    // Second close without nullification.\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    if (!N)\n      return;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \        *BT, \"Double close: pointer was closed but not set to NULL\", N);\n  \
+  \  R->addRange(Call.getSourceRange());\n    C.emitReport(std::move(R));\n    return;\n\
+  \  }\n\n  // If already nullified, it's fine (no report).\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n  if (!State)\n    return;\n\n  // Track aliasing: if binding\
+  \ a pointer value to a pointer location, record alias.\n  if (const MemRegion *LHS\
+  \ = Loc.getAsRegion()) {\n    LHS = LHS->getBaseRegion();\n    if (LHS) {\n    \
+  \  if (const MemRegion *RHS = Val.getAsRegion()) {\n        RHS = RHS->getBaseRegion();\n\
+  \        if (RHS) {\n          State = setAlias(State, LHS, RHS);\n        }\n \
+  \     }\n    }\n  }\n\n  // Nullification detection.\n  if (const MemRegion *LHS\
+  \ = Loc.getAsRegion()) {\n    LHS = LHS->getBaseRegion();\n    if (LHS) {\n    \
+  \  if (isNullSVal(Val)) {\n        // Explicitly set to NULL.\n        State = setResState(State,\
+  \ LHS, Nullified);\n      } else if (isNonNullPointerish(Val, C.getASTContext()))\
+  \ {\n        // Overwrite with a new non-null pointer -> not a stale closed pointer\
+  \ anymore.\n        State = setResState(State, LHS, OpenOrUnknown);\n      }\n \
+  \   }\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects double close when a resource\
+  \ pointer is closed and not set to NULL\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbtrfs: fix use-after-free of block device file in\
+  \ __btrfs_free_extra_devids()\n\nMounting btrfs from two images (which have the\
+  \ same one fsid and two\ndifferent dev_uuids) in certain executing order may trigger\
+  \ an UAF for\nvariable 'device->bdev_file' in __btrfs_free_extra_devids(). And\n\
+  following are the details:\n\n1. Attach image_1 to loop0, attach image_2 to loop1,\
+  \ and scan btrfs\n   devices by ioctl(BTRFS_IOC_SCAN_DEV):\n\n             /  btrfs_device_1\
+  \ \u2192 loop0\n   fs_device\n             \\  btrfs_device_2 \u2192 loop1\n2. mount\
+  \ /dev/loop0 /mnt\n   btrfs_open_devices\n    btrfs_device_1->bdev_file = btrfs_get_bdev_and_sb(loop0)\n\
+  \    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n   btrfs_fill_super\n\
+  \    open_ctree\n     fail: btrfs_close_devices // -ENOMEM\n\t    btrfs_close_bdev(btrfs_device_1)\n\
+  \             fput(btrfs_device_1->bdev_file)\n\t      // btrfs_device_1->bdev_file\
+  \ is freed\n\t    btrfs_close_bdev(btrfs_device_2)\n             fput(btrfs_device_2->bdev_file)\n\
+  \n3. mount /dev/loop1 /mnt\n   btrfs_open_devices\n    btrfs_get_bdev_and_sb(&bdev_file)\n\
+  \     // EIO, btrfs_device_1->bdev_file is not assigned,\n     // which points to\
+  \ a freed memory area\n    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n\
+  \   btrfs_fill_super\n    open_ctree\n     btrfs_free_extra_devids\n      if (btrfs_device_1->bdev_file)\n\
+  \       fput(btrfs_device_1->bdev_file) // UAF !\n\nFix it by setting 'device->bdev_file'\
+  \ as 'NULL' after closing the\nbtrfs_device in btrfs_close_one_device().\n\nFixes:\
+  \ 142388194191 (\"btrfs: do not background blkdev_put()\")\nCC: stable@vger.kernel.org\
+  \ # 4.19+\nLink: https://bugzilla.kernel.org/show_bug.cgi?id=219408\nSigned-off-by:\
+  \ Zhihao Cheng <chengzhihao1@huawei.com>\nReviewed-by: David Sterba <dsterba@suse.com>\n\
+  Signed-off-by: David Sterba <dsterba@suse.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ btrfs_close_one_device in fs/btrfs/volumes.c\nstatic void btrfs_close_one_device(struct\
+  \ btrfs_device *device)\n{\n\tstruct btrfs_fs_devices *fs_devices = device->fs_devices;\n\
+  \n\tif (test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) &&\n\t    device->devid\
+  \ != BTRFS_DEV_REPLACE_DEVID) {\n\t\tlist_del_init(&device->dev_alloc_list);\n\t\
+  \tfs_devices->rw_devices--;\n\t}\n\n\tif (device->devid == BTRFS_DEV_REPLACE_DEVID)\n\
+  \t\tclear_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);\n\n\tif (test_bit(BTRFS_DEV_STATE_MISSING,\
+  \ &device->dev_state)) {\n\t\tclear_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state);\n\
+  \t\tfs_devices->missing_devices--;\n\t}\n\n\tbtrfs_close_bdev(device);\n\tif (device->bdev)\
+  \ {\n\t\tfs_devices->open_devices--;\n\t\tdevice->bdev = NULL;\n\t}\n\tclear_bit(BTRFS_DEV_STATE_WRITEABLE,\
+  \ &device->dev_state);\n\tbtrfs_destroy_dev_zone_info(device);\n\n\tdevice->fs_info\
+  \ = NULL;\n\tatomic_set(&device->dev_stats_ccnt, 0);\n\textent_io_tree_release(&device->alloc_state);\n\
+  \n\t/*\n\t * Reset the flush error record. We might have a transient flush error\n\
+  \t * in this mount, and if so we aborted the current transaction and set\n\t * the\
+  \ fs to an error state, guaranteeing no super blocks can be further\n\t * committed.\
+  \ However that error might be transient and if we unmount the\n\t * filesystem and\
+  \ mount it again, we should allow the mount to succeed\n\t * (btrfs_check_rw_degradable()\
+  \ should not fail) - if after mounting the\n\t * filesystem again we still get flush\
+  \ errors, then we will again abort\n\t * any transaction and set the error state,\
+  \ guaranteeing no commits of\n\t * unsafe super blocks.\n\t */\n\tdevice->last_flush_error\
+  \ = 0;\n\n\t/* Verify the device is back in a pristine state  */\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_FLUSH_SENT,\
+  \ &device->dev_state));\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state));\n\
+  \tWARN_ON(!list_empty(&device->dev_alloc_list));\n\tWARN_ON(!list_empty(&device->post_commit_list));\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c\n\
+  index 8f340ad1d938..eb51b609190f 100644\n--- a/fs/btrfs/volumes.c\n+++ b/fs/btrfs/volumes.c\n\
+  @@ -1105,6 +1105,7 @@ static void btrfs_close_one_device(struct btrfs_device *device)\n\
+  \ \tif (device->bdev) {\n \t\tfs_devices->open_devices--;\n \t\tdevice->bdev = NULL;\n\
+  +\t\tdevice->bdev_file = NULL;\n \t}\n \tclear_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state);\n\
+  \ \tbtrfs_destroy_dev_zone_info(device);\n```\n"
+pattern: '## Bug Pattern
+
+
+  A resource pointer (struct file* bdev_file) is released (fput/close) but not set
+  to NULL in the owning structure. Later code uses a non-NULL check on this stale
+  pointer to decide to release it again, leading to a use-after-free/double-fput.
+  The root cause is failing to nullify a stored resource pointer after closing it,
+  when other paths rely on NULL-ness to indicate validity.'
+plan: "Plan\n\n1. Program state customizations\n   - REGISTER_MAP_WITH_PROGRAMSTATE(ResourceStateMap,\
+  \ const MemRegion *, unsigned)\n     - Track the state of resource pointers (struct\
+  \ file* or other file-like pointers).\n     - Use an enum-like set of constants:\n\
+  \       - 0 = OpenOrUnknown\n       - 1 = Closed\n       - 2 = Nullified\n   - REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion *, const MemRegion *)\n     - Track pointer aliases: map alias\
+  \ region -> root region. The \u201Croot\u201D is the canonical region we update\
+  \ in ResourceStateMap. This lets us detect a second close through a different variable\
+  \ than the one originally closed.\n\n2. Helper utilities\n   - bool isCloseLike(const\
+  \ CallEvent &Call):\n     - Return true for known file-pointer release/close routines\
+  \ (kernel-oriented), e.g.:\n       - \"fput\", \"filp_close\", \"fclose\" (extendable).\n\
+  \     - Keep the list small and explicit.\n   - const MemRegion *getRootAlias(const\
+  \ MemRegion *R, ProgramStateRef State):\n     - Follow PtrAliasMap until no mapping\
+  \ exists, returning the ultimate root region.\n   - ProgramStateRef setResState(ProgramStateRef\
+  \ State, const MemRegion *R, unsigned NewState):\n     - RootR = getRootAlias(R,\
+  \ State); update ResourceStateMap[RootR] = NewState.\n   - unsigned getResState(ProgramStateRef\
+  \ State, const MemRegion *R):\n     - RootR = getRootAlias(R, State); return ResourceStateMap[RootR]\
+  \ or 0 if not found.\n   - ProgramStateRef setAlias(ProgramStateRef State, const\
+  \ MemRegion *Alias, const MemRegion *Target):\n     - RootT = getRootAlias(Target,\
+  \ State); set PtrAliasMap[Alias] = RootT.\n   - ProgramStateRef clearAliasesTo(ProgramStateRef\
+  \ State, const MemRegion *R):\n     - Optional: not strictly needed; simplest approach\
+  \ is to leave alias entries until overwritten.\n   - Notes:\n     - Use getMemRegionFromExpr(E,\
+  \ C) to get regions from expressions.\n     - If set to NULL, mark Nullified; if\
+  \ set to non-NULL, remove state entry (or set to OpenOrUnknown) to avoid false positives.\n\
+  \n3. checkPostCall (close tracking and state updates after close)\n   - What to\
+  \ intercept:\n     - If isCloseLike(Call) is false, do nothing.\n     - Otherwise:\n\
+  \       - Extract the pointer argument expression (arg 0).\n       - Resolve its\
+  \ region via getMemRegionFromExpr.\n       - If not a region, bail.\n       - Root\
+  \ = getRootAlias(Region, State).\n       - Update ResourceStateMap[Root] = Closed.\n\
+  \     - Rationale:\n       - This marks the resource pointer as already released\
+  \ but not necessarily nullified.\n\n4. checkPreCall (detect second close on a closed-but-not-nullified\
+  \ pointer)\n   - If isCloseLike(Call):\n     - Extract arg0 region.\n     - Root\
+  \ = getRootAlias.\n     - StateVal = getResState(State, Root).\n     - If StateVal\
+  \ == Closed:\n       - Report a bug: \u201Cresource pointer already closed; not\
+  \ nullified before being closed again\u201D.\n       - Create non-fatal error node\
+  \ and emit PathSensitiveBugReport.\n     - Else continue.\n   - Rationale:\n   \
+  \  - This is the core of detecting the \u201Cuse-after-free/double-fput\u201D triggered\
+  \ by relying on non-NULL-ness after the first close.\n\n5. checkBind (alias tracking\
+  \ and nullification/open writes)\n   - Build pointer aliasing:\n     - If binding\
+  \ a pointer value to a pointer location (Loc is a region RL, Val is an SVal whose\
+  \ region is RR):\n       - Set alias RL -> Root(RR) using setAlias.\n     - This\
+  \ captures cases like:\n       - f = device->bdev_file; fput(f); later fput(device->bdev_file);\n\
+  \   - Nullification detection:\n     - If Val is a null SVal (zero), and Loc is\
+  \ a region RL:\n       - Root = getRootAlias(RL, State).\n       - Set ResourceStateMap[Root]\
+  \ = Nullified.\n   - Re-opening/overwriting detection (to reduce false positives):\n\
+  \     - If Val is a non-null pointer (or unknown non-zero) and Loc is a region RL\
+  \ that is currently in ResourceStateMap:\n       - Clear or set ResourceStateMap[Root(RL)]\
+  \ = OpenOrUnknown (i.e., remove mapping).\n     - This handles assignments like\
+  \ device->bdev_file = newfile; which means a second fput is not necessarily a bug.\n\
+  \n6. checkBranchCondition (optional; do not report here)\n   - Observe conditions\
+  \ of the form:\n     - if (ptr), if (ptr != NULL), if (!!ptr), if (NULL != ptr)\n\
+  \   - Implementation detail:\n     - Extract the region tested by the condition\
+  \ (look for DeclRefExpr or MemberExpr).\n     - If the region\u2019s state is Closed,\
+  \ you may add a program state note or internal mark. However, keep the checker simple:\
+  \ no report is issued here. The actual error is reported on the second close in\
+  \ checkPreCall.\n\n7. Bug reporting\n   - Use a single BugType, e.g., \u201CDouble\
+  \ close / use-after-free (not nullified)\u201D.\n   - In checkPreCall, when detecting\
+  \ a second close of a Closed pointer:\n     - Generate a non-fatal error node and\
+  \ emit a PathSensitiveBugReport with a short message:\n       - \u201CPointer closed\
+  \ with fput() but not set to NULL; closed again\u201D\n     - Optionally add a note\
+  \ at the first close location by tracking the previous program point (if available),\
+  \ but not required.\n\n8. Scope/heuristics for the target pattern\n   - The checker\
+  \ specifically models file-pointer-like resources that are closed by known close-like\
+  \ functions (fput/filp_close/etc.).\n   - It flags a second close if the pointer\
+  \ has not been nullified after the first close (Closed state).\n   - It is robust\
+  \ across aliases using PtrAliasMap.\n   - It suppresses false positives when the\
+  \ pointer is overwritten with a non-null value after being closed by clearing the\
+  \ tracked state in checkBind.\n\n9. Minimal function usage summary\n   - Program\
+  \ state:\n     - REGISTER_MAP_WITH_PROGRAMSTATE(ResourceStateMap, const MemRegion\
+  \ *, unsigned)\n     - REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion\
+  \ *, const MemRegion *)\n   - Callbacks used:\n     - checkPostCall: mark Closed\
+  \ on fput-like calls.\n     - checkPreCall: detect second close on Closed pointers;\
+  \ report.\n     - checkBind: maintain alias map; mark Nullified on stores of NULL;\
+  \ clear state on stores of non-null values.\n     - checkBranchCondition: optional\
+  \ observation only (no reporting).\n   - Utility functions leveraged:\n     - getMemRegionFromExpr\
+  \ for argument region extraction.\n     - ExprHasName not required in the minimal\
+  \ plan.\n     - findSpecificTypeInParents/Children not required."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state: track resource pointer state.\n// 0 = OpenOrUnknown (default /\
+  \ not tracked)\n// 1 = Closed (freed/released but not set to NULL)\n// 2 = Nullified\
+  \ (explicitly set to NULL after close)\nREGISTER_MAP_WITH_PROGRAMSTATE(ResourceStateMap,\
+  \ const MemRegion *, unsigned)\n// Program state: track aliasing, mapping alias\
+  \ region -> root region.\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion\
+  \ *, const MemRegion *)\n\nnamespace {\n\nenum ResState : unsigned {\n  OpenOrUnknown\
+  \ = 0,\n  Closed = 1,\n  Nullified = 2\n};\n\nclass SAGenTestChecker\n    : public\
+  \ Checker<\n          check::PreCall,\n          check::PostCall,\n          check::Bind>\
+  \ {\n  mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n \
+  \     : BT(new BugType(this, \"Double close / use-after-free (not nullified)\",\n\
+  \                       \"Resource Handling\")) {}\n\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  static bool isCloseLike(const\
+  \ CallEvent &Call, CheckerContext &C);\n  static const MemRegion *getRootAlias(const\
+  \ MemRegion *R, ProgramStateRef State);\n  static ProgramStateRef setAlias(ProgramStateRef\
+  \ State, const MemRegion *Alias,\n                                  const MemRegion\
+  \ *Target);\n  static ProgramStateRef setResState(ProgramStateRef State, const MemRegion\
+  \ *R,\n                                     unsigned NewState);\n  static unsigned\
+  \ getResState(ProgramStateRef State, const MemRegion *R);\n  static bool isNullSVal(SVal\
+  \ V);\n  static bool isNonNullPointerish(SVal V, ASTContext &ACtx);\n};\n\nbool\
+  \ SAGenTestChecker::isCloseLike(const CallEvent &Call, CheckerContext &C) {\n  const\
+  \ Expr *OE = Call.getOriginExpr();\n  if (!OE)\n    return false;\n\n  // Use source-text-based\
+  \ name check for robustness.\n  // Known close-like functions for file pointers\
+  \ in kernel/user space.\n  if (ExprHasName(OE, \"fput\", C))\n    return true;\n\
+  \  if (ExprHasName(OE, \"filp_close\", C))\n    return true;\n  if (ExprHasName(OE,\
+  \ \"fclose\", C))\n    return true;\n\n  // Optionally extend if needed.\n  return\
+  \ false;\n}\n\nconst MemRegion *SAGenTestChecker::getRootAlias(const MemRegion *R,\
+  \ ProgramStateRef State) {\n  if (!R)\n    return nullptr;\n  const MemRegion *Cur\
+  \ = R->getBaseRegion();\n  // Follow alias chain with a simple loop guard.\n  for\
+  \ (unsigned i = 0; i < 8; ++i) {\n    if (!Cur)\n      break;\n    if (const MemRegion\
+  \ *const *NextPtr = State->get<PtrAliasMap>(Cur)) {\n      const MemRegion *Next\
+  \ = *NextPtr;\n      const MemRegion *NextBase = Next->getBaseRegion();\n      if\
+  \ (!NextBase || NextBase == Cur)\n        break;\n      Cur = NextBase;\n      continue;\n\
+  \    }\n    break;\n  }\n  return Cur;\n}\n\nProgramStateRef SAGenTestChecker::setAlias(ProgramStateRef\
+  \ State, const MemRegion *Alias,\n                                           const\
+  \ MemRegion *Target) {\n  if (!State || !Alias || !Target)\n    return State;\n\
+  \  const MemRegion *AliasB = Alias->getBaseRegion();\n  const MemRegion *TargetB\
+  \ = getRootAlias(Target->getBaseRegion(), State);\n  if (!AliasB || !TargetB)\n\
+  \    return State;\n  State = State->set<PtrAliasMap>(AliasB, TargetB);\n  // Also\
+  \ set reverse alias (symmetric) to strengthen tracking.\n  State = State->set<PtrAliasMap>(TargetB,\
+  \ AliasB);\n  return State;\n}\n\nProgramStateRef SAGenTestChecker::setResState(ProgramStateRef\
+  \ State, const MemRegion *R,\n                                              unsigned\
+  \ NewState) {\n  if (!State || !R)\n    return State;\n  const MemRegion *Root =\
+  \ getRootAlias(R, State);\n  if (!Root)\n    return State;\n\n  if (NewState ==\
+  \ OpenOrUnknown) {\n    // Clearing state when overwritten with new non-null value.\n\
+  \    State = State->remove<ResourceStateMap>(Root);\n  } else {\n    State = State->set<ResourceStateMap>(Root,\
+  \ NewState);\n  }\n  return State;\n}\n\nunsigned SAGenTestChecker::getResState(ProgramStateRef\
+  \ State, const MemRegion *R) {\n  if (!State || !R)\n    return OpenOrUnknown;\n\
+  \  const MemRegion *Root = getRootAlias(R, State);\n  if (!Root)\n    return OpenOrUnknown;\n\
+  \  if (const unsigned *S = State->get<ResourceStateMap>(Root))\n    return *S;\n\
+  \  return OpenOrUnknown;\n}\n\nbool SAGenTestChecker::isNullSVal(SVal V) {\n  if\
+  \ (auto L = V.getAs<Loc>()) {\n    if (auto CI = L->getAs<loc::ConcreteInt>()) {\n\
+  \      return CI->getValue().isZero();\n    }\n  }\n  if (auto CI = V.getAs<nonloc::ConcreteInt>())\
+  \ {\n    return CI->getValue().isZero();\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isNonNullPointerish(SVal\
+  \ V, ASTContext &ACtx) {\n  // Heuristic: if we have a region or a non-zero concrete\
+  \ int as pointer.\n  if (V.getAsRegion())\n    return true;\n\n  if (auto L = V.getAs<Loc>())\
+  \ {\n    if (auto CI = L->getAs<loc::ConcreteInt>()) {\n      return !CI->getValue().isZero();\n\
+  \    }\n    // Unknown pointer value: can't assert non-null.\n    return false;\n\
+  \  }\n\n  // For typed ints used as pointers, avoid guessing.\n  return false;\n\
+  }\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (!isCloseLike(Call, C))\n    return;\n\n  ProgramStateRef State\
+  \ = C.getState();\n  if (!State)\n    return;\n\n  if (Call.getNumArgs() < 1)\n\
+  \    return;\n\n  // Arg0 should be the file pointer being closed.\n  SVal Arg0\
+  \ = Call.getArgSVal(0);\n  const MemRegion *MR = Arg0.getAsRegion();\n  if (!MR)\
+  \ {\n    // As a fallback, try extracting region from the expression directly.\n\
+  \    if (const Expr *AE = Call.getArgExpr(0)) {\n      MR = getMemRegionFromExpr(AE,\
+  \ C);\n    }\n  }\n  if (!MR)\n    return;\n\n  MR = MR->getBaseRegion();\n  if\
+  \ (!MR)\n    return;\n\n  // Mark as Closed after successful close-like call.\n\
+  \  State = setResState(State, MR, Closed);\n  C.addTransition(State);\n}\n\nvoid\
+  \ SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  if (!isCloseLike(Call, C))\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  if (!State)\n    return;\n\n  if (Call.getNumArgs() < 1)\n    return;\n\n  SVal\
+  \ Arg0 = Call.getArgSVal(0);\n  const MemRegion *MR = Arg0.getAsRegion();\n  if\
+  \ (!MR) {\n    if (const Expr *AE = Call.getArgExpr(0)) {\n      MR = getMemRegionFromExpr(AE,\
+  \ C);\n    }\n  }\n  if (!MR)\n    return;\n\n  MR = MR->getBaseRegion();\n  if\
+  \ (!MR)\n    return;\n\n  unsigned RS = getResState(State, MR);\n  if (RS == Closed)\
+  \ {\n    // Second close without nullification.\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    if (!N)\n      return;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \        *BT, \"Double close: pointer was closed but not set to NULL\", N);\n  \
+  \  R->addRange(Call.getSourceRange());\n    C.emitReport(std::move(R));\n    return;\n\
+  \  }\n\n  // If already nullified, it's fine (no report).\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n  if (!State)\n    return;\n\n  // Track aliasing: if binding\
+  \ a pointer value to a pointer location, record alias.\n  if (const MemRegion *LHS\
+  \ = Loc.getAsRegion()) {\n    LHS = LHS->getBaseRegion();\n    if (LHS) {\n    \
+  \  if (const MemRegion *RHS = Val.getAsRegion()) {\n        RHS = RHS->getBaseRegion();\n\
+  \        if (RHS) {\n          State = setAlias(State, LHS, RHS);\n        }\n \
+  \     }\n    }\n  }\n\n  // Nullification detection.\n  if (const MemRegion *LHS\
+  \ = Loc.getAsRegion()) {\n    LHS = LHS->getBaseRegion();\n    if (LHS) {\n    \
+  \  if (isNullSVal(Val)) {\n        // Explicitly set to NULL.\n        State = setResState(State,\
+  \ LHS, Nullified);\n      } else if (isNonNullPointerish(Val, C.getASTContext()))\
+  \ {\n        // Overwrite with a new non-null pointer -> not a stale closed pointer\
+  \ anymore.\n        State = setResState(State, LHS, OpenOrUnknown);\n      }\n \
+  \   }\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects double close when a resource\
+  \ pointer is closed and not set to NULL\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

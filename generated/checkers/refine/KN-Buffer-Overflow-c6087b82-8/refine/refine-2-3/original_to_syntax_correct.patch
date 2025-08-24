@@ -1,0 +1,170 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -58,6 +58,15 @@
+   void reportUnbounded(const CallEvent &Call, const Expr *Dst,
+                        const Expr *Len, CheckerContext &C) const;
++
++  // Robustly extract RHS/init expression associated with the bind to LHSReg by walking up parents.
++  const Expr *recoverRHSForBind(const Stmt *S, const MemRegion *LHSReg, CheckerContext &C) const;
++
++  // Try to record that LHSReg is a safe length for some array found via sizeof in RHS/init.
++  ProgramStateRef tryRecordArraySafeLen(ProgramStateRef State,
++                                        const Expr *RHS,
++                                        const MemRegion *LHSReg,
++                                        CheckerContext &C) const;
+ };
+
+ bool SAGenTestChecker::isCopyFromUser(const CallEvent &Call, CheckerContext &C) const {
+@@ -166,16 +175,84 @@   C.emitReport(std::move(R));
+ }
+
++// Recover RHS of an assignment or initializer responsible for binding to LHSReg.
++// This handles cases where checkBind is invoked on subexpressions inside a macro expansion.
++const Expr *SAGenTestChecker::recoverRHSForBind(const Stmt *S, const MemRegion *LHSReg,
++                                                CheckerContext &C) const {
++  if (!S || !LHSReg)
++    return nullptr;
++
++  // Direct assignment
++  if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
++    if (BO->isAssignmentOp())
++      return BO->getRHS();
++  }
++
++  // Walk up to the nearest assignment
++  if (const auto *PBO = findSpecificTypeInParents<BinaryOperator>(S, C)) {
++    if (PBO->isAssignmentOp())
++      return PBO->getRHS();
++  }
++
++  // Variable initialization in a DeclStmt
++  const DeclStmt *DS = dyn_cast<DeclStmt>(S);
++  if (!DS)
++    DS = findSpecificTypeInParents<DeclStmt>(S, C);
++
++  if (DS) {
++    MemRegionManager &MRMgr = C.getSValBuilder().getRegionManager();
++    for (const Decl *D : DS->decls()) {
++      const auto *VD = dyn_cast<VarDecl>(D);
++      if (!VD || !VD->hasInit())
++        continue;
++      const VarRegion *VR = MRMgr.getVarRegion(VD, C.getLocationContext());
++      if (!VR)
++        continue;
++      if (VR->getBaseRegion() == LHSReg)
++        return VD->getInit();
++    }
++  }
++
++  return nullptr;
++}
++
++// Record in the program state that LHSReg is a "safe length" for an array found via sizeof() in RHS.
++ProgramStateRef SAGenTestChecker::tryRecordArraySafeLen(ProgramStateRef State,
++                                                        const Expr *RHS,
++                                                        const MemRegion *LHSReg,
++                                                        CheckerContext &C) const {
++  if (!RHS || !LHSReg)
++    return State;
++
++  const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(RHS);
++  if (!UE || UE->getKind() != UETT_SizeOf)
++    return State;
++
++  const Expr *Arg = UE->getArgumentExpr();
++  if (!Arg)
++    return State;
++
++  // Confirm it's an actual array
++  llvm::APInt DummySize;
++  if (!getArraySizeFromExpr(DummySize, Arg))
++    return State;
++
++  // Get the array region and normalize
++  const MemRegion *ArrMR = getMemRegionFromExpr(Arg, C);
++  if (!ArrMR)
++    return State;
++  ArrMR = ArrMR->getBaseRegion();
++  if (!ArrMR)
++    return State;
++
++  return State->set<ArraySafeLenMap>(ArrMR, LHSReg);
++}
++
+ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+   if (!S)
+     return;
+
+-  const auto *BO = dyn_cast<BinaryOperator>(S);
+-  if (!BO || !BO->isAssignmentOp())
+-    return;
+-
+-  ProgramStateRef State = C.getState();
+-
++  // Identify the LHS region being assigned to
+   const MemRegion *LHSReg = Loc.getAsRegion();
+   if (!LHSReg)
+     return;
+@@ -183,36 +260,37 @@   if (!LHSReg)
+     return;
+
+-  const Expr *RHS = BO->getRHS();
+-  if (!RHS)
+-    return;
+-
+-  // Look for sizeof(array) in RHS; if found, associate the array with this LHS length variable
+-  if (const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(RHS)) {
+-    if (UE->getKind() == UETT_SizeOf) {
+-      if (const Expr *Arg = UE->getArgumentExpr()) {
+-        // Confirm it's an array decl ref
+-        llvm::APInt DummySize;
+-        if (getArraySizeFromExpr(DummySize, Arg)) {
+-          const MemRegion *ArrMR = getMemRegionFromExpr(Arg, C);
+-          if (ArrMR) {
+-            ArrMR = ArrMR->getBaseRegion();
+-            if (ArrMR) {
+-              State = State->set<ArraySafeLenMap>(ArrMR, LHSReg);
+-            }
+-          }
+-        }
+-      }
+-    }
+-  } else {
+-    // Weak heuristic: if RHS contains both min and sizeof, consider LHS symbol bounded
++  ProgramStateRef State = C.getState();
++
++  // Try to robustly get the RHS/init expression that leads to this bind.
++  const Expr *RHS = recoverRHSForBind(S, LHSReg, C);
++  if (!RHS) {
++    // As a fallback, if S itself is a BinaryOperator we may still use it
++    if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
++      if (BO->isAssignmentOp())
++        RHS = BO->getRHS();
++    }
++  }
++  if (!RHS) {
++    // No syntactic RHS we can analyze.
++    return;
++  }
++
++  // If RHS contains sizeof(array), and we can resolve the array, record that this LHS is a safe len for that array.
++  ProgramStateRef NewState = tryRecordArraySafeLen(State, RHS, LHSReg, C);
++
++  // Weak heuristic kept: if RHS contains both min and sizeof, but we could not resolve array,
++  // keep previous behavior to optionally mark the bound symbol as "bounded". This does not
++  // affect the precise array mapping logic.
++  if (NewState == State) {
+     if (ExprHasName(RHS, "min", C) && ExprHasName(RHS, "sizeof", C)) {
+       if (SymbolRef Sym = Val.getAsSymbol())
+-        State = State->add<BoundedLenSyms>(Sym);
+-    }
+-  }
+-
+-  C.addTransition(State);
++        NewState = NewState->add<BoundedLenSyms>(Sym);
++    }
++  }
++
++  if (NewState != State)
++    C.addTransition(NewState);
+ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {

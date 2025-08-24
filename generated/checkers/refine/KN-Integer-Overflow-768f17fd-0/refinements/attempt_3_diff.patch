@@ -1,0 +1,822 @@
+--- attempt_3_original.cpp+++ attempt_3.cpp@@ -43,6 +43,9 @@ // Key: VarDecl*, Value: APSInt upper bound (unsigned).
+ namespace {
+ struct VarUpperBoundMap {};
++// Track exact integer-constant assignments for variables within a function.
++// Key: VarDecl*, Value: exact APSInt value assigned via literal/constant expression.
++struct VarConstMap {};
+ }
+
+ namespace clang {
+@@ -55,6 +58,15 @@     return &Index;
+   }
+ };
++
++template <>
++struct ProgramStateTrait<VarConstMap>
++    : public ProgramStatePartialTrait<llvm::ImmutableMap<const VarDecl *, llvm::APSInt>> {
++  static void *GDMIndex() {
++    static int Index;
++    return &Index;
++  }
++};
+ } // namespace ento
+ } // namespace clang
+
+@@ -103,8 +115,10 @@     return Top == static_cast<const Expr *>(Shl);
+   }
+
+-  static bool constantShiftFitsInLHSWidth(const Expr *L, const Expr *R,
+-                                          unsigned LHSW, CheckerContext &C) {
++  // Check if constant L and R guarantee that (L << R) fits within OpW bits (the
++  // promoted width of the shift expression).
++  static bool constantShiftFitsInWidth(const Expr *L, const Expr *R,
++                                       unsigned OpW, CheckerContext &C) {
+     llvm::APSInt LHSEval, RHSEval;
+     if (!EvaluateExprToInt(LHSEval, L, C))
+       return false;
+@@ -118,7 +132,7 @@     uint64_t ShiftAmt = RHSEval.getZExtValue();
+     if (LBits == 0)
+       return true;
+-    return (uint64_t)LBits + ShiftAmt <= (uint64_t)LHSW;
++    return (uint64_t)LBits + ShiftAmt <= (uint64_t)OpW;
+   }
+
+   static bool isAnyLongType(QualType QT) {
+@@ -180,7 +194,7 @@         return true;
+       }
+     }
+-       return false;
++    return false;
+   }
+
+   static bool isFalsePositiveContext(const Expr *WholeExpr,
+@@ -223,7 +237,6 @@   }
+
+   // Extract a coarse upper bound from an assignment RHS by scanning integer literals.
+-  // Intended to capture patterns like min(x, CONST) where CONST is the controlling bound.
+   static bool extractUpperBoundLiteralFromRHS(const Expr *RHS, CheckerContext &C,
+                                               llvm::APSInt &Out) {
+     if (!RHS)
+@@ -250,8 +263,6 @@           MaxVal = llvm::APSInt(V, /*isUnsigned=*/true);
+         Found = true;
+       } else if (const auto *UO = dyn_cast<UnaryOperator>(Cur)) {
+-        // Try to handle sizeof-like folds that may appear as integral casts.
+-        // We still just traverse.
+         if (const Expr *SubE = UO->getSubExpr())
+           Worklist.push_back(SubE);
+       } else {
+@@ -268,7 +279,24 @@     return false;
+   }
+
+-  // Get a recorded per-variable upper bound from program state.
++  // Exact constant for variables from program state
++  static bool getRecordedVarExactConst(const Expr *E, CheckerContext &C,
++                                       llvm::APSInt &Out) {
++    const auto *DRE = dyn_cast_or_null<DeclRefExpr>(peel(E));
++    if (!DRE)
++      return false;
++    const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
++    if (!VD)
++      return false;
++
++    ProgramStateRef State = C.getState();
++    const llvm::APSInt *Stored = State->get<VarConstMap>(VD);
++    if (!Stored)
++      return false;
++    Out = *Stored;
++    return true;
++  }
++
+   static bool getRecordedVarUpperBound(const Expr *E, CheckerContext &C,
+                                        llvm::APSInt &Out) {
+     const auto *DRE = dyn_cast_or_null<DeclRefExpr>(peel(E));
+@@ -286,29 +314,84 @@     return true;
+   }
+
+-  // Compute an upper bound for an expression based on:
+-  // - Exact constant evaluation
+-  // - Recorded per-variable upper bounds
+-  // - Simple addition of sub-bounds
+-  static bool computeExprUpperBound(const Expr *E, CheckerContext &C,
+-                                    llvm::APSInt &Out) {
+-    if (!E)
+-      return false;
+-    E = peel(E);
+-
+-    // Constant?
++  enum UpperBoundOrigin {
++    UBO_None = 0,
++    UBO_Const = 1,
++    UBO_ExactVar = 2,
++    UBO_FromState = 4,
++    UBO_FromVarUB = 8,
++    UBO_FromExpr = 16
++  };
++
++  static bool tryEvalConstOrRecorded(const Expr *E, CheckerContext &C,
++                                     llvm::APSInt &Out, UpperBoundOrigin &Origin) {
+     llvm::APSInt Val;
+     if (EvaluateExprToInt(Val, E, C)) {
+-      if (Val.isSigned() && Val.isNegative())
+-        return false; // not handling negative bounds here
+-      Out = Val.extOrTrunc(64);
++      Out = Val;
++      Origin = UBO_Const;
++      return true;
++    }
++    if (getRecordedVarExactConst(E, C, Val)) {
++      Out = Val;
++      Origin = UBO_ExactVar;
++      return true;
++    }
++    return false;
++  }
++
++  // Helper: bitfield info for MemberExpr
++  static bool getBitfieldInfo(const Expr *E, CheckerContext &C,
++                              unsigned &Width, bool &IsUnsigned) {
++    E = peel(E);
++    const auto *ME = dyn_cast_or_null<MemberExpr>(E);
++    if (!ME)
++      return false;
++    const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
++    if (!FD || !FD->isBitField())
++      return false;
++    Width = FD->getBitWidthValue(C.getASTContext());
++    IsUnsigned = FD->getType()->isUnsignedIntegerType();
++    return true;
++  }
++
++  // Compute an upper bound for an expression. Also report where it comes from.
++  static bool computeExprUpperBoundEx(const Expr *E, CheckerContext &C,
++                                      llvm::APSInt &Out, UpperBoundOrigin &Origin) {
++    if (!E)
++      return false;
++    E = peel(E);
++
++    // Constants or recorded exact values
++    if (tryEvalConstOrRecorded(E, C, Out, Origin)) {
++      if (Out.isSigned() && Out.isNegative())
++        return false;
++      Out = Out.extOrTrunc(64);
+       Out.setIsUnsigned(true);
+       return true;
+     }
+
+-    // Variable with recorded bound?
+-    if (getRecordedVarUpperBound(E, C, Out))
+-      return true;
++    // Bitfield member expression: compute UB from declared width.
++    unsigned BFWidth = 0;
++    bool BFUnsigned = false;
++    if (getBitfieldInfo(E, C, BFWidth, BFUnsigned)) {
++      unsigned EffWidth = BFUnsigned ? BFWidth : (BFWidth ? BFWidth - 1 : 0);
++      llvm::APInt MaxVal(64, 0);
++      if (EffWidth > 0) {
++        llvm::APInt Ones = llvm::APInt::getMaxValue(EffWidth);
++        MaxVal = Ones.zextOrTrunc(64);
++      }
++      Out = llvm::APSInt(MaxVal, /*isUnsigned=*/true);
++      Origin = UBO_FromExpr;
++      return true;
++    }
++
++    // Variable with recorded coarse upper bound?
++    if (getRecordedVarUpperBound(E, C, Out)) {
++      Origin = UBO_FromVarUB;
++      Out = Out.extOrTrunc(64);
++      Out.setIsUnsigned(true);
++      return true;
++    }
+
+     // Symbolic? Try constraint manager max.
+     ProgramStateRef State = C.getState();
+@@ -319,6 +402,7 @@         return false;
+       Out = CIVal.extOrTrunc(64);
+       Out.setIsUnsigned(true);
++      Origin = UBO_Const;
+       return true;
+     }
+     if (SymbolRef Sym = SV.getAsSymbol()) {
+@@ -328,34 +412,195 @@           return false;
+         Out = M.extOrTrunc(64);
+         Out.setIsUnsigned(true);
++        Origin = UBO_FromState;
+         return true;
+       }
+     }
+
+-    // Composite expressions: try L + R for additions
++    // Structural handling
++    if (const auto *CE = dyn_cast<CastExpr>(E)) {
++      llvm::APSInt SubUB;
++      UpperBoundOrigin SubO = UBO_None;
++      if (computeExprUpperBoundEx(CE->getSubExpr(), C, SubUB, SubO)) {
++        Out = SubUB;
++        Origin = (UpperBoundOrigin)(SubO | UBO_FromExpr);
++        return true;
++      }
++    }
++
++    if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
++      llvm::APSInt TUB, FUB;
++      UpperBoundOrigin TO = UBO_None, FO = UBO_None;
++      bool THave = computeExprUpperBoundEx(CO->getTrueExpr(), C, TUB, TO);
++      bool FHave = computeExprUpperBoundEx(CO->getFalseExpr(), C, FUB, FO);
++      if (THave && FHave) {
++        unsigned BW = std::max(TUB.getBitWidth(), FUB.getBitWidth());
++        llvm::APSInt T2 = TUB.extOrTrunc(BW);
++        llvm::APSInt F2 = FUB.extOrTrunc(BW);
++        T2.setIsUnsigned(true);
++        F2.setIsUnsigned(true);
++        Out = (T2 > F2) ? T2 : F2;
++        Origin = (UpperBoundOrigin)(TO | FO | UBO_FromExpr);
++        return true;
++      }
++      if (THave) {
++        Out = TUB;
++        Origin = (UpperBoundOrigin)(TO | UBO_FromExpr);
++        return true;
++      }
++      if (FHave) {
++        Out = FUB;
++        Origin = (UpperBoundOrigin)(FO | UBO_FromExpr);
++        return true;
++      }
++    }
++
+     if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+-      if (BO->getOpcode() == BO_Add) {
+-        llvm::APSInt LUB, RUB;
+-        if (computeExprUpperBound(BO->getLHS(), C, LUB) &&
+-            computeExprUpperBound(BO->getRHS(), C, RUB)) {
++      llvm::APSInt LUB, RUB;
++      UpperBoundOrigin LO = UBO_None, RO = UBO_None;
++
++      auto combineUBits = [&](llvm::APSInt &A, llvm::APSInt &B) -> unsigned {
++        llvm::APSInt A2 = A.extOrTrunc(64); A2.setIsUnsigned(true);
++        llvm::APSInt B2 = B.extOrTrunc(64); B2.setIsUnsigned(true);
++        return std::max(A2.getBitWidth(), B2.getBitWidth());
++      };
++
++      switch (BO->getOpcode()) {
++      case BO_Add:
++      case BO_Sub:
++      case BO_Mul:
++      case BO_Div:
++      case BO_Rem:
++        // Fallback: try generic UB on both sides, add for Add/Sub as a safe over-approx.
++        if (computeExprUpperBoundEx(BO->getLHS(), C, LUB, LO) &&
++            computeExprUpperBoundEx(BO->getRHS(), C, RUB, RO)) {
+           unsigned BW = std::max(LUB.getBitWidth(), RUB.getBitWidth());
+-          llvm::APSInt L2 = LUB.extOrTrunc(BW);
+-          llvm::APSInt R2 = RUB.extOrTrunc(BW);
+-          L2.setIsUnsigned(true);
+-          R2.setIsUnsigned(true);
+-          Out = L2 + R2;
+-          Out.setIsUnsigned(true);
++          llvm::APSInt L2 = LUB.extOrTrunc(BW); L2.setIsUnsigned(true);
++          llvm::APSInt R2 = RUB.extOrTrunc(BW); R2.setIsUnsigned(true);
++          if (BO->getOpcode() == BO_Add || BO->getOpcode() == BO_Sub) {
++            Out = L2 + R2; // Safe upper bound
++          } else if (BO->getOpcode() == BO_Mul) {
++            llvm::APInt Tmp = static_cast<const llvm::APInt &>(L2);
++            Tmp = Tmp.zextOrTrunc(64);
++            Tmp = Tmp * static_cast<const llvm::APInt &>(R2);
++            Out = llvm::APSInt(Tmp, true);
++          } else {
++            // For Div/Rem, upper bound cannot exceed LHS upper bound.
++            Out = L2;
++          }
++          Origin = (UpperBoundOrigin)(LO | RO | UBO_FromExpr);
+           return true;
+         }
+-      }
+-      // Other ops: give up (conservative)
++        break;
++
++      case BO_Or:
++        if (computeExprUpperBoundEx(BO->getLHS(), C, LUB, LO) &&
++            computeExprUpperBoundEx(BO->getRHS(), C, RUB, RO)) {
++          llvm::APInt LA = static_cast<const llvm::APInt &>(LUB.extOrTrunc(64));
++          llvm::APInt RA = static_cast<const llvm::APInt &>(RUB.extOrTrunc(64));
++          Out = llvm::APSInt(LA | RA, true);
++          Origin = (UpperBoundOrigin)(LO | RO | UBO_FromExpr);
++          return true;
++        }
++        break;
++
++      case BO_Xor:
++        if (computeExprUpperBoundEx(BO->getLHS(), C, LUB, LO) &&
++            computeExprUpperBoundEx(BO->getRHS(), C, RUB, RO)) {
++          llvm::APInt LA = static_cast<const llvm::APInt &>(LUB.extOrTrunc(64));
++          llvm::APInt RA = static_cast<const llvm::APInt &>(RUB.extOrTrunc(64));
++          // Upper bound of XOR is safely bounded by OR of UB's.
++          Out = llvm::APSInt(LA | RA, true);
++          Origin = (UpperBoundOrigin)(LO | RO | UBO_FromExpr);
++          return true;
++        }
++        break;
++
++      case BO_And: {
++        bool LH = computeExprUpperBoundEx(BO->getLHS(), C, LUB, LO);
++        bool RH = computeExprUpperBoundEx(BO->getRHS(), C, RUB, RO);
++        if (LH && RH) {
++          // A & B <= min(UB(A), UB(B))
++          llvm::APSInt L2 = LUB.extOrTrunc(64); L2.setIsUnsigned(true);
++          llvm::APSInt R2 = RUB.extOrTrunc(64); R2.setIsUnsigned(true);
++          Out = (L2 < R2) ? L2 : R2;
++          Origin = (UpperBoundOrigin)(LO | RO | UBO_FromExpr);
++          return true;
++        }
++        // Better: if one side is constant, result UB is <= that constant
++        llvm::APSInt ConstSide;
++        UpperBoundOrigin OO = UBO_None;
++        if (tryEvalConstOrRecorded(BO->getLHS(), C, ConstSide, OO)) {
++          Out = ConstSide.extOrTrunc(64);
++          Out.setIsUnsigned(true);
++          Origin = (UpperBoundOrigin)(OO | UBO_FromExpr);
++          return true;
++        }
++        if (tryEvalConstOrRecorded(BO->getRHS(), C, ConstSide, OO)) {
++          Out = ConstSide.extOrTrunc(64);
++          Out.setIsUnsigned(true);
++          Origin = (UpperBoundOrigin)(OO | UBO_FromExpr);
++          return true;
++        }
++        break;
++      }
++
++      case BO_Shl: {
++        if (computeExprUpperBoundEx(BO->getLHS(), C, LUB, LO) &&
++            computeExprUpperBoundEx(BO->getRHS(), C, RUB, RO)) {
++          uint64_t Sh = RUB.getZExtValue();
++          Sh = std::min<uint64_t>(Sh, 63);
++          llvm::APSInt L2 = LUB.extOrTrunc(64);
++          L2.setIsUnsigned(true);
++          llvm::APInt Tmp = static_cast<const llvm::APInt &>(L2);
++          Tmp = Tmp.shl((unsigned)Sh);
++          Out = llvm::APSInt(Tmp, true);
++          Origin = (UpperBoundOrigin)(LO | RO | UBO_FromExpr);
++          return true;
++        }
++        break;
++      }
++
++      case BO_Shr: {
++        if (computeExprUpperBoundEx(BO->getLHS(), C, LUB, LO)) {
++          // Use smallest shift (best-case for maximizing the result).
++          llvm::APSInt ShiftC;
++          UpperBoundOrigin SO = UBO_None;
++          uint64_t MinShift = 0;
++          if (tryEvalConstOrRecorded(BO->getRHS(), C, ShiftC, SO)) {
++            MinShift = std::min<uint64_t>(ShiftC.getZExtValue(), 63);
++          } else {
++            // If we can get an upper bound for shift, min is 0.
++            // So UB(result) <= UB(LHS)
++            MinShift = 0;
++          }
++          llvm::APSInt L2 = LUB.extOrTrunc(64);
++          L2.setIsUnsigned(true);
++          llvm::APInt Tmp = static_cast<const llvm::APInt &>(L2);
++          if (MinShift > 0)
++            Tmp = Tmp.lshr((unsigned)MinShift);
++          Out = llvm::APSInt(Tmp, true);
++          Origin = (UpperBoundOrigin)(LO | UBO_FromExpr);
++          return true;
++        }
++        break;
++      }
++
++      default:
++        break;
++      }
+     }
+
+     return false;
+   }
+
+-  // Compute maximum number of active bits an expression's value can have,
+-  // using constants or recorded/symbolic upper bounds.
++  static bool computeExprUpperBound(const Expr *E, CheckerContext &C,
++                                    llvm::APSInt &Out) {
++    UpperBoundOrigin Ign = UBO_None;
++    return computeExprUpperBoundEx(E, C, Out, Ign);
++  }
++
++  // Compute maximum number of active bits an expression's value can have.
+   static bool computeExprMaxActiveBits(const Expr *E, CheckerContext &C,
+                                        unsigned &OutBits) {
+     if (!E)
+@@ -370,9 +615,16 @@       return true;
+     }
+
++    // Bitfield exact bound
++    unsigned BFWidth = 0;
++    bool BFUnsigned = false;
++    if (getBitfieldInfo(E, C, BFWidth, BFUnsigned)) {
++      OutBits = BFUnsigned ? BFWidth : (BFWidth ? BFWidth - 1 : 0);
++      return true;
++    }
++
+     llvm::APSInt UB;
+     if (computeExprUpperBound(E, C, UB)) {
+-      // Active bits of the upper bound is an upper bound on the active bits.
+       OutBits = UB.getActiveBits();
+       return true;
+     }
+@@ -380,10 +632,84 @@     return false;
+   }
+
+-  // Decide if the shift is provably safe within the LHS bitwidth (e.g., 32-bit)
++  // Lightweight "forced-one" bits mask for an expression (64-bit).
++  static llvm::APInt computeForcedOneMask(const Expr *E, CheckerContext &C) {
++    E = peel(E);
++    llvm::APInt Zero(64, 0);
++
++    if (!E)
++      return Zero;
++
++    // Integer constant
++    if (const auto *IL = dyn_cast<IntegerLiteral>(E))
++      return IL->getValue().zextOrTrunc(64);
++
++    // Exact variable constant
++    llvm::APSInt Exact;
++    if (getRecordedVarExactConst(E, C, Exact)) {
++      llvm::APSInt E2 = Exact.extOrTrunc(64);
++      E2.setIsUnsigned(true);
++      return static_cast<const llvm::APInt &>(E2);
++    }
++
++    // Bitfield: unknown forced-one mask; return zeros (conservative).
++    unsigned BFWidth = 0; bool BFUnsigned = false;
++    if (getBitfieldInfo(E, C, BFWidth, BFUnsigned)) {
++      return Zero;
++    }
++
++    // Implicit/explicit casts, parens
++    if (const auto *CE = dyn_cast<CastExpr>(E))
++      return computeForcedOneMask(CE->getSubExpr(), C);
++
++    if (const auto *PE = dyn_cast<ParenExpr>(E))
++      return computeForcedOneMask(PE->getSubExpr(), C);
++
++    // Binary ops
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      switch (BO->getOpcode()) {
++      case BO_Or: {
++        llvm::APInt LMask = computeForcedOneMask(BO->getLHS(), C);
++        llvm::APInt RMask = computeForcedOneMask(BO->getRHS(), C);
++        return LMask | RMask;
++      }
++      case BO_Shl: {
++        llvm::APInt LMask = computeForcedOneMask(BO->getLHS(), C);
++        // Need exact shift amount
++        llvm::APSInt ShAmt;
++        if (EvaluateExprToInt(ShAmt, BO->getRHS(), C) ||
++            getRecordedVarExactConst(BO->getRHS(), C, ShAmt)) {
++          uint64_t K = ShAmt.getZExtValue();
++          if (K >= 64)
++            return Zero;
++          return LMask.shl((unsigned)K);
++        }
++        return Zero;
++      }
++      case BO_And: {
++        llvm::APInt LMask = computeForcedOneMask(BO->getLHS(), C);
++        llvm::APSInt RConst;
++        if (EvaluateExprToInt(RConst, BO->getRHS(), C) ||
++            getRecordedVarExactConst(BO->getRHS(), C, RConst)) {
++          llvm::APSInt RC2 = RConst.extOrTrunc(64);
++          RC2.setIsUnsigned(true);
++          llvm::APInt RMask = static_cast<const llvm::APInt &>(RC2);
++          return LMask & RMask;
++        }
++        return Zero;
++      }
++      default:
++        break;
++      }
++    }
++
++    return Zero;
++  }
++
++  // Decide if the shift is provably safe within the operation width (e.g., 32-bit)
+   // under computed upper bounds for L and R.
+   static bool shiftSafeUnderUpperBounds(const Expr *L, const Expr *R,
+-                                        unsigned LHSW, CheckerContext &C) {
++                                        unsigned OpW, CheckerContext &C) {
+     unsigned MaxLBits = 0;
+     if (!computeExprMaxActiveBits(L, C, MaxLBits))
+       return false;
+@@ -397,7 +723,159 @@     if (MaxLBits == 0)
+       return true;
+
+-    return (uint64_t)MaxLBits + ShiftMax <= (uint64_t)LHSW;
++    return (uint64_t)MaxLBits + ShiftMax <= (uint64_t)OpW;
++  }
++
++  // Small-constant-shift FP filter: suppress when RHS is a tiny constant (<= 5)
++  // and we cannot prove risk from L.
++  static bool smallConstantShiftBenign(const Expr *L, const Expr *R,
++                                       unsigned OpW, CheckerContext &C) {
++    llvm::APSInt RC;
++    if (!(EvaluateExprToInt(RC, R, C)))
++      return false;
++    uint64_t K = RC.getZExtValue();
++    const uint64_t SmallKThreshold = 5;
++    if (K > SmallKThreshold)
++      return false;
++
++    // If L is constant, check exactly.
++    llvm::APSInt LC;
++    if (EvaluateExprToInt(LC, L, C)) {
++      if (LC.isSigned() && LC.isNegative())
++        return false;
++      unsigned LBits = LC.getActiveBits();
++      return (uint64_t)LBits + K <= (uint64_t)OpW;
++    }
++
++    // Special-case: L is an unsigned bitfield of width W: check W + K
++    unsigned BFWidth = 0; bool BFUnsigned = false;
++    if (getBitfieldInfo(L, C, BFWidth, BFUnsigned) && BFUnsigned) {
++      return (uint64_t)BFWidth + K <= (uint64_t)OpW;
++    }
++
++    // Use forced-one bits to get a lower bound on L's active bits.
++    llvm::APInt Forced = computeForcedOneMask(L, C);
++    unsigned MinLBits = Forced.getActiveBits();
++    if (MinLBits == 0) {
++      // With no evidence of large L, treat tiny shifts as benign to reduce FP.
++      return true;
++    }
++    // If even the minimum L would overflow with K, do not suppress.
++    return (uint64_t)MinLBits + K <= (uint64_t)OpW;
++  }
++
++  // Targeted FP filter: if L is an unsigned bitfield of width W and RHS is a
++  // constant K such that W + K <= OpW, the shift is safe in 32-bit.
++  static bool bitfieldConstShiftSafe(const Expr *L, const Expr *R,
++                                     unsigned OpW, CheckerContext &C) {
++    unsigned W = 0; bool IsU = false;
++    if (!getBitfieldInfo(L, C, W, IsU) || !IsU)
++      return false;
++    llvm::APSInt RC;
++    if (!EvaluateExprToInt(RC, R, C))
++      return false;
++    uint64_t K = RC.getZExtValue();
++    return (uint64_t)W + K <= (uint64_t)OpW;
++  }
++
++  static bool isFunctionParamExpr(const Expr *E) {
++    const auto *DRE = dyn_cast_or_null<DeclRefExpr>(peel(E));
++    if (!DRE)
++      return false;
++    return isa<ParmVarDecl>(DRE->getDecl());
++  }
++
++  static bool isSmallLiteralLE(const Expr *E, unsigned Limit, CheckerContext &C, uint64_t &ValOut) {
++    llvm::APSInt LC;
++    if (!EvaluateExprToInt(LC, E, C))
++      return false;
++    if (LC.isSigned() && LC.isNegative())
++      return false;
++    uint64_t V = LC.getZExtValue();
++    if (V <= Limit) {
++      ValOut = V;
++      return true;
++    }
++    return false;
++  }
++
++  // New: check if RHS looks like PAGE_SHIFT and LHS looks like a page/entry count.
++  static bool isPageShiftExpr(const Expr *R, CheckerContext &C) {
++    if (!R) return false;
++    // Prefer direct textual match to avoid matching generic constants unrelated to pages.
++    if (ExprHasName(R, "PAGE_SHIFT", C))
++      return true;
++
++    // Sometimes PAGE_SHIFT folds to an integer constant. Restrict to common ranges [9..16]
++    // but only if the original text still contains PAGE_SHIFT to avoid over-suppression.
++    // If text isn't available, don't assume page-shift based only on value.
++    llvm::APSInt K;
++    if (EvaluateExprToInt(K, R, C)) {
++      uint64_t V = K.getZExtValue();
++      if (V >= 9 && V <= 16 && ExprHasName(R, "PAGE_SHIFT", C))
++        return true;
++    }
++    return false;
++  }
++
++  static bool nameLooksLikePageCountOrEntries(const Expr *L, CheckerContext &C) {
++    if (!L) return false;
++    // Use source text substring matching to catch patterns like "gtt_mappable_entries",
++    // "total_entries", "nr_pages", "npages", etc.
++    return ExprHasName(L, "entries", C) ||
++           ExprHasName(L, "entry", C)   || // e.g., gtt_total_entry_count
++           ExprHasName(L, "pages", C)   ||
++           ExprHasName(L, "npages", C)  ||
++           ExprHasName(L, "nr_pages", C)||
++           ExprHasName(L, "page_count", C) ||
++           ExprHasName(L, "n_pages", C);
++  }
++
++  // New: Targeted false-positive filter for PAGE_SHIFT conversions of page counts.
++  // Suppress when:
++  //  - RHS is PAGE_SHIFT (textual),
++  //  - LHS name suggests a page/entry count,
++  //  - and we don't have a precise (expression-derived) upper bound for LHS
++  //    other than generic symbolic/type constraints.
++  static bool isFalsePositive_PageCountToBytes(const Expr *L, const Expr *R,
++                                               unsigned OpW, QualType DestTy,
++                                               CheckerContext &C) {
++    if (!isPageShiftExpr(R, C))
++      return false;
++    if (!nameLooksLikePageCountOrEntries(L, C))
++      return false;
++
++    // If we can prove safety under upper bounds, suppress anyway.
++    if (shiftSafeUnderUpperBounds(L, R, OpW, C))
++      return true;
++
++    // If we only have a generic symbolic upper bound (e.g., type max) for LHS (or no UB),
++    // treat this as a benign PAGE_SHIFT conversion of a bounded page count and suppress.
++    llvm::APSInt LUB;
++    UpperBoundOrigin LOrigin = UBO_None;
++    bool HaveLUB = computeExprUpperBoundEx(L, C, LUB, LOrigin);
++    if (!HaveLUB)
++      return true;
++    // If UB is derived purely from the state (i.e., not from expression structure or literals),
++    // assume it's a generic type-bound and suppress.
++    if (LOrigin == UBO_FromState)
++      return true;
++
++    // Otherwise, do not suppress (we might have precise info coming from expression structure).
++    return false;
++  }
++
++  // Update VarConstMap for exact constant assignment
++  static ProgramStateRef setOrClearVarConst(ProgramStateRef State,
++                                            const VarDecl *VD,
++                                            const Expr *RHS,
++                                            CheckerContext &C) {
++    llvm::APSInt Exact;
++    if (EvaluateExprToInt(Exact, RHS, C)) {
++      return State->set<VarConstMap>(VD, Exact);
++    }
++    // Not a constant: clear any existing entry.
++    return State->remove<VarConstMap>(VD);
+   }
+ };
+
+@@ -463,31 +941,65 @@   if (!ShlTy->isIntegerType())
+     return;
+
+-  unsigned ShlW = ACtx.getIntWidth(ShlTy);
+-  if (ShlW >= 64)
++  // Width of the shift expression after usual promotions.
++  unsigned OpW = ACtx.getIntWidth(ShlTy);
++  if (OpW >= 64)
+     return; // Shift already performed in 64-bit, OK.
+
+   if (!L->getType()->isIntegerType())
+     return;
+
+-  unsigned LHSW = ACtx.getIntWidth(L->getType());
+-  if (LHSW >= 64)
+-    return; // LHS already wide.
+-
+   if (hasExplicitCastToWide64(L, ACtx))
+     return;
+
+   if (isFalsePositiveContext(E, Shl, DestTy, C, Ctx))
+     return;
+
+-  // Constant proof: safely fits.
+-  if (constantShiftFitsInLHSWidth(L, R, LHSW, C))
+-    return;
+-
+-  // New: Symbolic upper-bound proof: if we can prove the result fits in 32-bit,
+-  // suppress. This addresses cases like: pool_size = 1 << (PAGE_SHIFT + order),
+-  // where 'order' was clamped by min(..., MAX_PAGE_ORDER).
+-  if (shiftSafeUnderUpperBounds(L, R, LHSW, C))
++  // If L and R are constants and fit within OpW, suppress.
++  if (constantShiftFitsInWidth(L, R, OpW, C))
++    return;
++
++  // FP filter: L is an unsigned bitfield and RHS is a constant; if bounded within OpW, suppress.
++  if (bitfieldConstShiftSafe(L, R, OpW, C))
++    return;
++
++  // New targeted FP filter: PAGE_SHIFT conversion of page counts (e.g., entries << PAGE_SHIFT).
++  if (isFalsePositive_PageCountToBytes(L, R, OpW, DestTy, C))
++    return;
++
++  // Compute provable risk using upper bounds.
++  // 1) Compute maximum active bits for L.
++  unsigned MaxLBits = 0;
++  bool HaveLBits = computeExprMaxActiveBits(L, C, MaxLBits);
++
++  // 2) Compute an upper bound for shift amount and its origin.
++  llvm::APSInt RMax;
++  UpperBoundOrigin ROrigin = UBO_None;
++  bool HaveRMax = computeExprUpperBoundEx(R, C, RMax, ROrigin);
++
++  // Additional FP filter: if the only knowledge about RHS is the generic
++  // "shift less than OpW" constraint (common for preventing UB), and LHS is a tiny
++  // literal (<= 8) and RHS is a function parameter, treat as benign.
++  if (HaveRMax && ROrigin == UBO_FromState && RMax.getZExtValue() == (OpW - 1)) {
++    uint64_t TinyV = 0;
++    if (isFunctionParamExpr(R) && isSmallLiteralLE(L, 8, C, TinyV)) {
++      return; // suppress this likely benign test pattern, e.g., 3 << order
++    }
++  }
++
++  // If we can prove it's safe under upper bounds, suppress.
++  if (HaveLBits && HaveRMax) {
++    uint64_t ShiftMax = RMax.getZExtValue();
++    if (MaxLBits == 0 || (uint64_t)MaxLBits + ShiftMax <= (uint64_t)OpW)
++      return;
++  } else {
++    // If we cannot prove risk (lack of bounds), be conservative and do not warn.
++    // This avoids FPs where shift amount is effectively bounded but not modeled.
++    return;
++  }
++
++  // Suppress tiny constant shifts unless we can prove risk.
++  if (smallConstantShiftBenign(L, R, OpW, C))
+     return;
+
+   // Report
+@@ -509,12 +1021,29 @@     const auto *VD = dyn_cast<VarDecl>(D);
+     if (!VD)
+       continue;
+-    if (!VD->hasInit())
+-      continue;
+-
+-    QualType DestTy = VD->getType();
+-    const Expr *Init = VD->getInit();
+-    analyzeAndReportShiftToWide(Init, DestTy, C, "initialization");
++
++    if (VD->hasInit()) {
++      QualType DestTy = VD->getType();
++      const Expr *Init = VD->getInit();
++      analyzeAndReportShiftToWide(Init, DestTy, C, "initialization");
++
++      // Update VarConstMap if initializer is a constant.
++      ProgramStateRef State = C.getState();
++      ProgramStateRef NewState = setOrClearVarConst(State, VD, Init, C);
++
++      // Also maintain coarse upper bound map
++      llvm::APSInt BoundLit;
++      if (extractUpperBoundLiteralFromRHS(Init, C, BoundLit)) {
++        const llvm::APSInt *Cur = State->get<VarUpperBoundMap>(VD);
++        llvm::APSInt NewBound = BoundLit;
++        if (Cur && Cur->ugt(NewBound))
++          NewBound = *Cur;
++        NewState = NewState->set<VarUpperBoundMap>(VD, NewBound);
++      }
++
++      if (NewState != State)
++        C.addTransition(NewState);
++    }
+   }
+ }
+
+@@ -532,7 +1061,7 @@   QualType DestTy = LHS->getType();
+   analyzeAndReportShiftToWide(RHS, DestTy, C, "assignment");
+
+-  // Second, update per-variable upper bounds when possible to help suppress FPs.
++  // Update per-variable maps.
+   const auto *DRE = dyn_cast<DeclRefExpr>(peel(LHS));
+   if (!DRE)
+     return;
+@@ -540,18 +1069,20 @@   if (!VD)
+     return;
+
++  ProgramStateRef State = C.getState();
++  ProgramStateRef NewState = setOrClearVarConst(State, VD, RHS, C);
++
+   llvm::APSInt BoundLit;
+   if (extractUpperBoundLiteralFromRHS(RHS, C, BoundLit)) {
+-    // Store or update with the maximum bound seen.
+-    ProgramStateRef State = C.getState();
+-    const llvm::APSInt *Cur = State->get<VarUpperBoundMap>(VD);
++    const llvm::APSInt *Cur = NewState->get<VarUpperBoundMap>(VD);
+     llvm::APSInt NewBound = BoundLit;
+     if (Cur && Cur->ugt(NewBound))
+       NewBound = *Cur;
+-    ProgramStateRef NewState = State->set<VarUpperBoundMap>(VD, NewBound);
+-    if (NewState != State)
+-      C.addTransition(NewState);
+-  }
++    NewState = NewState->set<VarUpperBoundMap>(VD, NewBound);
++  }
++
++  if (NewState != State)
++    C.addTransition(NewState);
+ }
+
+ void SAGenTestChecker::checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const {

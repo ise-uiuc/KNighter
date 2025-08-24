@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Workqueue context (container_of(work, struct ctx, work)) is shared between the worker and the thread that schedules it, with a completion used to synchronize. The scheduling thread calls wait_for_completion_timeout() and frees the context on timeout, while the worker still dereferences the same context later (e.g., to complete() or free it), causing a use-after-free. The root cause is missing ownership coordination of the context across timeout paths: both sides may free or the worker may access memory already freed by the waiter. The fix ensures a single owner frees the context by checking completion_done() to decide whether the waiter timed out (worker frees) or is still waiting (waiter frees after completion).

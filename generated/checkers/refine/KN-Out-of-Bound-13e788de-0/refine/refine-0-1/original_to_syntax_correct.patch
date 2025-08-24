@@ -1,0 +1,132 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -44,14 +44,22 @@     return Lexer::getSourceText(Range, SM, LangOpts);
+   }
+
++  // Tighter "MAX-like" bound name matcher to reduce FPs in buffer-size checks.
++  // We explicitly exclude "size" which appears often in capacity comparisons.
+   static bool nameLooksLikeCountBound(StringRef Name) {
+-    // Heuristic: Names that denote counts/sizes/maximums
+-    // We intentionally do NOT match "INDEX" to avoid confusing last-index checks.
+     std::string Lower = Name.lower();
+-    return Lower.find("max") != std::string::npos ||
+-           Lower.find("count") != std::string::npos ||
+-           Lower.find("num") != std::string::npos ||
+-           Lower.find("size") != std::string::npos;
++    if (Lower.find("max") != std::string::npos)
++      return true;
++    if (Lower.find("limit") != std::string::npos || Lower.find("lim") != std::string::npos)
++      return true;
++    if (Lower.find("cap") != std::string::npos || Lower.find("capacity") != std::string::npos)
++      return true;
++    if (Lower.find("upper") != std::string::npos || Lower.find("bound") != std::string::npos)
++      return true;
++    // keep some numeric-ish identifiers that show up as bounds
++    if (Lower.find("count") != std::string::npos || Lower.find("num") != std::string::npos)
++      return true;
++    return false;
+   }
+
+   static bool isDeclRefWithNameLikeCount(const Expr *E) {
+@@ -62,8 +70,6 @@     if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+       if (const auto *II = DRE->getDecl()->getIdentifier())
+         return nameLooksLikeCountBound(II->getName());
+-      // Enum constants or unnamed identifiers may not have IdentifierInfo,
+-      // but they still have a Decl name string.
+       if (const NamedDecl *ND = dyn_cast<NamedDecl>(DRE->getDecl()))
+         return nameLooksLikeCountBound(ND->getName());
+     }
+@@ -83,6 +89,15 @@     if (!E)
+       return false;
+     return !isa<DeclRefExpr>(E) && !isa<MemberExpr>(E);
++  }
++
++  static bool isUnarySizeOf(const Expr *E) {
++    E = E ? E->IgnoreParenCasts() : nullptr;
++    if (!E)
++      return false;
++    if (const auto *U = dyn_cast<UnaryExprOrTypeTraitExpr>(E))
++      return U->getKind() == UETT_SizeOf;
++    return false;
+   }
+
+   static bool isLikelyErrorReturn(const ReturnStmt *RS, CheckerContext &C) {
+@@ -123,7 +138,7 @@   }
+
+   // A more precise bound check predicate: 'Var > Bound' where Bound is a simple
+-  // MAX/COUNT/NUM/SIZE-like identifier and not a composite expression or integer literal.
++  // MAX/COUNT/NUM-like identifier and not a composite expression or integer literal.
+   static bool isPlainMaxLikeBound(const Expr *Bound, CheckerContext &C) {
+     if (!Bound)
+       return false;
+@@ -133,21 +148,56 @@     if (isa<IntegerLiteral>(Bound))
+       return false; // do not treat integer literal RHS as a MAX-like bound
+
++    // size-of based comparisons are typical for buffer capacity checks, not index validation.
++    if (isUnarySizeOf(Bound))
++      return false;
++
+     if (isCompositeBoundExpr(Bound))
+       return false; // do not accept 'MAX - 1' or other complex forms
+
+     return isDeclRefWithNameLikeCount(Bound);
+   }
+
++  // Index-like expressions are generally simple variables, member refs, or array elements.
++  static bool isLikelyIndexExpr(const Expr *E) {
++    E = E ? E->IgnoreParenCasts() : nullptr;
++    if (!E)
++      return false;
++
++    if (isa<IntegerLiteral>(E))
++      return false;
++
++    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E) || isa<ArraySubscriptExpr>(E))
++      return true;
++
++    // A simple implicit-cast around any of the above is okay (handled by IgnoreParenCasts).
++    return false;
++  }
++
++  // Guard against buffer-capacity comparisons, e.g.:
++  //   if (strlen(buf) + k + 1 > sizeof(buf)) { ... }
++  static bool isBufferCapacityComparison(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
++    if (!LHS || !RHS)
++      return false;
++
++    if (isUnarySizeOf(RHS))
++      return true;
++
++    // Heuristic textual scan for strlen/strnlen in LHS.
++    if (ExprHasName(LHS, "strlen", C) || ExprHasName(LHS, "strnlen", C))
++      return true;
++
++    return false;
++  }
++
+   // Additional guard to reject obvious false positives.
+   static bool isFalsePositive(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+-    // Reject when RHS is a small integer literal like 0, 1, 2. These are often last-index checks.
++    // Reject small integer literal RHS (<= 2); these are often last-index checks.
+     const Expr *R = RHS ? RHS->IgnoreParenCasts() : nullptr;
+     if (!R)
+       return true;
+
+     if (const auto *IL = dyn_cast<IntegerLiteral>(R)) {
+-      // Anything small (<= 2) is very likely a last-index style check: 'idx > 1' for 0..1.
+       if (IL->getValue().ule(2))
+         return true;
+     }
+@@ -192,7 +242,15 @@   if (!LHS || !RHS)
+     return;
+
+-  // Bound should be a simple MAX/COUNT/NUM/SIZE-like identifier.
++  // Filter out buffer-capacity guard patterns: strlen(...) + ... > sizeof(...)
++  if (isBufferCapacityComparison(LHS, RHS, C))
++    return;
++
++  // LHS should look like an index-like expression, not a capacity arithmetic.
++  if (!isLikelyIndexExpr(LHS))
++    return;
++
++  // Bound should be a simple MAX/COUNT/NUM-like identifier.
+   if (!isPlainMaxLikeBound(RHS, C))
+     return;

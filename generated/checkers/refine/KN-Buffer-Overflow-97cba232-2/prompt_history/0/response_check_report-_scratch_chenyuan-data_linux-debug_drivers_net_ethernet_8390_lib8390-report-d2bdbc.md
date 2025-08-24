@@ -1,0 +1,2 @@
+- Decision: NotABug
+- Reason: The flagged loop is for (i = 0; i < 6; i++) and only accesses dev->dev_addr[i]. There is no access to dev->dev_addr[i + 1] (or any other array at i + 1). EN1_PHYS_SHIFT(i) affects the hardware register offset, not the array indexing. With i ranging 0..5 and ETH_ALEN = 6, dev->dev_addr[i] is in-bounds. This does not match the target off-by-one pattern (which requires an a[i + 1] access while iterating to i < N). No fix patch is needed; the code is correct and follows the standard practice of writing the 6-byte MAC address to the NIC registers.

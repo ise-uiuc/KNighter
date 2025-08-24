@@ -1,0 +1,461 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 78ec6f9df6642418411c534683da6133e0962ec7
+commit_type: Concurrency
+index: 4
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"llvm/ADT/SmallPtrSet.h\"\n#include \"clang/Lex/Lexer.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state: track\
+  \ per-CPU pointer kind for regions.\n// 0 = Unknown, 1 = LocalThisCPU (this_cpu_ptr),\
+  \ 2 = RemotePerCPU (per_cpu_ptr with explicit cpu arg not smp_processor_id()).\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrKindMap, const MemRegion*, unsigned)\n\n\
+  namespace {\n\nenum PerCpuKind : unsigned {\n  PCK_None   = 0,\n  PCK_Local  = 1,\n\
+  \  PCK_Remote = 2\n};\n\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker\
+  \ : public Checker< check::Bind, check::Location > {\n   // Unused default BT to\
+  \ satisfy template.\n   mutable std::unique_ptr<BugType> BT;\n\n   // Specific bug\
+  \ types we actually report.\n   mutable std::unique_ptr<BugType> BTRemoteWrite;\n\
+  \   mutable std::unique_ptr<BugType> BTRMW;\n\n   // Cache of fields that were observed\
+  \ accessed via a remote per_cpu_ptr.\n   mutable llvm::SmallPtrSet<const FieldDecl*,\
+  \ 32> RemotePerCpuFields;\n\n   public:\n      SAGenTestChecker()\n        : BT(new\
+  \ BugType(this, \"Kernel Concurrency\", \"Per-CPU cross-CPU unsynchronized access\"\
+  )),\n          BTRemoteWrite(new BugType(this, \"Cross-CPU per-CPU write without\
+  \ WRITE_ONCE\", \"Concurrency\")),\n          BTRMW(new BugType(this, \"RMW on per-CPU\
+  \ field without READ/WRITE_ONCE\", \"Concurrency\")) {}\n\n      void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n      void checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;\n\n   private:\n\n\
+  \      // Helper: does this expression look like a call with name?\n      bool isCallNamed(const\
+  \ CallExpr *CE, StringRef Name, CheckerContext &C) const {\n        if (!CE) return\
+  \ false;\n        const Expr *E = dyn_cast<Expr>(CE);\n        if (!E) return false;\n\
+  \        return ExprHasName(E, Name, C);\n      }\n\n      bool isSmpProcessorIdExpr(const\
+  \ Expr *E, CheckerContext &C) const {\n        if (!E) return false;\n        return\
+  \ ExprHasName(E, \"smp_processor_id\", C);\n      }\n\n      // Classify per-cpu\
+  \ pointer kind from a call expression.\n      unsigned classifyPerCpuFromCall(const\
+  \ CallExpr *CE, CheckerContext &C) const {\n        if (!CE) return PCK_None;\n\
+  \        if (isCallNamed(CE, \"this_cpu_ptr\", C))\n          return PCK_Local;\n\
+  \n        if (isCallNamed(CE, \"per_cpu_ptr\", C)) {\n          if (CE->getNumArgs()\
+  \ >= 2) {\n            const Expr *CPUArg = CE->getArg(1);\n            if (isSmpProcessorIdExpr(CPUArg,\
+  \ C))\n              return PCK_Local;\n            return PCK_Remote;\n       \
+  \   }\n          // If no cpu arg visible, conservatively treat as remote (cross-CPU)\
+  \ usage.\n          return PCK_Remote;\n        }\n        return PCK_None;\n  \
+  \    }\n\n      // Attempt to determine kind for the base expression of a MemberExpr.\n\
+  \      unsigned getPerCpuKindFromBaseExpr(const Expr *Base, CheckerContext &C, ProgramStateRef\
+  \ State) const {\n        if (!Base) return PCK_None;\n\n        // First, try using\
+  \ program state mapping via the base's region.\n        if (const MemRegion *MR\
+  \ = getMemRegionFromExpr(Base, C)) {\n          MR = MR->getBaseRegion();\n    \
+  \      if (MR) {\n            if (const unsigned *K = State->get<PerCpuPtrKindMap>(MR))\n\
+  \              return *K;\n          }\n        }\n\n        // Fallback: look inside\
+  \ the base for a call expression to classify.\n        if (const CallExpr *InnerCall\
+  \ = findSpecificTypeInChildren<CallExpr>(Base)) {\n          unsigned K = classifyPerCpuFromCall(InnerCall,\
+  \ C);\n          if (K != PCK_None)\n            return K;\n        }\n\n      \
+  \  return PCK_None;\n      }\n\n      void setPerCpuKindForRegion(ProgramStateRef\
+  \ &State, const MemRegion *MR, unsigned Kind) const {\n        if (!MR) return;\n\
+  \        MR = MR->getBaseRegion();\n        if (!MR) return;\n        if (Kind ==\
+  \ PCK_None) return;\n        State = State->set<PerCpuPtrKindMap>(MR, Kind);\n \
+  \     }\n\n      // Report helpers\n      void reportRemoteWrite(const BinaryOperator\
+  \ *BO, const FieldDecl *FD, CheckerContext &C) const {\n        if (!BTRemoteWrite)\
+  \ return;\n        ExplodedNode *N = C.generateNonFatalErrorNode();\n        if\
+  \ (!N) return;\n        auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \       *BTRemoteWrite, \"Cross-CPU write to per-CPU field without WRITE_ONCE\"\
+  , N);\n        if (BO)\n          R->addRange(BO->getSourceRange());\n        if\
+  \ (FD)\n          R->addNote(\"Field: \" + FD->getNameAsString(), BO ? BO->getBeginLoc()\
+  \ : SourceLocation());\n        C.emitReport(std::move(R));\n      }\n\n      void\
+  \ reportLocalRMW(const BinaryOperator *BO, const FieldDecl *FD, CheckerContext &C)\
+  \ const {\n        if (!BTRMW) return;\n        ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \        if (!N) return;\n        auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \          *BTRMW, \"RMW of per-CPU field also accessed cross-CPU; use READ_ONCE/WRITE_ONCE\"\
+  , N);\n        if (BO)\n          R->addRange(BO->getSourceRange());\n        if\
+  \ (FD)\n          R->addNote(\"Field: \" + FD->getNameAsString(), BO ? BO->getBeginLoc()\
+  \ : SourceLocation());\n        C.emitReport(std::move(R));\n      }\n};\n\nvoid\
+  \ SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Track per-cpu pointer\
+  \ origin when binding to a variable/region.\n  const MemRegion *LHSReg = Loc.getAsRegion();\n\
+  \  if (LHSReg) {\n    LHSReg = LHSReg->getBaseRegion();\n\n    // 1) If this bind\
+  \ is the result of a call expression (per_cpu_ptr/this_cpu_ptr), set kind for LHS.\n\
+  \    if (const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S)) {\n     \
+  \ unsigned Kind = classifyPerCpuFromCall(CE, C);\n      if (Kind != PCK_None) {\n\
+  \        setPerCpuKindForRegion(State, LHSReg, Kind);\n      }\n    }\n\n    //\
+  \ 2) Alias propagation: if RHS is a region already known, propagate its kind to\
+  \ LHS.\n    if (const MemRegion *RHSReg = Val.getAsRegion()) {\n      RHSReg = RHSReg->getBaseRegion();\n\
+  \      if (RHSReg) {\n        if (const unsigned *K = State->get<PerCpuPtrKindMap>(RHSReg))\
+  \ {\n          setPerCpuKindForRegion(State, LHSReg, *K);\n        }\n      }\n\
+  \    }\n\n    // 3) Special-case: RHS is a MemberExpr whose base is tracked (e.g.,\
+  \ statc = statc->parent;)\n    if (const BinaryOperator *BO = findSpecificTypeInParents<BinaryOperator>(S,\
+  \ C)) {\n      if (BO->isAssignmentOp()) {\n        const Expr *R = BO->getRHS();\n\
+  \        if (R) R = R->IgnoreParenImpCasts();\n        if (const auto *ME = dyn_cast_or_cast<MemberExpr>(R))\
+  \ {\n          unsigned K = getPerCpuKindFromBaseExpr(ME->getBase(), C, State);\n\
+  \          if (K != PCK_None) {\n            setPerCpuKindForRegion(State, LHSReg,\
+  \ K);\n          }\n        }\n      }\n    }\n  }\n\n  // Detect writes/RMWs to\
+  \ per-CPU fields.\n  if (const BinaryOperator *BO = findSpecificTypeInParents<BinaryOperator>(S,\
+  \ C)) {\n    const Expr *L = BO->getLHS();\n    if (L) L = L->IgnoreParenImpCasts();\n\
+  \    const auto *LME = dyn_cast_or_null<MemberExpr>(L);\n    if (LME) {\n      const\
+  \ FieldDecl *FD = dyn_cast<FieldDecl>(LME->getMemberDecl());\n      if (FD) {\n\
+  \        unsigned Kind = getPerCpuKindFromBaseExpr(LME->getBase(), C, State);\n\
+  \        if (Kind == PCK_Remote) {\n          // Mark field as remotely accessed.\n\
+  \          RemotePerCpuFields.insert(FD);\n\n          // Remote write without WRITE_ONCE:\
+  \ check for simple assignment and (optionally) zeroing.\n          if (BO->getOpcode()\
+  \ == BO_Assign) {\n            if (!ExprHasName(BO, \"WRITE_ONCE\", C)) {\n    \
+  \          bool IsZero = false;\n              if (const Expr *RHS = BO->getRHS())\
+  \ {\n                llvm::APSInt EvalRes;\n                if (EvaluateExprToInt(EvalRes,\
+  \ RHS, C))\n                  IsZero = (EvalRes == 0);\n              }\n      \
+  \        // Warn on the common flush zeroing pattern; this catches the target bug.\n\
+  \              if (IsZero) {\n                reportRemoteWrite(BO, FD, C);\n  \
+  \            }\n            }\n          }\n        } else if (Kind == PCK_Local)\
+  \ {\n          // Local compound RMW. If the same field is accessed remotely, require\
+  \ READ_ONCE/WRITE_ONCE.\n          if (BO->isCompoundAssignmentOp()) {\n       \
+  \     if (RemotePerCpuFields.count(FD)) {\n              if (!ExprHasName(BO, \"\
+  READ_ONCE\", C) && !ExprHasName(BO, \"WRITE_ONCE\", C)) {\n                reportLocalRMW(BO,\
+  \ FD, C);\n              }\n            }\n          }\n        }\n      }\n   \
+  \ }\n  }\n\n  if (State != C.getState())\n    C.addTransition(State);\n}\n\nvoid\
+  \ SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const {\n  if (!IsLoad)\n    return;\n\n  // Heuristic: if we're loading from\
+  \ a member expression via a remote per_cpu_ptr base,\n  // record that field as\
+  \ remotely accessed. This helps later local RMW checks.\n  const MemberExpr *ME\
+  \ = findSpecificTypeInParents<MemberExpr>(S, C);\n  if (!ME) return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n  unsigned Kind = getPerCpuKindFromBaseExpr(ME->getBase(),\
+  \ C, State);\n  if (Kind == PCK_Remote) {\n    if (const FieldDecl *FD = dyn_cast<FieldDecl>(ME->getMemberDecl()))\
+  \ {\n      RemotePerCpuFields.insert(FD);\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detect unsynchronized cross-CPU accesses\
+  \ to per-CPU fields (missing READ_ONCE/WRITE_ONCE)\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nmemcg: fix data-race KCSAN bug in rstats\n\nA data-race\
+  \ issue in memcg rstat occurs when two distinct code paths\naccess the same 4-byte\
+  \ region concurrently.  KCSAN detection triggers the\nfollowing BUG as a result.\n\
+  \n\tBUG: KCSAN: data-race in __count_memcg_events / mem_cgroup_css_rstat_flush\n\
+  \n\twrite to 0xffffe8ffff98e300 of 4 bytes by task 5274 on cpu 17:\n\tmem_cgroup_css_rstat_flush\
+  \ (mm/memcontrol.c:5850)\n\tcgroup_rstat_flush_locked (kernel/cgroup/rstat.c:243\
+  \ (discriminator 7))\n\tcgroup_rstat_flush (./include/linux/spinlock.h:401 kernel/cgroup/rstat.c:278)\n\
+  \tmem_cgroup_flush_stats.part.0 (mm/memcontrol.c:767)\n\tmemory_numa_stat_show (mm/memcontrol.c:6911)\n\
+  <snip>\n\n\tread to 0xffffe8ffff98e300 of 4 bytes by task 410848 on cpu 27:\n\t\
+  __count_memcg_events (mm/memcontrol.c:725 mm/memcontrol.c:962)\n\tcount_memcg_event_mm.part.0\
+  \ (./include/linux/memcontrol.h:1097 ./include/linux/memcontrol.h:1120)\n\thandle_mm_fault\
+  \ (mm/memory.c:5483 mm/memory.c:5622)\n<snip>\n\n\tvalue changed: 0x00000029 ->\
+  \ 0x00000000\n\nThe race occurs because two code paths access the same \"stats_updates\"\
+  \nlocation.  Although \"stats_updates\" is a per-CPU variable, it is remotely\n\
+  accessed by another CPU at\ncgroup_rstat_flush_locked()->mem_cgroup_css_rstat_flush(),\
+  \ leading to the\ndata race mentioned.\n\nConsidering that memcg_rstat_updated()\
+  \ is in the hot code path, adding a\nlock to protect it may not be desirable, especially\
+  \ since this variable\npertains solely to statistics.\n\nTherefore, annotating accesses\
+  \ to stats_updates with READ/WRITE_ONCE() can\nprevent KCSAN splats and potential\
+  \ partial reads/writes.\n\nLink: https://lkml.kernel.org/r/20240424125940.2410718-1-leitao@debian.org\n\
+  Fixes: 9cee7e8ef3e3 (\"mm: memcg: optimize parent iteration in memcg_rstat_updated()\"\
+  )\nSigned-off-by: Breno Leitao <leitao@debian.org>\nSuggested-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Acked-by: Johannes Weiner <hannes@cmpxchg.org>\nAcked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Reviewed-by: Yosry Ahmed <yosryahmed@google.com>\nCc: Michal Hocko <mhocko@suse.com>\n\
+  Cc: Roman Gushchin <roman.gushchin@linux.dev>\nCc: Muchun Song <songmuchun@bytedance.com>\n\
+  Signed-off-by: Andrew Morton <akpm@linux-foundation.org>\n\n## Buggy Code\n\n```c\n\
+  // Function: memcg_rstat_updated in mm/memcontrol.c\nstatic inline void memcg_rstat_updated(struct\
+  \ mem_cgroup *memcg, int val)\n{\n\tstruct memcg_vmstats_percpu *statc;\n\tint cpu\
+  \ = smp_processor_id();\n\n\tif (!val)\n\t\treturn;\n\n\tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n\tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n\tfor (; statc; statc =\
+  \ statc->parent) {\n\t\tstatc->stats_updates += abs(val);\n\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n\t\t\tcontinue;\n\n\t\t/*\n\t\t * If @memcg is already\
+  \ flush-able, increasing stats_updates is\n\t\t * redundant. Avoid the overhead\
+  \ of the atomic update.\n\t\t */\n\t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  \t\t\tatomic64_add(statc->stats_updates,\n\t\t\t\t     &statc->vmstats->stats_updates);\n\
+  \t\tstatc->stats_updates = 0;\n\t}\n}\n```\n\n```c\n// Function: mem_cgroup_css_rstat_flush\
+  \ in mm/memcontrol.c\nstatic void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state\
+  \ *css, int cpu)\n{\n\tstruct mem_cgroup *memcg = mem_cgroup_from_css(css);\n\t\
+  struct mem_cgroup *parent = parent_mem_cgroup(memcg);\n\tstruct memcg_vmstats_percpu\
+  \ *statc;\n\tlong delta, delta_cpu, v;\n\tint i, nid;\n\n\tstatc = per_cpu_ptr(memcg->vmstats_percpu,\
+  \ cpu);\n\n\tfor (i = 0; i < MEMCG_NR_STAT; i++) {\n\t\t/*\n\t\t * Collect the aggregated\
+  \ propagation counts of groups\n\t\t * below us. We're in a per-cpu loop here and\
+  \ this is\n\t\t * a global counter, so the first cycle will get them.\n\t\t */\n\
+  \t\tdelta = memcg->vmstats->state_pending[i];\n\t\tif (delta)\n\t\t\tmemcg->vmstats->state_pending[i]\
+  \ = 0;\n\n\t\t/* Add CPU changes on this level since the last flush */\n\t\tdelta_cpu\
+  \ = 0;\n\t\tv = READ_ONCE(statc->state[i]);\n\t\tif (v != statc->state_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->state_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\t\
+  \tstatc->state_prev[i] = v;\n\t\t}\n\n\t\t/* Aggregate counts on this level and\
+  \ propagate upwards */\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->state_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->state[i] += delta;\n\t\
+  \t\tif (parent)\n\t\t\t\tparent->vmstats->state_pending[i] += delta;\n\t\t}\n\t\
+  }\n\n\tfor (i = 0; i < NR_MEMCG_EVENTS; i++) {\n\t\tdelta = memcg->vmstats->events_pending[i];\n\
+  \t\tif (delta)\n\t\t\tmemcg->vmstats->events_pending[i] = 0;\n\n\t\tdelta_cpu =\
+  \ 0;\n\t\tv = READ_ONCE(statc->events[i]);\n\t\tif (v != statc->events_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->events_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\
+  \t\tstatc->events_prev[i] = v;\n\t\t}\n\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->events_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->events[i] += delta;\n\
+  \t\t\tif (parent)\n\t\t\t\tparent->vmstats->events_pending[i] += delta;\n\t\t}\n\
+  \t}\n\n\tfor_each_node_state(nid, N_MEMORY) {\n\t\tstruct mem_cgroup_per_node *pn\
+  \ = memcg->nodeinfo[nid];\n\t\tstruct mem_cgroup_per_node *ppn = NULL;\n\t\tstruct\
+  \ lruvec_stats_percpu *lstatc;\n\n\t\tif (parent)\n\t\t\tppn = parent->nodeinfo[nid];\n\
+  \n\t\tlstatc = per_cpu_ptr(pn->lruvec_stats_percpu, cpu);\n\n\t\tfor (i = 0; i <\
+  \ NR_VM_NODE_STAT_ITEMS; i++) {\n\t\t\tdelta = pn->lruvec_stats.state_pending[i];\n\
+  \t\t\tif (delta)\n\t\t\t\tpn->lruvec_stats.state_pending[i] = 0;\n\n\t\t\tdelta_cpu\
+  \ = 0;\n\t\t\tv = READ_ONCE(lstatc->state[i]);\n\t\t\tif (v != lstatc->state_prev[i])\
+  \ {\n\t\t\t\tdelta_cpu = v - lstatc->state_prev[i];\n\t\t\t\tdelta += delta_cpu;\n\
+  \t\t\t\tlstatc->state_prev[i] = v;\n\t\t\t}\n\n\t\t\tif (delta_cpu)\n\t\t\t\tpn->lruvec_stats.state_local[i]\
+  \ += delta_cpu;\n\n\t\t\tif (delta) {\n\t\t\t\tpn->lruvec_stats.state[i] += delta;\n\
+  \t\t\t\tif (ppn)\n\t\t\t\t\tppn->lruvec_stats.state_pending[i] += delta;\n\t\t\t\
+  }\n\t\t}\n\t}\n\tstatc->stats_updates = 0;\n\t/* We are in a per-cpu loop here,\
+  \ only do the atomic write once */\n\tif (atomic64_read(&memcg->vmstats->stats_updates))\n\
+  \t\tatomic64_set(&memcg->vmstats->stats_updates, 0);\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 9095ab05d47a..a111e0d981ba\
+  \ 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -715,6 +715,7 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n {\n \tstruct\
+  \ memcg_vmstats_percpu *statc;\n \tint cpu = smp_processor_id();\n+\tunsigned int\
+  \ stats_updates;\n \n \tif (!val)\n \t\treturn;\n@@ -722,8 +723,9 @@ static inline\
+  \ void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n \tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n \tfor (; statc; statc\
+  \ = statc->parent) {\n-\t\tstatc->stats_updates += abs(val);\n-\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n+\t\tstats_updates = READ_ONCE(statc->stats_updates) +\
+  \ abs(val);\n+\t\tWRITE_ONCE(statc->stats_updates, stats_updates);\n+\t\tif (stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n \t\t\tcontinue;\n \n \t\t/*\n@@ -731,9 +733,9 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \t\t * redundant.\
+  \ Avoid the overhead of the atomic update.\n \t\t */\n \t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  -\t\t\tatomic64_add(statc->stats_updates,\n+\t\t\tatomic64_add(stats_updates,\n\
+  \ \t\t\t\t     &statc->vmstats->stats_updates);\n-\t\tstatc->stats_updates = 0;\n\
+  +\t\tWRITE_ONCE(statc->stats_updates, 0);\n \t}\n }\n \n@@ -5887,7 +5889,7 @@ static\
+  \ void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)\n \t\
+  \t\t}\n \t\t}\n \t}\n-\tstatc->stats_updates = 0;\n+\tWRITE_ONCE(statc->stats_updates,\
+  \ 0);\n \t/* We are in a per-cpu loop here, only do the atomic write once */\n \t\
+  if (atomic64_read(&memcg->vmstats->stats_updates))\n \t\tatomic64_set(&memcg->vmstats->stats_updates,\
+  \ 0);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Plain (non-atomic) read/modify/write of a per-CPU counter that is also accessed
+  from other CPUs (via per_cpu_ptr(..., cpu)), i.e., cross-CPU access to per-CPU data
+  without synchronization or READ_ONCE/WRITE_ONCE. Specifically:
+
+  - Fast path does: statc->stats_updates += abs(val); if (statc->stats_updates < ...)
+  ...
+
+  - Flush path concurrently reads/zeros: statc->stats_updates = 0;
+
+
+  This unsynchronized concurrent access causes data races/torn reads/writes. The fix
+  snapshots with READ_ONCE, updates with WRITE_ONCE, and uses the snapshot for subsequent
+  logic.'
+plan: "```\nPlan: Detect unsynchronized cross-CPU accesses to per-CPU fields (e.g.,\
+  \ stats_updates) without READ_ONCE/WRITE_ONCE\n\n1) Program State\n   - Use a single\
+  \ Program State map to track whether a pointer value is a per-CPU pointer and whether\
+  \ it is local (this_cpu_ptr) or remote (per_cpu_ptr with explicit cpu).\n     -\
+  \ REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrKindMap, const MemRegion*, unsigned)\n\
+  \       - Kind: 1 = LocalThisCPU (from this_cpu_ptr), 2 = RemotePerCPU (from per_cpu_ptr\
+  \ with a cpu expression not smp_processor_id()).\n   - Checker-level (non-state)\
+  \ cache:\n     - SmallPtrSet<const FieldDecl*, 16> RemotePerCpuFields\n       -\
+  \ Fields observed accessed via remote per_cpu_ptr in this TU (read or write). Used\
+  \ to decide when to warn on local RMW that races with remote access.\n\n   No other\
+  \ custom traits are required.\n\n2) Callbacks and Logic\n\n   A) checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) \u2014 central logic\n      Goals:\n\
+  \      - Track origin of pointer variables (from this_cpu_ptr/per_cpu_ptr).\n  \
+  \    - Propagate aliasing of tracked pointers.\n      - Detect writes to per-CPU\
+  \ fields (assignment / compound assignment).\n      - Report two bug kinds:\n  \
+  \      - Remote per-CPU write without WRITE_ONCE.\n        - Local per-CPU RMW without\
+  \ READ/WRITE_ONCE when the same field is also accessed remotely.\n\n      Implementation\
+  \ steps:\n\n      1. Track pointer origin on assignment:\n         - If S is a BinaryOperator\
+  \ (use findSpecificTypeInParents<BinaryOperator>(S, C)), with opcode BO_Assign and\
+  \ RHS is a CallExpr:\n           - Extract callee name.\n           - If name ==\
+  \ \"per_cpu_ptr\" and it has two args:\n             - Determine if the 2nd arg\
+  \ is smp_processor_id():\n               - Use ExprHasName on the second argument\
+  \ to check it contains \"smp_processor_id\".\n               - If NOT smp_processor_id,\
+  \ mark LHS region as RemotePerCPU (2).\n               - If smp_processor_id, mark\
+  \ as LocalThisCPU (1) (rare but safe).\n           - If name == \"this_cpu_ptr\"\
+  :\n             - Mark LHS region as LocalThisCPU (1).\n         - If RHS is a DeclRefExpr\
+  \ pointing to a tracked region:\n           - Propagate PerCpuPtrKindMap from RHS\
+  \ region to LHS region (alias propagation).\n         - If RHS is a MemberExpr whose\
+  \ base region is tracked:\n           - Propagate PerCpuPtrKindMap from that base\
+  \ to LHS region (handles assignments like statc = statc->parent).\n\n      2. Detect\
+  \ and classify writes to per-CPU fields:\n         - If S has a BinaryOperator B\
+  \ (assignment or compound):\n           - Let LHS be B->getLHS()->IgnoreParenImpCasts().\n\
+  \           - If LHS is not a MemberExpr, return.\n           - Get the MemberExpr\
+  \ ME and its FieldDecl FD = cast<FieldDecl>(ME->getMemberDecl()).\n           -\
+  \ Determine per-CPU pointer kind for the base of ME:\n             a) Try getMemRegionFromExpr(ME->getBase(),\
+  \ C), lookup in PerCpuPtrKindMap.\n             b) If not found in the map, fallback:\
+  \ search for a CallExpr inside ME->getBase() (findSpecificTypeInChildren<CallExpr>(ME->getBase())).\
+  \ \n                - If callee name == \"per_cpu_ptr\" and second arg does NOT\
+  \ have \"smp_processor_id\", treat as RemotePerCPU (2).\n                - If callee\
+  \ name == \"this_cpu_ptr\", treat as LocalThisCPU (1).\n           - If still unknown,\
+  \ stop (we only warn for known per-CPU pointers).\n\n         2.1 Remote write check\
+  \ (WRITE_ONCE required):\n           - If kind == RemotePerCPU (2) AND B is a simple\
+  \ assignment (BO_Assign):\n             - Evaluate RHS constant using EvaluateExprToInt;\
+  \ if it evaluates to 0 (typical flush case), this is a cross-CPU zeroing write.\n\
+  \             - Ensure the statement is not using WRITE_ONCE:\n               -\
+  \ Use ExprHasName on B (or S) with \"WRITE_ONCE\".\n               - If absent,\
+  \ add FD to RemotePerCpuFields and report:\n                 - BugType: \"Cross-CPU\
+  \ per-CPU write without WRITE_ONCE\"\n                 - Message: \"Cross-CPU write\
+  \ to per-CPU field without WRITE_ONCE\"\n           - Regardless of value, since\
+  \ it\u2019s a remote write, add FD to RemotePerCpuFields for later local-RMW checks.\n\
+  \n         2.2 Local RMW check (READ/WRITE_ONCE required when field is remotely\
+  \ accessed):\n           - If kind == LocalThisCPU (1) AND operation is a compound\
+  \ assignment (e.g., +=, -=, |=, etc.; use B->isCompoundAssignmentOp()):\n      \
+  \       - If FD is in RemotePerCpuFields:\n               - Ensure statement text\
+  \ does not include READ_ONCE or WRITE_ONCE (ExprHasName(B, \"READ_ONCE\") or \"\
+  WRITE_ONCE\"):\n                 - If both absent, report:\n                   -\
+  \ BugType: \"RMW on per-CPU field without READ/WRITE_ONCE\"\n                  \
+  \ - Message: \"RMW of per-CPU field also accessed cross-CPU; use READ_ONCE/WRITE_ONCE\"\
+  \n           - (Optional) For ++/-- on fields: If needed, handle UnaryOperator in\
+  \ a similar way (see note below).\n\n      Notes:\n      - This approach intentionally\
+  \ focuses on two high-signal cases from the patch:\n        - Remote zeroing writes\
+  \ via per_cpu_ptr(..., cpu) must use WRITE_ONCE.\n        - Local fast path RMW\
+  \ (+=) must switch to READ_ONCE snapshot + WRITE_ONCE when the field is also accessed\
+  \ cross-CPU elsewhere.\n      - It avoids heavy interprocedural data flow by tracking\
+  \ per-CPU pointer kinds in ProgramState and recording which fields have been seen\
+  \ remotely in a checker-level set.\n\n   B) checkLocation(SVal Loc, bool IsLoad,\
+  \ const Stmt *S, CheckerContext &C) \u2014 mark remote reads\n      - If IsLoad\
+  \ is true and S contains a MemberExpr ME:\n        - Determine if ME->getBase()\
+  \ refers to a RemotePerCPU (as in A.2 fallback or via PerCpuPtrKindMap).\n     \
+  \   - If yes, add the FieldDecl to RemotePerCpuFields (so that later local RMW to\
+  \ the same field can be flagged).\n      - No direct reporting here.\n\n   C) Optional\
+  \ (if desired): Handle ++/-- on fields\n      - In checkBind, the binding for ++/--\
+  \ often still appears as a BinaryOperator internally; but to be safe:\n        -\
+  \ Use findSpecificTypeInParents<UnaryOperator>(S, C) to detect pre/post inc/dec.\n\
+  \        - If operand is a MemberExpr and base is LocalThisCPU and FD is in RemotePerCpuFields,\
+  \ and neither READ_ONCE nor WRITE_ONCE is present in the source text for S:\n  \
+  \        - Report with the same \"RMW of per-CPU field ...\" message.\n\n3) Helper\
+  \ routines (internal to checker)\n   - isPerCpuPtrCall(const CallExpr*): returns\
+  \ true if callee name is \"per_cpu_ptr\".\n   - isThisCpuPtrCall(const CallExpr*):\
+  \ returns true if callee name is \"this_cpu_ptr\".\n   - isSmpProcessorIdExpr(const\
+  \ Expr*): returns true if ExprHasName(expr, \"smp_processor_id\").\n   - getPerCpuKindFromBaseExpr(const\
+  \ Expr* Base, CheckerContext &C):\n     - Try PerCpuPtrKindMap via getMemRegionFromExpr.\n\
+  \     - If not present, look for CallExpr in children and classify as LocalThisCPU\
+  \ or RemotePerCPU as described above.\n\n4) Bug reporting\n   - Use two BugType\
+  \ singletons stored in the checker:\n     - \"Cross-CPU per-CPU write without WRITE_ONCE\"\
+  \n     - \"RMW on per-CPU field without READ/WRITE_ONCE\"\n   - For each violation:\n\
+  \     - auto N = C.generateNonFatalErrorNode();\n     - If (!N) return;\n     -\
+  \ Create PathSensitiveBugReport with the corresponding BugType and short message:\n\
+  \       - Remote write: \"Cross-CPU write to per-CPU field without WRITE_ONCE\"\n\
+  \       - Local RMW: \"RMW of per-CPU field also accessed cross-CPU; use READ_ONCE/WRITE_ONCE\"\
+  \n     - Attach the relevant expression (the BinaryOperator) as the location of\
+  \ interest.\n\n5) Simplifications and rationale\n   - We avoid complex alias graphs;\
+  \ pointer origin is tracked when assigned from calls or from already tracked pointers,\
+  \ and propagated through member-based reassignments like statc = statc->parent.\n\
+  \   - We key warnings off of:\n     - Remote writes via per_cpu_ptr(..., cpu) without\
+  \ WRITE_ONCE.\n     - Local compound RMW via this_cpu_ptr when the same field is\
+  \ known to be accessed cross-CPU elsewhere, without READ_ONCE/WRITE_ONCE.\n   -\
+  \ We rely on ExprHasName to recognize presence of READ_ONCE/WRITE_ONCE in the source\
+  \ text, which is sufficient for this kernel macro pattern.\n\n6) Minimal callbacks\
+  \ used\n   - checkBind: main tracking and reporting.\n   - checkLocation: to mark\
+  \ remote-read fields so that later local RMW can be flagged.\n\n```"
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"llvm/ADT/SmallPtrSet.h\"\n#include \"clang/Lex/Lexer.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state: track\
+  \ per-CPU pointer kind for regions.\n// 0 = Unknown, 1 = LocalThisCPU (this_cpu_ptr),\
+  \ 2 = RemotePerCPU (per_cpu_ptr with explicit cpu arg not smp_processor_id()).\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrKindMap, const MemRegion*, unsigned)\n\n\
+  namespace {\n\nenum PerCpuKind : unsigned {\n  PCK_None   = 0,\n  PCK_Local  = 1,\n\
+  \  PCK_Remote = 2\n};\n\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker\
+  \ : public Checker< check::Bind, check::Location > {\n   // Unused default BT to\
+  \ satisfy template.\n   mutable std::unique_ptr<BugType> BT;\n\n   // Specific bug\
+  \ types we actually report.\n   mutable std::unique_ptr<BugType> BTRemoteWrite;\n\
+  \   mutable std::unique_ptr<BugType> BTRMW;\n\n   // Cache of fields that were observed\
+  \ accessed via a remote per_cpu_ptr.\n   mutable llvm::SmallPtrSet<const FieldDecl*,\
+  \ 32> RemotePerCpuFields;\n\n   public:\n      SAGenTestChecker()\n        : BT(new\
+  \ BugType(this, \"Kernel Concurrency\", \"Per-CPU cross-CPU unsynchronized access\"\
+  )),\n          BTRemoteWrite(new BugType(this, \"Cross-CPU per-CPU write without\
+  \ WRITE_ONCE\", \"Concurrency\")),\n          BTRMW(new BugType(this, \"RMW on per-CPU\
+  \ field without READ/WRITE_ONCE\", \"Concurrency\")) {}\n\n      void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n      void checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;\n\n   private:\n\n\
+  \      // Helper: does this expression look like a call with name?\n      bool isCallNamed(const\
+  \ CallExpr *CE, StringRef Name, CheckerContext &C) const {\n        if (!CE) return\
+  \ false;\n        const Expr *E = dyn_cast<Expr>(CE);\n        if (!E) return false;\n\
+  \        return ExprHasName(E, Name, C);\n      }\n\n      bool isSmpProcessorIdExpr(const\
+  \ Expr *E, CheckerContext &C) const {\n        if (!E) return false;\n        return\
+  \ ExprHasName(E, \"smp_processor_id\", C);\n      }\n\n      // Classify per-cpu\
+  \ pointer kind from a call expression.\n      unsigned classifyPerCpuFromCall(const\
+  \ CallExpr *CE, CheckerContext &C) const {\n        if (!CE) return PCK_None;\n\
+  \        if (isCallNamed(CE, \"this_cpu_ptr\", C))\n          return PCK_Local;\n\
+  \n        if (isCallNamed(CE, \"per_cpu_ptr\", C)) {\n          if (CE->getNumArgs()\
+  \ >= 2) {\n            const Expr *CPUArg = CE->getArg(1);\n            if (isSmpProcessorIdExpr(CPUArg,\
+  \ C))\n              return PCK_Local;\n            return PCK_Remote;\n       \
+  \   }\n          // If no cpu arg visible, conservatively treat as remote (cross-CPU)\
+  \ usage.\n          return PCK_Remote;\n        }\n        return PCK_None;\n  \
+  \    }\n\n      // Attempt to determine kind for the base expression of a MemberExpr.\n\
+  \      unsigned getPerCpuKindFromBaseExpr(const Expr *Base, CheckerContext &C, ProgramStateRef\
+  \ State) const {\n        if (!Base) return PCK_None;\n\n        // First, try using\
+  \ program state mapping via the base's region.\n        if (const MemRegion *MR\
+  \ = getMemRegionFromExpr(Base, C)) {\n          MR = MR->getBaseRegion();\n    \
+  \      if (MR) {\n            if (const unsigned *K = State->get<PerCpuPtrKindMap>(MR))\n\
+  \              return *K;\n          }\n        }\n\n        // Fallback: look inside\
+  \ the base for a call expression to classify.\n        if (const CallExpr *InnerCall\
+  \ = findSpecificTypeInChildren<CallExpr>(Base)) {\n          unsigned K = classifyPerCpuFromCall(InnerCall,\
+  \ C);\n          if (K != PCK_None)\n            return K;\n        }\n\n      \
+  \  return PCK_None;\n      }\n\n      void setPerCpuKindForRegion(ProgramStateRef\
+  \ &State, const MemRegion *MR, unsigned Kind) const {\n        if (!MR) return;\n\
+  \        MR = MR->getBaseRegion();\n        if (!MR) return;\n        if (Kind ==\
+  \ PCK_None) return;\n        State = State->set<PerCpuPtrKindMap>(MR, Kind);\n \
+  \     }\n\n      // Report helpers\n      void reportRemoteWrite(const BinaryOperator\
+  \ *BO, const FieldDecl *FD, CheckerContext &C) const {\n        if (!BTRemoteWrite)\
+  \ return;\n        ExplodedNode *N = C.generateNonFatalErrorNode();\n        if\
+  \ (!N) return;\n        auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \       *BTRemoteWrite, \"Cross-CPU write to per-CPU field without WRITE_ONCE\"\
+  , N);\n        if (BO)\n          R->addRange(BO->getSourceRange());\n        C.emitReport(std::move(R));\n\
+  \      }\n\n      void reportLocalRMW(const BinaryOperator *BO, const FieldDecl\
+  \ *FD, CheckerContext &C) const {\n        if (!BTRMW) return;\n        ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n        if (!N) return;\n        auto R =\
+  \ std::make_unique<PathSensitiveBugReport>(\n          *BTRMW, \"RMW of per-CPU\
+  \ field also accessed cross-CPU; use READ_ONCE/WRITE_ONCE\", N);\n        if (BO)\n\
+  \          R->addRange(BO->getSourceRange());\n        C.emitReport(std::move(R));\n\
+  \      }\n};\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\n  //\
+  \ Track per-cpu pointer origin when binding to a variable/region.\n  const MemRegion\
+  \ *LHSReg = Loc.getAsRegion();\n  if (LHSReg) {\n    LHSReg = LHSReg->getBaseRegion();\n\
+  \n    // 1) If this bind is the result of a call expression (per_cpu_ptr/this_cpu_ptr),\
+  \ set kind for LHS.\n    if (const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S))\
+  \ {\n      unsigned Kind = classifyPerCpuFromCall(CE, C);\n      if (Kind != PCK_None)\
+  \ {\n        setPerCpuKindForRegion(State, LHSReg, Kind);\n      }\n    }\n\n  \
+  \  // 2) Alias propagation: if RHS is a region already known, propagate its kind\
+  \ to LHS.\n    if (const MemRegion *RHSReg = Val.getAsRegion()) {\n      RHSReg\
+  \ = RHSReg->getBaseRegion();\n      if (RHSReg) {\n        if (const unsigned *K\
+  \ = State->get<PerCpuPtrKindMap>(RHSReg)) {\n          setPerCpuKindForRegion(State,\
+  \ LHSReg, *K);\n        }\n      }\n    }\n\n    // 3) Special-case: RHS is a MemberExpr\
+  \ whose base is tracked (e.g., statc = statc->parent;)\n    if (const BinaryOperator\
+  \ *BO = findSpecificTypeInParents<BinaryOperator>(S, C)) {\n      if (BO->isAssignmentOp())\
+  \ {\n        const Expr *R = BO->getRHS();\n        if (R) R = R->IgnoreParenImpCasts();\n\
+  \        if (const auto *ME = dyn_cast<MemberExpr>(R)) {\n          unsigned K =\
+  \ getPerCpuKindFromBaseExpr(ME->getBase(), C, State);\n          if (K != PCK_None)\
+  \ {\n            setPerCpuKindForRegion(State, LHSReg, K);\n          }\n      \
+  \  }\n      }\n    }\n  }\n\n  // Detect writes/RMWs to per-CPU fields.\n  if (const\
+  \ BinaryOperator *BO = findSpecificTypeInParents<BinaryOperator>(S, C)) {\n    const\
+  \ Expr *L = BO->getLHS();\n    if (L) L = L->IgnoreParenImpCasts();\n    const auto\
+  \ *LME = dyn_cast_or_null<MemberExpr>(L);\n    if (LME) {\n      const FieldDecl\
+  \ *FD = dyn_cast<FieldDecl>(LME->getMemberDecl());\n      if (FD) {\n        unsigned\
+  \ Kind = getPerCpuKindFromBaseExpr(LME->getBase(), C, State);\n        if (Kind\
+  \ == PCK_Remote) {\n          // Mark field as remotely accessed.\n          RemotePerCpuFields.insert(FD);\n\
+  \n          // Remote write without WRITE_ONCE: check for simple assignment and\
+  \ (optionally) zeroing.\n          if (BO->getOpcode() == BO_Assign) {\n       \
+  \     if (!ExprHasName(BO, \"WRITE_ONCE\", C)) {\n              bool IsZero = false;\n\
+  \              if (const Expr *RHS = BO->getRHS()) {\n                llvm::APSInt\
+  \ EvalRes;\n                if (EvaluateExprToInt(EvalRes, RHS, C))\n          \
+  \        IsZero = (EvalRes == 0);\n              }\n              // Warn on the\
+  \ common flush zeroing pattern; this catches the target bug.\n              if (IsZero)\
+  \ {\n                reportRemoteWrite(BO, FD, C);\n              }\n          \
+  \  }\n          }\n        } else if (Kind == PCK_Local) {\n          // Local compound\
+  \ RMW. If the same field is accessed remotely, require READ_ONCE/WRITE_ONCE.\n \
+  \         if (BO->isCompoundAssignmentOp()) {\n            if (RemotePerCpuFields.count(FD))\
+  \ {\n              if (!ExprHasName(BO, \"READ_ONCE\", C) && !ExprHasName(BO, \"\
+  WRITE_ONCE\", C)) {\n                reportLocalRMW(BO, FD, C);\n              }\n\
+  \            }\n          }\n        }\n      }\n    }\n  }\n\n  if (State != C.getState())\n\
+  \    C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkLocation(SVal Loc,\
+  \ bool IsLoad, const Stmt *S, CheckerContext &C) const {\n  if (!IsLoad)\n    return;\n\
+  \n  // Heuristic: if we're loading from a member expression via a remote per_cpu_ptr\
+  \ base,\n  // record that field as remotely accessed. This helps later local RMW\
+  \ checks.\n  const MemberExpr *ME = findSpecificTypeInParents<MemberExpr>(S, C);\n\
+  \  if (!ME) return;\n\n  ProgramStateRef State = C.getState();\n  unsigned Kind\
+  \ = getPerCpuKindFromBaseExpr(ME->getBase(), C, State);\n  if (Kind == PCK_Remote)\
+  \ {\n    if (const FieldDecl *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {\n\
+  \      RemotePerCpuFields.insert(FD);\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detect unsynchronized cross-CPU accesses\
+  \ to per-CPU fields (missing READ_ONCE/WRITE_ONCE)\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

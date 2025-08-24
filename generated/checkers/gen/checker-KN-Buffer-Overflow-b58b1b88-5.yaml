@@ -1,0 +1,548 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: b58b1b883b9b702e25204dbe2b221eecc8ecd159
+commit_type: Buffer-Overflow
+index: 5
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state:\n// - ShortenBaseMap: remembers that a particular \"shorten\" variable\
+  \ is derived\n//                   from (total - round_up(...)) and ties it to the\
+  \ base object\n//                   whose \"count/length\" it subtracts from (e.g.\
+  \ iter).\n// - ShortenGuardedMap: remembers whether we've seen a guard like\n//\
+  \                   \"if (shorten >= base->count) shorten = 0;\".\nREGISTER_MAP_WITH_PROGRAMSTATE(ShortenBaseMap,\
+  \ const MemRegion*, const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(ShortenGuardedMap,\
+  \ const MemRegion*, bool)\n\nnamespace {\nclass SAGenTestChecker\n  : public Checker<\n\
+  \      check::PostStmt<DeclStmt>,\n      check::Bind,\n      check::BranchCondition\n\
+  \    > {\n\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \    : BT(std::make_unique<BugType>(this, \"Underflow risk in count adjustment\"\
+  , \"Logic error\")) {}\n\n  void checkPostStmt(const DeclStmt *DS, CheckerContext\
+  \ &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n  void checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const;\n\nprivate:\n  // Helpers\n  static bool isUnsignedIntLike(QualType\
+  \ QT);\n  static bool exprContainsRoundUp(const Expr *E, CheckerContext &C);\n \
+  \ static const MemRegion* tryGetBaseRegionFromTotalExpr(const Expr *E, CheckerContext\
+  \ &C);\n  static const MemRegion* getShortenVarRegionFromVarDecl(const VarDecl *VD,\
+  \ CheckerContext &C);\n  static const MemRegion* getShortenVarRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C);\n  static const MemRegion* getBaseRegionFromLHS(const\
+  \ Expr *LHS, CheckerContext &C);\n\n  static const DeclRefExpr* findDeclRefInExpr(const\
+  \ Expr *E);\n  static const MemberExpr* findMemberExprInExpr(const Expr *E);\n \
+  \ static const CallExpr* findCallExprInExpr(const Expr *E);\n\n  void recordShortenPattern(ProgramStateRef\
+  \ &State,\n                            const MemRegion *ShortenReg,\n          \
+  \                  const MemRegion *BaseReg,\n                            CheckerContext\
+  \ &C) const;\n\n  void markGuarded(ProgramStateRef &State, const MemRegion *ShortenReg,\
+  \ CheckerContext &C) const;\n\n  void tryDetectAndReportUseSubtractingShorten(const\
+  \ Stmt *S,\n                                               const Expr *TargetLHS,\n\
+  \                                               const Expr *RHSExpr,\n         \
+  \                                      bool IsCompoundSubAssign,\n             \
+  \                                  CheckerContext &C) const;\n\n  void reportBug(const\
+  \ Stmt *S, CheckerContext &C) const;\n};\n\n// ======================== Helper Implementations\
+  \ ========================\n\nbool SAGenTestChecker::isUnsignedIntLike(QualType\
+  \ QT) {\n  if (QT.isNull())\n    return false;\n  return QT->isUnsignedIntegerType();\n\
+  }\n\nbool SAGenTestChecker::exprContainsRoundUp(const Expr *E, CheckerContext &C)\
+  \ {\n  if (!E)\n    return false;\n  // Heuristically match common names used for\
+  \ roundup/align.\n  if (ExprHasName(E, \"round_up\", C)) return true;\n  if (ExprHasName(E,\
+  \ \"roundup\", C)) return true;\n  if (ExprHasName(E, \"ALIGN\", C)) return true;\n\
+  \  return false;\n}\n\nconst MemRegion* SAGenTestChecker::tryGetBaseRegionFromTotalExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n\n  // If it's\
+  \ like \"iter->count\" - use the base (iter).\n  if (const auto *ME = dyn_cast<MemberExpr>(E->IgnoreParenImpCasts()))\
+  \ {\n    const Expr *Base = ME->getBase();\n    if (!Base) return nullptr;\n   \
+  \ const MemRegion *MR = getMemRegionFromExpr(Base, C);\n    if (!MR) return nullptr;\n\
+  \    return MR->getBaseRegion();\n  }\n\n  // If it's iov_iter_count(iter) - use\
+  \ the first argument's region as base.\n  if (const auto *CE = dyn_cast<CallExpr>(E->IgnoreParenImpCasts()))\
+  \ {\n    if (ExprHasName(CE, \"iov_iter_count\", C) && CE->getNumArgs() >= 1) {\n\
+  \      const Expr *Arg0 = CE->getArg(0);\n      const MemRegion *MR = getMemRegionFromExpr(Arg0,\
+  \ C);\n      if (!MR) return nullptr;\n      return MR->getBaseRegion();\n    }\n\
+  \  }\n\n  return nullptr;\n}\n\nconst MemRegion* SAGenTestChecker::getShortenVarRegionFromVarDecl(const\
+  \ VarDecl *VD, CheckerContext &C) {\n  if (!VD) return nullptr;\n  MemRegionManager\
+  \ &MRMgr = C.getSValBuilder().getRegionManager();\n  const MemRegion *MR = MRMgr.getVarRegion(VD,\
+  \ C.getLocationContext());\n  if (!MR) return nullptr;\n  return MR->getBaseRegion();\n\
+  }\n\nconst MemRegion* SAGenTestChecker::getShortenVarRegionFromExpr(const Expr *E,\
+  \ CheckerContext &C) {\n  if (!E) return nullptr;\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts()))\
+  \ {\n    const MemRegion *MR = getMemRegionFromExpr(DRE, C);\n    if (!MR) return\
+  \ nullptr;\n    return MR->getBaseRegion();\n  }\n  return nullptr;\n}\n\nconst\
+  \ MemRegion* SAGenTestChecker::getBaseRegionFromLHS(const Expr *LHS, CheckerContext\
+  \ &C) {\n  if (!LHS) return nullptr;\n  if (const auto *ME = dyn_cast<MemberExpr>(LHS->IgnoreParenImpCasts()))\
+  \ {\n    const Expr *Base = ME->getBase();\n    if (!Base) return nullptr;\n   \
+  \ const MemRegion *MR = getMemRegionFromExpr(Base, C);\n    if (!MR) return nullptr;\n\
+  \    return MR->getBaseRegion();\n  }\n  return nullptr;\n}\n\nconst DeclRefExpr*\
+  \ SAGenTestChecker::findDeclRefInExpr(const Expr *E) {\n  if (!E) return nullptr;\n\
+  \  return findSpecificTypeInChildren<DeclRefExpr>(E);\n}\n\nconst MemberExpr* SAGenTestChecker::findMemberExprInExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  return findSpecificTypeInChildren<MemberExpr>(E);\n\
+  }\n\nconst CallExpr* SAGenTestChecker::findCallExprInExpr(const Expr *E) {\n  if\
+  \ (!E) return nullptr;\n  return findSpecificTypeInChildren<CallExpr>(E);\n}\n\n\
+  void SAGenTestChecker::recordShortenPattern(ProgramStateRef &State,\n          \
+  \                                  const MemRegion *ShortenReg,\n              \
+  \                              const MemRegion *BaseReg,\n                     \
+  \                       CheckerContext &C) const {\n  if (!ShortenReg || !BaseReg)\
+  \ return;\n  State = State->set<ShortenBaseMap>(ShortenReg, BaseReg);\n  State =\
+  \ State->set<ShortenGuardedMap>(ShortenReg, false);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::markGuarded(ProgramStateRef &State, const MemRegion\
+  \ *ShortenReg, CheckerContext &C) const {\n  if (!ShortenReg) return;\n  const bool\
+  \ *Old = State->get<ShortenGuardedMap>(ShortenReg);\n  if (!Old || *Old == false)\
+  \ {\n    State = State->set<ShortenGuardedMap>(ShortenReg, true);\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::reportBug(const Stmt *S, CheckerContext &C) const\
+  \ {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\
+  \  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\n      \"Possible\
+  \ unsigned underflow: subtracting rounded-up length from total without bounds check.\"\
+  ,\n      N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// Tries to detect:\n// - Compound:   LHS -= shorten;\n// - Simple:     LHS\
+  \ = LHS - shorten;\n// and report if 'shorten' maps to the same base object as LHS\
+  \ and not guarded.\nvoid SAGenTestChecker::tryDetectAndReportUseSubtractingShorten(const\
+  \ Stmt *S,\n                                                               const\
+  \ Expr *TargetLHS,\n                                                           \
+  \    const Expr *RHSExpr,\n                                                    \
+  \           bool IsCompoundSubAssign,\n                                        \
+  \                       CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  if (!TargetLHS || !RHSExpr)\n    return;\n\n  // Get the base region for LHS\
+  \ like \"iter->count\".\n  const MemRegion *LHSBase = getBaseRegionFromLHS(TargetLHS,\
+  \ C);\n  if (!LHSBase)\n    return;\n\n  const MemRegion *ShortenReg = nullptr;\n\
+  \n  if (IsCompoundSubAssign) {\n    // Pattern: X -= shorten\n    if (const DeclRefExpr\
+  \ *DR = findDeclRefInExpr(RHSExpr)) {\n      const MemRegion *MR = getMemRegionFromExpr(DR,\
+  \ C);\n      if (MR) ShortenReg = MR->getBaseRegion();\n    }\n  } else {\n    //\
+  \ Pattern: X = X - shorten\n    const auto *BOSub = dyn_cast<BinaryOperator>(RHSExpr->IgnoreParenImpCasts());\n\
+  \    if (!BOSub || BOSub->getOpcode() != BO_Sub)\n      return;\n\n    // RHS must\
+  \ be 'LHS_like - shorten'\n    const Expr *RHSLHS = BOSub->getLHS();\n    const\
+  \ Expr *RHSRHS = BOSub->getRHS();\n\n    // Check LHS of subtraction refers to same\
+  \ base object as assignment LHS\n    const MemRegion *RHSLHSBase = getBaseRegionFromLHS(RHSLHS,\
+  \ C);\n    if (!RHSLHSBase || RHSLHSBase != LHSBase)\n      return;\n\n    if (const\
+  \ DeclRefExpr *DR = findDeclRefInExpr(RHSRHS)) {\n      const MemRegion *MR = getMemRegionFromExpr(DR,\
+  \ C);\n      if (MR) ShortenReg = MR->getBaseRegion();\n    }\n  }\n\n  if (!ShortenReg)\n\
+  \    return;\n\n  // Verify that ShortenReg is a tracked \"shorten\" derived from\
+  \ this base object.\n  const MemRegion *MappedBase = State->get<ShortenBaseMap>(ShortenReg);\n\
+  \  if (!MappedBase || MappedBase != LHSBase)\n    return;\n\n  const bool *Guarded\
+  \ = State->get<ShortenGuardedMap>(ShortenReg);\n  if (Guarded && *Guarded)\n   \
+  \ return; // A guard/clamp was observed earlier.\n\n  // Report\n  reportBug(S,\
+  \ C);\n\n  // Optionally, drop mapping to avoid duplicate reports on same path.\n\
+  \  State = State->remove<ShortenBaseMap>(ShortenReg);\n  State = State->remove<ShortenGuardedMap>(ShortenReg);\n\
+  \  C.addTransition(State);\n}\n\n// ======================== Checker Callbacks ========================\n\
+  \nvoid SAGenTestChecker::checkPostStmt(const DeclStmt *DS, CheckerContext &C) const\
+  \ {\n  if (!DS)\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  for\
+  \ (const Decl *D : DS->decls()) {\n    const auto *VD = dyn_cast<VarDecl>(D);\n\
+  \    if (!VD)\n      continue;\n\n    if (!VD->hasInit())\n      continue;\n\n \
+  \   // Only track unsigned-like variables (e.g., size_t).\n    if (!isUnsignedIntLike(VD->getType()))\n\
+  \      continue;\n\n    const Expr *Init = VD->getInit();\n    if (!Init)\n    \
+  \  continue;\n\n    // Look for: shorten = U - round_up(...)\n    const auto *BOSub\
+  \ = dyn_cast<BinaryOperator>(Init->IgnoreParenImpCasts());\n    if (!BOSub || BOSub->getOpcode()\
+  \ != BO_Sub)\n      continue;\n\n    const Expr *U = BOSub->getLHS();\n    const\
+  \ Expr *W = BOSub->getRHS();\n    if (!U || !W)\n      continue;\n\n    if (!exprContainsRoundUp(W,\
+  \ C))\n      continue;\n\n    const MemRegion *BaseReg = tryGetBaseRegionFromTotalExpr(U,\
+  \ C);\n    if (!BaseReg)\n      continue;\n\n    const MemRegion *ShortenReg = getShortenVarRegionFromVarDecl(VD,\
+  \ C);\n    if (!ShortenReg)\n      continue;\n\n    recordShortenPattern(State,\
+  \ ShortenReg, BaseReg, C);\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc,\
+  \ SVal Val, const Stmt *S, CheckerContext &C) const {\n  if (!S)\n    return;\n\n\
+  \  ProgramStateRef State = C.getState();\n\n  // A) Record shorten = U - round_up(...)\
+  \ assignments (non-declarative).\n  if (const auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n    if (BO->getOpcode() == BO_Assign) {\n      const Expr *LHS = BO->getLHS();\n\
+  \      const Expr *RHS = BO->getRHS();\n\n      // Only track if LHS variable is\
+  \ unsigned-like.\n      if (!LHS || !isUnsignedIntLike(LHS->getType()))\n      \
+  \  /* fallthrough to other checks */;\n\n      // Look for RHS: U - round_up(...)\n\
+  \      const auto *BOSub = dyn_cast<BinaryOperator>(RHS ? RHS->IgnoreParenImpCasts()\
+  \ : nullptr);\n      if (BOSub && BOSub->getOpcode() == BO_Sub) {\n        const\
+  \ Expr *U = BOSub->getLHS();\n        const Expr *W = BOSub->getRHS();\n       \
+  \ if (U && W && exprContainsRoundUp(W, C)) {\n          const MemRegion *BaseReg\
+  \ = tryGetBaseRegionFromTotalExpr(U, C);\n          const MemRegion *ShortenReg\
+  \ = getShortenVarRegionFromExpr(LHS, C);\n          if (BaseReg && ShortenReg) {\n\
+  \            recordShortenPattern(State, ShortenReg, BaseReg, C);\n          }\n\
+  \        }\n      }\n\n      // B2) Detect \"X = X - shorten\" pattern for use.\n\
+  \      tryDetectAndReportUseSubtractingShorten(S, LHS, RHS, /*IsCompoundSubAssign*/false,\
+  \ C);\n      return;\n    }\n  }\n\n  // B1) Detect \"X -= shorten\" pattern for\
+  \ use.\n  if (const auto *CAO = dyn_cast<CompoundAssignOperator>(S)) {\n    if (CAO->getOpcode()\
+  \ == BO_SubAssign) {\n      const Expr *LHS = CAO->getLHS();\n      const Expr *RHS\
+  \ = CAO->getRHS();\n      tryDetectAndReportUseSubtractingShorten(S, LHS, RHS, /*IsCompoundSubAssign*/true,\
+  \ C);\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const auto *CondE = dyn_cast<Expr>(Condition);\n  if (!CondE) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  const auto *BO = dyn_cast<BinaryOperator>(CondE->IgnoreParenImpCasts());\n\
+  \  if (!BO) {\n    C.addTransition(State);\n    return;\n  }\n\n  BinaryOperator::Opcode\
+  \ Op = BO->getOpcode();\n  // We consider comparisons which could indicate a guard:\n\
+  \  // shorten >= base->count, shorten > base->count, etc.\n  if (!(Op == BO_GE ||\
+  \ Op == BO_GT || Op == BO_LE || Op == BO_LT || Op == BO_EQ || Op == BO_NE)) {\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  const Expr *LHS = BO->getLHS();\n\
+  \  const Expr *RHS = BO->getRHS();\n  if (!LHS || !RHS) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Try to find a 'shorten' variable (DeclRefExpr) on one\
+  \ side and a base 'count'\n  // reference (MemberExpr or iov_iter_count(base)) on\
+  \ the other side.\n  const DeclRefExpr *DRE_L = findDeclRefInExpr(LHS);\n  const\
+  \ DeclRefExpr *DRE_R = findDeclRefInExpr(RHS);\n\n  const MemRegion *ShortenReg\
+  \ = nullptr;\n  const MemRegion *OtherBase = nullptr;\n  const Expr *OtherExpr =\
+  \ nullptr;\n\n  if (DRE_L) {\n    const MemRegion *MR = getMemRegionFromExpr(DRE_L,\
+  \ C);\n    if (MR) {\n      MR = MR->getBaseRegion();\n      // Ensure this DRE\
+  \ is one of tracked 'shorten' variables\n      if (State->contains<ShortenBaseMap>(MR))\
+  \ {\n        ShortenReg = MR;\n        OtherExpr = RHS;\n      }\n    }\n  }\n\n\
+  \  if (!ShortenReg && DRE_R) {\n    const MemRegion *MR = getMemRegionFromExpr(DRE_R,\
+  \ C);\n    if (MR) {\n      MR = MR->getBaseRegion();\n      if (State->contains<ShortenBaseMap>(MR))\
+  \ {\n        ShortenReg = MR;\n        OtherExpr = LHS;\n      }\n    }\n  }\n\n\
+  \  if (!ShortenReg || !OtherExpr) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  // Find base on the other side.\n  if (const auto *ME = findMemberExprInExpr(OtherExpr))\
+  \ {\n    OtherBase = getBaseRegionFromLHS(ME, C);\n  } else if (const auto *CE =\
+  \ findCallExprInExpr(OtherExpr)) {\n    if (ExprHasName(CE, \"iov_iter_count\",\
+  \ C) && CE->getNumArgs() >= 1) {\n      const MemRegion *MR = getMemRegionFromExpr(CE->getArg(0),\
+  \ C);\n      if (MR) OtherBase = MR->getBaseRegion();\n    }\n  }\n\n  if (!OtherBase)\
+  \ {\n    // Heuristic fallback: if we cannot resolve base of the other side,\n \
+  \   // conservatively do nothing.\n    C.addTransition(State);\n    return;\n  }\n\
+  \n  const MemRegion *MappedBase = State->get<ShortenBaseMap>(ShortenReg);\n  if\
+  \ (MappedBase && MappedBase == OtherBase) {\n    markGuarded(State, ShortenReg,\
+  \ C);\n    return;\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects unsigned underflow when subtracting\
+  \ rounded-up length from a total without a guard\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbcachefs: fix iov_iter count underflow on sub-block\
+  \ dio read\n\nbch2_direct_IO_read() checks the request offset and size for sector\n\
+  alignment and then falls through to a couple calculations to shrink\nthe size of\
+  \ the request based on the inode size. The problem is that\nthese checks round up\
+  \ to the fs block size, which runs the risk of\nunderflowing iter->count if the\
+  \ block size happens to be large\nenough. This is triggered by fstest generic/361\
+  \ with a 4k block\nsize, which subsequently leads to a crash. To avoid this crash,\n\
+  check that the shorten length doesn't exceed the overall length of\nthe iter.\n\n\
+  Fixes:\nSigned-off-by: Brian Foster <bfoster@redhat.com>\nReviewed-by: Su Yue <glass.su@suse.com>\n\
+  Signed-off-by: Kent Overstreet <kent.overstreet@linux.dev>\n\n## Buggy Code\n\n\
+  ```c\n// Function: bch2_direct_IO_read in fs/bcachefs/fs-io-direct.c\nstatic int\
+  \ bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)\n{\n\tstruct file\
+  \ *file = req->ki_filp;\n\tstruct bch_inode_info *inode = file_bch_inode(file);\n\
+  \tstruct bch_fs *c = inode->v.i_sb->s_fs_info;\n\tstruct bch_io_opts opts;\n\tstruct\
+  \ dio_read *dio;\n\tstruct bio *bio;\n\tloff_t offset = req->ki_pos;\n\tbool sync\
+  \ = is_sync_kiocb(req);\n\tsize_t shorten;\n\tssize_t ret;\n\n\tbch2_inode_opts_get(&opts,\
+  \ c, &inode->ei_inode);\n\n\t/* bios must be 512 byte aligned: */\n\tif ((offset|iter->count)\
+  \ & (SECTOR_SIZE - 1))\n\t\treturn -EINVAL;\n\n\tret = min_t(loff_t, iter->count,\n\
+  \t\t    max_t(loff_t, 0, i_size_read(&inode->v) - offset));\n\n\tif (!ret)\n\t\t\
+  return ret;\n\n\tshorten = iov_iter_count(iter) - round_up(ret, block_bytes(c));\n\
+  \titer->count -= shorten;\n\n\tbio = bio_alloc_bioset(NULL,\n\t\t\t       bio_iov_vecs_to_alloc(iter,\
+  \ BIO_MAX_VECS),\n\t\t\t       REQ_OP_READ,\n\t\t\t       GFP_KERNEL,\n\t\t\t  \
+  \     &c->dio_read_bioset);\n\n\tbio->bi_end_io = bch2_direct_IO_read_endio;\n\n\
+  \tdio = container_of(bio, struct dio_read, rbio.bio);\n\tclosure_init(&dio->cl,\
+  \ NULL);\n\n\t/*\n\t * this is a _really_ horrible hack just to avoid an atomic\
+  \ sub at the\n\t * end:\n\t */\n\tif (!sync) {\n\t\tset_closure_fn(&dio->cl, bch2_dio_read_complete,\
+  \ NULL);\n\t\tatomic_set(&dio->cl.remaining,\n\t\t\t   CLOSURE_REMAINING_INITIALIZER\
+  \ -\n\t\t\t   CLOSURE_RUNNING +\n\t\t\t   CLOSURE_DESTRUCTOR);\n\t} else {\n\t\t\
+  atomic_set(&dio->cl.remaining,\n\t\t\t   CLOSURE_REMAINING_INITIALIZER + 1);\n\t\
+  \tdio->cl.closure_get_happened = true;\n\t}\n\n\tdio->req\t= req;\n\tdio->ret\t\
+  = ret;\n\t/*\n\t * This is one of the sketchier things I've encountered: we have\
+  \ to skip\n\t * the dirtying of requests that are internal from the kernel (i.e.\
+  \ from\n\t * loopback), because we'll deadlock on page_lock.\n\t */\n\tdio->should_dirty\
+  \ = iter_is_iovec(iter);\n\n\tgoto start;\n\twhile (iter->count) {\n\t\tbio = bio_alloc_bioset(NULL,\n\
+  \t\t\t\t       bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS),\n\t\t\t\t       REQ_OP_READ,\n\
+  \t\t\t\t       GFP_KERNEL,\n\t\t\t\t       &c->bio_read);\n\t\tbio->bi_end_io\t\t\
+  = bch2_direct_IO_read_split_endio;\nstart:\n\t\tbio->bi_opf\t\t= REQ_OP_READ|REQ_SYNC;\n\
+  \t\tbio->bi_iter.bi_sector\t= offset >> 9;\n\t\tbio->bi_private\t\t= dio;\n\n\t\t\
+  ret = bio_iov_iter_get_pages(bio, iter);\n\t\tif (ret < 0) {\n\t\t\t/* XXX: fault\
+  \ inject this path */\n\t\t\tbio->bi_status = BLK_STS_RESOURCE;\n\t\t\tbio_endio(bio);\n\
+  \t\t\tbreak;\n\t\t}\n\n\t\toffset += bio->bi_iter.bi_size;\n\n\t\tif (dio->should_dirty)\n\
+  \t\t\tbio_set_pages_dirty(bio);\n\n\t\tif (iter->count)\n\t\t\tclosure_get(&dio->cl);\n\
+  \n\t\tbch2_read(c, rbio_init(bio, opts), inode_inum(inode));\n\t}\n\n\titer->count\
+  \ += shorten;\n\n\tif (sync) {\n\t\tclosure_sync(&dio->cl);\n\t\tclosure_debug_destroy(&dio->cl);\n\
+  \t\tret = dio->ret;\n\t\tbio_check_or_release(&dio->rbio.bio, dio->should_dirty);\n\
+  \t\treturn ret;\n\t} else {\n\t\treturn -EIOCBQUEUED;\n\t}\n}\n```\n\n## Bug Fix\
+  \ Patch\n\n```diff\ndiff --git a/fs/bcachefs/fs-io-direct.c b/fs/bcachefs/fs-io-direct.c\n\
+  index e3b219e19e10..33cb6da3a5ad 100644\n--- a/fs/bcachefs/fs-io-direct.c\n+++ b/fs/bcachefs/fs-io-direct.c\n\
+  @@ -88,6 +88,8 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter\
+  \ *iter)\n \t\treturn ret;\n \n \tshorten = iov_iter_count(iter) - round_up(ret,\
+  \ block_bytes(c));\n+\tif (shorten >= iter->count)\n+\t\tshorten = 0;\n \titer->count\
+  \ -= shorten;\n \n \tbio = bio_alloc_bioset(NULL,\n```\n"
+pattern: "## Bug Pattern\n\nSubtracting an alignment-rounded size from an unsigned\
+  \ length without bounds checking:\n- The code rounds up a desired I/O length to\
+  \ the filesystem block size (round_up(ret, block_bytes(...))) and then computes\
+  \ shorten = iov_iter_count(iter) - rounded_up_len using size_t.\n- If the rounded-up\
+  \ length exceeds the iterator\u2019s total length, this subtraction underflows (wraps\
+  \ to a huge size), and applying iter->count -= shorten underflows iter->count, corrupting\
+  \ the iterator and causing crashes.\n- Root cause: using unsigned arithmetic to\
+  \ shrink a count based on a rounded-up value without first verifying that the rounded-up\
+  \ value is <= the original count (or clamping the result to zero)."
+plan: "Plan\n\n1) Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(ShortenBaseMap,\
+  \ const MemRegion*, const MemRegion*)\n  - Key: MemRegion of the temporary \u201C\
+  shorten\u201D variable.\n  - Value: MemRegion of the \u201Ctotal/count\u201D base\
+  \ object (e.g., the iter pointer used by iov_iter_count(iter), or the base of a\
+  \ MemberExpr like iter->count).\n- REGISTER_MAP_WITH_PROGRAMSTATE(ShortenGuardedMap,\
+  \ const MemRegion*, bool)\n  - Key: MemRegion of the \u201Cshorten\u201D variable.\n\
+  \  - Value: whether there appears to be a guard/clamp (true) observed before use.\n\
+  \nRationale: We only need to remember that a variable was computed as an unsigned\
+  \ difference with a round_up/ALIGN on the right-hand side, what total/base object\
+  \ it relates to, and if a guard was observed. No further aliasing/state is necessary.\n\
+  \n2) Helper predicates and utilities\n- isUnsignedIntLike(QualType QT): return true\
+  \ if QT is an unsigned integer type (including size_t).\n- exprContainsRoundUp(const\
+  \ Expr *E, CheckerContext &C): return true if ExprHasName(E, \"round_up\") || ExprHasName(E,\
+  \ \"ALIGN\") || ExprHasName(E, \"roundup\") (cover typical spellings/macros).\n\
+  - tryGetBaseRegionFromTotalExpr(const Expr *E, CheckerContext &C) -> const MemRegion*\n\
+  \  - If E is a MemberExpr like X->count or X.len, return getMemRegionFromExpr(MemberExpr->getBase()).\n\
+  \  - Else if E is a CallExpr named iov_iter_count (or similar), return getMemRegionFromExpr(its\
+  \ first argument).\n  - Otherwise return nullptr.\n- getShortenVarRegion(const Expr\
+  \ *LHS, CheckerContext &C) -> const MemRegion*\n  - If LHS is a DeclRefExpr, use\
+  \ getMemRegionFromExpr to get its region; else nullptr.\n- getBaseRegionFromLHS(const\
+  \ Expr *LHS, CheckerContext &C) -> const MemRegion*\n  - If LHS is MemberExpr, return\
+  \ getMemRegionFromExpr(MemberExpr->getBase()); else nullptr.\n\n3) checkPostStmt(const\
+  \ DeclStmt *DS)\nPurpose: Detect declarations that compute the \u201Cshorten\u201D\
+  \ variable as an unsigned subtraction of a round_up/ALIGNed value and record base\
+  \ relationship.\nImplementation details:\n- Iterate VarDecls in DS; for each with\
+  \ an initializer:\n  - Ensure VarDecl type isUnsignedIntLike.\n  - If the initializer\
+  \ is a BinaryOperator with opcode BO_Sub:\n    - Let U = LHS, W = RHS of the subtraction.\n\
+  \    - If !exprContainsRoundUp(W, C), skip.\n    - Try to infer base region from\
+  \ U using tryGetBaseRegionFromTotalExpr(U, C). If nullptr, skip.\n    - Obtain MemRegion\
+  \ of the declared variable (shorten) via getMemRegionFromExpr on a DeclRefExpr built\
+  \ from VarDecl (or extract from the initializer binding in state if available).\n\
+  \    - Record ShortenBaseMap[shortenReg] = baseReg and ShortenGuardedMap[shortenReg]\
+  \ = false.\n\n4) checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C)\n\
+  Two responsibilities:\nA) Track non-declarative assignments that compute \u201C\
+  shorten\u201D.\n- If S is a BinaryOperator with opcode BO_Assign:\n  - Let LHS be\
+  \ the assigned expression; get shortenReg via getShortenVarRegion(LHS, C). If nullptr,\
+  \ skip.\n  - Let RHS = assigned value; if RHS is BinaryOperator BO_Sub with RHS\
+  \ expr W and exprContainsRoundUp(W, C):\n    - Extract U = LHS of the subtraction;\
+  \ obtain baseReg via tryGetBaseRegionFromTotalExpr(U, C). If nullptr, skip.\n  \
+  \  - Record ShortenBaseMap[shortenReg] = baseReg and ShortenGuardedMap[shortenReg]\
+  \ = false.\n\nB) Detect and warn on subtracting \u201Cshorten\u201D from the corresponding\
+  \ count without a guard.\n- Case 1: Compound subtraction \u201CX -= shorten\u201D\
+  \n  - If S is a CompoundAssignOperator with opcode BO_SubAssign:\n    - Let LHS\
+  \ be the target; get lhsBaseReg via getBaseRegionFromLHS(LHS, C). If nullptr, skip.\n\
+  \    - Let RHS be the expression; if RHS is a DeclRefExpr, get its region rShorten;\
+  \ check ShortenBaseMap contains rShorten.\n    - If ShortenBaseMap[rShorten] ==\
+  \ lhsBaseReg and ShortenGuardedMap[rShorten] is false, report bug.\n    - Optional:\
+  \ after reporting or confirming safe, remove rShorten from maps to reduce noise\
+  \ on repeated uses.\n- Case 2: \u201CX = X - shorten\u201D\n  - If S is a BinaryOperator\
+  \ with opcode BO_Assign:\n    - Let LHS be target location locL; also attempt to\
+  \ get MemRegion of LHS (e.g., for MemberExpr base via getBaseRegionFromLHS(LHS,\
+  \ C) as lhsBaseReg).\n    - Let RHS be BinaryOperator BO_Sub. If not, skip.\n  \
+  \  - Check RHS RHSOperand is DeclRefExpr to rShorten; check ShortenBaseMap contains\
+  \ rShorten.\n    - Also ensure RHS LHSOperand semantically refers to the same target\
+  \ as the assignment\u2019s LHS:\n      - Compare base region of RHS LHSOperand (if\
+  \ a MemberExpr, use getBaseRegionFromLHS) against lhsBaseReg.\n    - If equal and\
+  \ ShortenGuardedMap[rShorten] is false, report bug.\n\nReport message: \"Possible\
+  \ unsigned underflow: subtracting rounded-up length from total without bounds check.\"\
+  \n\n5) checkBranchCondition(const Stmt *Condition, CheckerContext &C)\nPurpose:\
+  \ Mark \u201Cshorten\u201D as guarded if we observe a comparison check that likely\
+  \ clamps or validates it.\nImplementation details:\n- Attempt dyn_cast<BinaryOperator>(Condition).\
+  \ If not comparison, return.\n- If comparison opcode is one of BO_GE, BO_GT, BO_LE,\
+  \ BO_LT:\n  - Inspect if either side contains a DeclRefExpr for a variable whose\
+  \ region is in ShortenBaseMap (use findSpecificTypeInChildren<DeclRefExpr> and getMemRegionFromExpr).\n\
+  \  - If a rShorten is found:\n    - Optionally check that the other side references\
+  \ the corresponding total (heuristics):\n      - If other side has a MemberExpr\
+  \ where getBaseRegionFromLHS(MemberExpr, C) == ShortenBaseMap[rShorten], or\n  \
+  \    - Other side contains a call like iov_iter_count(...) whose argument region\
+  \ equals ShortenBaseMap[rShorten], or\n      - ExprHasName(otherSide, \"count\"\
+  ) is true and ShortenBaseMap[rShorten] is non-null.\n    - If heuristic matches,\
+  \ set ShortenGuardedMap[rShorten] = true.\nRationale: We approximate that such a\
+  \ comparison implies a clamp/check against the total. This suppresses warnings when\
+  \ authors explicitly verify bounds (e.g., if (shorten >= iter->count) shorten =\
+  \ 0;).\n\n6) Notes on robustness and precision\n- round_up/ALIGN are often macros;\
+  \ use ExprHasName in exprContainsRoundUp to robustly catch them in source text.\n\
+  - The base association relies on either:\n  - MemberExpr bases (e.g., iter->count),\
+  \ or\n  - Known count getters like iov_iter_count(iter) where we use the first argument\u2019\
+  s region as the base.\n- If either side cannot be resolved to a MemRegion, skip\
+  \ to avoid false positives.\n- Keep the checker conservative: only warn when:\n\
+  \  - A \u201Cshorten\u201D is computed from an unsigned subtraction with a round-up\
+  \ on RHS, and\n  - That \u201Cshorten\u201D is subsequently used to decrease a count\
+  \ tied to the same base object, and\n  - No guard was observed.\n\n7) Bug report\
+  \ emission\n- When the pattern matches and ShortenGuardedMap[shorten] is false:\n\
+  \  - Node N = C.generateNonFatalErrorNode();\n  - Create a PathSensitiveBugReport\
+  \ with a concise message:\n    - Title: \"Underflow risk in count adjustment\"\n\
+  \    - Message: \"Possible unsigned underflow: subtracting rounded-up length from\
+  \ total without bounds check.\"\n  - Point the primary location to the subtraction\
+  \ statement (the '-=' or 'X = X - shorten').\n  - Optionally add a note at the \u201C\
+  shorten\u201D computation site (retrieve from S pointer when recorded) if available.\n\
+  \n8) Callback selection summary\n- checkPostStmt(DeclStmt): record \u201Cshorten\
+  \ = U - round_up(...)\u201D patterns at declaration-initializer time.\n- checkBind(...):\
+  \ record assignment-based patterns; and detect/warn when \u201Cshorten\u201D is\
+  \ used in a subtraction against the corresponding base count.\n- checkBranchCondition(...):\
+  \ mark \u201Cshorten\u201D as guarded if a comparison with the corresponding base\
+  \ count is observed.\n\nThis minimal, path-sensitive plan targets the kernel pattern\
+  \ that caused the iov_iter count underflow, and will also catch similar unsigned\
+  \ subtractions against rounded-up sizes that are later subtracted from related size/count\
+  \ fields without a prior clamp."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state:\n// - ShortenBaseMap: remembers that a particular \"shorten\" variable\
+  \ is derived\n//                   from (total - round_up(...)) and ties it to the\
+  \ base object\n//                   whose \"count/length\" it subtracts from (e.g.\
+  \ iter).\n// - ShortenGuardedMap: remembers whether we've seen a guard like\n//\
+  \                   \"if (shorten >= base->count) shorten = 0;\".\nREGISTER_MAP_WITH_PROGRAMSTATE(ShortenBaseMap,\
+  \ const MemRegion*, const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(ShortenGuardedMap,\
+  \ const MemRegion*, bool)\n\nnamespace {\nclass SAGenTestChecker\n  : public Checker<\n\
+  \      check::PostStmt<DeclStmt>,\n      check::Bind,\n      check::BranchCondition\n\
+  \    > {\n\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \    : BT(std::make_unique<BugType>(this, \"Underflow risk in count adjustment\"\
+  , \"Logic error\")) {}\n\n  void checkPostStmt(const DeclStmt *DS, CheckerContext\
+  \ &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n  void checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const;\n\nprivate:\n  // Helpers\n  static bool isUnsignedIntLike(QualType\
+  \ QT);\n  static bool exprContainsRoundUp(const Expr *E, CheckerContext &C);\n \
+  \ static const MemRegion* tryGetBaseRegionFromTotalExpr(const Expr *E, CheckerContext\
+  \ &C);\n  static const MemRegion* getShortenVarRegionFromVarDecl(const VarDecl *VD,\
+  \ CheckerContext &C);\n  static const MemRegion* getShortenVarRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C);\n  static const MemRegion* getBaseRegionFromLHS(const\
+  \ Expr *LHS, CheckerContext &C);\n\n  static const DeclRefExpr* findDeclRefInExpr(const\
+  \ Expr *E);\n  static const MemberExpr* findMemberExprInExpr(const Expr *E);\n \
+  \ static const CallExpr* findCallExprInExpr(const Expr *E);\n\n  void recordShortenPattern(ProgramStateRef\
+  \ &State,\n                            const MemRegion *ShortenReg,\n          \
+  \                  const MemRegion *BaseReg,\n                            CheckerContext\
+  \ &C) const;\n\n  void markGuarded(ProgramStateRef &State, const MemRegion *ShortenReg,\
+  \ CheckerContext &C) const;\n\n  void tryDetectAndReportUseSubtractingShorten(const\
+  \ Stmt *S,\n                                               const Expr *TargetLHS,\n\
+  \                                               const Expr *RHSExpr,\n         \
+  \                                      bool IsCompoundSubAssign,\n             \
+  \                                  CheckerContext &C) const;\n\n  void reportBug(const\
+  \ Stmt *S, CheckerContext &C) const;\n};\n\n// ======================== Helper Implementations\
+  \ ========================\n\nbool SAGenTestChecker::isUnsignedIntLike(QualType\
+  \ QT) {\n  if (QT.isNull())\n    return false;\n  return QT->isUnsignedIntegerType();\n\
+  }\n\nbool SAGenTestChecker::exprContainsRoundUp(const Expr *E, CheckerContext &C)\
+  \ {\n  if (!E)\n    return false;\n  // Heuristically match common names used for\
+  \ roundup/align.\n  if (ExprHasName(E, \"round_up\", C)) return true;\n  if (ExprHasName(E,\
+  \ \"roundup\", C)) return true;\n  if (ExprHasName(E, \"ALIGN\", C)) return true;\n\
+  \  return false;\n}\n\nconst MemRegion* SAGenTestChecker::tryGetBaseRegionFromTotalExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n\n  // If it's\
+  \ like \"iter->count\" - use the base (iter).\n  if (const auto *ME = dyn_cast<MemberExpr>(E->IgnoreParenImpCasts()))\
+  \ {\n    const Expr *Base = ME->getBase();\n    if (!Base) return nullptr;\n   \
+  \ const MemRegion *MR = getMemRegionFromExpr(Base, C);\n    if (!MR) return nullptr;\n\
+  \    return MR->getBaseRegion();\n  }\n\n  // If it's iov_iter_count(iter) - use\
+  \ the first argument's region as base.\n  if (const auto *CE = dyn_cast<CallExpr>(E->IgnoreParenImpCasts()))\
+  \ {\n    if (ExprHasName(CE, \"iov_iter_count\", C) && CE->getNumArgs() >= 1) {\n\
+  \      const Expr *Arg0 = CE->getArg(0);\n      const MemRegion *MR = getMemRegionFromExpr(Arg0,\
+  \ C);\n      if (!MR) return nullptr;\n      return MR->getBaseRegion();\n    }\n\
+  \  }\n\n  return nullptr;\n}\n\nconst MemRegion* SAGenTestChecker::getShortenVarRegionFromVarDecl(const\
+  \ VarDecl *VD, CheckerContext &C) {\n  if (!VD) return nullptr;\n  MemRegionManager\
+  \ &MRMgr = C.getSValBuilder().getRegionManager();\n  const MemRegion *MR = MRMgr.getVarRegion(VD,\
+  \ C.getLocationContext());\n  if (!MR) return nullptr;\n  return MR->getBaseRegion();\n\
+  }\n\nconst MemRegion* SAGenTestChecker::getShortenVarRegionFromExpr(const Expr *E,\
+  \ CheckerContext &C) {\n  if (!E) return nullptr;\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts()))\
+  \ {\n    const MemRegion *MR = getMemRegionFromExpr(DRE, C);\n    if (!MR) return\
+  \ nullptr;\n    return MR->getBaseRegion();\n  }\n  return nullptr;\n}\n\nconst\
+  \ MemRegion* SAGenTestChecker::getBaseRegionFromLHS(const Expr *LHS, CheckerContext\
+  \ &C) {\n  if (!LHS) return nullptr;\n  if (const auto *ME = dyn_cast<MemberExpr>(LHS->IgnoreParenImpCasts()))\
+  \ {\n    const Expr *Base = ME->getBase();\n    if (!Base) return nullptr;\n   \
+  \ const MemRegion *MR = getMemRegionFromExpr(Base, C);\n    if (!MR) return nullptr;\n\
+  \    return MR->getBaseRegion();\n  }\n  return nullptr;\n}\n\nconst DeclRefExpr*\
+  \ SAGenTestChecker::findDeclRefInExpr(const Expr *E) {\n  if (!E) return nullptr;\n\
+  \  return findSpecificTypeInChildren<DeclRefExpr>(E);\n}\n\nconst MemberExpr* SAGenTestChecker::findMemberExprInExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  return findSpecificTypeInChildren<MemberExpr>(E);\n\
+  }\n\nconst CallExpr* SAGenTestChecker::findCallExprInExpr(const Expr *E) {\n  if\
+  \ (!E) return nullptr;\n  return findSpecificTypeInChildren<CallExpr>(E);\n}\n\n\
+  void SAGenTestChecker::recordShortenPattern(ProgramStateRef &State,\n          \
+  \                                  const MemRegion *ShortenReg,\n              \
+  \                              const MemRegion *BaseReg,\n                     \
+  \                       CheckerContext &C) const {\n  if (!ShortenReg || !BaseReg)\
+  \ return;\n  State = State->set<ShortenBaseMap>(ShortenReg, BaseReg);\n  State =\
+  \ State->set<ShortenGuardedMap>(ShortenReg, false);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::markGuarded(ProgramStateRef &State, const MemRegion\
+  \ *ShortenReg, CheckerContext &C) const {\n  if (!ShortenReg) return;\n  const bool\
+  \ *Old = State->get<ShortenGuardedMap>(ShortenReg);\n  if (!Old || *Old == false)\
+  \ {\n    State = State->set<ShortenGuardedMap>(ShortenReg, true);\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::reportBug(const Stmt *S, CheckerContext &C) const\
+  \ {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\
+  \  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\n      \"Possible\
+  \ unsigned underflow: subtracting rounded-up length from total without bounds check.\"\
+  ,\n      N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// Tries to detect:\n// - Compound:   LHS -= shorten;\n// - Simple:     LHS\
+  \ = LHS - shorten;\n// and report if 'shorten' maps to the same base object as LHS\
+  \ and not guarded.\nvoid SAGenTestChecker::tryDetectAndReportUseSubtractingShorten(const\
+  \ Stmt *S,\n                                                               const\
+  \ Expr *TargetLHS,\n                                                           \
+  \    const Expr *RHSExpr,\n                                                    \
+  \           bool IsCompoundSubAssign,\n                                        \
+  \                       CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  if (!TargetLHS || !RHSExpr)\n    return;\n\n  // Get the base region for LHS\
+  \ like \"iter->count\".\n  const MemRegion *LHSBase = getBaseRegionFromLHS(TargetLHS,\
+  \ C);\n  if (!LHSBase)\n    return;\n\n  const MemRegion *ShortenReg = nullptr;\n\
+  \n  if (IsCompoundSubAssign) {\n    // Pattern: X -= shorten\n    if (const DeclRefExpr\
+  \ *DR = findDeclRefInExpr(RHSExpr)) {\n      const MemRegion *MR = getMemRegionFromExpr(DR,\
+  \ C);\n      if (MR) ShortenReg = MR->getBaseRegion();\n    }\n  } else {\n    //\
+  \ Pattern: X = X - shorten\n    const auto *BOSub = dyn_cast<BinaryOperator>(RHSExpr->IgnoreParenImpCasts());\n\
+  \    if (!BOSub || BOSub->getOpcode() != BO_Sub)\n      return;\n\n    // RHS must\
+  \ be 'LHS_like - shorten'\n    const Expr *RHSLHS = BOSub->getLHS();\n    const\
+  \ Expr *RHSRHS = BOSub->getRHS();\n\n    // Check LHS of subtraction refers to same\
+  \ base object as assignment LHS\n    const MemRegion *RHSLHSBase = getBaseRegionFromLHS(RHSLHS,\
+  \ C);\n    if (!RHSLHSBase || RHSLHSBase != LHSBase)\n      return;\n\n    if (const\
+  \ DeclRefExpr *DR = findDeclRefInExpr(RHSRHS)) {\n      const MemRegion *MR = getMemRegionFromExpr(DR,\
+  \ C);\n      if (MR) ShortenReg = MR->getBaseRegion();\n    }\n  }\n\n  if (!ShortenReg)\n\
+  \    return;\n\n  // Verify that ShortenReg is a tracked \"shorten\" derived from\
+  \ this base object.\n  const MemRegion *const *MappedBase = State->get<ShortenBaseMap>(ShortenReg);\n\
+  \  if (!MappedBase || *MappedBase != LHSBase)\n    return;\n\n  const bool *Guarded\
+  \ = State->get<ShortenGuardedMap>(ShortenReg);\n  if (Guarded && *Guarded)\n   \
+  \ return; // A guard/clamp was observed earlier.\n\n  // Report\n  reportBug(S,\
+  \ C);\n\n  // Optionally, drop mapping to avoid duplicate reports on same path.\n\
+  \  State = State->remove<ShortenBaseMap>(ShortenReg);\n  State = State->remove<ShortenGuardedMap>(ShortenReg);\n\
+  \  C.addTransition(State);\n}\n\n// ======================== Checker Callbacks ========================\n\
+  \nvoid SAGenTestChecker::checkPostStmt(const DeclStmt *DS, CheckerContext &C) const\
+  \ {\n  if (!DS)\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  for\
+  \ (const Decl *D : DS->decls()) {\n    const auto *VD = dyn_cast<VarDecl>(D);\n\
+  \    if (!VD)\n      continue;\n\n    if (!VD->hasInit())\n      continue;\n\n \
+  \   // Only track unsigned-like variables (e.g., size_t).\n    if (!isUnsignedIntLike(VD->getType()))\n\
+  \      continue;\n\n    const Expr *Init = VD->getInit();\n    if (!Init)\n    \
+  \  continue;\n\n    // Look for: shorten = U - round_up(...)\n    const auto *BOSub\
+  \ = dyn_cast<BinaryOperator>(Init->IgnoreParenImpCasts());\n    if (!BOSub || BOSub->getOpcode()\
+  \ != BO_Sub)\n      continue;\n\n    const Expr *U = BOSub->getLHS();\n    const\
+  \ Expr *W = BOSub->getRHS();\n    if (!U || !W)\n      continue;\n\n    if (!exprContainsRoundUp(W,\
+  \ C))\n      continue;\n\n    const MemRegion *BaseReg = tryGetBaseRegionFromTotalExpr(U,\
+  \ C);\n    if (!BaseReg)\n      continue;\n\n    const MemRegion *ShortenReg = getShortenVarRegionFromVarDecl(VD,\
+  \ C);\n    if (!ShortenReg)\n      continue;\n\n    recordShortenPattern(State,\
+  \ ShortenReg, BaseReg, C);\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc,\
+  \ SVal Val, const Stmt *S, CheckerContext &C) const {\n  if (!S)\n    return;\n\n\
+  \  ProgramStateRef State = C.getState();\n\n  // A) Record shorten = U - round_up(...)\
+  \ assignments (non-declarative).\n  if (const auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n    if (BO->getOpcode() == BO_Assign) {\n      const Expr *LHS = BO->getLHS();\n\
+  \      const Expr *RHS = BO->getRHS();\n\n      // Only track if LHS variable is\
+  \ unsigned-like.\n      if (!LHS || !isUnsignedIntLike(LHS->getType()))\n      \
+  \  /* fallthrough to other checks */;\n\n      // Look for RHS: U - round_up(...)\n\
+  \      const auto *BOSub = dyn_cast<BinaryOperator>(RHS ? RHS->IgnoreParenImpCasts()\
+  \ : nullptr);\n      if (BOSub && BOSub->getOpcode() == BO_Sub) {\n        const\
+  \ Expr *U = BOSub->getLHS();\n        const Expr *W = BOSub->getRHS();\n       \
+  \ if (U && W && exprContainsRoundUp(W, C)) {\n          const MemRegion *BaseReg\
+  \ = tryGetBaseRegionFromTotalExpr(U, C);\n          const MemRegion *ShortenReg\
+  \ = getShortenVarRegionFromExpr(LHS, C);\n          if (BaseReg && ShortenReg) {\n\
+  \            recordShortenPattern(State, ShortenReg, BaseReg, C);\n          }\n\
+  \        }\n      }\n\n      // B2) Detect \"X = X - shorten\" pattern for use.\n\
+  \      tryDetectAndReportUseSubtractingShorten(S, LHS, RHS, /*IsCompoundSubAssign*/false,\
+  \ C);\n      return;\n    }\n  }\n\n  // B1) Detect \"X -= shorten\" pattern for\
+  \ use.\n  if (const auto *CAO = dyn_cast<CompoundAssignOperator>(S)) {\n    if (CAO->getOpcode()\
+  \ == BO_SubAssign) {\n      const Expr *LHS = CAO->getLHS();\n      const Expr *RHS\
+  \ = CAO->getRHS();\n      tryDetectAndReportUseSubtractingShorten(S, LHS, RHS, /*IsCompoundSubAssign*/true,\
+  \ C);\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const auto *CondE = dyn_cast<Expr>(Condition);\n  if (!CondE) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  const auto *BO = dyn_cast<BinaryOperator>(CondE->IgnoreParenImpCasts());\n\
+  \  if (!BO) {\n    C.addTransition(State);\n    return;\n  }\n\n  BinaryOperator::Opcode\
+  \ Op = BO->getOpcode();\n  // We consider comparisons which could indicate a guard:\n\
+  \  // shorten >= base->count, shorten > base->count, etc.\n  if (!(Op == BO_GE ||\
+  \ Op == BO_GT || Op == BO_LE || Op == BO_LT || Op == BO_EQ || Op == BO_NE)) {\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  const Expr *LHS = BO->getLHS();\n\
+  \  const Expr *RHS = BO->getRHS();\n  if (!LHS || !RHS) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Try to find a 'shorten' variable (DeclRefExpr) on one\
+  \ side and a base 'count'\n  // reference (MemberExpr or iov_iter_count(base)) on\
+  \ the other side.\n  const DeclRefExpr *DRE_L = findDeclRefInExpr(LHS);\n  const\
+  \ DeclRefExpr *DRE_R = findDeclRefInExpr(RHS);\n\n  const MemRegion *ShortenReg\
+  \ = nullptr;\n  const MemRegion *OtherBase = nullptr;\n  const Expr *OtherExpr =\
+  \ nullptr;\n\n  if (DRE_L) {\n    const MemRegion *MR = getMemRegionFromExpr(DRE_L,\
+  \ C);\n    if (MR) {\n      MR = MR->getBaseRegion();\n      // Ensure this DRE\
+  \ is one of tracked 'shorten' variables\n      if (State->contains<ShortenBaseMap>(MR))\
+  \ {\n        ShortenReg = MR;\n        OtherExpr = RHS;\n      }\n    }\n  }\n\n\
+  \  if (!ShortenReg && DRE_R) {\n    const MemRegion *MR = getMemRegionFromExpr(DRE_R,\
+  \ C);\n    if (MR) {\n      MR = MR->getBaseRegion();\n      if (State->contains<ShortenBaseMap>(MR))\
+  \ {\n        ShortenReg = MR;\n        OtherExpr = LHS;\n      }\n    }\n  }\n\n\
+  \  if (!ShortenReg || !OtherExpr) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  // Find base on the other side.\n  if (const auto *ME = findMemberExprInExpr(OtherExpr))\
+  \ {\n    OtherBase = getBaseRegionFromLHS(ME, C);\n  } else if (const auto *CE =\
+  \ findCallExprInExpr(OtherExpr)) {\n    if (ExprHasName(CE, \"iov_iter_count\",\
+  \ C) && CE->getNumArgs() >= 1) {\n      const MemRegion *MR = getMemRegionFromExpr(CE->getArg(0),\
+  \ C);\n      if (MR) OtherBase = MR->getBaseRegion();\n    }\n  }\n\n  if (!OtherBase)\
+  \ {\n    // Heuristic fallback: if we cannot resolve base of the other side,\n \
+  \   // conservatively do nothing.\n    C.addTransition(State);\n    return;\n  }\n\
+  \n  const MemRegion *const *MappedBase = State->get<ShortenBaseMap>(ShortenReg);\n\
+  \  if (MappedBase && *MappedBase == OtherBase) {\n    markGuarded(State, ShortenReg,\
+  \ C);\n    return;\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects unsigned underflow when subtracting\
+  \ rounded-up length from a total without a guard\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

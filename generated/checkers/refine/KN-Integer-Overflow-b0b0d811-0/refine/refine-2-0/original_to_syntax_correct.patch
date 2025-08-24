@@ -1,0 +1,141 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -129,6 +129,12 @@                               const Expr *LHSExpr,
+                               CheckerContext &C);
+
++  // New helpers for path-sensitive bounds
++  static bool isNonNegativeIndexLike(const Expr *E);
++  static bool tryGetSymMax128(const Expr *E, CheckerContext &C, llvm::APInt &Max128);
++  static void refineBoundWithSymMaxAndHeuristics(const Expr *E, CheckerContext &C,
++                                                 llvm::APInt &Min, llvm::APInt &Max);
++
+   void emitReport(const BinaryOperator *MulBO, QualType LHSType,
+                   CheckerContext &C) const;
+ };
+@@ -183,6 +189,63 @@   }
+ }
+
++// Identify typical non-negative, bounded index-like variable names.
++bool SAGenTestChecker::isNonNegativeIndexLike(const Expr *E) {
++  std::string Name = extractIdentifierLikeName(E);
++  if (Name.empty())
++    return false;
++  std::string Lower = Name;
++  std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++  // Conservative list: do not include "len"/"height"/"width" to avoid masking target bugs.
++  return nameContains(Lower, {"idx", "index", "slot", "pos"});
++}
++
++// Try to obtain a path-sensitive max bound for an rvalue expression using Sym constraints.
++bool SAGenTestChecker::tryGetSymMax128(const Expr *E, CheckerContext &C, llvm::APInt &Max128) {
++  if (!E)
++    return false;
++  ProgramStateRef State = C.getState();
++  // Important: query the SVal of the rvalue expression as-is (without stripping casts)
++  // to maximize chance of getting a symbolic value instead of a location region.
++  SVal SV = State->getSVal(E, C.getLocationContext());
++  if (SymbolRef Sym = SV.getAsSymbol()) {
++    if (const llvm::APSInt *MaxV = inferSymbolMaxVal(Sym, C)) {
++      Max128 = MaxV->extOrTrunc(128);
++      return true;
++    }
++  }
++  return false;
++}
++
++// Refine [Min, Max] using program state max bound and index-like non-negativity.
++void SAGenTestChecker::refineBoundWithSymMaxAndHeuristics(const Expr *E, CheckerContext &C,
++                                                          llvm::APInt &Min, llvm::APInt &Max) {
++  QualType T = E->getType();
++  llvm::APInt TMin(128, 0), TMax(128, 0);
++  getTypeRange128(T, C, TMin, TMax);
++
++  // Apply max bound from constraints if available (work best on rvalues)
++  llvm::APInt SymMax(128, 0);
++  if (tryGetSymMax128(E, C, SymMax)) {
++    if (Max.sgt(SymMax))
++      Max = SymMax;
++  }
++  // If type is unsigned, min is zero.
++  if (T->isUnsignedIntegerOrEnumerationType()) {
++    if (Min.slt(llvm::APInt(128, 0)))
++      Min = llvm::APInt(128, 0);
++  } else {
++    // Heuristic: for common index-like names, assume non-negative on this path.
++    if (isNonNegativeIndexLike(E)) {
++      if (Min.slt(llvm::APInt(128, 0)))
++        Min = llvm::APInt(128, 0);
++    }
++  }
++  // Clamp to type representable interval.
++  if (Min.slt(TMin)) Min = TMin;
++  if (Max.sgt(TMax)) Max = TMax;
++}
++
+ // Lightweight interval analysis for expressions. Always returns true,
+ // providing a conservative range, falling back to type-based ranges.
+ // Depth-limited to avoid pathological recursion.
+@@ -209,18 +272,34 @@     return getExprRange128(PE->getSubExpr(), C, Min, Max, Depth + 1);
+   }
+
+-  // Casts: get sub-range and clamp to destination type.
++  // Casts: attempt to retrieve rvalue symbol range first; then clamp to destination.
+   if (const auto *CE = dyn_cast<CastExpr>(E)) {
++    // First, try to use the value of the cast expression itself (often rvalue due to LValueToRValue),
++    // which allows pulling path-sensitive bounds from constraints.
++    llvm::APInt CMin(128, 0), CMax(128, 0);
++    // Start from the type range of the cast result.
++    getTypeRange128(CE->getType(), C, CMin, CMax);
++
++    // Try bounding with symbol max and index-like min>=0.
++    refineBoundWithSymMaxAndHeuristics(CE, C, CMin, CMax);
++
++    // If we managed to refine (i.e., got constraints or min==0 due to heuristics),
++    // keep the refined [CMin, CMax] but still intersect with type bounds (already done inside).
++    Min = CMin;
++    Max = CMax;
++
++    // As a fallback, intersect with the subexpr-derived bounds to not lose information.
+     llvm::APInt SMin(128, 0), SMax(128, 0);
+     (void)getExprRange128(CE->getSubExpr(), C, SMin, SMax, Depth + 1);
++    if (Min.slt(SMin)) Min = SMin;
++    if (Max.sgt(SMax)) Max = SMax;
++
++    // Finally clamp to destination type (ensure soundness).
+     llvm::APInt TMin(128, 0), TMax(128, 0);
+     getTypeRange128(CE->getType(), C, TMin, TMax);
+-    // Intersect [SMin, SMax] with [TMin, TMax].
+-    Min = SMin;
+-    Max = SMax;
+     if (Min.slt(TMin)) Min = TMin;
+     if (Max.sgt(TMax)) Max = TMax;
+-    if (Min.sgt(Max)) { Min = TMin; Max = TMax; }
++
+     return true;
+   }
+
+@@ -251,7 +330,6 @@     if (K == UO_Minus) {
+       llvm::APInt SMin(128, 0), SMax(128, 0);
+       (void)getExprRange128(UO->getSubExpr(), C, SMin, SMax, Depth + 1);
+-      // Negate reverses bounds: [-b, -a]
+       Min = -SMax;
+       Max = -SMin;
+       return true;
+@@ -329,9 +407,10 @@     return true;
+   }
+
+-  // Member access / decl ref: use their type ranges.
++  // Member access / decl ref: use their type ranges, then refine with sym max and heuristics.
+   if (isa<MemberExpr>(E) || isa<DeclRefExpr>(E)) {
+     getTypeRange128(E->getType(), C, Min, Max);
++    refineBoundWithSymMaxAndHeuristics(E, C, Min, Max);
+     return true;
+   }
+
+@@ -341,7 +420,8 @@ }
+
+ // If we can bound both operands, compute the product interval and verify it fits
+-// entirely in the multiplication's result type. No non-negativity requirement.
++// entirely in the multiplication's result type. Now enhanced with path-sensitive
++// max bounds and non-negativity heuristics via getExprRange128.
+ bool SAGenTestChecker::productDefinitelyFitsInType(const Expr *L, const Expr *R,
+                                                    QualType MulType, CheckerContext &C) {
+   llvm::APInt LMin(128, 0), LMax(128, 0), RMin(128, 0), RMax(128, 0);

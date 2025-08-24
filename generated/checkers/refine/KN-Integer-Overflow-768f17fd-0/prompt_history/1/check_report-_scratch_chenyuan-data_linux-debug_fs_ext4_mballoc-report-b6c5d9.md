@@ -1,0 +1,440 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Left-shifting a 32-bit expression and only widening to 64-bit after the shift, causing the shift to be performed in 32-bit width and overflow/truncation before assignment:
+
+u64 tau4 = ((1 << x_w) | x) << y;   // shift happens in 32-bit -> overflow
+// Correct:
+u64 tau4 = (u64)((1 << x_w) | x) << y;
+
+Root cause: the shift is evaluated in the type of the left operand (u32), so bits are lost when y or the result exceeds 32 bits; casting must occur before the shift.
+
+## Bug Pattern
+
+Left-shifting a 32-bit expression and only widening to 64-bit after the shift, causing the shift to be performed in 32-bit width and overflow/truncation before assignment:
+
+u64 tau4 = ((1 << x_w) | x) << y;   // shift happens in 32-bit -> overflow
+// Correct:
+u64 tau4 = (u64)((1 << x_w) | x) << y;
+
+Root cause: the shift is evaluated in the type of the left operand (u32), so bits are lost when y or the result exceeds 32 bits; casting must occur before the shift.
+
+# Report
+
+### Report Summary
+
+File:| /scratch/chenyuan-data/linux-debug/fs/ext4/mballoc.c
+---|---
+Warning:| line 6520, column 4
+Shift done in 32-bit, widened after; cast left operand to 64-bit before <<
+
+### Annotated Source Code
+
+
+6339  | 		}
+6340  | 	}
+6341  |
+6342  | 	rb_link_node(new_node, parent, n);
+6343  | 	rb_insert_color(new_node, &db->bb_free_root);
+6344  |
+6345  |  /* Now try to see the extent can be merged to left and right */
+6346  | 	node = rb_prev(new_node);
+6347  |  if (node) {
+6348  | 		entry = rb_entry(node, struct ext4_free_data, efd_node);
+6349  | 		ext4_try_merge_freed_extent(sbi, entry, new_entry,
+6350  | 					    &(db->bb_free_root));
+6351  | 	}
+6352  |
+6353  | 	node = rb_next(new_node);
+6354  |  if (node) {
+6355  | 		entry = rb_entry(node, struct ext4_free_data, efd_node);
+6356  | 		ext4_try_merge_freed_extent(sbi, entry, new_entry,
+6357  | 					    &(db->bb_free_root));
+6358  | 	}
+6359  |
+6360  | 	spin_lock(&sbi->s_md_lock);
+6361  | 	list_add_tail(&new_entry->efd_list, &sbi->s_freed_data_list[new_entry->efd_tid & 1]);
+6362  | 	sbi->s_mb_free_pending += clusters;
+6363  | 	spin_unlock(&sbi->s_md_lock);
+6364  | }
+6365  |
+6366  | static void ext4_free_blocks_simple(struct inode *inode, ext4_fsblk_t block,
+6367  |  unsigned long count)
+6368  | {
+6369  |  struct super_block *sb = inode->i_sb;
+6370  | 	ext4_group_t group;
+6371  | 	ext4_grpblk_t blkoff;
+6372  |
+6373  | 	ext4_get_group_no_and_offset(sb, block, &group, &blkoff);
+6374  | 	ext4_mb_mark_context(NULL, sb, false, group, blkoff, count,
+6375  |  EXT4_MB_BITMAP_MARKED_CHECK |
+6376  |  EXT4_MB_SYNC_UPDATE,
+6377  |  NULL);
+6378  | }
+6379  |
+6380  | /**
+6381  |  * ext4_mb_clear_bb() -- helper function for freeing blocks.
+6382  |  *			Used by ext4_free_blocks()
+6383  |  * @handle:		handle for this transaction
+6384  |  * @inode:		inode
+6385  |  * @block:		starting physical block to be freed
+6386  |  * @count:		number of blocks to be freed
+6387  |  * @flags:		flags used by ext4_free_blocks
+6388  |  */
+6389  | static void ext4_mb_clear_bb(handle_t *handle, struct inode *inode,
+6390  | 			       ext4_fsblk_t block, unsigned long count,
+6391  |  int flags)
+6392  | {
+6393  |  struct super_block *sb = inode->i_sb;
+6394  |  struct ext4_group_info *grp;
+6395  |  unsigned int overflow;
+6396  | 	ext4_grpblk_t bit;
+6397  | 	ext4_group_t block_group;
+6398  |  struct ext4_sb_info *sbi;
+6399  |  struct ext4_buddy e4b;
+6400  |  unsigned int count_clusters;
+6401  |  int err = 0;
+6402  |  int mark_flags = 0;
+6403  | 	ext4_grpblk_t changed;
+6404  |
+6405  | 	sbi = EXT4_SB(sb);
+6406  |
+6407  |  if (!(flags & EXT4_FREE_BLOCKS_VALIDATED) &&
+    19←Assuming the condition is true→
+    21←Taking false branch→
+6408  |  !ext4_inode_block_valid(inode, block, count)) {
+    20←Assuming the condition is false→
+6409  |  ext4_error(sb, "Freeing blocks in system zone - "
+6410  |  "Block = %llu, count = %lu", block, count);
+6411  |  /* err = 0. ext4_std_error should be a no op */
+6412  |  goto error_out;
+6413  | 	}
+6414  |  flags |= EXT4_FREE_BLOCKS_VALIDATED;
+6415  |
+6416  | do_more:
+6417  |  overflow = 0;
+6418  |  ext4_get_group_no_and_offset(sb, block, &block_group, &bit);
+6419  |
+6420  | 	grp = ext4_get_group_info(sb, block_group);
+6421  |  if (unlikely(!grp || EXT4_MB_GRP_BBITMAP_CORRUPT(grp)))
+    22←Assuming 'grp' is non-null→
+    23←Assuming the condition is false→
+    24←Taking false branch→
+6422  |  return;
+6423  |
+6424  |  /*
+6425  |  * Check to see if we are freeing blocks across a group
+6426  |  * boundary.
+6427  |  */
+6428  |  if (EXT4_C2B(sbi, bit) + count > EXT4_BLOCKS_PER_GROUP(sb)) {
+    25←Assuming right operand of bit shift is less than 32→
+    26←Assuming the condition is false→
+    27←Taking false branch→
+6429  | 		overflow = EXT4_C2B(sbi, bit) + count -
+6430  |  EXT4_BLOCKS_PER_GROUP(sb);
+6431  | 		count -= overflow;
+6432  |  /* The range changed so it's no longer validated */
+6433  | 		flags &= ~EXT4_FREE_BLOCKS_VALIDATED;
+6434  | 	}
+6435  |  count_clusters = EXT4_NUM_B2C(sbi, count);
+6436  | 	trace_ext4_mballoc_free(sb, inode, block_group, bit, count_clusters);
+6437  |
+6438  |  /* __GFP_NOFAIL: retry infinitely, ignore TIF_MEMDIE and memcg limit. */
+6439  | 	err = ext4_mb_load_buddy_gfp(sb, block_group, &e4b,
+6440  |  GFP_NOFS|__GFP_NOFAIL);
+6441  |  if (err)
+    28←Assuming 'err' is 0→
+6442  |  goto error_out;
+6443  |
+6444  |  if (!(flags & EXT4_FREE_BLOCKS_VALIDATED) &&
+    29←Assuming the condition is true→
+    31←Taking false branch→
+6445  |  !ext4_inode_block_valid(inode, block, count)) {
+    30←Assuming the condition is false→
+6446  |  ext4_error(sb, "Freeing blocks in system zone - "
+6447  |  "Block = %llu, count = %lu", block, count);
+6448  |  /* err = 0. ext4_std_error should be a no op */
+6449  |  goto error_clean;
+6450  | 	}
+6451  |
+6452  | #ifdef AGGRESSIVE_CHECK
+6453  | 	mark_flags |= EXT4_MB_BITMAP_MARKED_CHECK;
+6454  | #endif
+6455  |  err = ext4_mb_mark_context(handle, sb, false, block_group, bit,
+6456  | 				   count_clusters, mark_flags, &changed);
+6457  |
+6458  |
+6459  |  if (err && changed == 0)
+    32←Assuming 'err' is 0→
+6460  |  goto error_clean;
+6461  |
+6462  | #ifdef AGGRESSIVE_CHECK
+6463  |  BUG_ON(changed != count_clusters);
+6464  | #endif
+6465  |
+6466  |  /*
+6467  |  * We need to make sure we don't reuse the freed block until after the
+6468  |  * transaction is committed. We make an exception if the inode is to be
+6469  |  * written in writeback mode since writeback mode has weak data
+6470  |  * consistency guarantees.
+6471  |  */
+6472  |  if (ext4_handle_valid(handle) &&
+6473  | 	    ((flags & EXT4_FREE_BLOCKS_METADATA) ||
+6474  | 	     !ext4_should_writeback_data(inode))) {
+6475  |  struct ext4_free_data *new_entry;
+6476  |  /*
+6477  |  * We use __GFP_NOFAIL because ext4_free_blocks() is not allowed
+6478  |  * to fail.
+6479  |  */
+6480  | 		new_entry = kmem_cache_alloc(ext4_free_data_cachep,
+6481  |  GFP_NOFS|__GFP_NOFAIL);
+6482  | 		new_entry->efd_start_cluster = bit;
+6483  | 		new_entry->efd_group = block_group;
+6484  | 		new_entry->efd_count = count_clusters;
+6485  | 		new_entry->efd_tid = handle->h_transaction->t_tid;
+6486  |
+6487  | 		ext4_lock_group(sb, block_group);
+6488  | 		ext4_mb_free_metadata(handle, &e4b, new_entry);
+6489  | 	} else {
+6490  |  if (test_opt(sb, DISCARD)) {
+    33←Assuming the condition is false→
+    34←Taking false branch→
+6491  | 			err = ext4_issue_discard(sb, block_group, bit,
+6492  | 						 count_clusters);
+6493  |  /*
+6494  |  * Ignore EOPNOTSUPP error. This is consistent with
+6495  |  * what happens when using journal.
+6496  |  */
+6497  |  if (err == -EOPNOTSUPP)
+6498  | 				err = 0;
+6499  |  if (err)
+6500  |  ext4_msg(sb, KERN_WARNING, "discard request in"
+6501  |  " group:%u block:%d count:%lu failed"
+6502  |  " with %d", block_group, bit, count,
+6503  |  err);
+6504  | 		} else
+6505  |  EXT4_MB_GRP_CLEAR_TRIMMED(e4b.bd_info);
+6506  |
+6507  |  ext4_lock_group(sb, block_group);
+6508  |  mb_free_blocks(inode, &e4b, bit, count_clusters);
+6509  | 	}
+6510  |
+6511  |  ext4_unlock_group(sb, block_group);
+6512  |
+6513  |  /*
+6514  |  * on a bigalloc file system, defer the s_freeclusters_counter
+6515  |  * update to the caller (ext4_remove_space and friends) so they
+6516  |  * can determine if a cluster freed here should be rereserved
+6517  |  */
+6518  |  if (!(flags & EXT4_FREE_BLOCKS_RERESERVE_CLUSTER)) {
+    35←Assuming the condition is true→
+    36←Taking true branch→
+6519  |  if (!(flags & EXT4_FREE_BLOCKS_NO_QUOT_UPDATE))
+    37←Assuming the condition is true→
+    38←Taking true branch→
+6520  |  dquot_free_block(inode, EXT4_C2B(sbi, count_clusters));
+    39←Shift done in 32-bit, widened after; cast left operand to 64-bit before <<
+6521  | 		percpu_counter_add(&sbi->s_freeclusters_counter,
+6522  | 				   count_clusters);
+6523  | 	}
+6524  |
+6525  |  if (overflow && !err) {
+6526  | 		block += count;
+6527  | 		count = overflow;
+6528  | 		ext4_mb_unload_buddy(&e4b);
+6529  |  /* The range changed so it's no longer validated */
+6530  | 		flags &= ~EXT4_FREE_BLOCKS_VALIDATED;
+6531  |  goto do_more;
+6532  | 	}
+6533  |
+6534  | error_clean:
+6535  | 	ext4_mb_unload_buddy(&e4b);
+6536  | error_out:
+6537  |  ext4_std_error(sb, err);
+6538  | }
+6539  |
+6540  | /**
+6541  |  * ext4_free_blocks() -- Free given blocks and update quota
+6542  |  * @handle:		handle for this transaction
+6543  |  * @inode:		inode
+6544  |  * @bh:			optional buffer of the block to be freed
+6545  |  * @block:		starting physical block to be freed
+6546  |  * @count:		number of blocks to be freed
+6547  |  * @flags:		flags used by ext4_free_blocks
+6548  |  */
+6549  | void ext4_free_blocks(handle_t *handle, struct inode *inode,
+6550  |  struct buffer_head *bh, ext4_fsblk_t block,
+6551  |  unsigned long count, int flags)
+6552  | {
+6553  |  struct super_block *sb = inode->i_sb;
+6554  |  unsigned int overflow;
+6555  |  struct ext4_sb_info *sbi;
+6556  |
+6557  | 	sbi = EXT4_SB(sb);
+6558  |
+6559  |  if (bh) {
+    1Assuming 'bh' is null→
+    2←Taking false branch→
+6560  |  if (block)
+6561  |  BUG_ON(block != bh->b_blocknr);
+6562  |  else
+6563  | 			block = bh->b_blocknr;
+6564  | 	}
+6565  |
+6566  |  if (sbi->s_mount_state & EXT4_FC_REPLAY) {
+    3←Assuming the condition is false→
+    4←Taking false branch→
+6567  | 		ext4_free_blocks_simple(inode, block, EXT4_NUM_B2C(sbi, count));
+6568  |  return;
+6569  | 	}
+6570  |
+6571  |  might_sleep();
+6572  |
+6573  |  if (!(flags & EXT4_FREE_BLOCKS_VALIDATED) &&
+    5←Assuming the condition is false→
+6574  | 	    !ext4_inode_block_valid(inode, block, count)) {
+6575  |  ext4_error(sb, "Freeing blocks not in datazone - "
+6576  |  "block = %llu, count = %lu", block, count);
+6577  |  return;
+6578  | 	}
+6579  |  flags |= EXT4_FREE_BLOCKS_VALIDATED;
+6580  |
+6581  |  ext4_debug("freeing block %llu\n", block);
+    6←Taking false branch→
+6582  | 	trace_ext4_free_blocks(inode, block, count, flags);
+6583  |
+6584  |  if (bh6.1'bh' is null && (flags & EXT4_FREE_BLOCKS_FORGET)) {
+6585  |  BUG_ON(count > 1);
+6586  |
+6587  |  ext4_forget(handle, flags & EXT4_FREE_BLOCKS_METADATA,
+6588  |  inode, bh, block);
+6589  | 	}
+6590  |
+6591  |  /*
+6592  |  * If the extent to be freed does not begin on a cluster
+6593  |  * boundary, we need to deal with partial clusters at the
+6594  |  * beginning and end of the extent.  Normally we will free
+6595  |  * blocks at the beginning or the end unless we are explicitly
+6596  |  * requested to avoid doing so.
+6597  |  */
+6598  |  overflow = EXT4_PBLK_COFF(sbi, block);
+6599  |  if (overflow) {
+    7←Assuming 'overflow' is 0→
+    8←Taking false branch→
+6600  |  if (flags & EXT4_FREE_BLOCKS_NOFREE_FIRST_CLUSTER) {
+6601  | 			overflow = sbi->s_cluster_ratio - overflow;
+6602  | 			block += overflow;
+6603  |  if (count > overflow)
+6604  | 				count -= overflow;
+6605  |  else
+6606  |  return;
+6607  | 		} else {
+6608  | 			block -= overflow;
+6609  | 			count += overflow;
+6610  | 		}
+6611  |  /* The range changed so it's no longer validated */
+6612  | 		flags &= ~EXT4_FREE_BLOCKS_VALIDATED;
+6613  | 	}
+6614  |  overflow = EXT4_LBLK_COFF(sbi, count);
+6615  |  if (overflow) {
+    9←Assuming 'overflow' is 0→
+6616  |  if (flags & EXT4_FREE_BLOCKS_NOFREE_LAST_CLUSTER) {
+6617  |  if (count > overflow)
+6618  | 				count -= overflow;
+6619  |  else
+6620  |  return;
+6621  | 		} else
+6622  | 			count += sbi->s_cluster_ratio - overflow;
+6623  |  /* The range changed so it's no longer validated */
+6624  | 		flags &= ~EXT4_FREE_BLOCKS_VALIDATED;
+6625  | 	}
+6626  |
+6627  |  if (!bh9.1'bh' is null && (flags & EXT4_FREE_BLOCKS_FORGET)) {
+    10←Assuming the condition is true→
+    11←Taking true branch→
+6628  |  int i;
+6629  |  int is_metadata = flags & EXT4_FREE_BLOCKS_METADATA;
+6630  |
+6631  |  for (i = 0; i < count; i++) {
+    12←Assuming 'i' is < 'count'→
+    13←Loop condition is true.  Entering loop body→
+    16←Assuming 'i' is >= 'count'→
+    17←Loop condition is false. Execution continues on line 6639→
+6632  |  cond_resched();
+6633  |  if (is_metadata)
+    14←Assuming 'is_metadata' is 0→
+    15←Taking false branch→
+6634  | 				bh = sb_find_get_block(inode->i_sb, block + i);
+6635  |  ext4_forget(handle, is_metadata, inode, bh, block + i);
+6636  |  }
+6637  | 	}
+6638  |
+6639  |  ext4_mb_clear_bb(handle, inode, block, count, flags);
+    18←Calling 'ext4_mb_clear_bb'→
+6640  | }
+6641  |
+6642  | /**
+6643  |  * ext4_group_add_blocks() -- Add given blocks to an existing group
+6644  |  * @handle:			handle to this transaction
+6645  |  * @sb:				super block
+6646  |  * @block:			start physical block to add to the block group
+6647  |  * @count:			number of blocks to free
+6648  |  *
+6649  |  * This marks the blocks as free in the bitmap and buddy.
+6650  |  */
+6651  | int ext4_group_add_blocks(handle_t *handle, struct super_block *sb,
+6652  | 			 ext4_fsblk_t block, unsigned long count)
+6653  | {
+6654  | 	ext4_group_t block_group;
+6655  | 	ext4_grpblk_t bit;
+6656  |  struct ext4_sb_info *sbi = EXT4_SB(sb);
+6657  |  struct ext4_buddy e4b;
+6658  |  int err = 0;
+6659  | 	ext4_fsblk_t first_cluster = EXT4_B2C(sbi, block);
+6660  | 	ext4_fsblk_t last_cluster = EXT4_B2C(sbi, block + count - 1);
+6661  |  unsigned long cluster_count = last_cluster - first_cluster + 1;
+6662  | 	ext4_grpblk_t changed;
+6663  |
+6664  |  ext4_debug("Adding block(s) %llu-%llu\n", block, block + count - 1);
+6665  |
+6666  |  if (cluster_count == 0)
+6667  |  return 0;
+6668  |
+6669  | 	ext4_get_group_no_and_offset(sb, block, &block_group, &bit);
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

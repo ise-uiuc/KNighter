@@ -1,0 +1,328 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 5aa2184e29081665f915594bc6de9b7fee6e4883
+commit_type: Double-Free
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Decl.h\"\n#include \"\
+  clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"llvm/ADT/DenseMap.h\"\n#include \"llvm/ADT/SmallVector.h\"\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program\
+  \ state: symbols returned by allocators.\nREGISTER_SET_WITH_PROGRAMSTATE(AllocSymSet,\
+  \ SymbolRef)\n// Program state: regions that this function explicitly owns (assigned\
+  \ an allocator return).\nREGISTER_SET_WITH_PROGRAMSTATE(OwnedRegionSet, const MemRegion*)\n\
+  \nnamespace {\n\nclass SAGenTestChecker : public Checker<\n                    \
+  \         check::BeginFunction,\n                             check::EndFunction,\n\
+  \                             check::PostCall,\n                             check::PreCall,\n\
+  \                             check::Bind> {\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\n  // Per-function: how many gotos target each label.\n  mutable llvm::DenseMap<const\
+  \ FunctionDecl*, llvm::DenseMap<const LabelStmt*, unsigned>> FuncLabelIncoming;\n\
+  \npublic:\n  SAGenTestChecker()\n      : BT(new BugType(this, \"Double free in shared\
+  \ error label\", \"Memory Management\")) {}\n\n  void checkBeginFunction(CheckerContext\
+  \ &C) const;\n  void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;\n\
+  \  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n\nprivate:\n  // Helper to collect labels\
+  \ and gotos from a function body.\n  struct LabelGotoCollector : public RecursiveASTVisitor<LabelGotoCollector>\
+  \ {\n    llvm::DenseMap<const LabelDecl *, const LabelStmt *> LabelMap;\n    llvm::SmallVector<const\
+  \ GotoStmt *, 16> Gotos;\n\n    bool VisitLabelStmt(const LabelStmt *LS) {\n   \
+  \   if (const LabelDecl *LD = LS->getDecl())\n        LabelMap[LD] = LS;\n     \
+  \ return true;\n    }\n\n    bool VisitGotoStmt(const GotoStmt *GS) {\n      Gotos.push_back(GS);\n\
+  \      return true;\n    }\n  };\n\n  const FunctionDecl *getCurrentFunction(const\
+  \ CheckerContext &C) const {\n    const auto *D = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());\n\
+  \    return D;\n  }\n\n  void buildLabelIncomingMapForFunction(const FunctionDecl\
+  \ *FD) const;\n\n  bool isAllocatorCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n  bool isFreeLikeCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n  void reportFreeUnownedInSharedLabel(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n};\n\nvoid SAGenTestChecker::buildLabelIncomingMapForFunction(const FunctionDecl\
+  \ *FD) const {\n  if (!FD)\n    return;\n  const Stmt *Body = FD->getBody();\n \
+  \ if (!Body)\n    return;\n\n  LabelGotoCollector Collector;\n  Collector.TraverseStmt(const_cast<Stmt\
+  \ *>(Body));\n\n  llvm::DenseMap<const LabelStmt*, unsigned> IncomingCount;\n  for\
+  \ (const GotoStmt *GS : Collector.Gotos) {\n    const LabelDecl *LD = GS->getLabel();\n\
+  \    if (!LD)\n      continue;\n    auto It = Collector.LabelMap.find(LD);\n   \
+  \ if (It == Collector.LabelMap.end())\n      continue;\n    const LabelStmt *LS\
+  \ = It->second;\n    IncomingCount[LS] = IncomingCount.lookup(LS) + 1;\n  }\n\n\
+  \  FuncLabelIncoming[FD] = std::move(IncomingCount);\n}\n\nbool SAGenTestChecker::isAllocatorCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E)\n    return false;\n\n  // Typical Linux allocators.\n  static const\
+  \ char *Names[] = {\n      \"kmalloc\", \"kzalloc\", \"kcalloc\", \"kvzalloc\",\
+  \ \"kvmalloc\", \"krealloc\",\n      \"devm_kmalloc\", \"devm_kzalloc\", \"devm_kcalloc\"\
+  \n  };\n  for (const char *N : Names) {\n    if (ExprHasName(E, N, C))\n      return\
+  \ true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isFreeLikeCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E)\n    return false;\n\n  static const char *Names[] = {\"kfree\", \"kvfree\"\
+  , \"vfree\"};\n  for (const char *N : Names) {\n    if (ExprHasName(E, N, C))\n\
+  \      return true;\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::checkBeginFunction(CheckerContext\
+  \ &C) const {\n  const FunctionDecl *FD = getCurrentFunction(C);\n  if (!FD)\n \
+  \   return;\n  // Rebuild (or build) label incoming counts for this function.\n\
+  \  buildLabelIncomingMapForFunction(FD);\n}\n\nvoid SAGenTestChecker::checkEndFunction(const\
+  \ ReturnStmt *RS, CheckerContext &C) const {\n  const FunctionDecl *FD = getCurrentFunction(C);\n\
+  \  if (!FD)\n    return;\n  // Clean per-function metadata.\n  FuncLabelIncoming.erase(FD);\n\
+  }\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (!isAllocatorCall(Call, C))\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n  SVal Ret = Call.getReturnValue();\n  SymbolRef RetSym\
+  \ = Ret.getAsSymbol();\n  if (!RetSym)\n    return;\n\n  if (!State->contains<AllocSymSet>(RetSym))\
+  \ {\n    State = State->add<AllocSymSet>(RetSym);\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *DstReg\
+  \ = Loc.getAsRegion();\n  if (!DstReg)\n    return;\n  DstReg = DstReg->getBaseRegion();\n\
+  \  if (!DstReg)\n    return;\n\n  SymbolRef RHSym = Val.getAsSymbol();\n  if (!RHSym)\n\
+  \    return;\n\n  if (State->contains<AllocSymSet>(RHSym)) {\n    if (!State->contains<OwnedRegionSet>(DstReg))\
+  \ {\n      State = State->add<OwnedRegionSet>(DstReg);\n      C.addTransition(State);\n\
+  \    }\n  }\n}\n\nvoid SAGenTestChecker::reportFreeUnownedInSharedLabel(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Freeing unowned field in shared error label; possible double free\"\
+  , N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\
+  \nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  if (!isFreeLikeCall(Call, C))\n    return;\n\n  if (Call.getNumArgs()\
+  \ < 1)\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(0);\n  if (!ArgE)\n\
+  \    return;\n\n  // Reduce FPs: only warn when freeing a struct/union field like\
+  \ mt->fc.\n  const Expr *Stripped = ArgE->IgnoreParenImpCasts();\n  if (!isa<MemberExpr>(Stripped))\n\
+  \    return;\n\n  // Get region of the freed expression (do not strip casts before\
+  \ calling).\n  const MemRegion *FreedReg = getMemRegionFromExpr(ArgE, C);\n  if\
+  \ (!FreedReg)\n    return;\n  FreedReg = FreedReg->getBaseRegion();\n  if (!FreedReg)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  // If this function has\
+  \ taken ownership of this region (or its base), do not warn.\n  if (State->contains<OwnedRegionSet>(FreedReg))\n\
+  \    return;\n\n  // Determine if the call is under a label with multiple incoming\
+  \ gotos.\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return;\n\
+  \n  const LabelStmt *EnclosingLabel = findSpecificTypeInParents<LabelStmt>(Origin,\
+  \ C);\n  if (!EnclosingLabel)\n    return;\n\n  const FunctionDecl *FD = getCurrentFunction(C);\n\
+  \  if (!FD)\n    return;\n\n  auto Fit = FuncLabelIncoming.find(FD);\n  if (Fit\
+  \ == FuncLabelIncoming.end())\n    return;\n\n  const auto &IncomingMap = Fit->second;\n\
+  \  auto Lit = IncomingMap.find(EnclosingLabel);\n  unsigned Count = (Lit == IncomingMap.end())\
+  \ ? 0u : Lit->second;\n\n  // Only warn for shared labels (2 or more incoming gotos).\n\
+  \  if (Count >= 2) {\n    reportFreeUnownedInSharedLabel(Call, C);\n  }\n}\n\n}\
+  \ // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing unowned fields in shared error labels that may cause\
+  \ double free\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nnet/mlx5: HWS, fixed double free in error flow of\
+  \ definer layout\n\nFix error flow bug that could lead to double free of a buffer\n\
+  during a failure to calculate a suitable definer layout.\n\nFixes: 74a778b4a63f\
+  \ (\"net/mlx5: HWS, added definers handling\")\nSigned-off-by: Yevgeny Kliteynik\
+  \ <kliteyn@nvidia.com>\nReviewed-by: Itamar Gozlan <igozlan@nvidia.com>\nSigned-off-by:\
+  \ Tariq Toukan <tariqt@nvidia.com>\nSigned-off-by: Paolo Abeni <pabeni@redhat.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: mlx5hws_definer_calc_layout in drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\n\
+  int\nmlx5hws_definer_calc_layout(struct mlx5hws_context *ctx,\n\t\t\t    struct\
+  \ mlx5hws_match_template *mt,\n\t\t\t    struct mlx5hws_definer *match_definer)\n\
+  {\n\tu8 *match_hl;\n\tint ret;\n\n\t/* Union header-layout (hl) is used for creating\
+  \ a single definer\n\t * field layout used with different bitmasks for hash and\
+  \ match.\n\t */\n\tmatch_hl = kzalloc(MLX5_ST_SZ_BYTES(definer_hl), GFP_KERNEL);\n\
+  \tif (!match_hl)\n\t\treturn -ENOMEM;\n\n\t/* Convert all mt items to header layout\
+  \ (hl)\n\t * and allocate the match and range field copy array (fc & fcr).\n\t */\n\
+  \tret = hws_definer_conv_match_params_to_hl(ctx, mt, match_hl);\n\tif (ret) {\n\t\
+  \tmlx5hws_err(ctx, \"Failed to convert items to header layout\\n\");\n\t\tgoto free_fc;\n\
+  \t}\n\n\t/* Find the match definer layout for header layout match union */\n\tret\
+  \ = hws_definer_find_best_match_fit(ctx, match_definer, match_hl);\n\tif (ret) {\n\
+  \t\tif (ret == -E2BIG)\n\t\t\tmlx5hws_dbg(ctx,\n\t\t\t\t    \"Failed to create match\
+  \ definer from header layout - E2BIG\\n\");\n\t\telse\n\t\t\tmlx5hws_err(ctx,\n\t\
+  \t\t\t    \"Failed to create match definer from header layout (%d)\\n\",\n\t\t\t\
+  \t    ret);\n\t\tgoto free_fc;\n\t}\n\n\tkfree(match_hl);\n\treturn 0;\n\nfree_fc:\n\
+  \tkfree(mt->fc);\n\n\tkfree(match_hl);\n\treturn ret;\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\
+  \ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\nindex\
+  \ d566d2ddf424..3f4c58bada37 100644\n--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\n\
+  +++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\n@@\
+  \ -1925,7 +1925,7 @@ mlx5hws_definer_calc_layout(struct mlx5hws_context *ctx,\n\
+  \ \tret = hws_definer_conv_match_params_to_hl(ctx, mt, match_hl);\n \tif (ret) {\n\
+  \ \t\tmlx5hws_err(ctx, \"Failed to convert items to header layout\\n\");\n-\t\t\
+  goto free_fc;\n+\t\tgoto free_match_hl;\n \t}\n \n \t/* Find the match definer layout\
+  \ for header layout match union */\n@@ -1946,7 +1946,7 @@ mlx5hws_definer_calc_layout(struct\
+  \ mlx5hws_context *ctx,\n \n free_fc:\n \tkfree(mt->fc);\n-\n+free_match_hl:\n \t\
+  kfree(match_hl);\n \treturn ret;\n }\n```\n"
+pattern: '## Bug Pattern
+
+
+  Unconditional cleanup via a shared error label frees resources that are not guaranteed
+  to be allocated/owned at that point. Specifically, jumping to a label that does
+  kfree(mt->fc) even when hws_definer_conv_match_params_to_hl() failed (and may have
+  already freed or never allocated mt->fc) leads to a double free. The root cause
+  is using a single error path to free callee-managed/conditionally allocated memory,
+  instead of separating cleanup by resource lifetime and ownership.'
+plan: "Plan\n\n1. Program state customization\n- REGISTER_SET_WITH_PROGRAMSTATE(AllocSymSet,\
+  \ SymbolRef)\n  - Records symbols returned by heap allocators in this function (e.g.,\
+  \ kmalloc/kzalloc/kcalloc/etc.).\n- REGISTER_SET_WITH_PROGRAMSTATE(OwnedRegionSet,\
+  \ const MemRegion *)\n  - Records memory regions that this function has explicitly\
+  \ taken ownership of by assigning an allocator return into them.\n\n2. Auxiliary\
+  \ per-function metadata (not in program state)\n- Maintain a per-function map LabelIncomingCount:\
+  \ DenseMap<const LabelStmt*, unsigned>\n  - Tracks how many GotoStmt jump to each\
+  \ LabelStmt in the current function. We consider labels with count >= 2 as shared\
+  \ error/cleanup labels.\n- Build and clear this map in per-function callbacks.\n\
+  \n3. Callback selection and implementation details\n\n3.1 checkBeginFunction\n-\
+  \ Purpose: Pre-scan the function body to compute LabelIncomingCount.\n- Steps:\n\
+  \  - Retrieve the current function body Stmt from Ctx.getLocationContext()->getDecl().\n\
+  \  - Traverse the body AST:\n    - Collect all LabelStmt nodes into a map LabelDecl*\
+  \ -> LabelStmt* (via LabelStmt->getDecl()).\n    - For each GotoStmt, obtain its\
+  \ LabelDecl with GotoStmt->getLabel(), resolve to LabelStmt through the previous\
+  \ map, and increment LabelIncomingCount[LabelStmt].\n  - Store LabelIncomingCount\
+  \ in a checker member map keyed by the current FunctionDecl pointer (or current\
+  \ LocationContext root). Clear or overwrite on every function entry.\n\n3.2 checkPostCall\n\
+  - Purpose: Track allocator return symbols (to later detect local ownership when\
+  \ assigned) and avoid over-approximating unknown callees.\n- Steps:\n  - If callee\
+  \ identifier name is one of {kmalloc, kzalloc, kcalloc, krealloc, kvzalloc, kvmalloc,\
+  \ devm_kmalloc, devm_kzalloc, devm_kcalloc} (extendable):\n    - Obtain the return\
+  \ SVal: Call.getReturnValue().\n    - If it has a SymbolRef (retSym), add it to\
+  \ AllocSymSet.\n  - No reporting here.\n\n3.3 checkBind\n- Purpose: Record when\
+  \ this function explicitly takes ownership of a region by assigning an allocator\u2019\
+  s return value into it.\n- Steps:\n  - Extract the destination region from Loc (Loc.getAsRegion()).\n\
+  \  - If no region, return.\n  - If Val has a SymbolRef and that symbol is in AllocSymSet:\n\
+  \    - Insert the destination region into OwnedRegionSet.\n  - Notes:\n    - This\
+  \ will mark \u201Cowned\u201D when we do things like p = kmalloc(...); or mt->fc\
+  \ = kmalloc(...); which is exactly the ownership we want to accept as safe to kfree\
+  \ in cleanup.\n    - We do not attempt alias tracking here to keep it simple. The\
+  \ target bug is a field (mt->fc) not assigned in this function at all.\n\n3.4 checkPreCall\n\
+  - Purpose: Detect freeing in a shared cleanup label of a region that isn\u2019t\
+  \ owned by this function.\n- Steps:\n  - Identify frees: if Call callee name in\
+  \ {kfree, kvfree, vfree}.\n  - Get the first argument expression E = Call.getArgExpr(0).\n\
+  \  - Restrict to freeing a struct field only:\n    - If E->IgnoreParenImpCasts()\
+  \ is not a MemberExpr, return (reduces false positives and captures the mt->fc pattern).\n\
+  \  - Obtain the freed region via getMemRegionFromExpr(E, C). If null, return.\n\
+  \  - Check ownership: if the freed region is NOT in OwnedRegionSet, continue; otherwise,\
+  \ return (we own it, freeing is expected).\n  - Determine if we are in a cleanup\
+  \ label:\n    - Use findSpecificTypeInParents<LabelStmt>(Call.getOriginExpr() or\
+  \ the Call\u2019s statement, C) to find the nearest parent LabelStmt, L.\n    -\
+  \ If no parent LabelStmt, return (we only warn for label-based cleanups).\n    -\
+  \ Lookup LabelIncomingCount[L]; if count < 2, return (not a shared error label;\
+  \ reduce FP).\n  - If all conditions met, report:\n    - Generate a non-fatal error\
+  \ node and emit a PathSensitiveBugReport with a short message like:\n      - \u201C\
+  Freeing unowned field in shared error label; possible double free.\u201D\n    -\
+  \ Add the free call as the primary location.\n\n3.5 checkEndFunction\n- Purpose:\
+  \ Clear per-function label metadata.\n- Steps:\n  - Erase the current function\u2019\
+  s LabelIncomingCount entry from the checker\u2019s member map to avoid leaking across\
+  \ functions.\n\n4. Notes and heuristics\n- Why this catches the target bug:\n  -\
+  \ The problematic free is kfree(mt->fc) under a shared cleanup label with multiple\
+  \ gotos.\n  - In the function, mt->fc is never assigned from an allocator return;\
+  \ hence, the region won\u2019t be marked Owned.\n  - The checker warns only when:\n\
+  \    - The freed expression is a struct field (mt->fc), AND\n    - It is within\
+  \ a shared cleanup label (>= 2 gotos), AND\n    - The field wasn\u2019t marked as\
+  \ owned by this function.\n  - This aligns with the root cause: a shared error label\
+  \ frees a resource not guaranteed to be allocated/owned at that point, potentially\
+  \ double freeing callee-managed memory.\n\n- Optional small improvements (keep simple\
+  \ if not needed):\n  - Expand allocator list if necessary.\n  - If desired, allow\
+  \ OwnedRegionSet marking when the RHS is a known non-null constant buffer allocator\
+  \ or factory function (extend checkPostCall).\n  - You may also add a check that\
+  \ the label name contains \u201Cfree\u201D or \u201Cerr\u201D using LabelStmt->getName()\
+  \ or source text, but the incoming-count heuristic is stronger and language-agnostic.\n\
+  \n5. Utility functions used\n- getMemRegionFromExpr for region extraction of the\
+  \ freed argument.\n- findSpecificTypeInParents<LabelStmt> to determine if the free\
+  \ happens under a label.\n- ExprHasName is not required (we use CallEvent callee\
+  \ name); can be used as fallback if needed.\n\n6. Reporting\n- Use std::make_unique<PathSensitiveBugReport>.\n\
+  - Message: \u201CFreeing unowned field in shared error label; possible double free.\u201D\
+  \n- Point to the kfree call location.\n\nThis plan stays simple and focused while\
+  \ being path-sensitive enough to catch the specific kernel pattern without requiring\
+  \ heavy alias reasoning or inter-procedural summaries."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Decl.h\"\n#include \"\
+  clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"llvm/ADT/DenseMap.h\"\n#include \"llvm/ADT/SmallVector.h\"\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program\
+  \ state: symbols returned by allocators.\nREGISTER_SET_WITH_PROGRAMSTATE(AllocSymSet,\
+  \ SymbolRef)\n// Program state: regions that this function explicitly owns (assigned\
+  \ an allocator return).\nREGISTER_SET_WITH_PROGRAMSTATE(OwnedRegionSet, const MemRegion*)\n\
+  \nnamespace {\n\nclass SAGenTestChecker : public Checker<\n                    \
+  \         check::BeginFunction,\n                             check::EndFunction,\n\
+  \                             check::PostCall,\n                             check::PreCall,\n\
+  \                             check::Bind> {\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\n  // Per-function: how many gotos target each label.\n  mutable llvm::DenseMap<const\
+  \ FunctionDecl*, llvm::DenseMap<const LabelStmt*, unsigned>> FuncLabelIncoming;\n\
+  \npublic:\n  SAGenTestChecker()\n      : BT(new BugType(this, \"Double free in shared\
+  \ error label\", \"Memory Management\")) {}\n\n  void checkBeginFunction(CheckerContext\
+  \ &C) const;\n  void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;\n\
+  \  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n\nprivate:\n  // Helper to collect labels\
+  \ and gotos from a function body.\n  struct LabelGotoCollector : public RecursiveASTVisitor<LabelGotoCollector>\
+  \ {\n    llvm::DenseMap<const LabelDecl *, const LabelStmt *> LabelMap;\n    llvm::SmallVector<const\
+  \ GotoStmt *, 16> Gotos;\n\n    bool VisitLabelStmt(const LabelStmt *LS) {\n   \
+  \   if (const LabelDecl *LD = LS->getDecl())\n        LabelMap[LD] = LS;\n     \
+  \ return true;\n    }\n\n    bool VisitGotoStmt(const GotoStmt *GS) {\n      Gotos.push_back(GS);\n\
+  \      return true;\n    }\n  };\n\n  const FunctionDecl *getCurrentFunction(const\
+  \ CheckerContext &C) const {\n    const auto *D = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());\n\
+  \    return D;\n  }\n\n  void buildLabelIncomingMapForFunction(const FunctionDecl\
+  \ *FD) const;\n\n  bool isAllocatorCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n  bool isFreeLikeCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n  void reportFreeUnownedInSharedLabel(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n};\n\nvoid SAGenTestChecker::buildLabelIncomingMapForFunction(const FunctionDecl\
+  \ *FD) const {\n  if (!FD)\n    return;\n  const Stmt *Body = FD->getBody();\n \
+  \ if (!Body)\n    return;\n\n  LabelGotoCollector Collector;\n  Collector.TraverseStmt(const_cast<Stmt\
+  \ *>(Body));\n\n  llvm::DenseMap<const LabelStmt*, unsigned> IncomingCount;\n  for\
+  \ (const GotoStmt *GS : Collector.Gotos) {\n    const LabelDecl *LD = GS->getLabel();\n\
+  \    if (!LD)\n      continue;\n    auto It = Collector.LabelMap.find(LD);\n   \
+  \ if (It == Collector.LabelMap.end())\n      continue;\n    const LabelStmt *LS\
+  \ = It->second;\n    IncomingCount[LS] = IncomingCount.lookup(LS) + 1;\n  }\n\n\
+  \  FuncLabelIncoming[FD] = std::move(IncomingCount);\n}\n\nbool SAGenTestChecker::isAllocatorCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E)\n    return false;\n\n  // Typical Linux allocators.\n  static const\
+  \ char *Names[] = {\n      \"kmalloc\", \"kzalloc\", \"kcalloc\", \"kvzalloc\",\
+  \ \"kvmalloc\", \"krealloc\",\n      \"devm_kmalloc\", \"devm_kzalloc\", \"devm_kcalloc\"\
+  \n  };\n  for (const char *N : Names) {\n    if (ExprHasName(E, N, C))\n      return\
+  \ true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isFreeLikeCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E)\n    return false;\n\n  static const char *Names[] = {\"kfree\", \"kvfree\"\
+  , \"vfree\"};\n  for (const char *N : Names) {\n    if (ExprHasName(E, N, C))\n\
+  \      return true;\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::checkBeginFunction(CheckerContext\
+  \ &C) const {\n  const FunctionDecl *FD = getCurrentFunction(C);\n  if (!FD)\n \
+  \   return;\n  // Rebuild (or build) label incoming counts for this function.\n\
+  \  buildLabelIncomingMapForFunction(FD);\n}\n\nvoid SAGenTestChecker::checkEndFunction(const\
+  \ ReturnStmt *RS, CheckerContext &C) const {\n  const FunctionDecl *FD = getCurrentFunction(C);\n\
+  \  if (!FD)\n    return;\n  // Clean per-function metadata.\n  FuncLabelIncoming.erase(FD);\n\
+  }\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (!isAllocatorCall(Call, C))\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n  SVal Ret = Call.getReturnValue();\n  SymbolRef RetSym\
+  \ = Ret.getAsSymbol();\n  if (!RetSym)\n    return;\n\n  if (!State->contains<AllocSymSet>(RetSym))\
+  \ {\n    State = State->add<AllocSymSet>(RetSym);\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *DstReg\
+  \ = Loc.getAsRegion();\n  if (!DstReg)\n    return;\n  DstReg = DstReg->getBaseRegion();\n\
+  \  if (!DstReg)\n    return;\n\n  SymbolRef RHSym = Val.getAsSymbol();\n  if (!RHSym)\n\
+  \    return;\n\n  if (State->contains<AllocSymSet>(RHSym)) {\n    if (!State->contains<OwnedRegionSet>(DstReg))\
+  \ {\n      State = State->add<OwnedRegionSet>(DstReg);\n      C.addTransition(State);\n\
+  \    }\n  }\n}\n\nvoid SAGenTestChecker::reportFreeUnownedInSharedLabel(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Freeing unowned field in shared error label; possible double free\"\
+  , N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\
+  \nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  if (!isFreeLikeCall(Call, C))\n    return;\n\n  if (Call.getNumArgs()\
+  \ < 1)\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(0);\n  if (!ArgE)\n\
+  \    return;\n\n  // Reduce FPs: only warn when freeing a struct/union field like\
+  \ mt->fc.\n  const Expr *Stripped = ArgE->IgnoreParenImpCasts();\n  if (!isa<MemberExpr>(Stripped))\n\
+  \    return;\n\n  // Get region of the freed expression (do not strip casts before\
+  \ calling).\n  const MemRegion *FreedReg = getMemRegionFromExpr(ArgE, C);\n  if\
+  \ (!FreedReg)\n    return;\n  FreedReg = FreedReg->getBaseRegion();\n  if (!FreedReg)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  // If this function has\
+  \ taken ownership of this region (or its base), do not warn.\n  if (State->contains<OwnedRegionSet>(FreedReg))\n\
+  \    return;\n\n  // Determine if the call is under a label with multiple incoming\
+  \ gotos.\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return;\n\
+  \n  const LabelStmt *EnclosingLabel = findSpecificTypeInParents<LabelStmt>(Origin,\
+  \ C);\n  if (!EnclosingLabel)\n    return;\n\n  const FunctionDecl *FD = getCurrentFunction(C);\n\
+  \  if (!FD)\n    return;\n\n  auto Fit = FuncLabelIncoming.find(FD);\n  if (Fit\
+  \ == FuncLabelIncoming.end())\n    return;\n\n  const auto &IncomingMap = Fit->second;\n\
+  \  auto Lit = IncomingMap.find(EnclosingLabel);\n  unsigned Count = (Lit == IncomingMap.end())\
+  \ ? 0u : Lit->second;\n\n  // Only warn for shared labels (2 or more incoming gotos).\n\
+  \  if (Count >= 2) {\n    reportFreeUnownedInSharedLabel(Call, C);\n  }\n}\n\n}\
+  \ // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing unowned fields in shared error labels that may cause\
+  \ double free\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

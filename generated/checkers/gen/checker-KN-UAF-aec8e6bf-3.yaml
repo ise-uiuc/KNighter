@@ -1,0 +1,433 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: aec8e6bf839101784f3ef037dcdb9432c3f32343
+commit_type: UAF
+index: 3
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n#include \"llvm/ADT/StringRef.h\"\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track pointer\
+  \ regions that have been released by release-by-pointer APIs.\nREGISTER_SET_WITH_PROGRAMSTATE(ReleasedSet,\
+  \ const MemRegion*)\n// Record where a region was released, for diagnostics.\nREGISTER_MAP_WITH_PROGRAMSTATE(ReleasedOriginMap,\
+  \ const MemRegion*, const Stmt*)\n\n// Track that, after calling a \"container-releasing\"\
+  \ function (like btrfs_close_bdev(dev)),\n// certain member fields of the container\
+  \ pointer must be nullified by the caller.\n//\n// We key the tracking by the VarDecl*\
+  \ of the container pointer as it appears at the call site.\n// This is robust enough\
+  \ for the target pattern (btrfs_close_one_device) where the argument is\n// a named\
+  \ pointer variable 'device'.\nREGISTER_MAP_WITH_PROGRAMSTATE(ContainerMaskMap, const\
+  \ VarDecl*, unsigned)\nREGISTER_MAP_WITH_PROGRAMSTATE(ContainerOriginMap, const\
+  \ VarDecl*, const Stmt*)\n\nnamespace {\n\nstatic unsigned getFieldBitByName(StringRef\
+  \ Name) {\n  if (Name == \"bdev\")\n    return 1u << 0;\n  if (Name == \"bdev_file\"\
+  )\n    return 1u << 1;\n  return 0;\n}\n\nstatic StringRef getFieldNameFromMember(const\
+  \ MemberExpr *ME) {\n  if (!ME) return {};\n  if (const auto *FD = dyn_cast_or_null<FieldDecl>(ME->getMemberDecl()))\n\
+  \    return FD->getName();\n  return {};\n}\n\nstatic const VarDecl *getVarDeclFromExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  E = E->IgnoreParenCasts();\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    return dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \  }\n  return nullptr;\n}\n\nstruct ReleaseByPtrEntry {\n  const char *Name;\n\
+  \  unsigned ParamIdx;\n};\n\nstatic const ReleaseByPtrEntry ReleaseByPtrTable[]\
+  \ = {\n  {\"fput\", 0},\n  {\"blkdev_put\", 0},\n  {\"kfree\", 0},\n  {\"kvfree\"\
+  , 0},\n  {\"put_device\", 0},\n  {\"filp_close\", 0},\n};\n\nclass SAGenTestChecker\n\
+  \  : public Checker<\n      check::PostCall,\n      check::PreCall,\n      check::Bind,\n\
+  \      check::EndFunction\n    > {\n   mutable std::unique_ptr<BugType> BT;\n\n\
+  \   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Released member pointer\
+  \ not set to NULL\", \"Resource Management\")) {}\n\n      void checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *StoreE, CheckerContext &C) const;\n      void checkEndFunction(const ReturnStmt\
+  \ *RS, CheckerContext &C) const;\n\n   private:\n      // Helpers for release-by-pointer\
+  \ modeling\n      void handleReleaseByPointer(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n\n      // Helpers for container-release modeling (e.g., btrfs_close_bdev(device))\n\
+  \      void handleContainerRelease(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n      bool isReleaseByPointerCall(const CallEvent &Call, const ReleaseByPtrEntry\
+  \ *&Entry, CheckerContext &C) const;\n      bool isKnownContainerRelease(const CallEvent\
+  \ &Call, unsigned &ParamIdx, unsigned &FieldMask, CheckerContext &C) const;\n\n\
+  \      void reportDoubleRelease(const CallEvent &Call, CheckerContext &C, const\
+  \ MemRegion *R) const;\n      void reportNotNullified(const VarDecl *VD, unsigned\
+  \ Mask, const Stmt *Origin, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isReleaseByPointerCall(const\
+  \ CallEvent &Call,\n                                              const ReleaseByPtrEntry\
+  \ *&Entry,\n                                              CheckerContext &C) const\
+  \ {\n  const Expr *OE = Call.getOriginExpr();\n  if (!OE) return false;\n\n  for\
+  \ (const auto &E : ReleaseByPtrTable) {\n    if (ExprHasName(OE, E.Name, C)) {\n\
+  \      Entry = &E;\n      return true;\n    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isKnownContainerRelease(const\
+  \ CallEvent &Call,\n                                               unsigned &ParamIdx,\n\
+  \                                               unsigned &FieldMask,\n         \
+  \                                      CheckerContext &C) const {\n  const Expr\
+  \ *OE = Call.getOriginExpr();\n  if (!OE) return false;\n\n  // For this checker\
+  \ we model: btrfs_close_bdev(device) releases \"bdev\" and \"bdev_file\".\n  if\
+  \ (ExprHasName(OE, \"btrfs_close_bdev\", C)) {\n    ParamIdx = 0;\n    FieldMask\
+  \ = (1u << 0) | (1u << 1); // bdev | bdev_file\n    return true;\n  }\n\n  return\
+  \ false;\n}\n\nvoid SAGenTestChecker::handleReleaseByPointer(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const ReleaseByPtrEntry *Entry = nullptr;\n  if\
+  \ (!isReleaseByPointerCall(Call, Entry, C))\n    return;\n\n  if (Entry->ParamIdx\
+  \ >= Call.getNumArgs())\n    return;\n\n  // Track the argument region as released.\n\
+  \  const Expr *ArgE = Call.getArgExpr(Entry->ParamIdx);\n  if (!ArgE) return;\n\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR) return;\n  MR\
+  \ = MR->getBaseRegion();\n  if (!MR) return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  if (!State->contains<ReleasedSet>(MR)) {\n    State = State->add<ReleasedSet>(MR);\n\
+  \    State = State->set<ReleasedOriginMap>(MR, Call.getOriginExpr());\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::handleContainerRelease(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  unsigned ParamIdx = 0;\n  unsigned FieldMask = 0;\n\
+  \  if (!isKnownContainerRelease(Call, ParamIdx, FieldMask, C))\n    return;\n\n\
+  \  if (ParamIdx >= Call.getNumArgs())\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(ParamIdx);\n\
+  \  if (!ArgE) return;\n\n  // We key by the VarDecl* of the container pointer as\
+  \ passed at this call site.\n  const VarDecl *VD = getVarDeclFromExpr(ArgE);\n \
+  \ if (!VD) return;\n\n  ProgramStateRef State = C.getState();\n  unsigned CurMask\
+  \ = 0;\n  if (const unsigned *M = State->get<ContainerMaskMap>(VD))\n    CurMask\
+  \ = *M;\n\n  unsigned NewMask = CurMask | FieldMask;\n  if (NewMask != CurMask)\
+  \ {\n    State = State->set<ContainerMaskMap>(VD, NewMask);\n    State = State->set<ContainerOriginMap>(VD,\
+  \ Call.getOriginExpr());\n    C.addTransition(State);\n  }\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  // Model both:\n  // 1) Release-by-pointer\
+  \ calls (e.g., fput(ptr)).\n  handleReleaseByPointer(Call, C);\n\n  // 2) Container-release\
+  \ calls that release specific members by convention.\n  handleContainerRelease(Call,\
+  \ C);\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  // Detect double release when the same region is passed again to\
+  \ a release-by-pointer API.\n  const ReleaseByPtrEntry *Entry = nullptr;\n  if (!isReleaseByPointerCall(Call,\
+  \ Entry, C))\n    return;\n\n  if (Entry->ParamIdx >= Call.getNumArgs())\n    return;\n\
+  \n  const Expr *ArgE = Call.getArgExpr(Entry->ParamIdx);\n  if (!ArgE) return;\n\
+  \n  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR) return;\n \
+  \ MR = MR->getBaseRegion();\n  if (!MR) return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  if (State->contains<ReleasedSet>(MR)) {\n    reportDoubleRelease(Call, C, MR);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,\
+  \ CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\n  // 1)\
+  \ Any assignment to a location that we considered \"released-by-pointer\" clears\
+  \ its stale state.\n  if (const MemRegion *L = Loc.getAsRegion()) {\n    L = L->getBaseRegion();\n\
+  \    if (L && State->contains<ReleasedSet>(L)) {\n      State = State->remove<ReleasedSet>(L);\n\
+  \      State = State->remove<ReleasedOriginMap>(L);\n      C.addTransition(State);\n\
+  \    }\n  }\n\n  // 2) Handle member assignments to clear \"must-nullify\" bits\
+  \ after container-release.\n  //    For example, device->bdev = NULL; or device->bdev_file\
+  \ = NULL;\n  const BinaryOperator *BO = dyn_cast_or_null<BinaryOperator>(StoreE);\n\
+  \  if (!BO || !BO->isAssignmentOp())\n    return;\n\n  const Expr *LHS = BO->getLHS();\n\
+  \  if (!LHS) return;\n\n  LHS = LHS->IgnoreParenCasts();\n  const MemberExpr *ME\
+  \ = dyn_cast<MemberExpr>(LHS);\n  if (!ME) return;\n\n  // Get the container variable\
+  \ used as the base expression (e.g. 'device' in 'device->bdev_file').\n  const Expr\
+  \ *Base = ME->getBase();\n  if (!Base) return;\n\n  const VarDecl *BaseVD = getVarDeclFromExpr(Base);\n\
+  \  if (!BaseVD) return;\n\n  const unsigned *MaskPtr = State->get<ContainerMaskMap>(BaseVD);\n\
+  \  if (!MaskPtr || *MaskPtr == 0)\n    return;\n\n  unsigned Mask = *MaskPtr;\n\
+  \  StringRef FieldName = getFieldNameFromMember(ME);\n  unsigned Bit = getFieldBitByName(FieldName);\n\
+  \  if (Bit == 0)\n    return;\n\n  if (Mask & Bit) {\n    unsigned NewMask = Mask\
+  \ & ~Bit;\n    State = State->set<ContainerMaskMap>(BaseVD, NewMask);\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::reportDoubleRelease(const CallEvent &Call, CheckerContext\
+  \ &C, const MemRegion *R) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto Report = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Double release of stale pointer\", N);\n\n  // Add note pointing to\
+  \ the first release if we have it.\n  ProgramStateRef State = C.getState();\n  if\
+  \ (const Stmt *Origin = State->get<ReleasedOriginMap>(R)) {\n    PathDiagnosticLocation\
+  \ Loc(Origin, C.getSourceManager(), C.getLocationContext());\n    Report->addNote(\"\
+  Pointer was released here\", Loc);\n  }\n\n  Report->addRange(Call.getSourceRange());\n\
+  \  C.emitReport(std::move(Report));\n}\n\nvoid SAGenTestChecker::reportNotNullified(const\
+  \ VarDecl *VD, unsigned Mask, const Stmt *Origin, CheckerContext &C) const {\n \
+  \ if (!VD || Mask == 0)\n    return;\n\n  // Create a short message mentioning the\
+  \ missing member(s).\n  SmallString<128> Msg(\"Released member pointer not set to\
+  \ NULL: \");\n  bool First = true;\n  if (Mask & (1u << 0)) { // bdev\n    if (!First)\
+  \ Msg += \", \";\n    Msg += VD->getName();\n    Msg += \"->bdev\";\n    First =\
+  \ false;\n  }\n  if (Mask & (1u << 1)) { // bdev_file\n    if (!First) Msg += \"\
+  , \";\n    Msg += VD->getName();\n    Msg += \"->bdev_file\";\n    First = false;\n\
+  \  }\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N) return;\n\n\
+  \  auto Report = std::make_unique<PathSensitiveBugReport>(*BT, Msg.str(), N);\n\n\
+  \  if (Origin) {\n    PathDiagnosticLocation Loc(Origin, C.getSourceManager(), C.getLocationContext());\n\
+  \    Report->addNote(\"Members were released here\", Loc);\n  }\n\n  C.emitReport(std::move(Report));\n\
+  }\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Iterate over all\
+  \ container entries that still have un-cleared bits (i.e., not nullified).\n  auto\
+  \ Map = State->get<ContainerMaskMap>();\n  for (auto It = Map.begin(); It != Map.end();\
+  \ ++It) {\n    const VarDecl *VD = It->first;\n    unsigned Mask = It->second;\n\
+  \    if (Mask == 0)\n      continue;\n\n    const Stmt *Origin = State->get<ContainerOriginMap>(VD);\n\
+  \    reportNotNullified(VD, Mask, Origin, C);\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects missing NULL assignment of\
+  \ released struct member pointers and double release\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbtrfs: fix use-after-free of block device file in\
+  \ __btrfs_free_extra_devids()\n\nMounting btrfs from two images (which have the\
+  \ same one fsid and two\ndifferent dev_uuids) in certain executing order may trigger\
+  \ an UAF for\nvariable 'device->bdev_file' in __btrfs_free_extra_devids(). And\n\
+  following are the details:\n\n1. Attach image_1 to loop0, attach image_2 to loop1,\
+  \ and scan btrfs\n   devices by ioctl(BTRFS_IOC_SCAN_DEV):\n\n             /  btrfs_device_1\
+  \ \u2192 loop0\n   fs_device\n             \\  btrfs_device_2 \u2192 loop1\n2. mount\
+  \ /dev/loop0 /mnt\n   btrfs_open_devices\n    btrfs_device_1->bdev_file = btrfs_get_bdev_and_sb(loop0)\n\
+  \    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n   btrfs_fill_super\n\
+  \    open_ctree\n     fail: btrfs_close_devices // -ENOMEM\n\t    btrfs_close_bdev(btrfs_device_1)\n\
+  \             fput(btrfs_device_1->bdev_file)\n\t      // btrfs_device_1->bdev_file\
+  \ is freed\n\t    btrfs_close_bdev(btrfs_device_2)\n             fput(btrfs_device_2->bdev_file)\n\
+  \n3. mount /dev/loop1 /mnt\n   btrfs_open_devices\n    btrfs_get_bdev_and_sb(&bdev_file)\n\
+  \     // EIO, btrfs_device_1->bdev_file is not assigned,\n     // which points to\
+  \ a freed memory area\n    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n\
+  \   btrfs_fill_super\n    open_ctree\n     btrfs_free_extra_devids\n      if (btrfs_device_1->bdev_file)\n\
+  \       fput(btrfs_device_1->bdev_file) // UAF !\n\nFix it by setting 'device->bdev_file'\
+  \ as 'NULL' after closing the\nbtrfs_device in btrfs_close_one_device().\n\nFixes:\
+  \ 142388194191 (\"btrfs: do not background blkdev_put()\")\nCC: stable@vger.kernel.org\
+  \ # 4.19+\nLink: https://bugzilla.kernel.org/show_bug.cgi?id=219408\nSigned-off-by:\
+  \ Zhihao Cheng <chengzhihao1@huawei.com>\nReviewed-by: David Sterba <dsterba@suse.com>\n\
+  Signed-off-by: David Sterba <dsterba@suse.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ btrfs_close_one_device in fs/btrfs/volumes.c\nstatic void btrfs_close_one_device(struct\
+  \ btrfs_device *device)\n{\n\tstruct btrfs_fs_devices *fs_devices = device->fs_devices;\n\
+  \n\tif (test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) &&\n\t    device->devid\
+  \ != BTRFS_DEV_REPLACE_DEVID) {\n\t\tlist_del_init(&device->dev_alloc_list);\n\t\
+  \tfs_devices->rw_devices--;\n\t}\n\n\tif (device->devid == BTRFS_DEV_REPLACE_DEVID)\n\
+  \t\tclear_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);\n\n\tif (test_bit(BTRFS_DEV_STATE_MISSING,\
+  \ &device->dev_state)) {\n\t\tclear_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state);\n\
+  \t\tfs_devices->missing_devices--;\n\t}\n\n\tbtrfs_close_bdev(device);\n\tif (device->bdev)\
+  \ {\n\t\tfs_devices->open_devices--;\n\t\tdevice->bdev = NULL;\n\t}\n\tclear_bit(BTRFS_DEV_STATE_WRITEABLE,\
+  \ &device->dev_state);\n\tbtrfs_destroy_dev_zone_info(device);\n\n\tdevice->fs_info\
+  \ = NULL;\n\tatomic_set(&device->dev_stats_ccnt, 0);\n\textent_io_tree_release(&device->alloc_state);\n\
+  \n\t/*\n\t * Reset the flush error record. We might have a transient flush error\n\
+  \t * in this mount, and if so we aborted the current transaction and set\n\t * the\
+  \ fs to an error state, guaranteeing no super blocks can be further\n\t * committed.\
+  \ However that error might be transient and if we unmount the\n\t * filesystem and\
+  \ mount it again, we should allow the mount to succeed\n\t * (btrfs_check_rw_degradable()\
+  \ should not fail) - if after mounting the\n\t * filesystem again we still get flush\
+  \ errors, then we will again abort\n\t * any transaction and set the error state,\
+  \ guaranteeing no commits of\n\t * unsafe super blocks.\n\t */\n\tdevice->last_flush_error\
+  \ = 0;\n\n\t/* Verify the device is back in a pristine state  */\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_FLUSH_SENT,\
+  \ &device->dev_state));\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state));\n\
+  \tWARN_ON(!list_empty(&device->dev_alloc_list));\n\tWARN_ON(!list_empty(&device->post_commit_list));\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c\n\
+  index 8f340ad1d938..eb51b609190f 100644\n--- a/fs/btrfs/volumes.c\n+++ b/fs/btrfs/volumes.c\n\
+  @@ -1105,6 +1105,7 @@ static void btrfs_close_one_device(struct btrfs_device *device)\n\
+  \ \tif (device->bdev) {\n \t\tfs_devices->open_devices--;\n \t\tdevice->bdev = NULL;\n\
+  +\t\tdevice->bdev_file = NULL;\n \t}\n \tclear_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state);\n\
+  \ \tbtrfs_destroy_dev_zone_info(device);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Failing to nullify a struct member pointer after releasing/closing its referenced
+  object. One path drops the last reference (e.g., fput/blkdev_put) but leaves the
+  pointer non-NULL; later code uses a non-NULL check as a validity/ownership test
+  and performs a second release (e.g., fput) on the stale pointer, causing use-after-free.'
+plan: "Plan to detect \u201Creleased member pointer not set to NULL\u201D (leading\
+  \ to later double-free/UAF)\n\n1) Program state customizations\n- REGISTER_SET_WITH_PROGRAMSTATE(ReleasedSet,\
+  \ const MemRegion*)\n  - Tracks pointer regions that have been released/closed and\
+  \ have not been nullified yet.\n- REGISTER_MAP_WITH_PROGRAMSTATE(ReleasedOriginMap,\
+  \ const MemRegion*, const Stmt*)\n  - Remembers the statement (typically the call)\
+  \ that performed the release, for precise diagnostics at report time.\n\n2) Known\
+  \ release tables\n- Release-by-pointer functions (directly release their pointer\
+  \ argument). Maintain a small static table of names and 0-based parameter indices:\n\
+  \  - Examples: fput (0), blkdev_put (0), kfree (0), kvfree (0), put_device (0),\
+  \ filp_close (0) as needed.\n- Release-by-container functions (release specific\
+  \ member fields of a struct pointer parameter). Maintain a table of:\n  - Function\
+  \ name, parameter index that is the \u201Ccontainer\u201D (struct pointer), and\
+  \ a list of member names that are released by the callee.\n  - Include for this\
+  \ bug: btrfs_close_bdev: param 0; members [\"bdev\", \"bdev_file\"].\n  - This is\
+  \ intentionally a small, explicit list to keep the checker simple and effective.\n\
+  \n3) checkPostCall \u2014 mark regions as released\n- Get callee identifier from\
+  \ Call.getCalleeIdentifier(). If none, return.\n- For release-by-pointer functions:\n\
+  \  - For each listed parameter index, retrieve the corresponding argument expression\
+  \ and its MemRegion via getMemRegionFromExpr().\n  - If region is non-null, add\
+  \ it to ReleasedSet and record ReleasedOriginMap[region] = Call.getOriginExpr()\
+  \ or Call.getSourceRange start stmt.\n- For release-by-container functions:\n  -\
+  \ Get the MemRegion for the container argument.\n  - If it\u2019s a record region\
+  \ (or a pointer to one), obtain the base (e.g., CXXRecordDecl/RecordDecl) and look\
+  \ up FieldDecls by name (exact string match).\n  - For each member name in the table:\n\
+  \    - Build the FieldRegion for that member under the container\u2019s base region\
+  \ (RegionManager::getFieldRegion(FieldDecl*, baseRegion)).\n    - Add each FieldRegion\
+  \ to ReleasedSet and record the Call as the origin in ReleasedOriginMap.\n- Rationale:\
+  \ This models the effect of both direct releases (fput(ptr)) and callee-releases\
+  \ of struct members (btrfs_close_bdev(device) releases device->bdev_file).\n\n4)\
+  \ checkBind \u2014 clear released state on (re)assignment\n- If Loc.getAsRegion()\
+  \ yields a region R and R is in ReleasedSet:\n  - Remove R from ReleasedSet and\
+  \ ReleasedOriginMap unconditionally on any assignment.\n  - Special-case not required:\
+  \ if assigned NULL, it is the desired fix; if assigned a new non-NULL value, the\
+  \ pointer is no longer stale and shouldn\u2019t trigger a \u201Cnot set to NULL\u201D\
+  \ warning later.\n- Additionally handle common syntactic forms:\n  - Member assignments\
+  \ (e.g., device->bdev_file = NULL;).\n  - Variable assignments (DeclRefExpr).\n\
+  - This keeps false positives low and recognizes \u201Creset to NULL\u201D or \u201C\
+  re-initialize\u201D as fixing the state.\n\n5) checkPreCall \u2014 detect double\
+  \ release on stale pointers\n- If the callee is a release-by-pointer function:\n\
+  \  - Get the argument region for the known release parameters.\n  - If the region\
+  \ is present in ReleasedSet, report a bug:\n    - Message: \"Double release of stale\
+  \ pointer.\"\n    - Create a non-fatal error node with generateNonFatalErrorNode().\n\
+  \    - Use PathSensitiveBugReport, attach a note pointing to the origin Stmt from\
+  \ ReleasedOriginMap[region] like \"Pointer was released here.\"\n- This precisely\
+  \ fires on the problematic \u201Cif (ptr) release(ptr)\u201D after having released\
+  \ earlier without resetting the pointer to NULL.\n\n6) checkEndFunction \u2014 detect\
+  \ \u201Creleased but not nullified\u201D at function exit\n- At end of the function\
+  \ (checkEndFunction), iterate over ReleasedSet:\n  - Only consider FieldRegion entries\
+  \ (member pointers). Ignore plain locals/DeclRegions to focus on the intended pattern\
+  \ (struct member left non-NULL).\n  - For each such region R, retrieve origin from\
+  \ ReleasedOriginMap[R] and emit a warning that the released member pointer was not\
+  \ set to NULL before function return:\n    - Message: \"Released member pointer\
+  \ not set to NULL.\"\n    - The bug location can be at the function end, and add\
+  \ a note at the origin release call.\n- This captures the exact scenario in the\
+  \ provided patch: btrfs_close_bdev(device) releases members, but the caller function\
+  \ forgets to nullify all released member pointers.\n\n7) Optional: checkBranchCondition\
+  \ (not required for minimal checker)\n- Not strictly necessary because double-release\
+  \ detection in checkPreCall already fires when a stale pointer is used in a guarded\
+  \ \u201Cif (ptr)\u201D and re-released.\n- If desired, you can inspect conditions\
+  \ like \u201Cif (dev->field)\u201D or comparisons to NULL and, if the field is in\
+  \ ReleasedSet, add a path note or a weaker warning. Prefer to keep it off to avoid\
+  \ noise.\n\n8) Bug report details\n- Use concise messages per Suggestions:\n  -\
+  \ Double-release report: \"Double release of stale pointer.\"\n  - Exit report:\
+  \ \"Released member pointer not set to NULL.\"\n- Use std::make_unique<PathSensitiveBugReport>.\n\
+  - Provide a path note showing where the original release occurred via ReleasedOriginMap.\n\
+  \n9) Implementation notes/heuristics\n- Use getMemRegionFromExpr to resolve expression\
+  \ to MemRegion; for MemberExpr this should yield a FieldRegion, which is ideal for\
+  \ our tracking.\n- When handling container closers:\n  - Resolve param region; if\
+  \ it\u2019s a pointer to record, get the pointee record decl to find FieldDecls.\n\
+  \  - Use exact field name matches from the table; the provided utility ExprHasName\
+  \ can help when needed, but FieldDecl name matching is more robust.\n- Avoid overtainting:\n\
+  \  - Do not attempt alias tracking for member pointers in this minimal version;\
+  \ FieldRegions are stable and precise for this pattern.\n- Keep the known release\
+  \ tables small and explicit:\n  - Release-by-pointer: fput, blkdev_put, kfree, kvfree,\
+  \ put_device, filp_close (extendable).\n  - Release-by-container: btrfs_close_bdev\
+  \ \u2192 members \"bdev\", \"bdev_file\" (extendable).\n\nChosen callbacks and their\
+  \ roles\n- checkPostCall: recognize releases and mark regions as released (ReleasedSet/ReleasedOriginMap).\n\
+  - checkBind: clear released state on any assignment to the region (covers reset\
+  \ to NULL and re-initialization).\n- checkPreCall: warn on double release of already\
+  \ released regions.\n- checkEndFunction: warn if member pointers released during\
+  \ this function were not set to NULL by function exit.\n\nThis plan yields:\n- A\
+  \ precise warning at the misuse point (double release).\n- A proactive warning at\
+  \ function exit for missing nullification (the exact fix performed in the patch\
+  \ by adding device->bdev_file = NULL;)."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n#include \"llvm/ADT/StringRef.h\"\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track pointer\
+  \ regions that have been released by release-by-pointer APIs.\nREGISTER_SET_WITH_PROGRAMSTATE(ReleasedSet,\
+  \ const MemRegion*)\n// Record where a region was released, for diagnostics.\nREGISTER_MAP_WITH_PROGRAMSTATE(ReleasedOriginMap,\
+  \ const MemRegion*, const Stmt*)\n\n// Track that, after calling a \"container-releasing\"\
+  \ function (like btrfs_close_bdev(dev)),\n// certain member fields of the container\
+  \ pointer must be nullified by the caller.\n//\n// We key the tracking by the VarDecl*\
+  \ of the container pointer as it appears at the call site.\n// This is robust enough\
+  \ for the target pattern (btrfs_close_one_device) where the argument is\n// a named\
+  \ pointer variable 'device'.\nREGISTER_MAP_WITH_PROGRAMSTATE(ContainerMaskMap, const\
+  \ VarDecl*, unsigned)\nREGISTER_MAP_WITH_PROGRAMSTATE(ContainerOriginMap, const\
+  \ VarDecl*, const Stmt*)\n\nnamespace {\n\nstatic unsigned getFieldBitByName(StringRef\
+  \ Name) {\n  if (Name == \"bdev\")\n    return 1u << 0;\n  if (Name == \"bdev_file\"\
+  )\n    return 1u << 1;\n  return 0;\n}\n\nstatic StringRef getFieldNameFromMember(const\
+  \ MemberExpr *ME) {\n  if (!ME) return {};\n  if (const auto *FD = dyn_cast_or_null<FieldDecl>(ME->getMemberDecl()))\n\
+  \    return FD->getName();\n  return {};\n}\n\nstatic const VarDecl *getVarDeclFromExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  E = E->IgnoreParenCasts();\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    return dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \  }\n  return nullptr;\n}\n\nstruct ReleaseByPtrEntry {\n  const char *Name;\n\
+  \  unsigned ParamIdx;\n};\n\nstatic const ReleaseByPtrEntry ReleaseByPtrTable[]\
+  \ = {\n  {\"fput\", 0},\n  {\"blkdev_put\", 0},\n  {\"kfree\", 0},\n  {\"kvfree\"\
+  , 0},\n  {\"put_device\", 0},\n  {\"filp_close\", 0},\n};\n\nclass SAGenTestChecker\n\
+  \  : public Checker<\n      check::PostCall,\n      check::PreCall,\n      check::Bind,\n\
+  \      check::EndFunction\n    > {\n   mutable std::unique_ptr<BugType> BT;\n\n\
+  \   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Released member pointer\
+  \ not set to NULL\", \"Resource Management\")) {}\n\n      void checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *StoreE, CheckerContext &C) const;\n      void checkEndFunction(const ReturnStmt\
+  \ *RS, CheckerContext &C) const;\n\n   private:\n      // Helpers for release-by-pointer\
+  \ modeling\n      void handleReleaseByPointer(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n\n      // Helpers for container-release modeling (e.g., btrfs_close_bdev(device))\n\
+  \      void handleContainerRelease(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n      bool isReleaseByPointerCall(const CallEvent &Call, const ReleaseByPtrEntry\
+  \ *&Entry, CheckerContext &C) const;\n      bool isKnownContainerRelease(const CallEvent\
+  \ &Call, unsigned &ParamIdx, unsigned &FieldMask, CheckerContext &C) const;\n\n\
+  \      void reportDoubleRelease(const CallEvent &Call, CheckerContext &C, const\
+  \ MemRegion *R) const;\n      void reportNotNullified(const VarDecl *VD, unsigned\
+  \ Mask, const Stmt *Origin, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isReleaseByPointerCall(const\
+  \ CallEvent &Call,\n                                              const ReleaseByPtrEntry\
+  \ *&Entry,\n                                              CheckerContext &C) const\
+  \ {\n  const Expr *OE = Call.getOriginExpr();\n  if (!OE) return false;\n\n  for\
+  \ (const auto &E : ReleaseByPtrTable) {\n    if (ExprHasName(OE, E.Name, C)) {\n\
+  \      Entry = &E;\n      return true;\n    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isKnownContainerRelease(const\
+  \ CallEvent &Call,\n                                               unsigned &ParamIdx,\n\
+  \                                               unsigned &FieldMask,\n         \
+  \                                      CheckerContext &C) const {\n  const Expr\
+  \ *OE = Call.getOriginExpr();\n  if (!OE) return false;\n\n  // For this checker\
+  \ we model: btrfs_close_bdev(device) releases \"bdev\" and \"bdev_file\".\n  if\
+  \ (ExprHasName(OE, \"btrfs_close_bdev\", C)) {\n    ParamIdx = 0;\n    FieldMask\
+  \ = (1u << 0) | (1u << 1); // bdev | bdev_file\n    return true;\n  }\n\n  return\
+  \ false;\n}\n\nvoid SAGenTestChecker::handleReleaseByPointer(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const ReleaseByPtrEntry *Entry = nullptr;\n  if\
+  \ (!isReleaseByPointerCall(Call, Entry, C))\n    return;\n\n  if (Entry->ParamIdx\
+  \ >= Call.getNumArgs())\n    return;\n\n  // Track the argument region as released.\n\
+  \  const Expr *ArgE = Call.getArgExpr(Entry->ParamIdx);\n  if (!ArgE) return;\n\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR) return;\n  MR\
+  \ = MR->getBaseRegion();\n  if (!MR) return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  if (!State->contains<ReleasedSet>(MR)) {\n    State = State->add<ReleasedSet>(MR);\n\
+  \    State = State->set<ReleasedOriginMap>(MR, Call.getOriginExpr());\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::handleContainerRelease(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  unsigned ParamIdx = 0;\n  unsigned FieldMask = 0;\n\
+  \  if (!isKnownContainerRelease(Call, ParamIdx, FieldMask, C))\n    return;\n\n\
+  \  if (ParamIdx >= Call.getNumArgs())\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(ParamIdx);\n\
+  \  if (!ArgE) return;\n\n  // We key by the VarDecl* of the container pointer as\
+  \ passed at this call site.\n  const VarDecl *VD = getVarDeclFromExpr(ArgE);\n \
+  \ if (!VD) return;\n\n  ProgramStateRef State = C.getState();\n  unsigned CurMask\
+  \ = 0;\n  if (const unsigned *M = State->get<ContainerMaskMap>(VD))\n    CurMask\
+  \ = *M;\n\n  unsigned NewMask = CurMask | FieldMask;\n  if (NewMask != CurMask)\
+  \ {\n    State = State->set<ContainerMaskMap>(VD, NewMask);\n    State = State->set<ContainerOriginMap>(VD,\
+  \ Call.getOriginExpr());\n    C.addTransition(State);\n  }\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  // Model both:\n  // 1) Release-by-pointer\
+  \ calls (e.g., fput(ptr)).\n  handleReleaseByPointer(Call, C);\n\n  // 2) Container-release\
+  \ calls that release specific members by convention.\n  handleContainerRelease(Call,\
+  \ C);\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  // Detect double release when the same region is passed again to\
+  \ a release-by-pointer API.\n  const ReleaseByPtrEntry *Entry = nullptr;\n  if (!isReleaseByPointerCall(Call,\
+  \ Entry, C))\n    return;\n\n  if (Entry->ParamIdx >= Call.getNumArgs())\n    return;\n\
+  \n  const Expr *ArgE = Call.getArgExpr(Entry->ParamIdx);\n  if (!ArgE) return;\n\
+  \n  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR) return;\n \
+  \ MR = MR->getBaseRegion();\n  if (!MR) return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  if (State->contains<ReleasedSet>(MR)) {\n    reportDoubleRelease(Call, C, MR);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,\
+  \ CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\n  // 1)\
+  \ Any assignment to a location that we considered \"released-by-pointer\" clears\
+  \ its stale state.\n  if (const MemRegion *L = Loc.getAsRegion()) {\n    L = L->getBaseRegion();\n\
+  \    if (L && State->contains<ReleasedSet>(L)) {\n      State = State->remove<ReleasedSet>(L);\n\
+  \      State = State->remove<ReleasedOriginMap>(L);\n      C.addTransition(State);\n\
+  \    }\n  }\n\n  // 2) Handle member assignments to clear \"must-nullify\" bits\
+  \ after container-release.\n  //    For example, device->bdev = NULL; or device->bdev_file\
+  \ = NULL;\n  const BinaryOperator *BO = dyn_cast_or_null<BinaryOperator>(StoreE);\n\
+  \  if (!BO || !BO->isAssignmentOp())\n    return;\n\n  const Expr *LHS = BO->getLHS();\n\
+  \  if (!LHS) return;\n\n  LHS = LHS->IgnoreParenCasts();\n  const MemberExpr *ME\
+  \ = dyn_cast<MemberExpr>(LHS);\n  if (!ME) return;\n\n  // Get the container variable\
+  \ used as the base expression (e.g. 'device' in 'device->bdev_file').\n  const Expr\
+  \ *Base = ME->getBase();\n  if (!Base) return;\n\n  const VarDecl *BaseVD = getVarDeclFromExpr(Base);\n\
+  \  if (!BaseVD) return;\n\n  const unsigned *MaskPtr = State->get<ContainerMaskMap>(BaseVD);\n\
+  \  if (!MaskPtr || *MaskPtr == 0)\n    return;\n\n  unsigned Mask = *MaskPtr;\n\
+  \  StringRef FieldName = getFieldNameFromMember(ME);\n  unsigned Bit = getFieldBitByName(FieldName);\n\
+  \  if (Bit == 0)\n    return;\n\n  if (Mask & Bit) {\n    unsigned NewMask = Mask\
+  \ & ~Bit;\n    State = State->set<ContainerMaskMap>(BaseVD, NewMask);\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::reportDoubleRelease(const CallEvent &Call, CheckerContext\
+  \ &C, const MemRegion *R) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto Report = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Double release of stale pointer\", N);\n\n  // Add note pointing to\
+  \ the first release if we have it.\n  ProgramStateRef State = C.getState();\n  if\
+  \ (const auto *OriginPtr = State->get<ReleasedOriginMap>(R)) {\n    const Stmt *Origin\
+  \ = *OriginPtr;\n    PathDiagnosticLocation Loc(Origin, C.getSourceManager(), C.getLocationContext());\n\
+  \    Report->addNote(\"Pointer was released here\", Loc);\n  }\n\n  Report->addRange(Call.getSourceRange());\n\
+  \  C.emitReport(std::move(Report));\n}\n\nvoid SAGenTestChecker::reportNotNullified(const\
+  \ VarDecl *VD, unsigned Mask, const Stmt *Origin, CheckerContext &C) const {\n \
+  \ if (!VD || Mask == 0)\n    return;\n\n  // Create a short message mentioning the\
+  \ missing member(s).\n  SmallString<128> Msg(\"Released member pointer not set to\
+  \ NULL: \");\n  bool First = true;\n  if (Mask & (1u << 0)) { // bdev\n    if (!First)\
+  \ Msg += \", \";\n    Msg += VD->getName();\n    Msg += \"->bdev\";\n    First =\
+  \ false;\n  }\n  if (Mask & (1u << 1)) { // bdev_file\n    if (!First) Msg += \"\
+  , \";\n    Msg += VD->getName();\n    Msg += \"->bdev_file\";\n    First = false;\n\
+  \  }\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N) return;\n\n\
+  \  auto Report = std::make_unique<PathSensitiveBugReport>(*BT, Msg.str(), N);\n\n\
+  \  if (Origin) {\n    PathDiagnosticLocation Loc(Origin, C.getSourceManager(), C.getLocationContext());\n\
+  \    Report->addNote(\"Members were released here\", Loc);\n  }\n\n  C.emitReport(std::move(Report));\n\
+  }\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Iterate over all\
+  \ container entries that still have un-cleared bits (i.e., not nullified).\n  auto\
+  \ Map = State->get<ContainerMaskMap>();\n  for (auto It = Map.begin(); It != Map.end();\
+  \ ++It) {\n    const VarDecl *VD = It->first;\n    unsigned Mask = It->second;\n\
+  \    if (Mask == 0)\n      continue;\n\n    const auto *OriginPtr = State->get<ContainerOriginMap>(VD);\n\
+  \    const Stmt *Origin = OriginPtr ? *OriginPtr : nullptr;\n    reportNotNullified(VD,\
+  \ Mask, Origin, C);\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void\
+  \ clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects missing NULL assignment of\
+  \ released struct member pointers and double release\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

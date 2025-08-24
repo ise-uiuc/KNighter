@@ -1,0 +1,301 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -17,6 +17,8 @@ #include "clang/AST/Expr.h"
+ #include "clang/AST/Stmt.h"
+ #include "clang/Lex/Lexer.h"
++#include <memory>
++#include <array>
+
+ using namespace clang;
+ using namespace ento;
+@@ -24,6 +26,89 @@
+ // Track unchecked symbols returned by devm_kzalloc.
+ REGISTER_SET_WITH_PROGRAMSTATE(UncheckedDevmPtrSyms, SymbolRef)
++
++// Utility Functions (provided)
++template <typename T>
++const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
++
++template <typename T>
++const T* findSpecificTypeInChildren(const Stmt *S);
++
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C) {
++  Expr::EvalResult ExprRes;
++  if (expr->EvaluateAsInt(ExprRes, C.getASTContext())) {
++    EvalRes = ExprRes.Val.getInt();
++    return true;
++  }
++  return false;
++}
++
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C) {
++  ProgramStateRef State = C.getState();
++  const llvm::APSInt *maxVal = State->getConstraintManager().getSymMaxVal(State, Sym);
++  return maxVal;
++}
++
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E) {
++  if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E->IgnoreImplicit())) {
++    if (const VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++      QualType QT = VD->getType();
++      if (const ConstantArrayType *ArrayType = dyn_cast<ConstantArrayType>(QT.getTypePtr())) {
++        ArraySize = ArrayType->getSize();
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool getStringSize(llvm::APInt &StringSize, const Expr *E) {
++  if (const auto *SL = dyn_cast<StringLiteral>(E->IgnoreImpCasts())) {
++    StringSize = llvm::APInt(32, SL->getLength());
++    return true;
++  }
++  return false;
++}
++
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C) {
++  ProgramStateRef State = C.getState();
++  return State->getSVal(E, C.getLocationContext()).getAsRegion();
++}
++
++struct KnownDerefFunction {
++  const char *Name;
++  llvm::SmallVector<unsigned, 4> Params;
++};
++
++bool functionKnownToDeref(const CallEvent &Call,
++                                 llvm::SmallVectorImpl<unsigned> &DerefParams) {
++  // No known dereferencing functions are specified; keep the table empty.
++  static const std::array<KnownDerefFunction, 0> DerefTable = {};
++
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    StringRef FnName = ID->getName();
++
++    for (const auto &Entry : DerefTable) {
++      if (FnName.equals(Entry.Name)) {
++        DerefParams.append(Entry.Params.begin(), Entry.Params.end());
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C) {
++  if (!E)
++    return false;
++
++  const SourceManager &SM = C.getSourceManager();
++  const LangOptions &LangOpts = C.getLangOpts();
++  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());
++  StringRef ExprText = Lexer::getSourceText(Range, SM, LangOpts);
++
++  return ExprText.contains(Name);
++}
+
+ namespace {
+
+@@ -47,6 +132,117 @@   SymbolRef getDereferencedBaseSymbol(const Stmt *S, SVal Loc, CheckerContext &C) const;
+
+   void reportBug(CheckerContext &C, const Stmt *S) const;
++
++  // Helpers to reason about conditions and symbols.
++  static const Expr *stripParensAndCasts(const Expr *E) {
++    return E ? E->IgnoreParenImpCasts() : nullptr;
++  }
++
++  // If condition is wrapped in __builtin_expect (i.e., likely/unlikely), unwrap it.
++  static const Expr *unwrapBuiltinExpect(const Expr *E) {
++    E = stripParensAndCasts(E);
++    if (!E)
++      return nullptr;
++
++    if (const auto *CE = dyn_cast<CallExpr>(E)) {
++      if (const FunctionDecl *FD = CE->getDirectCallee()) {
++        if (const IdentifierInfo *ID = FD->getIdentifier()) {
++          StringRef Name = ID->getName();
++          if (Name.equals("__builtin_expect")) {
++            if (CE->getNumArgs() >= 1)
++              return stripParensAndCasts(CE->getArg(0));
++          }
++        }
++      }
++    }
++    return E;
++  }
++
++  // Try to get a symbol from an expression that denotes a pointer rvalue.
++  SymbolRef getSymbolFromExpr(const Expr *E, CheckerContext &C) const {
++    if (!E) return nullptr;
++    ProgramStateRef State = C.getState();
++    const LocationContext *LCtx = C.getLocationContext();
++    E = stripParensAndCasts(E);
++    SVal SV = State->getSVal(E, LCtx);
++
++    if (SymbolRef Sym = SV.getAsSymbol())
++      return Sym;
++
++    if (const MemRegion *MR = SV.getAsRegion()) {
++      MR = MR->getBaseRegion();
++      if (const auto *SR = dyn_cast<SymbolicRegion>(MR))
++        return SR->getSymbol();
++    }
++    return nullptr;
++  }
++
++  // Collect symbols that are explicitly NULL-checked in the condition.
++  void collectNullCheckedSymbols(const Expr *CondE,
++                                 CheckerContext &C,
++                                 llvm::SmallVectorImpl<SymbolRef> &Out) const {
++    if (!CondE) return;
++
++    // Unwrap builtin_expect (likely/unlikely) and ignore parens/casts.
++    CondE = unwrapBuiltinExpect(CondE);
++    CondE = stripParensAndCasts(CondE);
++    if (!CondE) return;
++
++    // Handle logical combinations: (A && B), (A || B).
++    if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {
++      if (BO->isLogicalOp()) {
++        collectNullCheckedSymbols(BO->getLHS(), C, Out);
++        collectNullCheckedSymbols(BO->getRHS(), C, Out);
++        return;
++      }
++
++      // Handle ptr == NULL or ptr != NULL
++      if (BO->getOpcode() == BO_EQ || BO->getOpcode() == BO_NE) {
++        const Expr *LHS = stripParensAndCasts(BO->getLHS());
++        const Expr *RHS = stripParensAndCasts(BO->getRHS());
++        if (!LHS || !RHS) return;
++
++        bool LHSIsNull = LHS->isNullPointerConstant(C.getASTContext(),
++                                 Expr::NPC_ValueDependentIsNull);
++        bool RHSIsNull = RHS->isNullPointerConstant(C.getASTContext(),
++                                 Expr::NPC_ValueDependentIsNull);
++
++        const Expr *PtrExpr = nullptr;
++        if (LHSIsNull && !RHSIsNull)
++          PtrExpr = RHS;
++        else if (RHSIsNull && !LHSIsNull)
++          PtrExpr = LHS;
++
++        if (PtrExpr) {
++          if (SymbolRef S = getSymbolFromExpr(PtrExpr, C))
++            Out.push_back(S);
++        }
++        return;
++      }
++    }
++
++    // Handle '!ptr' or nested '!!ptr' etc.
++    if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {
++      if (UO->getOpcode() == UO_LNot) {
++        const Expr *Sub = stripParensAndCasts(UO->getSubExpr());
++        // If it is another !, recurse to peel
++        if (const auto *InnerUO = dyn_cast<UnaryOperator>(Sub)) {
++          if (InnerUO->getOpcode() == UO_LNot) {
++            collectNullCheckedSymbols(InnerUO->getSubExpr(), C, Out);
++            return;
++          }
++        }
++        // Otherwise the subexpr is the pointer being tested for falsiness
++        if (SymbolRef S = getSymbolFromExpr(Sub, C))
++          Out.push_back(S);
++        return;
++      }
++    }
++
++    // We intentionally DO NOT treat bare "if (ptr)" as a NULL check here,
++    // because without branch sensitivity we can't safely clear the unchecked
++    // state on both branches. This avoids masking real bugs.
++  }
+ };
+
+ SymbolRef SAGenTestChecker::getDereferencedBaseSymbol(const Stmt *S, SVal Loc,
+@@ -115,8 +311,9 @@   if (!OriginExpr)
+     return;
+
+-  // Only track devm_kzalloc results.
+-  if (!ExprHasName(OriginExpr, "devm_kzalloc", C))
++  // Precisely track calls to devm_kzalloc (by callee identifier).
++  const IdentifierInfo *ID = Call.getCalleeIdentifier();
++  if (!ID || !ID->getName().equals("devm_kzalloc"))
+     return;
+
+   ProgramStateRef State = C.getState();
+@@ -129,58 +326,25 @@
+ void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+   const Expr *CondE = dyn_cast_or_null<Expr>(Condition);
+-  if (!CondE) {
+-    return;
+-  }
+-
+-  ProgramStateRef State = C.getState();
+-  const LocationContext *LCtx = C.getLocationContext();
+-  SymbolRef TargetSym = nullptr;
+-
+-  // Handle: if (!ptr)
+-  if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {
+-    if (UO->getOpcode() == UO_LNot) {
+-      const Expr *SubE = UO->getSubExpr();
+-      if (SubE) {
+-        SVal SV = State->getSVal(SubE, LCtx);
+-        TargetSym = SV.getAsSymbol();
+-      }
+-    }
+-  }
+-  // Handle: if (ptr == NULL) or if (ptr != NULL)
+-  else if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {
+-    BinaryOperator::Opcode Op = BO->getOpcode();
+-    if (Op == BO_EQ || Op == BO_NE) {
+-      const Expr *LHS = BO->getLHS();
+-      const Expr *RHS = BO->getRHS();
+-      if (LHS && RHS) {
+-        bool LHSIsNull = LHS->IgnoreParenImpCasts()->isNullPointerConstant(C.getASTContext(),
+-                                         Expr::NPC_ValueDependentIsNull);
+-        bool RHSIsNull = RHS->IgnoreParenImpCasts()->isNullPointerConstant(C.getASTContext(),
+-                                         Expr::NPC_ValueDependentIsNull);
+-        const Expr *PtrExpr = nullptr;
+-        if (LHSIsNull && !RHSIsNull)
+-          PtrExpr = RHS;
+-        else if (RHSIsNull && !LHSIsNull)
+-          PtrExpr = LHS;
+-
+-        if (PtrExpr) {
+-          SVal SV = State->getSVal(PtrExpr, LCtx);
+-          TargetSym = SV.getAsSymbol();
+-        }
+-      }
+-    }
+-  }
+-  // Handle: if (ptr)
+-  else {
+-    SVal SV = State->getSVal(CondE, LCtx);
+-    TargetSym = SV.getAsSymbol();
+-  }
+-
+-  if (TargetSym && State->contains<UncheckedDevmPtrSyms>(TargetSym)) {
+-    State = State->remove<UncheckedDevmPtrSyms>(TargetSym);
++  if (!CondE)
++    return;
++
++  llvm::SmallVector<SymbolRef, 4> CheckedSyms;
++  collectNullCheckedSymbols(CondE, C, CheckedSyms);
++
++  if (CheckedSyms.empty())
++    return;
++
++  ProgramStateRef State = C.getState();
++  bool Changed = false;
++  for (SymbolRef S : CheckedSyms) {
++    if (State->contains<UncheckedDevmPtrSyms>(S)) {
++      State = State->remove<UncheckedDevmPtrSyms>(S);
++      Changed = true;
++    }
++  }
++  if (Changed)
+     C.addTransition(State);
+-  }
+ }
+
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {

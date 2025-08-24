@@ -1,0 +1,245 @@
+### Report Summary
+
+File:| drivers/soc/fsl/dpaa2-console.c
+---|---
+Warning:| line 217, column 7
+copy_to_user may leak uninitialized kernel memory from kmalloc buffer; use
+kzalloc or memset
+
+### Annotated Source Code
+
+
+13    | #include <linux/of_address.h>
+14    | #include <linux/miscdevice.h>
+15    | #include <linux/platform_device.h>
+16    | #include <linux/uaccess.h>
+17    | #include <linux/slab.h>
+18    | #include <linux/fs.h>
+19    | #include <linux/io.h>
+20    |
+21    | /* MC firmware base low/high registers indexes */
+22    | #define MCFBALR_OFFSET 0
+23    | #define MCFBAHR_OFFSET 1
+24    |
+25    | /* Bit masks used to get the most/least significant part of the MC base addr */
+26    | #define MC_FW_ADDR_MASK_HIGH 0x1FFFF
+27    | #define MC_FW_ADDR_MASK_LOW  0xE0000000
+28    |
+29    | #define MC_BUFFER_OFFSET 0x01000000
+30    | #define MC_BUFFER_SIZE   (1024 * 1024 * 16)
+31    | #define MC_OFFSET_DELTA MC_BUFFER_OFFSET
+32    |
+33    | #define AIOP_BUFFER_OFFSET 0x06000000
+34    | #define AIOP_BUFFER_SIZE   (1024 * 1024 * 16)
+35    | #define AIOP_OFFSET_DELTA  0
+36    |
+37    | #define LOG_HEADER_FLAG_BUFFER_WRAPAROUND 0x80000000
+38    | #define LAST_BYTE(a) ((a) & ~(LOG_HEADER_FLAG_BUFFER_WRAPAROUND))
+39    |
+40    | /* MC and AIOP Magic words */
+41    | #define MAGIC_MC   0x4d430100
+42    | #define MAGIC_AIOP 0x41494F50
+43    |
+44    | struct log_header {
+45    | 	__le32 magic_word;
+46    |  char reserved[4];
+47    | 	__le32 buf_start;
+48    | 	__le32 buf_length;
+49    | 	__le32 last_byte;
+50    | };
+51    |
+52    | struct console_data {
+53    |  void __iomem *map_addr;
+54    |  struct log_header __iomem *hdr;
+55    |  void __iomem *start_addr;
+56    |  void __iomem *end_addr;
+57    |  void __iomem *end_of_data;
+58    |  void __iomem *cur_ptr;
+59    | };
+60    |
+61    | static struct resource mc_base_addr;
+62    |
+63    | static inline void adjust_end(struct console_data *cd)
+64    | {
+65    | 	u32 last_byte = readl(&cd->hdr->last_byte);
+66    |
+67    | 	cd->end_of_data = cd->start_addr + LAST_BYTE(last_byte);
+68    | }
+69    |
+70    | static u64 get_mc_fw_base_address(void)
+71    | {
+72    | 	u64 mcfwbase = 0ULL;
+73    | 	u32 __iomem *mcfbaregs;
+74    |
+75    | 	mcfbaregs = ioremap(mc_base_addr.start, resource_size(&mc_base_addr));
+76    |  if (!mcfbaregs) {
+77    |  pr_err("could not map MC Firmware Base registers\n");
+78    |  return 0;
+79    | 	}
+80    |
+81    | 	mcfwbase  = readl(mcfbaregs + MCFBAHR_OFFSET) &
+82    |  MC_FW_ADDR_MASK_HIGH;
+83    | 	mcfwbase <<= 32;
+84    | 	mcfwbase |= readl(mcfbaregs + MCFBALR_OFFSET) & MC_FW_ADDR_MASK_LOW;
+85    |  iounmap(mcfbaregs);
+86    |
+87    |  pr_debug("MC base address at 0x%016llx\n", mcfwbase);
+88    |  return mcfwbase;
+89    | }
+90    |
+91    | static ssize_t dpaa2_console_size(struct console_data *cd)
+92    | {
+93    | 	ssize_t size;
+94    |
+95    |  if (cd->cur_ptr <= cd->end_of_data)
+96    | 		size = cd->end_of_data - cd->cur_ptr;
+97    |  else
+98    | 		size = (cd->end_addr - cd->cur_ptr) +
+99    | 			(cd->end_of_data - cd->start_addr);
+100   |
+101   |  return size;
+102   | }
+103   |
+104   | static int dpaa2_generic_console_open(struct inode *node, struct file *fp,
+105   | 				      u64 offset, u64 size,
+106   | 				      u32 expected_magic,
+107   | 				      u32 offset_delta)
+108   | {
+109   | 	u32 read_magic, wrapped, last_byte, buf_start, buf_length;
+110   |  struct console_data *cd;
+111   | 	u64 base_addr;
+112   |  int err;
+113   |
+114   | 	cd = kmalloc(sizeof(*cd), GFP_KERNEL);
+115   |  if (!cd)
+116   |  return -ENOMEM;
+117   |
+118   | 	base_addr = get_mc_fw_base_address();
+119   |  if (!base_addr) {
+120   | 		err = -EIO;
+121   |  goto err_fwba;
+122   | 	}
+123   |
+124   | 	cd->map_addr = ioremap(base_addr + offset, size);
+125   |  if (!cd->map_addr) {
+126   |  pr_err("cannot map console log memory\n");
+127   | 		err = -EIO;
+128   |  goto err_ioremap;
+129   | 	}
+130   |
+131   | 	cd->hdr = (struct log_header __iomem *)cd->map_addr;
+142   | 	}
+143   |
+144   | 	cd->start_addr = cd->map_addr + buf_start - offset_delta;
+145   | 	cd->end_addr = cd->start_addr + buf_length;
+146   |
+147   | 	wrapped = last_byte & LOG_HEADER_FLAG_BUFFER_WRAPAROUND;
+148   |
+149   | 	adjust_end(cd);
+150   |  if (wrapped && cd->end_of_data != cd->end_addr)
+151   | 		cd->cur_ptr = cd->end_of_data + 1;
+152   |  else
+153   | 		cd->cur_ptr = cd->start_addr;
+154   |
+155   | 	fp->private_data = cd;
+156   |
+157   |  return 0;
+158   |
+159   | err_magic:
+160   |  iounmap(cd->map_addr);
+161   |
+162   | err_ioremap:
+163   | err_fwba:
+164   | 	kfree(cd);
+165   |
+166   |  return err;
+167   | }
+168   |
+169   | static int dpaa2_mc_console_open(struct inode *node, struct file *fp)
+170   | {
+171   |  return dpaa2_generic_console_open(node, fp,
+172   |  MC_BUFFER_OFFSET, MC_BUFFER_SIZE,
+173   |  MAGIC_MC, MC_OFFSET_DELTA);
+174   | }
+175   |
+176   | static int dpaa2_aiop_console_open(struct inode *node, struct file *fp)
+177   | {
+178   |  return dpaa2_generic_console_open(node, fp,
+179   |  AIOP_BUFFER_OFFSET, AIOP_BUFFER_SIZE,
+180   |  MAGIC_AIOP, AIOP_OFFSET_DELTA);
+181   | }
+182   |
+183   | static int dpaa2_console_close(struct inode *node, struct file *fp)
+184   | {
+185   |  struct console_data *cd = fp->private_data;
+186   |
+187   |  iounmap(cd->map_addr);
+188   | 	kfree(cd);
+189   |  return 0;
+190   | }
+191   |
+192   | static ssize_t dpaa2_console_read(struct file *fp, char __user *buf,
+193   | 				  size_t count, loff_t *f_pos)
+194   | {
+195   |  struct console_data *cd = fp->private_data;
+196   | 	size_t bytes = dpaa2_console_size(cd);
+197   | 	size_t bytes_end = cd->end_addr - cd->cur_ptr;
+198   | 	size_t written = 0;
+199   |  void *kbuf;
+200   |  int err;
+201   |
+202   |  /* Check if we need to adjust the end of data addr */
+203   | 	adjust_end(cd);
+204   |
+205   |  if (cd->end_of_data == cd->cur_ptr)
+    1Assuming field 'end_of_data' is not equal to field 'cur_ptr'→
+    2←Taking false branch→
+206   |  return 0;
+207   |
+208   |  if (count < bytes)
+    3←Assuming 'count' is >= 'bytes'→
+    4←Taking false branch→
+209   | 		bytes = count;
+210   |
+211   |  kbuf = kmalloc(bytes, GFP_KERNEL);
+212   |  if (!kbuf)
+    5←Assuming 'kbuf' is non-null→
+    6←Taking false branch→
+213   |  return -ENOMEM;
+214   |
+215   |  if (bytes > bytes_end) {
+    7←Assuming 'bytes' is > 'bytes_end'→
+    8←Taking true branch→
+216   |  memcpy_fromio(kbuf, cd->cur_ptr, bytes_end);
+217   |  if (copy_to_user(buf, kbuf, bytes_end)) {
+    9←copy_to_user may leak uninitialized kernel memory from kmalloc buffer; use kzalloc or memset
+218   | 			err = -EFAULT;
+219   |  goto err_free_buf;
+220   | 		}
+221   | 		buf += bytes_end;
+222   | 		cd->cur_ptr = cd->start_addr;
+223   | 		bytes -= bytes_end;
+224   | 		written += bytes_end;
+225   | 	}
+226   |
+227   |  memcpy_fromio(kbuf, cd->cur_ptr, bytes);
+228   |  if (copy_to_user(buf, kbuf, bytes)) {
+229   | 		err = -EFAULT;
+230   |  goto err_free_buf;
+231   | 	}
+232   | 	cd->cur_ptr += bytes;
+233   | 	written += bytes;
+234   |
+235   | 	kfree(kbuf);
+236   |  return written;
+237   |
+238   | err_free_buf:
+239   | 	kfree(kbuf);
+240   |
+241   |  return err;
+242   | }
+243   |
+244   | static const struct file_operations dpaa2_mc_console_fops = {
+245   | 	.owner          = THIS_MODULE,
+246   | 	.open           = dpaa2_mc_console_open,
+247   | 	.release        = dpaa2_console_close,

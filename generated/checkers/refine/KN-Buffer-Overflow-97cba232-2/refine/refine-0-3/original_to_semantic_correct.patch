@@ -1,0 +1,187 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -488,6 +488,161 @@     return ArrSz == BVal;
+   }
+
++  // Get the enclosing function body for a statement.
++  static const Stmt *getEnclosingFunctionBody(const Stmt *S, ASTContext &Ctx) {
++    if (!S)
++      return nullptr;
++    DynTypedNode N = DynTypedNode::create<const Stmt>(*S);
++    while (true) {
++      auto Parents = Ctx.getParents(N);
++      if (Parents.empty())
++        break;
++      bool Advanced = false;
++      for (const DynTypedNode &P : Parents) {
++        if (const auto *FD = P.get<FunctionDecl>()) {
++          return FD->getBody();
++        }
++        if (const Stmt *PS = P.get<Stmt>()) {
++          N = DynTypedNode::create<const Stmt>(*PS);
++          Advanced = true;
++          break;
++        }
++        if (const auto *DC = P.get<Decl>()) {
++          // Keep climbing through decls if needed.
++          N = DynTypedNode::create<const Decl>(*DC);
++          Advanced = true;
++          break;
++        }
++      }
++      if (!Advanced)
++        break;
++    }
++    return nullptr;
++  }
++
++  // Check if an expression is "&Base[1]" or "Base + 1" with the same base.
++  static bool isAddrOrPtrArithBasePlusOne(const Expr *E, const Expr *Base) {
++    if (!E || !Base)
++      return false;
++    E = E->IgnoreParenImpCasts();
++    Base = stripCastsAndParens(Base);
++
++    // &Base[1]
++    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++      if (UO->getOpcode() == UO_AddrOf) {
++        const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
++        if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(Sub)) {
++          const Expr *ASEBase = ASE->getBase()->IgnoreParenImpCasts();
++          const Expr *Idx = ASE->getIdx()->IgnoreParenImpCasts();
++          if (sameBaseExpr(Base, ASEBase) && isIntLiteralOne(Idx))
++            return true;
++        }
++      }
++    }
++
++    // Base + 1 or 1 + Base
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      if (BO->getOpcode() == BO_Add) {
++        const Expr *L = BO->getLHS()->IgnoreParenImpCasts();
++        const Expr *R = BO->getRHS()->IgnoreParenImpCasts();
++        if ((sameBaseExpr(Base, L) && isIntLiteralOne(R)) ||
++            (sameBaseExpr(Base, R) && isIntLiteralOne(L)))
++          return true;
++      }
++    }
++
++    return false;
++  }
++
++  // Detect pre-loop setup like "xfer[1].rx_buf = &Base[1]" that legitimizes Base[i+1] for i < len.
++  static bool hasRxBufOffsetOneSetupBefore(const Expr *Base,
++                                           const ForStmt *FS,
++                                           ASTContext &Ctx) {
++    if (!Base || !FS)
++      return false;
++
++    const Stmt *Body = getEnclosingFunctionBody(FS, Ctx);
++    if (!Body)
++      return false;
++
++    const SourceManager &SM = Ctx.getSourceManager();
++    SourceLocation LoopLoc = FS->getBeginLoc();
++
++    struct Finder : public RecursiveASTVisitor<Finder> {
++      const Expr *Base;
++      const ForStmt *FS;
++      ASTContext &Ctx;
++      const SourceManager &SM;
++      SourceLocation LoopLoc;
++      bool Found = false;
++
++      Finder(const Expr *Base, const ForStmt *FS,
++             ASTContext &Ctx)
++          : Base(Base), FS(FS), Ctx(Ctx), SM(Ctx.getSourceManager()),
++            LoopLoc(FS->getBeginLoc()) {}
++
++      bool VisitBinaryOperator(BinaryOperator *BO) {
++        if (Found)
++          return true;
++        if (!BO || BO->getOpcode() != BO_Assign)
++          return true;
++
++        // Only consider statements textually before the loop.
++        if (!BO->getBeginLoc().isValid() || !LoopLoc.isValid())
++          return true;
++        if (!SM.isBeforeInTranslationUnit(BO->getBeginLoc(), LoopLoc))
++          return true;
++
++        const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
++        const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
++
++        // Match LHS '.rx_buf' or '->rx_buf'
++        bool LHSMatchesRxBuf = false;
++        if (const auto *ME = dyn_cast<MemberExpr>(LHS)) {
++          if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {
++            LHSMatchesRxBuf = FD->getName().equals("rx_buf");
++          }
++        } else if (const auto *DRE = dyn_cast<DeclRefExpr>(LHS)) {
++          // Very conservative: allow a standalone variable named rx_buf too.
++          if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++            LHSMatchesRxBuf = VD->getName().equals("rx_buf");
++          }
++        }
++
++        if (!LHSMatchesRxBuf)
++          return true;
++
++        if (SAGenTestChecker::isAddrOrPtrArithBasePlusOne(RHS, Base)) {
++          Found = true;
++        }
++
++        return true;
++      }
++    };
++
++    Finder F(Base, FS, Ctx);
++    F.TraverseStmt(const_cast<Stmt *>(Body));
++    return F.Found;
++  }
++
++  // Aggregate FP checks into a single helper for clarity.
++  bool isFalsePositive(const ArraySubscriptExpr *ASE,
++                       const ForStmt *FS,
++                       const VarDecl *IVar,
++                       const Expr *BoundExpr,
++                       ASTContext &Ctx) const {
++    // 1) Local guard present: i + 1 < X or i < X - 1
++    if (hasLocalGuardForASE(Ctx, ASE, FS, IVar))
++      return true;
++
++    // 2) SPI-like pre-loop setup: rx_buf points to &Base[1] or Base + 1
++    const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
++    if (hasRxBufOffsetOneSetupBefore(Base, FS, Ctx))
++      return true;
++
++    return false;
++  }
++
+   void analyzeForStmt(const ForStmt *FS, ASTContext &Ctx,
+                       BugReporter &BR) const {
+     if (!FS)
+@@ -497,7 +652,7 @@     if (!IVar)
+       return;
+
+-    // Require your loop to start from 0 to match the target bug pattern and
++    // Require loop to start from 0 to match the target bug pattern and
+     // avoid stencil/edge-handling loops that often start from 1.
+     if (!isInitZero(FS->getInit(), IVar))
+       return;
+@@ -548,8 +703,8 @@         if (!Checker->isVarPlusOne(Idx, IVar))
+           return true;
+
+-        // Check for a local guard like "if (i + 1 < X)" or "if (i < X - 1)".
+-        if (Checker->hasLocalGuardForASE(Ctx, ASE, FS, IVar))
++        // False-positive filters (local guard, I/O rx_buf offset setup).
++        if (Checker->isFalsePositive(ASE, FS, IVar, BoundExpr, Ctx))
+           return true;
+
+         // Additional FP filter: ensure the loop bound is the actual size of this array base.
+@@ -557,7 +712,7 @@         if (!Base || !BoundExpr)
+           return true;
+
+-        if (!loopBoundEqualsArraySize(BoundExpr, Base, Ctx))
++        if (!SAGenTestChecker::loopBoundEqualsArraySize(BoundExpr, Base, Ctx))
+           return true; // The loop bound doesn't tie to this array's size; likely false positive.
+
+         // Only warn if the same base array is also accessed with index [i]

@@ -1,0 +1,108 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -58,19 +58,28 @@
+   void reportUnbounded(const CallEvent &Call, const Expr *Dst,
+                        const Expr *Len, CheckerContext &C) const;
++
++  // False-positive filter: safe when Len is a compile-time constant <= array size.
++  bool isFalsePositiveConstLenLEArray(const Expr *LenArg, uint64_t ArraySize, CheckerContext &C) const;
+ };
+
+ bool SAGenTestChecker::isCopyFromUser(const CallEvent &Call, CheckerContext &C) const {
+   const Expr *OE = Call.getOriginExpr();
+   if (!OE)
+     return false;
+-  // Use textual match as recommended to be robust with macros and wrappers.
++
++  // Recognize common Linux helpers (explicit first)
++  if (ExprHasName(OE, "copy_from_user_nmi", C))
++    return true;
++
++  // Textual matches to be robust with macros/wrappers.
+   if (ExprHasName(OE, "copy_from_user", C))
+     return true;
+   if (ExprHasName(OE, "__copy_from_user", C))
+     return true;
+   if (ExprHasName(OE, "raw_copy_from_user", C))
+     return true;
++
+   return false;
+ }
+
+@@ -164,6 +173,24 @@   if (Len)
+     R->addRange(Len->getSourceRange());
+   C.emitReport(std::move(R));
++}
++
++bool SAGenTestChecker::isFalsePositiveConstLenLEArray(const Expr *LenArg, uint64_t ArraySize, CheckerContext &C) const {
++  // If LenArg is a compile-time constant and <= array size, it's safe from overflow.
++  llvm::APSInt ConstLen;
++  if (!EvaluateExprToInt(ConstLen, LenArg, C))
++    return false;
++
++  if (ConstLen.isSigned()) {
++    int64_t V = ConstLen.getSExtValue();
++    if (V >= 0 && static_cast<uint64_t>(V) <= ArraySize)
++      return true;
++  } else {
++    uint64_t V = ConstLen.getZExtValue();
++    if (V <= ArraySize)
++      return true;
++  }
++  return false;
+ }
+
+ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+@@ -235,7 +262,10 @@     return; // Only warn when destination is a provable fixed-size array
+
+   uint64_t ArraySize = ArraySizeAP.getZExtValue();
+-  uint64_t SafeCopyLimit = (ArraySize > 0) ? (ArraySize - 1) : 0;
++
++  // 0) Obvious safe pattern: len is a constant <= sizeof(array).
++  if (isFalsePositiveConstLenLEArray(LenArg, ArraySize, C))
++    return;
+
+   // 1) Len directly contains sizeof(array)
+   if (exprContainsSizeofOfArray(LenArg, ArrReg, ArrName, C))
+@@ -252,29 +282,29 @@   if (BoundRegForArray && LenReg && (BoundRegForArray == LenReg))
+     return;
+
+-  // 3) Try to infer if Len is constant and exceeds the array size
++  // 3) Constant len exceeding array size is definitely unsafe
+   llvm::APSInt ConstLen;
+   if (EvaluateExprToInt(ConstLen, LenArg, C)) {
+-    // If definitely larger than the array, report.
+-    if (ConstLen.isSigned() ? ConstLen.getSExtValue() > (int64_t)ArraySize
+-                            : ConstLen.getZExtValue() > ArraySize) {
+-      reportUnbounded(Call, DstArg, LenArg, C);
+-      return;
+-    }
+-    // If definitely <= SafeCopyLimit, consider safe.
+-    if (ConstLen.isSigned() ? ConstLen.getSExtValue() <= (int64_t)SafeCopyLimit
+-                            : ConstLen.getZExtValue() <= SafeCopyLimit) {
+-      return;
+-    }
+-    // Otherwise, do not early report here; continue checks.
++    if (ConstLen.isSigned()) {
++      if (ConstLen.getSExtValue() > static_cast<int64_t>(ArraySize)) {
++        reportUnbounded(Call, DstArg, LenArg, C);
++        return;
++      }
++    } else {
++      if (ConstLen.getZExtValue() > ArraySize) {
++        reportUnbounded(Call, DstArg, LenArg, C);
++        return;
++      }
++    }
++    // Otherwise constant <= ArraySize already returned in step 0.
+   }
+
+   // 4) Infer maximal value for symbolic Len
+   if (LenSym) {
+     if (const llvm::APSInt *MaxV = inferSymbolMaxVal(LenSym, C)) {
+       uint64_t MaxVal = MaxV->isSigned() ? (uint64_t)MaxV->getSExtValue() : MaxV->getZExtValue();
+-      if (MaxVal <= SafeCopyLimit)
+-        return; // safely bounded
++      if (MaxVal <= ArraySize)
++        return; // safely bounded by array size
+       if (MaxVal > ArraySize) {
+         // Definitely can exceed buffer size.
+         reportUnbounded(Call, DstArg, LenArg, C);

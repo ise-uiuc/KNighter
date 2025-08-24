@@ -1,0 +1,538 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -31,8 +31,6 @@ using namespace ento;
+ using namespace taint;
+
+-// No custom program state is needed.
+-
+ namespace {
+
+ class SAGenTestChecker : public Checker< check::ASTCodeBody > {
+@@ -47,10 +45,11 @@       struct ArrayUseInfo {
+         const ValueDecl *VD = nullptr;                  // VarDecl or FieldDecl
+         uint64_t Size = 0;                              // Constant array size
+-        const ArraySubscriptExpr *ExampleUse = nullptr; // Example use site for diagnostics
++        const ArraySubscriptExpr *ExampleUse = nullptr; // Earliest example use site for diagnostics
+       };
+
+       enum class GuardKind { None, Lt, Le, Gt, Ge, Eq, Ne };
++      enum class ExitKind { None, Continue, Break, Return };
+
+       static bool evalToUInt64(const Expr *E, ASTContext &ACtx, uint64_t &Out);
+       static bool evalToInt64(const Expr *E, ASTContext &ACtx, int64_t &Out);
+@@ -63,26 +62,35 @@       void processForStmt(const ForStmt *FS, ASTContext &ACtx, BugReporter &BR) const;
+       void collectArrayUsesIndexedBy(const Stmt *Body, const VarDecl *IVar, ASTContext &ACtx,
+                                      llvm::DenseMap<const ValueDecl*, ArrayUseInfo> &Out) const;
++
++      // Existing simple loop-level guard heuristic (kept for compatibility).
+       bool hasGuardForBound(const Stmt *Body, const VarDecl *IVar, uint64_t SmallSize, ASTContext &ACtx) const;
+       static bool condHasIVarAgainstConst(const Expr *CondE, const VarDecl *IVar, uint64_t ConstVal, ASTContext &ACtx);
+
+-      // New helpers to suppress false positives when the subscript is guarded by a branch.
++      // General helpers
+       static bool containsStmt(const Stmt *Parent, const Stmt *Target);
+       static bool parseCondOnIVar(const Expr *Cond, const VarDecl *IVar, uint64_t &Const, GuardKind &Kind, ASTContext &ACtx);
++
++      // Parent-branch guard heuristic: if use is in a branch that ensures i < SmallSize
+       static bool branchImpliesIndexInRange(GuardKind Kind, uint64_t Const, bool BranchWhenCondTrue,
+                                             uint64_t SmallSize, uint64_t UB);
+       static bool isIndexUseGuardedByBranch(const ArraySubscriptExpr *ASE, const VarDecl *IVar,
+                                             uint64_t SmallSize, uint64_t UB, ASTContext &ACtx);
+
+-      // New: Mapping-guard suppression for patterns like:
+-      //   inst = map(i);
+-      //   if (inst >= 0) { small[i] = ...; other[inst] = ...; }
++      // Mapping-guard suppression heuristic
+       static const IfStmt *findEnclosingIfWithBranch(const Stmt *S, const Stmt *&OutBranch, ASTContext &ACtx);
+       static bool parseMappingGuard(const Expr *Cond, const VarDecl *&InstVar, bool &ValidWhenTrue, ASTContext &ACtx);
+       static const CompoundStmt *findDirectCompoundParent(const Stmt *S, ASTContext &ACtx);
+       static bool hasPriorAssignFromIVar(const CompoundStmt *CS, const IfStmt *IS, const VarDecl *InstVar, const VarDecl *IVar);
+       static bool branchContainsArrayIndexWithVar(const Stmt *Branch, const VarDecl *IdxVar);
+       static bool isGuardedByIndexMapping(const ArraySubscriptExpr *ASE, const VarDecl *IVar, ASTContext &ACtx);
++
++      // New: Early-exit-before-use guard heuristic to handle "if (i > S-1) continue;" style guards
++      static ExitKind getSimpleEarlyExit(const Stmt *S);
++      static bool branchImpliesIndexOutOfRange(GuardKind Kind, uint64_t Const, bool BranchWhenCondTrue,
++                                               uint64_t SmallSize, ExitKind EK);
++      static bool hasEarlyExitGuardBeforeUse(const ArraySubscriptExpr *Use, const VarDecl *IVar,
++                                             uint64_t SmallSize, ASTContext &ACtx);
+ };
+
+ bool SAGenTestChecker::evalToUInt64(const Expr *E, ASTContext &ACtx, uint64_t &Out) {
+@@ -238,7 +246,6 @@                                                  llvm::DenseMap<const ValueDecl*, ArrayUseInfo> &Out) const {
+   if (!Body || !IVar) return;
+
+-  // Recursive walk
+   for (const Stmt *Child : Body->children()) {
+     if (!Child) continue;
+
+@@ -257,9 +264,17 @@             AU.ExampleUse = ASE;
+             Out.insert({V, AU});
+           } else {
+-            // Sizes should match for the same decl; keep the example if not set.
+-            if (!It->second.ExampleUse)
++            // Keep the earliest example use (by source order).
++            const SourceManager &SM = ACtx.getSourceManager();
++            if (It->second.ExampleUse) {
++              SourceLocation CurLoc = It->second.ExampleUse->getBeginLoc();
++              SourceLocation NewLoc = ASE->getBeginLoc();
++              if (SM.isBeforeInTranslationUnit(NewLoc, CurLoc)) {
++                It->second.ExampleUse = ASE;
++              }
++            } else {
+               It->second.ExampleUse = ASE;
++            }
+           }
+         }
+       }
+@@ -304,7 +319,6 @@     if (const auto *IS = dyn_cast<IfStmt>(Child)) {
+       const Expr *Cond = IS->getCond();
+       if (condHasIVarAgainstConst(Cond, IVar, SmallSize, ACtx)) {
+-        // Check then-branch for break or return
+         const Stmt *Then = IS->getThen();
+         if (!Then) continue;
+         if (findSpecificTypeInChildren<BreakStmt>(Then) ||
+@@ -312,13 +326,11 @@           return true;
+         }
+       }
+-      // Also check nested statements within If
+       if (hasGuardForBound(IS->getThen(), IVar, SmallSize, ACtx))
+         return true;
+       if (hasGuardForBound(IS->getElse(), IVar, SmallSize, ACtx))
+         return true;
+     } else {
+-      // Recurse
+       if (hasGuardForBound(Child, IVar, SmallSize, ACtx))
+         return true;
+     }
+@@ -327,7 +339,6 @@   return false;
+ }
+
+-// New: subtree containment helper.
+ bool SAGenTestChecker::containsStmt(const Stmt *Parent, const Stmt *Target) {
+   if (!Parent || !Target) return false;
+   if (Parent == Target) return true;
+@@ -339,7 +350,6 @@   return false;
+ }
+
+-// New: parse a simple binary condition on the loop index into a normalized form.
+ bool SAGenTestChecker::parseCondOnIVar(const Expr *Cond, const VarDecl *IVar, uint64_t &Const, GuardKind &Kind, ASTContext &ACtx) {
+   Kind = GuardKind::None;
+   if (!Cond) return false;
+@@ -389,7 +399,6 @@   return false;
+ }
+
+-// New: determine if a branch implies i within [0, SmallSize-1].
+ bool SAGenTestChecker::branchImpliesIndexInRange(GuardKind Kind, uint64_t Const, bool BranchWhenCondTrue,
+                                                  uint64_t SmallSize, uint64_t UB) {
+   if (Kind == GuardKind::None) return false;
+@@ -438,13 +447,11 @@   return false;
+ }
+
+-// New: check if the actual array subscript is within a branch/conditional that keeps i in range.
+ bool SAGenTestChecker::isIndexUseGuardedByBranch(const ArraySubscriptExpr *ASE, const VarDecl *IVar,
+                                                  uint64_t SmallSize, uint64_t UB, ASTContext &ACtx) {
+   if (!ASE) return false;
+
+   const Stmt *Node = ASE;
+-  // Walk up the parent chain (limit depth defensively).
+   for (unsigned Depth = 0; Depth < 64 && Node; ++Depth) {
+     auto Parents = ACtx.getParents(*Node);
+     if (Parents.empty())
+@@ -481,7 +488,7 @@       bool InThen = ThenS && containsStmt(ThenS, ASE);
+       bool InElse = ElseS && containsStmt(ElseS, ASE);
+       if (InThen || InElse) {
+-        bool BranchWhenCondTrue = InThen; // then-branch executes when condition true
++        bool BranchWhenCondTrue = InThen;
+         if (branchImpliesIndexInRange(GK, C, BranchWhenCondTrue, SmallSize, UB))
+           return true;
+       }
+@@ -493,15 +500,13 @@       Node = ParentStmt;
+       continue;
+     } else {
+-      // No more Stmt parents (could be Decl); stop.
+-      break;
+-    }
+-  }
+-
+-  return false;
+-}
+-
+-// Find the nearest enclosing IfStmt and whether ASE lies in its then/else branch.
++      break;
++    }
++  }
++
++  return false;
++}
++
+ const IfStmt *SAGenTestChecker::findEnclosingIfWithBranch(const Stmt *S, const Stmt *&OutBranch, ASTContext &ACtx) {
+   OutBranch = nullptr;
+   const Stmt *Node = S;
+@@ -533,7 +538,6 @@   return nullptr;
+ }
+
+-// Parse mapping guard: inst >= 0, inst > -1, inst != -1, inst == -1, inst < 0 (including commuted forms).
+ bool SAGenTestChecker::parseMappingGuard(const Expr *Cond, const VarDecl *&InstVar, bool &ValidWhenTrue, ASTContext &ACtx) {
+   InstVar = nullptr;
+   ValidWhenTrue = false;
+@@ -556,35 +560,33 @@     return evalToInt64(E, ACtx, C);
+   };
+
+-  // Try Var op Const
+   if (const VarDecl *VD = asVar(L)) {
+     int64_t Cst;
+     if (!asConst(R, Cst))
+       return false;
+     switch (BO->getOpcode()) {
+-      case BO_GE: if (Cst == 0) { InstVar = VD; ValidWhenTrue = true; return true; } break;   // inst >= 0
+-      case BO_GT: if (Cst == -1){ InstVar = VD; ValidWhenTrue = true; return true; } break;   // inst > -1
+-      case BO_NE: if (Cst == -1){ InstVar = VD; ValidWhenTrue = true; return true; } break;   // inst != -1
+-      case BO_EQ: if (Cst == -1){ InstVar = VD; ValidWhenTrue = false; return true; } break;  // inst == -1 => else is valid
+-      case BO_LT: if (Cst == 0) { InstVar = VD; ValidWhenTrue = false; return true; } break;  // inst < 0   => else is valid
+-      case BO_LE: if (Cst == -1){ InstVar = VD; ValidWhenTrue = false; return true; } break;  // inst <= -1 => else is valid
++      case BO_GE: if (Cst == 0) { InstVar = VD; ValidWhenTrue = true; return true; } break;
++      case BO_GT: if (Cst == -1){ InstVar = VD; ValidWhenTrue = true; return true; } break;
++      case BO_NE: if (Cst == -1){ InstVar = VD; ValidWhenTrue = true; return true; } break;
++      case BO_EQ: if (Cst == -1){ InstVar = VD; ValidWhenTrue = false; return true; } break;
++      case BO_LT: if (Cst == 0) { InstVar = VD; ValidWhenTrue = false; return true; } break;
++      case BO_LE: if (Cst == -1){ InstVar = VD; ValidWhenTrue = false; return true; } break;
+       default: break;
+     }
+     return false;
+   }
+
+-  // Try Const op Var (commuted)
+   if (const VarDecl *VD = asVar(R)) {
+     int64_t Cst;
+     if (!asConst(L, Cst))
+       return false;
+     switch (BO->getOpcode()) {
+-      case BO_LE: if (Cst == 0) { InstVar = VD; ValidWhenTrue = true; return true; } break;   // 0 <= inst  => inst >= 0
+-      case BO_LT: if (Cst == -1){ InstVar = VD; ValidWhenTrue = true; return true; } break;   // -1 < inst  => inst > -1
+-      case BO_NE: if (Cst == -1){ InstVar = VD; ValidWhenTrue = true; return true; } break;   // -1 != inst => same as inst != -1 (always true but handled)
+-      case BO_EQ: if (Cst == -1){ InstVar = VD; ValidWhenTrue = false; return true; } break;  // -1 == inst
+-      case BO_GT: if (Cst == 0) { InstVar = VD; ValidWhenTrue = false; return true; } break;  // 0 > inst   => inst < 0
+-      case BO_GE: if (Cst == -1){ InstVar = VD; ValidWhenTrue = false; return true; } break;  // -1 >= inst => inst <= -1
++      case BO_LE: if (Cst == 0) { InstVar = VD; ValidWhenTrue = true; return true; } break;
++      case BO_LT: if (Cst == -1){ InstVar = VD; ValidWhenTrue = true; return true; } break;
++      case BO_NE: if (Cst == -1){ InstVar = VD; ValidWhenTrue = true; return true; } break;
++      case BO_EQ: if (Cst == -1){ InstVar = VD; ValidWhenTrue = false; return true; } break;
++      case BO_GT: if (Cst == 0) { InstVar = VD; ValidWhenTrue = false; return true; } break;
++      case BO_GE: if (Cst == -1){ InstVar = VD; ValidWhenTrue = false; return true; } break;
+       default: break;
+     }
+     return false;
+@@ -601,12 +603,10 @@       break;
+     const DynTypedNode &DN = Parents[0];
+     if (const auto *CS = DN.get<CompoundStmt>()) {
+-      // Ensure S is a direct child of CS
+       for (const Stmt *Ch : CS->body()) {
+         if (Ch == S)
+           return CS;
+       }
+-      // If not a direct child, continue climbing.
+       Node = CS;
+       continue;
+     }
+@@ -626,7 +626,6 @@     if (Ch == IS)
+       break;
+
+-    // Decl with initializer: VarDecl InstVar = expr(i);
+     if (const auto *DS = dyn_cast<DeclStmt>(Ch)) {
+       for (const Decl *Di : DS->decls()) {
+         if (const auto *VD = dyn_cast<VarDecl>(Di)) {
+@@ -639,7 +638,6 @@       }
+     }
+
+-    // Assignment: InstVar = expr(i);
+     if (const auto *BO = dyn_cast<BinaryOperator>(Ch)) {
+       if (BO->getOpcode() == BO_Assign) {
+         const Expr *L = BO->getLHS()->IgnoreParenImpCasts();
+@@ -676,41 +674,214 @@ bool SAGenTestChecker::isGuardedByIndexMapping(const ArraySubscriptExpr *ASE, const VarDecl *IVar, ASTContext &ACtx) {
+   if (!ASE || !IVar) return false;
+
+-  // Find enclosing if and the branch containing ASE.
+   const Stmt *Branch = nullptr;
+   const IfStmt *IS = findEnclosingIfWithBranch(ASE, Branch, ACtx);
+   if (!IS || !Branch)
+     return false;
+
+-  // Parse mapping guard in the condition.
+   const VarDecl *InstVar = nullptr;
+   bool ValidWhenTrue = false;
+   if (!parseMappingGuard(IS->getCond(), InstVar, ValidWhenTrue, ACtx) || !InstVar)
+     return false;
+
+-  // Ensure ASE is under the "valid" branch of the guard.
+   bool InThen = containsStmt(IS->getThen(), ASE);
+   bool InElse = IS->getElse() && containsStmt(IS->getElse(), ASE);
+   if (!( (ValidWhenTrue && InThen) || (!ValidWhenTrue && InElse) ))
+     return false;
+
+-  // Find prior assignment/declaration setting InstVar from an expression involving IVar (inst = f(i)).
+   const CompoundStmt *CS = findDirectCompoundParent(IS, ACtx);
+   if (!hasPriorAssignFromIVar(CS, IS, InstVar, IVar))
+     return false;
+
+-  // Within the same valid branch, look for an array access indexed by InstVar (e.g., other[inst]).
+   if (!branchContainsArrayIndexWithVar(Branch, InstVar))
+     return false;
+
+-  // All mapping heuristics satisfied: suppress as guarded-by-mapping.
+   return true;
++}
++
++SAGenTestChecker::ExitKind SAGenTestChecker::getSimpleEarlyExit(const Stmt *S) {
++  if (!S) return ExitKind::None;
++
++  if (isa<ContinueStmt>(S))
++    return ExitKind::Continue;
++  if (isa<BreakStmt>(S))
++    return ExitKind::Break;
++  if (isa<ReturnStmt>(S))
++    return ExitKind::Return;
++
++  if (const auto *CS = dyn_cast<CompoundStmt>(S)) {
++    // Accept only a single-statement compound of the exit.
++    const Stmt *Only = nullptr;
++    for (const Stmt *Ch : CS->body()) {
++      if (!Ch) continue;
++      if (Only) {
++        Only = nullptr; // multiple statements -> not simple
++        break;
++      }
++      Only = Ch;
++    }
++    if (Only)
++      return getSimpleEarlyExit(Only);
++  }
++
++  return ExitKind::None;
++}
++
++bool SAGenTestChecker::branchImpliesIndexOutOfRange(GuardKind Kind, uint64_t Const, bool BranchWhenCondTrue,
++                                                    uint64_t SmallSize, ExitKind EK) {
++  if (Kind == GuardKind::None || EK == ExitKind::None) return false;
++
++  auto hasSmallMinus1 = [](uint64_t S, uint64_t &Out) -> bool {
++    if (S == 0) return false;
++    Out = S - 1;
++    return true;
++  };
++
++  bool IsContinue = (EK == ExitKind::Continue);
++  bool IsBreakOrReturn = (EK == ExitKind::Break || EK == ExitKind::Return);
++
++  uint64_t S1 = 0;
++  bool HasS1 = hasSmallMinus1(SmallSize, S1);
++
++  if (BranchWhenCondTrue) {
++    // Then-branch exits.
++    switch (Kind) {
++      case GuardKind::Ge:
++        if (Const == SmallSize) return true; // i >= S
++        break;
++      case GuardKind::Gt:
++        if (HasS1 && Const == S1) return true; // i > S-1
++        break;
++      case GuardKind::Eq:
++        if (IsBreakOrReturn && Const == SmallSize) return true; // i == S, terminate loop
++        break;
++      default:
++        break;
++    }
++  } else {
++    // Else-branch exits.
++    switch (Kind) {
++      case GuardKind::Lt:
++        if (Const == SmallSize) return true; // !(i < S) => i >= S
++        break;
++      case GuardKind::Le:
++        if (HasS1 && Const == S1) return true; // !(i <= S-1) => i >= S
++        break;
++      case GuardKind::Ne:
++        if (IsBreakOrReturn && Const == SmallSize) return true; // !(i != S) => i == S
++        break;
++      default:
++        break;
++    }
++  }
++
++  // For continue, disallow equality-based one-off guards (they don't protect the whole tail).
++  if (IsContinue) {
++    // We already only allowed Ge/Gt and Lt/Le exact thresholds; Eq/Ne were excluded above.
++    // Nothing additional needed here.
++  }
++
++  return false;
++}
++
++bool SAGenTestChecker::hasEarlyExitGuardBeforeUse(const ArraySubscriptExpr *Use, const VarDecl *IVar,
++                                                  uint64_t SmallSize, ASTContext &ACtx) {
++  if (!Use || !IVar) return false;
++
++  const Stmt *Node = Use;
++
++  // Climb ancestors; at each direct compound parent, scan earlier siblings for a guarding if.
++  for (unsigned Depth = 0; Depth < 64 && Node; ++Depth) {
++    const CompoundStmt *CS = nullptr;
++
++    // Find the immediate compound that directly contains Node as a child subtree.
++    const Stmt *Cur = Node;
++    for (unsigned D2 = 0; D2 < 64 && Cur; ++D2) {
++      auto Parents = ACtx.getParents(*Cur);
++      if (Parents.empty())
++        break;
++      const DynTypedNode &DN = Parents[0];
++      if (const auto *PCS = DN.get<CompoundStmt>()) {
++        // Ensure Cur is a direct child of PCS.
++        bool IsDirectChild = false;
++        for (const Stmt *Ch : PCS->body()) {
++          if (Ch == Cur) {
++            IsDirectChild = true;
++            break;
++          }
++        }
++        if (IsDirectChild) {
++          CS = PCS;
++          break;
++        } else {
++          Cur = PCS;
++          continue;
++        }
++      }
++      if (const auto *PStmt = DN.get<Stmt>()) {
++        Cur = PStmt;
++        continue;
++      }
++      break;
++    }
++
++    if (!CS)
++      break;
++
++    // Identify which child contains Node, and scan earlier siblings for guarding If.
++    unsigned IndexOfChild = 0;
++    bool FoundChild = false;
++    for (const Stmt *Ch : CS->body()) {
++      if (!Ch) { ++IndexOfChild; continue; }
++      if (containsStmt(Ch, Node)) {
++        FoundChild = true;
++        break;
++      }
++      ++IndexOfChild;
++    }
++
++    if (FoundChild) {
++      unsigned CurIdx = 0;
++      for (const Stmt *Ch : CS->body()) {
++        if (!Ch) { ++CurIdx; continue; }
++        if (CurIdx >= IndexOfChild)
++          break;
++
++        if (const auto *IS = dyn_cast<IfStmt>(Ch)) {
++          uint64_t C = 0;
++          GuardKind GK = GuardKind::None;
++          if (!parseCondOnIVar(IS->getCond(), IVar, C, GK, ACtx)) {
++            ++CurIdx;
++            continue;
++          }
++
++          ExitKind ThenEK = getSimpleEarlyExit(IS->getThen());
++          ExitKind ElseEK = getSimpleEarlyExit(IS->getElse());
++
++          if (ThenEK != ExitKind::None) {
++            if (branchImpliesIndexOutOfRange(GK, C, /*BranchWhenCondTrue=*/true, SmallSize, ThenEK))
++              return true;
++          }
++          if (ElseEK != ExitKind::None) {
++            if (branchImpliesIndexOutOfRange(GK, C, /*BranchWhenCondTrue=*/false, SmallSize, ElseEK))
++              return true;
++          }
++        }
++
++        ++CurIdx;
++      }
++    }
++
++    // Move Node up to this compound to continue climbing.
++    Node = CS;
++  }
++
++  return false;
+ }
+
+ void SAGenTestChecker::processForStmt(const ForStmt *FS, ASTContext &ACtx, BugReporter &BR) const {
+   if (!FS) return;
+
+-  // Extract loop condition: expect i < UB or i <= UB
+   const Expr *Cond = FS->getCond();
+   if (!Cond) return;
+
+@@ -730,25 +901,20 @@   if (!evalToUInt64(BO->getRHS(), ACtx, UB))
+     return;
+
+-  // Adjust for <= bound: effective iteration count (UB is the count of iterations).
+   if (Op == BO_LE)
+     UB = UB + 1;
+
+-  // Check increment is a simple increasing increment
+   if (!isSimpleIncreasingIncrement(FS->getInc(), IVar, ACtx))
+     return;
+
+-  // Check initializer sets i = 0
+   if (!isZeroInitOfVar(FS->getInit(), IVar, ACtx))
+     return;
+
+-  // Collect array uses indexed by i
+   llvm::DenseMap<const ValueDecl*, ArrayUseInfo> Uses;
+   collectArrayUsesIndexedBy(FS->getBody(), IVar, ACtx, Uses);
+   if (Uses.size() < 2)
+-    return; // Need at least two arrays A[i], B[i]
+-
+-  // Find any array with size == UB
++    return;
++
+   bool HasBoundArray = false;
+   for (const auto &It : Uses) {
+     if (It.second.Size == UB) {
+@@ -759,7 +925,6 @@   if (!HasBoundArray)
+     return;
+
+-  // Find a smaller array with size < UB
+   const ArrayUseInfo *Small = nullptr;
+   for (const auto &It : Uses) {
+     if (It.second.Size < UB) {
+@@ -770,22 +935,22 @@   if (!Small)
+     return;
+
+-  // Suppress if there is a loop-level guard like: if (i >= SmallSize) break/return;
+   if (hasGuardForBound(FS->getBody(), IVar, Small->Size, ACtx))
+     return;
+
+-  // Suppress if the specific use site is guarded by a branch/conditional ensuring i < SmallSize.
+   if (Small->ExampleUse &&
+       isIndexUseGuardedByBranch(Small->ExampleUse, IVar, Small->Size, UB, ACtx))
+     return;
+
+-  // Suppress if the specific use site is guarded by an instance-mapping pattern:
+-  //   inst = f(i); if (inst >= 0) { ... small[i] ... something[inst] ... }
+   if (Small->ExampleUse &&
+       isGuardedByIndexMapping(Small->ExampleUse, IVar, ACtx))
+     return;
+
+-  // Report bug at the smaller array access site (if available), otherwise at the for condition
++  // New suppression: early-exit guard before the use (e.g. if (i > S-1) continue;)
++  if (Small->ExampleUse &&
++      hasEarlyExitGuardBeforeUse(Small->ExampleUse, IVar, Small->Size, ACtx))
++    return;
++
+   SourceLocation Loc;
+   if (Small->ExampleUse)
+     Loc = Small->ExampleUse->getExprLoc();
+@@ -819,7 +984,6 @@
+   ASTContext &ACtx = Mgr.getASTContext();
+
+-  // Simple recursive traversal to find ForStmt
+   llvm::SmallVector<const Stmt*, 16> Stack;
+   Stack.push_back(Body);
+   while (!Stack.empty()) {

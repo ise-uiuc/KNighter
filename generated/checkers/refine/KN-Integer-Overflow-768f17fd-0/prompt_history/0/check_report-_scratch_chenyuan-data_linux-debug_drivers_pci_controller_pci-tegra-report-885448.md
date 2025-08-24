@@ -1,0 +1,369 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Left-shifting a 32-bit expression and only widening to 64-bit after the shift, causing the shift to be performed in 32-bit width and overflow/truncation before assignment:
+
+u64 tau4 = ((1 << x_w) | x) << y;   // shift happens in 32-bit -> overflow
+// Correct:
+u64 tau4 = (u64)((1 << x_w) | x) << y;
+
+Root cause: the shift is evaluated in the type of the left operand (u32), so bits are lost when y or the result exceeds 32 bits; casting must occur before the shift.
+
+## Bug Pattern
+
+Left-shifting a 32-bit expression and only widening to 64-bit after the shift, causing the shift to be performed in 32-bit width and overflow/truncation before assignment:
+
+u64 tau4 = ((1 << x_w) | x) << y;   // shift happens in 32-bit -> overflow
+// Correct:
+u64 tau4 = (u64)((1 << x_w) | x) << y;
+
+Root cause: the shift is evaluated in the type of the left operand (u32), so bits are lost when y or the result exceeds 32 bits; casting must occur before the shift.
+
+# Report
+
+### Report Summary
+
+File:| /scratch/chenyuan-data/linux-debug/drivers/pci/controller/pci-tegra.c
+---|---
+Warning:| line 1113, column 9
+Shift done in 32-bit, widened after; cast left operand to 64-bit before <<
+
+### Annotated Source Code
+
+
+331   |
+332   |  struct clk *pex_clk;
+333   |  struct clk *afi_clk;
+334   |  struct clk *pll_e;
+335   |  struct clk *cml_clk;
+336   |
+337   |  struct reset_control *pex_rst;
+338   |  struct reset_control *afi_rst;
+339   |  struct reset_control *pcie_xrst;
+340   |
+341   | 	bool legacy_phy;
+342   |  struct phy *phy;
+343   |
+344   |  struct tegra_msi msi;
+345   |
+346   |  struct list_head ports;
+347   | 	u32 xbar_config;
+348   |
+349   |  struct regulator_bulk_data *supplies;
+350   |  unsigned int num_supplies;
+351   |
+352   |  const struct tegra_pcie_soc *soc;
+353   |  struct dentry *debugfs;
+354   | };
+355   |
+356   | static inline struct tegra_pcie *msi_to_pcie(struct tegra_msi *msi)
+357   | {
+358   |  return container_of(msi, struct tegra_pcie, msi);
+359   | }
+360   |
+361   | struct tegra_pcie_port {
+362   |  struct tegra_pcie *pcie;
+363   |  struct device_node *np;
+364   |  struct list_head list;
+365   |  struct resource regs;
+366   |  void __iomem *base;
+367   |  unsigned int index;
+368   |  unsigned int lanes;
+369   |
+370   |  struct phy **phys;
+371   |
+372   |  struct gpio_desc *reset_gpio;
+373   | };
+374   |
+375   | static inline void afi_writel(struct tegra_pcie *pcie, u32 value,
+376   |  unsigned long offset)
+377   | {
+378   |  writel(value, pcie->afi + offset);
+379   | }
+380   |
+381   | static inline u32 afi_readl(struct tegra_pcie *pcie, unsigned long offset)
+382   | {
+383   |  return readl(pcie->afi + offset);
+384   | }
+385   |
+386   | static inline void pads_writel(struct tegra_pcie *pcie, u32 value,
+387   |  unsigned long offset)
+388   | {
+389   |  writel(value, pcie->pads + offset);
+390   | }
+391   |
+392   | static inline u32 pads_readl(struct tegra_pcie *pcie, unsigned long offset)
+393   | {
+394   |  return readl(pcie->pads + offset);
+395   | }
+396   |
+397   | /*
+398   |  * The configuration space mapping on Tegra is somewhat similar to the ECAM
+399   |  * defined by PCIe. However it deviates a bit in how the 4 bits for extended
+400   |  * register accesses are mapped:
+401   |  *
+402   |  *    [27:24] extended register number
+403   |  *    [23:16] bus number
+404   |  *    [15:11] device number
+405   |  *    [10: 8] function number
+406   |  *    [ 7: 0] register number
+407   |  *
+408   |  * Mapping the whole extended configuration space would require 256 MiB of
+409   |  * virtual address space, only a small part of which will actually be used.
+410   |  *
+411   |  * To work around this, a 4 KiB region is used to generate the required
+412   |  * configuration transaction with relevant B:D:F and register offset values.
+413   |  * This is achieved by dynamically programming base address and size of
+1038  |  if (err < 0)
+1039  |  dev_err(dev, "failed to power on PHY: %d\n", err);
+1040  |
+1041  |  return err;
+1042  | 	}
+1043  |
+1044  |  list_for_each_entry(port, &pcie->ports, list) {
+1045  | 		err = tegra_pcie_port_phy_power_on(port);
+1046  |  if (err < 0) {
+1047  |  dev_err(dev,
+1048  |  "failed to power on PCIe port %u PHY: %d\n",
+1049  |  port->index, err);
+1050  |  return err;
+1051  | 		}
+1052  | 	}
+1053  |
+1054  |  return 0;
+1055  | }
+1056  |
+1057  | static int tegra_pcie_phy_power_off(struct tegra_pcie *pcie)
+1058  | {
+1059  |  struct device *dev = pcie->dev;
+1060  |  struct tegra_pcie_port *port;
+1061  |  int err;
+1062  |
+1063  |  if (pcie->legacy_phy) {
+1064  |  if (pcie->phy)
+1065  | 			err = phy_power_off(pcie->phy);
+1066  |  else
+1067  | 			err = tegra_pcie_phy_disable(pcie);
+1068  |
+1069  |  if (err < 0)
+1070  |  dev_err(dev, "failed to power off PHY: %d\n", err);
+1071  |
+1072  |  return err;
+1073  | 	}
+1074  |
+1075  |  list_for_each_entry(port, &pcie->ports, list) {
+1076  | 		err = tegra_pcie_port_phy_power_off(port);
+1077  |  if (err < 0) {
+1078  |  dev_err(dev,
+1079  |  "failed to power off PCIe port %u PHY: %d\n",
+1080  |  port->index, err);
+1081  |  return err;
+1082  | 		}
+1083  | 	}
+1084  |
+1085  |  return 0;
+1086  | }
+1087  |
+1088  | static void tegra_pcie_enable_controller(struct tegra_pcie *pcie)
+1089  | {
+1090  |  const struct tegra_pcie_soc *soc = pcie->soc;
+1091  |  struct tegra_pcie_port *port;
+1092  |  unsigned long value;
+1093  |
+1094  |  /* enable PLL power down */
+1095  |  if (pcie->phy) {
+    6←Assuming field 'phy' is null→
+    7←Taking false branch→
+1096  | 		value = afi_readl(pcie, AFI_PLLE_CONTROL);
+1097  | 		value &= ~AFI_PLLE_CONTROL_BYPASS_PADS2PLLE_CONTROL;
+1098  | 		value |= AFI_PLLE_CONTROL_PADS2PLLE_CONTROL_EN;
+1099  | 		afi_writel(pcie, value, AFI_PLLE_CONTROL);
+1100  | 	}
+1101  |
+1102  |  /* power down PCIe slot clock bias pad */
+1103  |  if (soc->has_pex_bias_ctrl)
+    8←Assuming field 'has_pex_bias_ctrl' is false→
+    9←Taking false branch→
+1104  | 		afi_writel(pcie, 0, AFI_PEXBIAS_CTRL_0);
+1105  |
+1106  |  /* configure mode and disable all ports */
+1107  |  value = afi_readl(pcie, AFI_PCIE_CONFIG);
+1108  | 	value &= ~AFI_PCIE_CONFIG_SM2TMS0_XBAR_CONFIG_MASK;
+1109  | 	value |= AFI_PCIE_CONFIG_PCIE_DISABLE_ALL | pcie->xbar_config;
+1110  |  value |= AFI_PCIE_CONFIG_PCIE_CLKREQ_GPIO_ALL;
+1111  |
+1112  |  list_for_each_entry(port, &pcie->ports, list) {
+    10←Loop condition is true.  Entering loop body→
+1113  |  value &= ~AFI_PCIE_CONFIG_PCIE_DISABLE(port->index);
+    11←Assuming right operand of bit shift is less than 32→
+    12←Shift done in 32-bit, widened after; cast left operand to 64-bit before <<
+1114  | 		value &= ~AFI_PCIE_CONFIG_PCIE_CLKREQ_GPIO(port->index);
+1115  | 	}
+1116  |
+1117  | 	afi_writel(pcie, value, AFI_PCIE_CONFIG);
+1118  |
+1119  |  if (soc->has_gen2) {
+1120  | 		value = afi_readl(pcie, AFI_FUSE);
+1121  | 		value &= ~AFI_FUSE_PCIE_T0_GEN2_DIS;
+1122  | 		afi_writel(pcie, value, AFI_FUSE);
+1123  | 	} else {
+1124  | 		value = afi_readl(pcie, AFI_FUSE);
+1125  | 		value |= AFI_FUSE_PCIE_T0_GEN2_DIS;
+1126  | 		afi_writel(pcie, value, AFI_FUSE);
+1127  | 	}
+1128  |
+1129  |  /* Disable AFI dynamic clock gating and enable PCIe */
+1130  | 	value = afi_readl(pcie, AFI_CONFIGURATION);
+1131  | 	value |= AFI_CONFIGURATION_EN_FPCI;
+1132  | 	value |= AFI_CONFIGURATION_CLKEN_OVERRIDE;
+1133  | 	afi_writel(pcie, value, AFI_CONFIGURATION);
+1134  |
+1135  | 	value = AFI_INTR_EN_INI_SLVERR | AFI_INTR_EN_INI_DECERR |
+1136  |  AFI_INTR_EN_TGT_SLVERR | AFI_INTR_EN_TGT_DECERR |
+1137  |  AFI_INTR_EN_TGT_WRERR | AFI_INTR_EN_DFPCI_DECERR;
+1138  |
+1139  |  if (soc->has_intr_prsnt_sense)
+1140  | 		value |= AFI_INTR_EN_PRSNT_SENSE;
+1141  |
+1142  | 	afi_writel(pcie, value, AFI_AFI_INTR_ENABLE);
+1143  | 	afi_writel(pcie, 0xffffffff, AFI_SM_INTR_ENABLE);
+2691  |
+2692  | 	pci_stop_root_bus(host->bus);
+2693  | 	pci_remove_root_bus(host->bus);
+2694  | 	pm_runtime_put_sync(pcie->dev);
+2695  | 	pm_runtime_disable(pcie->dev);
+2696  |
+2697  |  if (IS_ENABLED(CONFIG_PCI_MSI))
+2698  | 		tegra_pcie_msi_teardown(pcie);
+2699  |
+2700  | 	tegra_pcie_put_resources(pcie);
+2701  |
+2702  |  list_for_each_entry_safe(port, tmp, &pcie->ports, list)
+2703  | 		tegra_pcie_port_free(port);
+2704  | }
+2705  |
+2706  | static int tegra_pcie_pm_suspend(struct device *dev)
+2707  | {
+2708  |  struct tegra_pcie *pcie = dev_get_drvdata(dev);
+2709  |  struct tegra_pcie_port *port;
+2710  |  int err;
+2711  |
+2712  |  list_for_each_entry(port, &pcie->ports, list)
+2713  | 		tegra_pcie_pme_turnoff(port);
+2714  |
+2715  | 	tegra_pcie_disable_ports(pcie);
+2716  |
+2717  |  /*
+2718  |  * AFI_INTR is unmasked in tegra_pcie_enable_controller(), mask it to
+2719  |  * avoid unwanted interrupts raised by AFI after pex_rst is asserted.
+2720  |  */
+2721  | 	tegra_pcie_disable_interrupts(pcie);
+2722  |
+2723  |  if (pcie->soc->program_uphy) {
+2724  | 		err = tegra_pcie_phy_power_off(pcie);
+2725  |  if (err < 0)
+2726  |  dev_err(dev, "failed to power off PHY(s): %d\n", err);
+2727  | 	}
+2728  |
+2729  | 	reset_control_assert(pcie->pex_rst);
+2730  | 	clk_disable_unprepare(pcie->pex_clk);
+2731  |
+2732  |  if (IS_ENABLED(CONFIG_PCI_MSI))
+2733  | 		tegra_pcie_disable_msi(pcie);
+2734  |
+2735  | 	pinctrl_pm_select_idle_state(dev);
+2736  | 	tegra_pcie_power_off(pcie);
+2737  |
+2738  |  return 0;
+2739  | }
+2740  |
+2741  | static int tegra_pcie_pm_resume(struct device *dev)
+2742  | {
+2743  |  struct tegra_pcie *pcie = dev_get_drvdata(dev);
+2744  |  int err;
+2745  |
+2746  | 	err = tegra_pcie_power_on(pcie);
+2747  |  if (err) {
+    1Assuming 'err' is 0→
+    2←Taking false branch→
+2748  |  dev_err(dev, "tegra pcie power on fail: %d\n", err);
+2749  |  return err;
+2750  | 	}
+2751  |
+2752  |  err = pinctrl_pm_select_default_state(dev);
+2753  |  if (err < 0) {
+    3←Assuming 'err' is >= 0→
+    4←Taking false branch→
+2754  |  dev_err(dev, "failed to disable PCIe IO DPD: %d\n", err);
+2755  |  goto poweroff;
+2756  | 	}
+2757  |
+2758  |  tegra_pcie_enable_controller(pcie);
+    5←Calling 'tegra_pcie_enable_controller'→
+2759  | 	tegra_pcie_setup_translations(pcie);
+2760  |
+2761  |  if (IS_ENABLED(CONFIG_PCI_MSI))
+2762  | 		tegra_pcie_enable_msi(pcie);
+2763  |
+2764  | 	err = clk_prepare_enable(pcie->pex_clk);
+2765  |  if (err) {
+2766  |  dev_err(dev, "failed to enable PEX clock: %d\n", err);
+2767  |  goto pex_dpd_enable;
+2768  | 	}
+2769  |
+2770  | 	reset_control_deassert(pcie->pex_rst);
+2771  |
+2772  |  if (pcie->soc->program_uphy) {
+2773  | 		err = tegra_pcie_phy_power_on(pcie);
+2774  |  if (err < 0) {
+2775  |  dev_err(dev, "failed to power on PHY(s): %d\n", err);
+2776  |  goto disable_pex_clk;
+2777  | 		}
+2778  | 	}
+2779  |
+2780  | 	tegra_pcie_apply_pad_settings(pcie);
+2781  | 	tegra_pcie_enable_ports(pcie);
+2782  |
+2783  |  return 0;
+2784  |
+2785  | disable_pex_clk:
+2786  | 	reset_control_assert(pcie->pex_rst);
+2787  | 	clk_disable_unprepare(pcie->pex_clk);
+2788  | pex_dpd_enable:
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

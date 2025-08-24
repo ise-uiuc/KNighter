@@ -1,0 +1,415 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 67801fa67b94ebd0e4da7a77ac2d9f321b75fbe0
+commit_type: UAF
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Decl.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/StringRef.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track the object pointer\
+  \ that gets published into a global ID registry.\n// Key: MemRegion of the pointer\
+  \ variable passed to publish API (e.g., xa_alloc third arg).\n// Val: the Stmt*\
+  \ of the publish call (for diagnostics).\nREGISTER_MAP_WITH_PROGRAMSTATE(PublishedMap,\
+  \ const MemRegion*, const Stmt*)\n// Avoid duplicate reports for the same region.\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(ReportedSet, const MemRegion*)\n\nnamespace {\n/*\
+  \ The checker callbacks are to be decided. */\nclass SAGenTestChecker : public Checker<\n\
+  \  check::PostCall,\n  check::PreCall,\n  check::Bind,\n  check::EndFunction\n>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Publish-before-finalization (UAF risk)\", \"Use-after-free\"\
+  )) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n    \
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;\n\
+  \      void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;\n\n\
+  \   private:\n\n      // Helpers\n      static bool isIoctlFunction(const CheckerContext\
+  \ &C);\n      static bool isPublishCall(const CallEvent &Call, unsigned &PtrParamIndex,\
+  \ CheckerContext &C);\n      static bool isPublishCallItself(const CallEvent &Call,\
+  \ const MemRegion *Published, CheckerContext &C);\n      static const MemRegion*\
+  \ getVarRegionFromArg(const Expr *E, CheckerContext &C);\n      static const VarDecl*\
+  \ getVarDeclFromRegion(const MemRegion *R);\n      static bool containsDeclRefToVD(const\
+  \ Stmt *S, const VarDecl *VD);\n      static bool exprContainsVarDecl(const Expr\
+  \ *E, const VarDecl *VD);\n      static bool exprIsWriteThroughVar(const Expr *E,\
+  \ const VarDecl *VD);\n      static void addPublishNote(PathSensitiveBugReport &R,\
+  \ const Stmt *PubStmt, CheckerContext &C);\n};\n\nbool SAGenTestChecker::isIoctlFunction(const\
+  \ CheckerContext &C) {\n  const LocationContext *LCtx = C.getLocationContext();\n\
+  \  if (!LCtx)\n    return false;\n  const Decl *D = LCtx->getDecl();\n  if (!D)\n\
+  \    return false;\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD)\n\
+  \    return false;\n  StringRef Name = FD->getName();\n  if (Name.empty())\n   \
+  \ return false;\n  std::string Lower = Name.lower();\n  return Lower.find(\"ioctl\"\
+  ) != std::string::npos;\n}\n\nbool SAGenTestChecker::isPublishCall(const CallEvent\
+  \ &Call, unsigned &PtrParamIndex, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // xarray\n  if (ExprHasName(Origin, \"\
+  xa_alloc\", C)) {\n    PtrParamIndex = 2;\n    return true;\n  }\n  if (ExprHasName(Origin,\
+  \ \"xa_alloc_cyclic\", C)) {\n    PtrParamIndex = 2;\n    return true;\n  }\n\n\
+  \  // idr\n  if (ExprHasName(Origin, \"idr_alloc\", C)) {\n    PtrParamIndex = 1;\n\
+  \    return true;\n  }\n  if (ExprHasName(Origin, \"idr_alloc_u32\", C)) {\n   \
+  \ PtrParamIndex = 1;\n    return true;\n  }\n  if (ExprHasName(Origin, \"idr_alloc_cyclic\"\
+  , C)) {\n    PtrParamIndex = 1;\n    return true;\n  }\n\n  return false;\n}\n\n\
+  const MemRegion* SAGenTestChecker::getVarRegionFromArg(const Expr *E, CheckerContext\
+  \ &C) {\n  if (!E)\n    return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(E,\
+  \ C);\n  if (!MR)\n    return nullptr;\n  MR = MR->getBaseRegion();\n  if (!MR)\n\
+  \    return nullptr;\n  if (!isa<VarRegion>(MR))\n    return nullptr;\n  return\
+  \ MR;\n}\n\nconst VarDecl* SAGenTestChecker::getVarDeclFromRegion(const MemRegion\
+  \ *R) {\n  if (!R)\n    return nullptr;\n  if (const auto *VR = dyn_cast<VarRegion>(R))\n\
+  \    return VR->getDecl();\n  return nullptr;\n}\n\nbool SAGenTestChecker::containsDeclRefToVD(const\
+  \ Stmt *S, const VarDecl *VD) {\n  if (!S || !VD)\n    return false;\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(S)) {\n    if (DRE->getDecl() == VD)\n     \
+  \ return true;\n  }\n  for (const Stmt *Child : S->children()) {\n    if (containsDeclRefToVD(Child,\
+  \ VD))\n      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::exprContainsVarDecl(const\
+  \ Expr *E, const VarDecl *VD) {\n  if (!E || !VD)\n    return false;\n  return containsDeclRefToVD(E,\
+  \ VD);\n}\n\nbool SAGenTestChecker::exprIsWriteThroughVar(const Expr *E, const VarDecl\
+  \ *VD) {\n  if (!E || !VD)\n    return false;\n  const Expr *EE = E->IgnoreParenCasts();\n\
+  \n  // q->field or q.field\n  if (const auto *ME = dyn_cast<MemberExpr>(EE)) {\n\
+  \    const Expr *Base = ME->getBase();\n    if (exprContainsVarDecl(Base, VD))\n\
+  \      return true;\n  }\n\n  // *q = ...\n  if (const auto *UO = dyn_cast<UnaryOperator>(EE))\
+  \ {\n    if (UO->getOpcode() == UO_Deref) {\n      const Expr *Sub = UO->getSubExpr();\n\
+  \      if (exprContainsVarDecl(Sub, VD))\n        return true;\n    }\n  }\n\n \
+  \ // q[i] = ...\n  if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(EE)) {\n \
+  \   const Expr *Base = ASE->getBase();\n    if (exprContainsVarDecl(Base, VD))\n\
+  \      return true;\n  }\n\n  // We intentionally do NOT treat a bare DeclRefExpr\
+  \ (i.e., \"q = ...\") as a write-through.\n  return false;\n}\n\nbool SAGenTestChecker::isPublishCallItself(const\
+  \ CallEvent &Call, const MemRegion *Published, CheckerContext &C) {\n  unsigned\
+  \ PI = 0;\n  if (!isPublishCall(Call, PI, C))\n    return false;\n  if (PI >= Call.getNumArgs())\n\
+  \    return false;\n\n  const Expr *ArgE = Call.getArgExpr(PI);\n  const MemRegion\
+  \ *MR = getVarRegionFromArg(ArgE, C);\n  if (!MR)\n    return false;\n  return MR->getBaseRegion()\
+  \ == Published->getBaseRegion();\n}\n\nvoid SAGenTestChecker::addPublishNote(PathSensitiveBugReport\
+  \ &R, const Stmt *PubStmt, CheckerContext &C) {\n  if (!PubStmt)\n    return;\n\
+  \  PathDiagnosticLocation PubLoc =\n      PathDiagnosticLocation::createBegin(PubStmt,\
+  \ C.getSourceManager(), C.getLocationContext());\n  R.addNote(\"Object published\
+  \ here (xa/id alloc)\", PubLoc);\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isIoctlFunction(C))\n    return;\n\
+  \n  unsigned PtrIndex = 0;\n  if (!isPublishCall(Call, PtrIndex, C))\n    return;\n\
+  \n  if (PtrIndex >= Call.getNumArgs())\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(PtrIndex);\n\
+  \  const MemRegion *MR = getVarRegionFromArg(ArgE, C);\n  if (!MR)\n    return;\n\
+  \n  ProgramStateRef State = C.getState();\n  const Stmt *S = Call.getOriginExpr();\n\
+  \  if (!S)\n    return;\n\n  // Record that MR has been published at S.\n  State\
+  \ = State->set<PublishedMap>(MR->getBaseRegion(), S);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  if (!isIoctlFunction(C))\n    return;\n\n  ProgramStateRef State =\
+  \ C.getState();\n  const auto *PM = State->get<PublishedMap>();\n  if (!PM || PM->empty())\n\
+  \    return;\n\n  // Skip reporting on the publish call itself.\n  // For other\
+  \ calls, if a published var is used as an argument, warn.\n  for (auto It = PM->begin();\
+  \ It != PM->end(); ++It) {\n    const MemRegion *PubReg = It->first;\n    const\
+  \ Stmt *PubStmt = It->second;\n\n    if (State->contains<ReportedSet>(PubReg))\n\
+  \      continue;\n\n    if (isPublishCallItself(Call, PubReg, C))\n      continue;\n\
+  \n    const VarDecl *VD = getVarDeclFromRegion(PubReg);\n    if (!VD)\n      continue;\n\
+  \n    bool Used = false;\n    for (unsigned i = 0, e = Call.getNumArgs(); i < e;\
+  \ ++i) {\n      const Expr *ArgE = Call.getArgExpr(i);\n      if (!ArgE)\n     \
+  \   continue;\n      if (exprContainsVarDecl(ArgE, VD)) {\n        Used = true;\n\
+  \        break;\n      }\n    }\n\n    if (Used) {\n      ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \      if (!N)\n        return;\n      auto Rpt = std::make_unique<PathSensitiveBugReport>(\n\
+  \          *BT, \"Object used after publishing into ID registry; publish must be\
+  \ last in ioctl\", N);\n      Rpt->addRange(Call.getSourceRange());\n      addPublishNote(*Rpt,\
+  \ PubStmt, C);\n      C.emitReport(std::move(Rpt));\n\n      State = State->add<ReportedSet>(PubReg);\n\
+  \      C.addTransition(State);\n      // Only report once per call for the first\
+  \ matching published region.\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  if (!isIoctlFunction(C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  const auto *PM = State->get<PublishedMap>();\n\
+  \  if (!PM || PM->empty() || !StoreE)\n    return;\n\n  const BinaryOperator *BO\
+  \ = findSpecificTypeInChildren<BinaryOperator>(StoreE);\n  if (!BO || !BO->isAssignmentOp())\n\
+  \    return;\n\n  const Expr *LHS = BO->getLHS();\n  if (!LHS)\n    return;\n\n\
+  \  for (auto It = PM->begin(); It != PM->end(); ++It) {\n    const MemRegion *PubReg\
+  \ = It->first;\n    const Stmt *PubStmt = It->second;\n\n    if (State->contains<ReportedSet>(PubReg))\n\
+  \      continue;\n\n    const VarDecl *VD = getVarDeclFromRegion(PubReg);\n    if\
+  \ (!VD)\n      continue;\n\n    if (exprIsWriteThroughVar(LHS, VD)) {\n      ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n      if (!N)\n        return;\n\n      auto\
+  \ Rpt = std::make_unique<PathSensitiveBugReport>(\n          *BT, \"ID allocated\
+  \ before final initialization; publish must be last to avoid UAF\", N);\n      Rpt->addRange(StoreE->getSourceRange());\n\
+  \      addPublishNote(*Rpt, PubStmt, C);\n      C.emitReport(std::move(Rpt));\n\n\
+  \      State = State->add<ReportedSet>(PubReg);\n      C.addTransition(State);\n\
+  \      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt\
+  \ *RS, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n  State\
+  \ = State->remove<PublishedMap>();\n  State = State->remove<ReportedSet>();\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects publishing objects into ID registries before final initialization\
+  \ (UAF risk) in ioctl paths\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ndrm/xe/queue: move xa_alloc to prevent UAF\n\nEvil\
+  \ user can guess the next id of the queue before the ioctl completes\nand then call\
+  \ queue destroy ioctl to trigger UAF since create ioctl is\nstill referencing the\
+  \ same queue. Move the xa_alloc all the way to the end\nto prevent this.\n\nv2:\n\
+  \ - Rebase\n\nFixes: 2149ded63079 (\"drm/xe: Fix use after free when client stats\
+  \ are captured\")\nSigned-off-by: Matthew Auld <matthew.auld@intel.com>\nCc: Matthew\
+  \ Brost <matthew.brost@intel.com>\nReviewed-by: Nirmoy Das <nirmoy.das@intel.com>\n\
+  Reviewed-by: Matthew Brost <matthew.brost@intel.com>\nLink: https://patchwork.freedesktop.org/patch/msgid/20240925071426.144015-4-matthew.auld@intel.com\n\
+  (cherry picked from commit 16536582ddbebdbdf9e1d7af321bbba2bf955a87)\nSigned-off-by:\
+  \ Lucas De Marchi <lucas.demarchi@intel.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ xe_exec_queue_create_ioctl in drivers/gpu/drm/xe/xe_exec_queue.c\nint xe_exec_queue_create_ioctl(struct\
+  \ drm_device *dev, void *data,\n\t\t\t       struct drm_file *file)\n{\n\tstruct\
+  \ xe_device *xe = to_xe_device(dev);\n\tstruct xe_file *xef = to_xe_file(file);\n\
+  \tstruct drm_xe_exec_queue_create *args = data;\n\tstruct drm_xe_engine_class_instance\
+  \ eci[XE_HW_ENGINE_MAX_INSTANCE];\n\tstruct drm_xe_engine_class_instance __user\
+  \ *user_eci =\n\t\tu64_to_user_ptr(args->instances);\n\tstruct xe_hw_engine *hwe;\n\
+  \tstruct xe_vm *vm;\n\tstruct xe_gt *gt;\n\tstruct xe_tile *tile;\n\tstruct xe_exec_queue\
+  \ *q = NULL;\n\tu32 logical_mask;\n\tu32 id;\n\tu32 len;\n\tint err;\n\n\tif (XE_IOCTL_DBG(xe,\
+  \ args->flags) ||\n\t    XE_IOCTL_DBG(xe, args->reserved[0] || args->reserved[1]))\n\
+  \t\treturn -EINVAL;\n\n\tlen = args->width * args->num_placements;\n\tif (XE_IOCTL_DBG(xe,\
+  \ !len || len > XE_HW_ENGINE_MAX_INSTANCE))\n\t\treturn -EINVAL;\n\n\terr = __copy_from_user(eci,\
+  \ user_eci,\n\t\t\t       sizeof(struct drm_xe_engine_class_instance) *\n\t\t\t\
+  \       len);\n\tif (XE_IOCTL_DBG(xe, err))\n\t\treturn -EFAULT;\n\n\tif (XE_IOCTL_DBG(xe,\
+  \ eci[0].gt_id >= xe->info.gt_count))\n\t\treturn -EINVAL;\n\n\tif (eci[0].engine_class\
+  \ == DRM_XE_ENGINE_CLASS_VM_BIND) {\n\t\tif (XE_IOCTL_DBG(xe, args->width != 1)\
+  \ ||\n\t\t    XE_IOCTL_DBG(xe, args->num_placements != 1) ||\n\t\t    XE_IOCTL_DBG(xe,\
+  \ eci[0].engine_instance != 0))\n\t\t\treturn -EINVAL;\n\n\t\tfor_each_tile(tile,\
+  \ xe, id) {\n\t\t\tstruct xe_exec_queue *new;\n\t\t\tu32 flags = EXEC_QUEUE_FLAG_VM;\n\
+  \n\t\t\tif (id)\n\t\t\t\tflags |= EXEC_QUEUE_FLAG_BIND_ENGINE_CHILD;\n\n\t\t\tnew\
+  \ = xe_exec_queue_create_bind(xe, tile, flags,\n\t\t\t\t\t\t\targs->extensions);\n\
+  \t\t\tif (IS_ERR(new)) {\n\t\t\t\terr = PTR_ERR(new);\n\t\t\t\tif (q)\n\t\t\t\t\t\
+  goto put_exec_queue;\n\t\t\t\treturn err;\n\t\t\t}\n\t\t\tif (id == 0)\n\t\t\t\t\
+  q = new;\n\t\t\telse\n\t\t\t\tlist_add_tail(&new->multi_gt_list,\n\t\t\t\t\t   \
+  \   &q->multi_gt_link);\n\t\t}\n\t} else {\n\t\tgt = xe_device_get_gt(xe, eci[0].gt_id);\n\
+  \t\tlogical_mask = calc_validate_logical_mask(xe, gt, eci,\n\t\t\t\t\t\t\t  args->width,\n\
+  \t\t\t\t\t\t\t  args->num_placements);\n\t\tif (XE_IOCTL_DBG(xe, !logical_mask))\n\
+  \t\t\treturn -EINVAL;\n\n\t\thwe = xe_hw_engine_lookup(xe, eci[0]);\n\t\tif (XE_IOCTL_DBG(xe,\
+  \ !hwe))\n\t\t\treturn -EINVAL;\n\n\t\tvm = xe_vm_lookup(xef, args->vm_id);\n\t\t\
+  if (XE_IOCTL_DBG(xe, !vm))\n\t\t\treturn -ENOENT;\n\n\t\terr = down_read_interruptible(&vm->lock);\n\
+  \t\tif (err) {\n\t\t\txe_vm_put(vm);\n\t\t\treturn err;\n\t\t}\n\n\t\tif (XE_IOCTL_DBG(xe,\
+  \ xe_vm_is_closed_or_banned(vm))) {\n\t\t\tup_read(&vm->lock);\n\t\t\txe_vm_put(vm);\n\
+  \t\t\treturn -ENOENT;\n\t\t}\n\n\t\tq = xe_exec_queue_create(xe, vm, logical_mask,\n\
+  \t\t\t\t\t args->width, hwe, 0,\n\t\t\t\t\t args->extensions);\n\t\tup_read(&vm->lock);\n\
+  \t\txe_vm_put(vm);\n\t\tif (IS_ERR(q))\n\t\t\treturn PTR_ERR(q);\n\n\t\tif (xe_vm_in_preempt_fence_mode(vm))\
+  \ {\n\t\t\tq->lr.context = dma_fence_context_alloc(1);\n\n\t\t\terr = xe_vm_add_compute_exec_queue(vm,\
+  \ q);\n\t\t\tif (XE_IOCTL_DBG(xe, err))\n\t\t\t\tgoto put_exec_queue;\n\t\t}\n\n\
+  \t\tif (q->vm && q->hwe->hw_engine_group) {\n\t\t\terr = xe_hw_engine_group_add_exec_queue(q->hwe->hw_engine_group,\
+  \ q);\n\t\t\tif (err)\n\t\t\t\tgoto put_exec_queue;\n\t\t}\n\t}\n\n\terr = xa_alloc(&xef->exec_queue.xa,\
+  \ &id, q, xa_limit_32b, GFP_KERNEL);\n\tif (err)\n\t\tgoto kill_exec_queue;\n\n\t\
+  args->exec_queue_id = id;\n\tq->xef = xe_file_get(xef);\n\n\treturn 0;\n\nkill_exec_queue:\n\
+  \txe_exec_queue_kill(q);\nput_exec_queue:\n\txe_exec_queue_put(q);\n\treturn err;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/gpu/drm/xe/xe_exec_queue.c\
+  \ b/drivers/gpu/drm/xe/xe_exec_queue.c\nindex 7743ebdcbf4b..d098d2dd1b2d 100644\n\
+  --- a/drivers/gpu/drm/xe/xe_exec_queue.c\n+++ b/drivers/gpu/drm/xe/xe_exec_queue.c\n\
+  @@ -635,12 +635,14 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void\
+  \ *data,\n \t\t}\n \t}\n \n+\tq->xef = xe_file_get(xef);\n+\n+\t/* user id alloc\
+  \ must always be last in ioctl to prevent UAF */\n \terr = xa_alloc(&xef->exec_queue.xa,\
+  \ &id, q, xa_limit_32b, GFP_KERNEL);\n \tif (err)\n \t\tgoto kill_exec_queue;\n\
+  \ \n \targs->exec_queue_id = id;\n-\tq->xef = xe_file_get(xef);\n \n \treturn 0;\n\
+  \ \n```\n"
+pattern: '## Bug Pattern
+
+
+  Publishing a newly created object into a globally accessible ID registry (e.g.,
+  xarray/idr via xa_alloc) before the object is fully initialized and before the creating
+  ioctl completes. Because the assigned ID is predictable/guessable, another thread
+  can issue a destroy/lookup using that ID during the creation path, freeing the object
+  while the creator still uses it, leading to a use-after-free.'
+plan: "Plan\n\n1) Program state customization\n- REGISTER_MAP_WITH_PROGRAMSTATE(PublishedMap,\
+  \ const MemRegion*, const Stmt*)\n  - Key: the MemRegion of the pointer variable\
+  \ that is published into an ID registry (e.g., xa_alloc\u2019s 3rd parameter).\n\
+  \  - Value: the Stmt of the publish call (used for bug location/notes).\n- REGISTER_SET_WITH_PROGRAMSTATE(ReportedSet,\
+  \ const MemRegion*)\n  - Tracks regions we have already reported on to avoid duplicate\
+  \ diagnostics on different paths/statements.\n\n2) Helper utilities\n- bool isIoctlFunction(const\
+  \ CheckerContext &C)\n  - Return true if the current function name contains \u201C\
+  ioctl\u201D (case-insensitive). This limits the checker to ioctl-like creation paths\
+  \ where the pattern is relevant.\n- Optional: bool isCreateLike(const CheckerContext\
+  \ &C)\n  - If desired to further reduce false positives, also allow names containing\
+  \ \u201Ccreate\u201D in addition to \u201Cioctl\u201D.\n- Optional: Small allowlist/denylist\
+  \ of publish APIs\n  - Recognize publish APIs and the index of the pointer argument:\n\
+  \    - xa_alloc: pointer arg index = 2\n    - xa_alloc_cyclic: pointer arg index\
+  \ = 2\n    - idr_alloc: pointer arg index = 1\n    - idr_alloc_u32: pointer arg\
+  \ index = 1\n    - idr_alloc_cyclic: pointer arg index = 1\n  - Implement a helper:\n\
+  \    - bool isPublishCall(const CallEvent &Call, unsigned &PtrParamIndex)\n    \
+  \  - Returns true and sets PtrParamIndex when the callee name matches any known\
+  \ publish API.\n- const MemRegion* getVarRegionFromArg(const Expr *E, CheckerContext\
+  \ &C)\n  - Use getMemRegionFromExpr(E, C). If it is non-null and corresponds to\
+  \ a local VarRegion (i.e., a simple DeclRefExpr to a pointer variable), use it as\
+  \ the key in PublishedMap.\n- StringRef getVarNameForRegion(const MemRegion *R)\n\
+  \  - If R is a VarRegion, return the VarDecl\u2019s name (used in matching and better\
+  \ diagnostics).\n- bool exprUsesPublishedVar(const Expr *E, const MemRegion *Published,\
+  \ CheckerContext &C)\n  - Detect whether expression E uses the published pointer\
+  \ variable.\n  - Prefer AST-based checks: if E contains a MemberExpr whose base\
+  \ is a DeclRefExpr bound to the same VarDecl as the Published MemRegion, return\
+  \ true. Also check ArraySubscriptExpr base and UnaryOperator deref (*) with base\
+  \ DeclRefExpr.\n  - As fallback, use ExprHasName(E, getVarNameForRegion(Published),\
+  \ C) and ensure it\u2019s a pointer dereference or member access (look for MemberExpr\
+  \ base or deref operator).\n- bool isPublishCallItself(const CallEvent &Call, const\
+  \ MemRegion *Published, CheckerContext &C)\n  - If the callee is a publish API and\
+  \ the pointer parameter matches the Published MemRegion, this is the publish call\
+  \ itself; do not report on it.\n\n3) checkPostCall\nGoal: detect the moment the\
+  \ object is published into the ID registry and mark it in state.\n- If not isIoctlFunction(C)\
+  \ return.\n- If isPublishCall(Call, PtrParamIndex) is true:\n  - Get the pointer\
+  \ argument expression ArgE = Call.getArgExpr(PtrParamIndex).\n  - Get the pointer\
+  \ variable region: PtrR = getVarRegionFromArg(ArgE, C). If null, ignore (we only\
+  \ handle simple pointer variables to minimize noise).\n  - Add (PtrR -> Call.getOriginExpr()\
+  \ or Call.getStmt()) to PublishedMap.\n  - Do not report here; just mark as published.\n\
+  \n4) checkBind\nGoal: after publish, any write to fields/deref of the published\
+  \ pointer (e.g., q->field = ...) indicates \u201Cpublish not last\u201D.\n- If PublishedMap\
+  \ empty, return.\n- Extract an assignment BinaryOperator from S using findSpecificTypeInChildren<BinaryOperator>(S).\
+  \ If not found or not an assignment, return.\n- Let LHS = BO->getLHS().\n- For each\
+  \ (PublishedRegion -> PubStmt) in PublishedMap:\n  - If PublishedRegion already\
+  \ in ReportedSet, continue.\n  - If exprUsesPublishedVar(LHS, PublishedRegion, C)\
+  \ is true and the use is a member access or deref (i.e., writing through q, not\
+  \ just rebinding the pointer q itself):\n    - Report a bug:\n      - Message: \u201C\
+  ID allocated before final initialization; publish must be last to avoid UAF.\u201D\
+  \n      - Primary location: the current statement S (the post-publish write).\n\
+  \      - Add a note at PubStmt: \u201CObject published here (xa_alloc/id[r])\u201D\
+  .\n    - Insert PublishedRegion into ReportedSet.\n\n5) checkPreCall\nGoal: after\
+  \ publish, any call that uses the published pointer (passing q or q->something)\
+  \ indicates \u201Cpublish not last\u201D.\n- If PublishedMap empty, return.\n- For\
+  \ each (PublishedRegion -> PubStmt) in PublishedMap:\n  - If PublishedRegion already\
+  \ in ReportedSet, continue.\n  - If isPublishCallItself(Call, PublishedRegion, C),\
+  \ continue (skip the publish call itself).\n  - Iterate over Call arguments:\n \
+  \   - If exprUsesPublishedVar(ArgE, PublishedRegion, C):\n      - Report a bug:\n\
+  \        - Message: \u201CObject used after publishing into ID registry; publish\
+  \ must be last in ioctl.\u201D\n        - Primary location: current call statement.\n\
+  \        - Add a note at PubStmt: \u201CObject published here (xa_alloc/id[r])\u201D\
+  .\n      - Insert PublishedRegion into ReportedSet.\n      - Break.\n\n6) Optional:\
+  \ checkLocation\nGoal: catch post-publish memory writes via pointer derefs not seen\
+  \ in checkBind (e.g., compound assignments or implicit stores).\n- If PublishedMap\
+  \ empty, return.\n- If IsLoad is false (store):\n  - Try to get a relevant LHS/Expr\
+  \ from S (e.g., via findSpecificTypeInChildren<MemberExpr/UnaryOperator/ArraySubscriptExpr>(S)).\n\
+  \  - If exprUsesPublishedVar(thatExpr, PublishedRegion, C) for any PublishedRegion\
+  \ not yet reported:\n    - Report as in checkBind.\n\n7) State cleanup\n- checkEndFunction:\
+  \ Clear all per-function tracking by returning State->remove(PublishedMap) and State->remove(ReportedSet).\
+  \ The analyzer will discard state anyway when the function ends; this keeps it explicit.\n\
+  \n8) Reporting details\n- Use std::make_unique<PathSensitiveBugReport> with a dedicated\
+  \ BugType (e.g., \u201CPublish-before-finalization (UAF risk)\u201D).\n- Keep the\
+  \ message short and clear:\n  - \u201CID allocated before final initialization;\
+  \ publish must be last to avoid UAF.\u201D\n- Attach the publish call site (PubStmt)\
+  \ as an additional note/source range, and the misuse site (store/call) as the primary\
+  \ location.\n\n9) Summary of the rule enforced\n- Within ioctl-like functions, after\
+  \ a call to xa_alloc/idr_alloc that publishes an object pointer:\n  - No writes\
+  \ through the object pointer (q->..., *q, q[i]) are allowed.\n  - No further function\
+  \ calls passing the object pointer (q or q->...) are allowed.\n  - In short: the\
+  \ publish must be the last operation in the creation ioctl (except writing out the\
+  \ new ID to the user args and returning). The checker warns on any post-publish\
+  \ use of the object pointer."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Decl.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/StringRef.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track the object pointer\
+  \ that gets published into a global ID registry.\n// Key: MemRegion of the pointer\
+  \ variable passed to publish API (e.g., xa_alloc third arg).\n// Val: the Stmt*\
+  \ of the publish call (for diagnostics).\nREGISTER_MAP_WITH_PROGRAMSTATE(PublishedMap,\
+  \ const MemRegion*, const Stmt*)\n// Avoid duplicate reports for the same region.\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(ReportedSet, const MemRegion*)\n\nnamespace {\n/*\
+  \ The checker callbacks are to be decided. */\nclass SAGenTestChecker : public Checker<\n\
+  \  check::PostCall,\n  check::PreCall,\n  check::Bind,\n  check::EndFunction\n>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Publish-before-finalization (UAF risk)\", \"Use-after-free\"\
+  )) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n    \
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;\n\
+  \      void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;\n\n\
+  \   private:\n\n      // Helpers\n      static bool isIoctlFunction(const CheckerContext\
+  \ &C);\n      static bool isPublishCall(const CallEvent &Call, unsigned &PtrParamIndex,\
+  \ CheckerContext &C);\n      static bool isPublishCallItself(const CallEvent &Call,\
+  \ const MemRegion *Published, CheckerContext &C);\n      static const MemRegion*\
+  \ getVarRegionFromArg(const Expr *E, CheckerContext &C);\n      static const VarDecl*\
+  \ getVarDeclFromRegion(const MemRegion *R);\n      static bool containsDeclRefToVD(const\
+  \ Stmt *S, const VarDecl *VD);\n      static bool exprContainsVarDecl(const Expr\
+  \ *E, const VarDecl *VD);\n      static bool exprIsWriteThroughVar(const Expr *E,\
+  \ const VarDecl *VD);\n      static void addPublishNote(PathSensitiveBugReport &R,\
+  \ const Stmt *PubStmt, CheckerContext &C);\n};\n\nbool SAGenTestChecker::isIoctlFunction(const\
+  \ CheckerContext &C) {\n  const LocationContext *LCtx = C.getLocationContext();\n\
+  \  if (!LCtx)\n    return false;\n  const Decl *D = LCtx->getDecl();\n  if (!D)\n\
+  \    return false;\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD)\n\
+  \    return false;\n  StringRef Name = FD->getName();\n  if (Name.empty())\n   \
+  \ return false;\n  std::string Lower = Name.lower();\n  return Lower.find(\"ioctl\"\
+  ) != std::string::npos;\n}\n\nbool SAGenTestChecker::isPublishCall(const CallEvent\
+  \ &Call, unsigned &PtrParamIndex, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // xarray\n  if (ExprHasName(Origin, \"\
+  xa_alloc\", C)) {\n    PtrParamIndex = 2;\n    return true;\n  }\n  if (ExprHasName(Origin,\
+  \ \"xa_alloc_cyclic\", C)) {\n    PtrParamIndex = 2;\n    return true;\n  }\n\n\
+  \  // idr\n  if (ExprHasName(Origin, \"idr_alloc\", C)) {\n    PtrParamIndex = 1;\n\
+  \    return true;\n  }\n  if (ExprHasName(Origin, \"idr_alloc_u32\", C)) {\n   \
+  \ PtrParamIndex = 1;\n    return true;\n  }\n  if (ExprHasName(Origin, \"idr_alloc_cyclic\"\
+  , C)) {\n    PtrParamIndex = 1;\n    return true;\n  }\n\n  return false;\n}\n\n\
+  const MemRegion* SAGenTestChecker::getVarRegionFromArg(const Expr *E, CheckerContext\
+  \ &C) {\n  if (!E)\n    return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(E,\
+  \ C);\n  if (!MR)\n    return nullptr;\n  MR = MR->getBaseRegion();\n  if (!MR)\n\
+  \    return nullptr;\n  if (!isa<VarRegion>(MR))\n    return nullptr;\n  return\
+  \ MR;\n}\n\nconst VarDecl* SAGenTestChecker::getVarDeclFromRegion(const MemRegion\
+  \ *R) {\n  if (!R)\n    return nullptr;\n  if (const auto *VR = dyn_cast<VarRegion>(R))\n\
+  \    return VR->getDecl();\n  return nullptr;\n}\n\nbool SAGenTestChecker::containsDeclRefToVD(const\
+  \ Stmt *S, const VarDecl *VD) {\n  if (!S || !VD)\n    return false;\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(S)) {\n    if (DRE->getDecl() == VD)\n     \
+  \ return true;\n  }\n  for (const Stmt *Child : S->children()) {\n    if (containsDeclRefToVD(Child,\
+  \ VD))\n      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::exprContainsVarDecl(const\
+  \ Expr *E, const VarDecl *VD) {\n  if (!E || !VD)\n    return false;\n  return containsDeclRefToVD(E,\
+  \ VD);\n}\n\nbool SAGenTestChecker::exprIsWriteThroughVar(const Expr *E, const VarDecl\
+  \ *VD) {\n  if (!E || !VD)\n    return false;\n  const Expr *EE = E->IgnoreParenCasts();\n\
+  \n  // q->field or q.field\n  if (const auto *ME = dyn_cast<MemberExpr>(EE)) {\n\
+  \    const Expr *Base = ME->getBase();\n    if (exprContainsVarDecl(Base, VD))\n\
+  \      return true;\n  }\n\n  // *q = ...\n  if (const auto *UO = dyn_cast<UnaryOperator>(EE))\
+  \ {\n    if (UO->getOpcode() == UO_Deref) {\n      const Expr *Sub = UO->getSubExpr();\n\
+  \      if (exprContainsVarDecl(Sub, VD))\n        return true;\n    }\n  }\n\n \
+  \ // q[i] = ...\n  if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(EE)) {\n \
+  \   const Expr *Base = ASE->getBase();\n    if (exprContainsVarDecl(Base, VD))\n\
+  \      return true;\n  }\n\n  // We intentionally do NOT treat a bare DeclRefExpr\
+  \ (i.e., \"q = ...\") as a write-through.\n  return false;\n}\n\nbool SAGenTestChecker::isPublishCallItself(const\
+  \ CallEvent &Call, const MemRegion *Published, CheckerContext &C) {\n  unsigned\
+  \ PI = 0;\n  if (!isPublishCall(Call, PI, C))\n    return false;\n  if (PI >= Call.getNumArgs())\n\
+  \    return false;\n\n  const Expr *ArgE = Call.getArgExpr(PI);\n  const MemRegion\
+  \ *MR = getVarRegionFromArg(ArgE, C);\n  if (!MR)\n    return false;\n  return MR->getBaseRegion()\
+  \ == Published->getBaseRegion();\n}\n\nvoid SAGenTestChecker::addPublishNote(PathSensitiveBugReport\
+  \ &R, const Stmt *PubStmt, CheckerContext &C) {\n  if (!PubStmt)\n    return;\n\
+  \  PathDiagnosticLocation PubLoc =\n      PathDiagnosticLocation::createBegin(PubStmt,\
+  \ C.getSourceManager(), C.getLocationContext());\n  R.addNote(\"Object published\
+  \ here (xa/id alloc)\", PubLoc);\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isIoctlFunction(C))\n    return;\n\
+  \n  unsigned PtrIndex = 0;\n  if (!isPublishCall(Call, PtrIndex, C))\n    return;\n\
+  \n  if (PtrIndex >= Call.getNumArgs())\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(PtrIndex);\n\
+  \  const MemRegion *MR = getVarRegionFromArg(ArgE, C);\n  if (!MR)\n    return;\n\
+  \n  ProgramStateRef State = C.getState();\n  const Stmt *S = Call.getOriginExpr();\n\
+  \  if (!S)\n    return;\n\n  // Record that MR has been published at S.\n  State\
+  \ = State->set<PublishedMap>(MR->getBaseRegion(), S);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  if (!isIoctlFunction(C))\n    return;\n\n  ProgramStateRef State =\
+  \ C.getState();\n  auto PM = State->get<PublishedMap>();\n  if (PM.isEmpty())\n\
+  \    return;\n\n  // Skip reporting on the publish call itself.\n  // For other\
+  \ calls, if a published var is used as an argument, warn.\n  for (auto It = PM.begin();\
+  \ It != PM.end(); ++It) {\n    const MemRegion *PubReg = It->first;\n    const Stmt\
+  \ *PubStmt = It->second;\n\n    if (State->contains<ReportedSet>(PubReg))\n    \
+  \  continue;\n\n    if (isPublishCallItself(Call, PubReg, C))\n      continue;\n\
+  \n    const VarDecl *VD = getVarDeclFromRegion(PubReg);\n    if (!VD)\n      continue;\n\
+  \n    bool Used = false;\n    for (unsigned i = 0, e = Call.getNumArgs(); i < e;\
+  \ ++i) {\n      const Expr *ArgE = Call.getArgExpr(i);\n      if (!ArgE)\n     \
+  \   continue;\n      if (exprContainsVarDecl(ArgE, VD)) {\n        Used = true;\n\
+  \        break;\n      }\n    }\n\n    if (Used) {\n      ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \      if (!N)\n        return;\n      auto Rpt = std::make_unique<PathSensitiveBugReport>(\n\
+  \          *BT, \"Object used after publishing into ID registry; publish must be\
+  \ last in ioctl\", N);\n      Rpt->addRange(Call.getSourceRange());\n      addPublishNote(*Rpt,\
+  \ PubStmt, C);\n      C.emitReport(std::move(Rpt));\n\n      State = State->add<ReportedSet>(PubReg);\n\
+  \      C.addTransition(State);\n      // Only report once per call for the first\
+  \ matching published region.\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  if (!isIoctlFunction(C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  auto PM = State->get<PublishedMap>();\n\
+  \  if (PM.isEmpty() || !StoreE)\n    return;\n\n  const BinaryOperator *BO = findSpecificTypeInChildren<BinaryOperator>(StoreE);\n\
+  \  if (!BO || !BO->isAssignmentOp())\n    return;\n\n  const Expr *LHS = BO->getLHS();\n\
+  \  if (!LHS)\n    return;\n\n  for (auto It = PM.begin(); It != PM.end(); ++It)\
+  \ {\n    const MemRegion *PubReg = It->first;\n    const Stmt *PubStmt = It->second;\n\
+  \n    if (State->contains<ReportedSet>(PubReg))\n      continue;\n\n    const VarDecl\
+  \ *VD = getVarDeclFromRegion(PubReg);\n    if (!VD)\n      continue;\n\n    if (exprIsWriteThroughVar(LHS,\
+  \ VD)) {\n      ExplodedNode *N = C.generateNonFatalErrorNode();\n      if (!N)\n\
+  \        return;\n\n      auto Rpt = std::make_unique<PathSensitiveBugReport>(\n\
+  \          *BT, \"ID allocated before final initialization; publish must be last\
+  \ to avoid UAF\", N);\n      Rpt->addRange(StoreE->getSourceRange());\n      addPublishNote(*Rpt,\
+  \ PubStmt, C);\n      C.emitReport(std::move(Rpt));\n\n      State = State->add<ReportedSet>(PubReg);\n\
+  \      C.addTransition(State);\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkEndFunction(const\
+  \ ReturnStmt *RS, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  State = State->remove<PublishedMap>();\n  State = State->remove<ReportedSet>();\n\
+  \  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\nextern \"C\" void\
+  \ clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects publishing objects into ID\
+  \ registries before final initialization (UAF risk) in ioctl paths\",\n      \"\"\
+  );\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

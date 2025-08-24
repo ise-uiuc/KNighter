@@ -1,0 +1,207 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -124,8 +124,14 @@     return Lexer::getSourceText(Range, SM, LangOpts);
+   }
+
++  static std::string toLowerCopy(StringRef S) {
++    std::string L = S.str();
++    std::transform(L.begin(), L.end(), L.begin(), ::tolower);
++    return L;
++  }
++
+   static bool nameLooksLikeCountBound(StringRef Name) {
+-    std::string Lower = Name.lower();
++    std::string Lower = toLowerCopy(Name);
+     if (Lower.find("max") != std::string::npos)
+       return true;
+     if (Lower.find("limit") != std::string::npos || Lower.find("lim") != std::string::npos)
+@@ -139,31 +145,55 @@     return false;
+   }
+
+-  static bool isDeclRefWithNameLikeCount(const Expr *E) {
++  static bool nameLooksLikeLengthOrSize(StringRef Name) {
++    std::string Lower = toLowerCopy(Name);
++    if (Lower.find("len") != std::string::npos ||
++        Lower.find("length") != std::string::npos ||
++        Lower.find("size") != std::string::npos ||
++        Lower.find("nbytes") != std::string::npos ||
++        Lower.find("bytes") != std::string::npos)
++      return true;
++    return false;
++  }
++
++  static bool nameLooksLikeCapacityOrMax(StringRef Name) {
++    std::string Lower = toLowerCopy(Name);
++    if (Lower.find("max_len") != std::string::npos ||
++        Lower.find("maxlen") != std::string::npos ||
++        Lower.find("max") != std::string::npos ||
++        Lower.find("cap") != std::string::npos ||
++        Lower.find("capacity") != std::string::npos ||
++        Lower.find("space") != std::string::npos ||
++        Lower.find("avail") != std::string::npos ||
++        Lower.find("limit") != std::string::npos ||
++        Lower.find("bound") != std::string::npos)
++      return true;
++    return false;
++  }
++
++  static StringRef getIdentNameFromExpr(const Expr *E) {
+     E = E ? E->IgnoreParenCasts() : nullptr;
+     if (!E)
+-      return false;
++      return StringRef();
+
+     if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+-      if (const auto *II = DRE->getDecl()->getIdentifier())
+-        return nameLooksLikeCountBound(II->getName());
+-      if (const NamedDecl *ND = dyn_cast<NamedDecl>(DRE->getDecl()))
+-        return nameLooksLikeCountBound(ND->getName());
+-    }
+-
++      if (const auto *I = DRE->getDecl()->getIdentifier())
++        return I->getName();
++      if (const auto *ND = dyn_cast<NamedDecl>(DRE->getDecl()))
++        return ND->getName();
++    }
+     if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+       if (const auto *ND = dyn_cast<NamedDecl>(ME->getMemberDecl()))
+-        return nameLooksLikeCountBound(ND->getName());
+-    }
+-
+-    return false;
++        return ND->getName();
++    }
++    return StringRef();
+   }
+
+   static bool isCompositeBoundExpr(const Expr *E) {
+     E = E ? E->IgnoreParenCasts() : nullptr;
+     if (!E)
+       return false;
+-    return !isa<DeclRefExpr>(E) && !isa<MemberExpr>(E);
++    return !isa<DeclRefExpr>(E) && !isa<MemberExpr>(E) && !isa<IntegerLiteral>(E);
+   }
+
+   static bool isUnarySizeOf(const Expr *E) {
+@@ -189,7 +219,8 @@     StringRef Txt = getExprText(RV, C);
+     if (Txt.contains("-E") || Txt.contains("ERR_PTR") || Txt.contains("error") ||
+         Txt.contains("-EINVAL") || Txt.contains("-EFAULT") || Txt.contains("-ENODATA") ||
+-        Txt.contains("-ENOLINK") || Txt.contains("-ENOLCK") || Txt.contains("-ERANGE"))
++        Txt.contains("-ENOLINK") || Txt.contains("-ENOLCK") || Txt.contains("-ERANGE") ||
++        Txt.contains("-ENAMETOOLONG") || Txt.contains("-ENOKEY"))
+       return true;
+
+     return false;
+@@ -207,15 +238,26 @@     return isLikelyErrorReturn(RS, C);
+   }
+
++  static bool rhsTextLooksMaxLike(const Expr *RHS, CheckerContext &C) {
++    StringRef Txt = getExprText(RHS, C);
++    std::string L = toLowerCopy(Txt);
++    // Detect macro-like names that indicate a bound even if RHS is an IntegerLiteral in the AST.
++    return (!L.empty() &&
++            (L.find("max") != std::string::npos ||
++             L.find("limit") != std::string::npos ||
++             L.find("bound") != std::string::npos));
++  }
++
+   static bool isPlainMaxLikeBound(const Expr *Bound, CheckerContext &C) {
+     if (!Bound)
+       return false;
+
+     Bound = Bound->IgnoreParenCasts();
+
+-    // Do not consider literal bounds here; reduces FPs like 'bits > 32'.
+-    if (isa<IntegerLiteral>(Bound))
+-      return false;
++    // Accept integer literal only if its source text still looks like a named MAX-like macro.
++    if (isa<IntegerLiteral>(Bound)) {
++      return rhsTextLooksMaxLike(Bound, C);
++    }
+
+     // Do not consider sizeof-style bounds.
+     if (isUnarySizeOf(Bound))
+@@ -225,7 +267,13 @@     if (isCompositeBoundExpr(Bound))
+       return false;
+
+-    return isDeclRefWithNameLikeCount(Bound);
++    // Named identifiers that look like capacity/limit.
++    StringRef Name = getIdentNameFromExpr(Bound);
++    if (!Name.empty())
++      return nameLooksLikeCapacityOrMax(Name) || nameLooksLikeCountBound(Name);
++
++    // Fallback to source text check.
++    return rhsTextLooksMaxLike(Bound, C);
+   }
+
+   static bool isLikelyIndexExpr(const Expr *E) {
+@@ -237,6 +285,11 @@     if (isa<IntegerLiteral>(E))
+       return false;
+
++    // If the expression is a named entity with length/size semantics, do not treat as index.
++    StringRef Name = getIdentNameFromExpr(E);
++    if (!Name.empty() && nameLooksLikeLengthOrSize(Name))
++      return false;
++
+     // We consider raw vars/fields or explicit array indices as index-like.
+     if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E) || isa<ArraySubscriptExpr>(E))
+       return true;
+@@ -248,10 +301,24 @@     if (!LHS || !RHS)
+       return false;
+
++    // Right side is sizeof capacity.
+     if (isUnarySizeOf(RHS))
+       return true;
+
++    // Left side is a strlen/strnlen result.
+     if (ExprHasName(LHS, "strlen", C) || ExprHasName(LHS, "strnlen", C))
++      return true;
++
++    // Heuristic: LHS name looks like a length/size, and RHS looks like a capacity/max.
++    StringRef LName = getIdentNameFromExpr(LHS);
++    StringRef RName = getIdentNameFromExpr(RHS);
++    if ((!LName.empty() && nameLooksLikeLengthOrSize(LName)) &&
++        ((!RName.empty() && nameLooksLikeCapacityOrMax(RName)) || rhsTextLooksMaxLike(RHS, C)))
++      return true;
++
++    // As a fallback, also treat explicit field named 'len'/'size' against RHS that mentions 'max' in token text as capacity checks.
++    if ((LName.equals_insensitive("len") || LName.equals_insensitive("length") || LName.equals_insensitive("size")) &&
++        rhsTextLooksMaxLike(RHS, C))
+       return true;
+
+     return false;
+@@ -283,7 +350,6 @@         if (const IdentifierInfo *II = FD->getIdentifier())
+           LHSCallHasBits = containsBitsToken(II->getName());
+       } else {
+-        // As a fallback, use source text.
+         LHSCallHasBits = containsBitsToken(LT);
+       }
+     }
+@@ -292,16 +358,12 @@   }
+
+   static bool isFalsePositive(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+-    (void)LHS;
+-
+     const Expr *R = RHS ? RHS->IgnoreParenCasts() : nullptr;
+     if (!R)
+       return true;
+
+-    // Reject integer literal RHS outright. This excludes many non-index guards,
+-    // including 'bits > 32' and similar.
+-    if (const auto *IL = dyn_cast<IntegerLiteral>(R)) {
+-      (void)IL;
++    // Reject integer literal RHS outright unless it looks like a MAX-like macro in source text.
++    if (isa<IntegerLiteral>(R) && !rhsTextLooksMaxLike(RHS, C)) {
+       return true;
+     }
+
+@@ -353,11 +415,11 @@     if (!LHS || !RHS)
+       return false;
+
+-    // LHS should look like an index.
++    // LHS should look like an index. Exclude size/len fields.
+     if (!isLikelyIndexExpr(LHS))
+       return false;
+
+-    // RHS should be a named MAX-like bound.
++    // RHS should be a named MAX-like bound (including macros that expand to integers).
+     if (!isPlainMaxLikeBound(RHS, C))
+       return false;

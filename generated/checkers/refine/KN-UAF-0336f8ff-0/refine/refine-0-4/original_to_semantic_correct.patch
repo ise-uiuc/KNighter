@@ -1,0 +1,298 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -32,7 +32,6 @@
+ REGISTER_MAP_WITH_PROGRAMSTATE(Priv2DevMap, const MemRegion*, const MemRegion*)
+ REGISTER_SET_WITH_PROGRAMSTATE(FreedDevs, const MemRegion*)
+-
+ // Directed map: pointer-typed storage region -> pointee region (optional tracking).
+ REGISTER_MAP_WITH_PROGRAMSTATE(PtrPointsTo, const MemRegion*, const MemRegion*)
+
+@@ -89,12 +88,29 @@
+   void reportUAFAtCall(const CallEvent &Call, CheckerContext &C, StringRef Msg) const;
+   void reportUAFAtStmt(const Stmt *S, CheckerContext &C, StringRef Msg) const;
++
++  // Type-based gating: only consider pointers to work/timer objects.
++  static bool isKernelTypeOneOf(const QualType &QT, ArrayRef<StringRef> Names);
++  static bool isWorkOrTimerPointerType(const QualType &QT);
++
++  // Attempt to resolve argument pointee region robustly (direct &member, or via
++  // a pointer variable tracked by PtrPointsTo, or direct region-valued pointer).
++  static const MemRegion *getArgPointeeRegion(const CallEvent &Call, unsigned ArgIdx,
++                                              CheckerContext &C, ProgramStateRef State);
++
++  // Heuristic FP filter before reporting.
++  static bool isFalsePositive(const CallEvent &Call, unsigned ArgIdx,
++                              CheckerContext &C, ProgramStateRef State,
++                              const MemRegion *ArgPointee);
++
++  // Resolve pointer variable -> pointee via state if available.
++  static const MemRegion *resolvePointerVarToPointee(ProgramStateRef State,
++                                                     const MemRegion *MaybePtrVar);
+ };
+
+ bool SAGenTestChecker::callHasName(const CallEvent &Call, CheckerContext &C, StringRef Name) {
+   if (const IdentifierInfo *ID = Call.getCalleeIdentifier())
+     return ID->getName() == Name;
+-  // Fallback on textual check if no identifier (macros, etc.)
+   const Expr *OriginExpr = Call.getOriginExpr();
+   if (!OriginExpr)
+     return false;
+@@ -128,13 +144,32 @@   return State->contains<FreedDevs>(DevBase);
+ }
+
++const MemRegion *SAGenTestChecker::resolvePointerVarToPointee(ProgramStateRef State,
++                                                              const MemRegion *MaybePtrVar) {
++  if (!MaybePtrVar) return nullptr;
++  const auto *TVR = dyn_cast<TypedValueRegion>(MaybePtrVar);
++  if (!TVR)
++    return MaybePtrVar;
++
++  QualType Ty = TVR->getValueType();
++  if (!Ty->isPointerType())
++    return MaybePtrVar;
++
++  if (const MemRegion *const *Pointee = State->get<PtrPointsTo>(MaybePtrVar)) {
++    return *Pointee;
++  }
++  return MaybePtrVar;
++}
++
+ const MemRegion *SAGenTestChecker::findDevForPrivDerivedRegion(ProgramStateRef State,
+                                                                const MemRegion *R,
+                                                                const MemRegion **OutPrivBase) {
+   if (!R) return nullptr;
+
++  // If R is a pointer variable we have a mapping for, resolve to pointee region.
++  R = resolvePointerVarToPointee(State, R);
++
+   // Walk up ancestor chain from R, looking for a priv base that we recorded.
+-  // We intentionally do NOT follow arbitrary alias maps to avoid false positives.
+   const MemRegion *Cur = R;
+   llvm::SmallPtrSet<const MemRegion*, 8> Visited;
+   while (Cur && Visited.insert(Cur).second) {
+@@ -143,8 +178,6 @@         *OutPrivBase = Cur;
+       return *DevBase;
+     }
+-
+-    // For subregions, climb to the super-region.
+     if (const auto *SR = dyn_cast<SubRegion>(Cur)) {
+       Cur = SR->getSuperRegion();
+       continue;
+@@ -195,7 +228,6 @@   if (!CE)
+     return false;
+
+-  // Try identifier of direct callee decl.
+   if (const FunctionDecl *FD = CE->getDirectCallee()) {
+     if (const IdentifierInfo *ID = FD->getIdentifier()) {
+       StringRef Fn = ID->getName();
+@@ -216,7 +248,6 @@     }
+   }
+
+-  // Fallback to textual match on callee subexpression.
+   if (const Expr *Callee = CE->getCallee()) {
+     static const char *Names[] = {
+         "cancel_work_sync",
+@@ -261,16 +292,15 @@     return false;
+
+   const SourceManager &SM = C.getSourceManager();
+-  SourceRange SR = S->getSourceRange();
+-  SourceLocation SBegin = SR.getBegin();
+-  SourceLocation SEnd = SR.getEnd();
++  const SourceRange SR = S->getSourceRange();
++  const SourceLocation SBegin = SR.getBegin();
++  const SourceLocation SEnd = SR.getEnd();
+
+   unsigned NumArgs = OutCE->getNumArgs();
+   for (unsigned i = 0; i < NumArgs; ++i) {
+     const Expr *Arg = OutCE->getArg(i);
+     if (!Arg) continue;
+     SourceRange AR = Arg->getSourceRange();
+-    // Check if S is within the source range of this argument (best-effort).
+     if (!AR.isValid())
+       continue;
+
+@@ -306,6 +336,98 @@   if (S)
+     R->addRange(S->getSourceRange());
+   C.emitReport(std::move(R));
++}
++
++bool SAGenTestChecker::isKernelTypeOneOf(const QualType &QT, ArrayRef<StringRef> Names) {
++  QualType T = QT;
++  if (T.isNull())
++    return false;
++
++  if (T->isPointerType())
++    T = T->getPointeeType();
++
++  T = T.getCanonicalType().getUnqualifiedType();
++  const Type *Ty = T.getTypePtrOrNull();
++  if (!Ty || !Ty->isRecordType())
++    return false;
++
++  const auto RT = T->getAs<RecordType>();
++  if (!RT)
++    return false;
++
++  const RecordDecl *RD = RT->getDecl();
++  if (!RD)
++    return false;
++
++  // Kernel uses 'struct work_struct', 'struct delayed_work', 'struct timer_list'.
++  IdentifierInfo *II = RD->getIdentifier();
++  if (!II)
++    return false;
++
++  StringRef Name = II->getName();
++  for (StringRef N : Names) {
++    if (Name == N)
++      return true;
++  }
++  return false;
++}
++
++bool SAGenTestChecker::isWorkOrTimerPointerType(const QualType &QT) {
++  if (QT.isNull() || !QT->isPointerType())
++    return false;
++  static const StringRef Names[] = {"work_struct", "delayed_work", "timer_list"};
++  return isKernelTypeOneOf(QT, Names);
++}
++
++const MemRegion *SAGenTestChecker::getArgPointeeRegion(const CallEvent &Call, unsigned ArgIdx,
++                                                       CheckerContext &C, ProgramStateRef State) {
++  if (ArgIdx >= Call.getNumArgs())
++    return nullptr;
++
++  const Expr *ArgE = Call.getArgExpr(ArgIdx);
++  if (!ArgE)
++    return nullptr;
++
++  // Try using symbolic value first: for pointer arguments, this often is the pointee region.
++  SVal V = Call.getArgSVal(ArgIdx);
++  if (const MemRegion *R = V.getAsRegion())
++    return getBaseRegionOrSelf(R);
++
++  // Fall back to expression-based region (for &member expressions).
++  if (const MemRegion *R2 = exprToRegion(ArgE, C))
++    return getBaseRegionOrSelf(R2);
++
++  // As another fallback, if ArgE is an lvalue pointer variable, resolve via PtrPointsTo.
++  if (const MemRegion *VarR = exprToBaseRegion(ArgE, C)) {
++    const MemRegion *Resolved = resolvePointerVarToPointee(State, VarR);
++    return getBaseRegionOrSelf(Resolved);
++  }
++
++  return nullptr;
++}
++
++bool SAGenTestChecker::isFalsePositive(const CallEvent &Call, unsigned ArgIdx,
++                                       CheckerContext &C, ProgramStateRef State,
++                                       const MemRegion *ArgPointee) {
++  // 1) The parameter must be a pointer to a work or timer type.
++  const Expr *ArgE = Call.getArgExpr(ArgIdx);
++  if (!ArgE)
++    return true;
++  QualType ArgTy = ArgE->getType();
++  if (!isWorkOrTimerPointerType(ArgTy))
++    return true;
++
++  // 2) The pointee must be provably within a tracked netdev priv region.
++  const MemRegion *PrivBase = nullptr;
++  const MemRegion *DevBase = findDevForPrivDerivedRegion(State, ArgPointee, &PrivBase);
++  if (!DevBase || !PrivBase)
++    return true;
++
++  // 3) If the dev isn't known freed, then this isn't our bug.
++  if (!devIsFreed(State, DevBase))
++    return true;
++
++  return false;
+ }
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -361,27 +483,23 @@     if (Idx >= Call.getNumArgs())
+       continue;
+
+-    const Expr *ArgE = Call.getArgExpr(Idx);
+-    const MemRegion *ArgReg = exprToRegion(ArgE, C);
+-    if (!ArgReg)
++    // Resolve pointee region of the argument robustly.
++    const MemRegion *ArgPointee = getArgPointeeRegion(Call, Idx, C, State);
++    if (!ArgPointee)
+       continue;
+
+-    const MemRegion *DevBase = findDevForPrivDerivedRegion(State, ArgReg);
+-    if (!DevBase)
++    // Filter out non-work/timer and non-priv cases early.
++    if (isFalsePositive(Call, Idx, C, State, ArgPointee))
+       continue;
+
+-    if (devIsFreed(State, DevBase)) {
+-      reportUAFAtCall(Call, C, "Use of netdev priv after free_netdev");
+-      return;
+-    }
++    // If we reached here, it's a proven use of a work/timer inside netdev priv after dev free.
++    reportUAFAtCall(Call, C, "Use of netdev priv after free_netdev");
++    return;
+   }
+ }
+
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+-  // To avoid false positives (e.g., loads from shared 'hw' objects that are
+-  // not inside netdev priv), only consider loads that happen as part of
+-  // arguments to functions that are known to synchronously dereference
+-  // work/timer objects (cancel_work_sync, etc.). All other loads are ignored.
++  // Only consider loads that happen as part of arguments to known-deref functions.
+   const CallExpr *CE = nullptr;
+   unsigned ArgIdx = 0;
+   if (!findEnclosingCallArg(S, C, CE, ArgIdx))
+@@ -391,8 +509,6 @@   if (!knownWorkOrTimerDerefCE(CE, C, DerefParams))
+     return;
+
+-  // Only proceed if the accessed location belongs to an argument that
+-  // is known to be dereferenced by the callee.
+   bool Matches = llvm::is_contained(DerefParams, ArgIdx);
+   if (!Matches)
+     return;
+@@ -401,18 +517,26 @@   if (!ArgE)
+     return;
+
+-  const MemRegion *ArgReg = exprToRegion(ArgE, C);
++  // Type-based gating to avoid noise.
++  if (!isWorkOrTimerPointerType(ArgE->getType()))
++    return;
++
++  ProgramStateRef State = C.getState();
++
++  // Try to resolve the pointee region of the argument.
++  SVal ArgSV = C.getState()->getSVal(ArgE, C.getLocationContext());
++  const MemRegion *ArgReg = ArgSV.getAsRegion();
+   if (!ArgReg)
+-    return;
+-
+-  ProgramStateRef State = C.getState();
++    ArgReg = exprToRegion(ArgE, C);
++  if (!ArgReg)
++    return;
++  ArgReg = getBaseRegionOrSelf(ArgReg);
+
+   const MemRegion *PrivBase = nullptr;
+   const MemRegion *DevBase = findDevForPrivDerivedRegion(State, ArgReg, &PrivBase);
+   if (!DevBase || !PrivBase)
+     return;
+
+-  // If the dev is freed, report at the call site.
+   if (devIsFreed(State, DevBase)) {
+     reportUAFAtStmt(CE, C, "Use of netdev priv after free_netdev");
+   }
+@@ -421,13 +545,11 @@ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+
+-  // Optionally track pointer variable -> pointee mapping (directed), but
+-  // do not chase it in reporting to avoid FPs.
++  // Track pointer variable -> pointee mapping (directed).
+   const MemRegion *LHS = Loc.getAsRegion();
+   if (!LHS)
+     return;
+
+-  // Only track for pointer-typed lvalues.
+   const auto *TVR = dyn_cast<TypedValueRegion>(LHS);
+   if (!TVR || !TVR->getValueType()->isPointerType())
+     return;

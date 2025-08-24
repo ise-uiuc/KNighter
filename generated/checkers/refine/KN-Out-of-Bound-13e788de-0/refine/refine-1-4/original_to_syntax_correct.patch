@@ -1,0 +1,174 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -15,6 +15,9 @@ #include "clang/StaticAnalyzer/Checkers/utility.h"
+ #include "clang/AST/ParentMapContext.h"
+ #include "clang/Lex/Lexer.h"
++#include <algorithm>
++#include <string>
++#include <cctype>
+
+ using namespace clang;
+ using namespace ento;
+@@ -172,6 +175,16 @@     return false;
+   }
+
++  static bool looksLikeCountOrOrdinalName(StringRef Name) {
++    if (Name.empty())
++      return false;
++    std::string L = toLowerCopy(Name);
++    return (L.find("count") != std::string::npos ||
++            L.find("num") != std::string::npos ||
++            L.find("_nr") != std::string::npos ||
++            L == "nr" || L == "cnt");
++  }
++
+   static StringRef getIdentNameFromExpr(const Expr *E) {
+     E = E ? E->IgnoreParenCasts() : nullptr;
+     if (!E)
+@@ -266,7 +279,7 @@
+     StringRef Name = getIdentNameFromExpr(Bound);
+     if (!Name.empty())
+-      return nameLooksLikeCapacityOrMax(Name) || nameLooksLikeCountBound(Name);
++      return nameLooksLikeCapacityOrMax(Name); // Do not treat *_count/*_num as MAX-like.
+
+     return rhsTextLooksMaxLike(Bound, C);
+   }
+@@ -384,8 +397,9 @@   }
+
+   static bool containsBitsToken(StringRef S) {
+-    StringRef L = S.lower();
+-    return L.contains("bit") || L.contains("bits");
++    std::string L = S.lower();
++    auto has = [&](const char *Tok){ return L.find(Tok) != std::string::npos; };
++    return has("bit") || has("bits");
+   }
+
+   static bool isBitWidthStyleGuard(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+@@ -535,6 +549,83 @@     }
+   }
+
++  static const Decl* getReferencedDecl(const Expr *E) {
++    if (!E) return nullptr;
++    E = E->IgnoreParenCasts();
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
++      return DRE->getDecl()->getCanonicalDecl();
++    if (const auto *ME = dyn_cast<MemberExpr>(E))
++      return ME->getMemberDecl()->getCanonicalDecl();
++    return nullptr;
++  }
++
++  static bool sameReferencedVar(const Expr *A, const Expr *B) {
++    const Decl *DA = getReferencedDecl(A);
++    const Decl *DB = getReferencedDecl(B);
++    return DA && DB && (DA == DB);
++  }
++
++  static bool isIntLiteralEqual(const Expr *E, unsigned V) {
++    E = E ? E->IgnoreParenCasts() : nullptr;
++    if (!E) return false;
++    if (const auto *IL = dyn_cast<IntegerLiteral>(E))
++      return IL->getValue() == V;
++    return false;
++  }
++
++  // Detect the 1-based ordinal guard pattern for the same LHS symbol:
++  // "!x" or "x == 0" or "x <= 0" or "x < 1"
++  static bool hasZeroOrOneGuardForVar(const Expr *E, const Expr *LHSVar, CheckerContext &C) {
++    if (!E || !LHSVar) return false;
++    E = E->IgnoreParenImpCasts();
++
++    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++      if (UO->getOpcode() == UO_LNot) {
++        const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
++        if (sameReferencedVar(Sub, LHSVar))
++          return true;
++      }
++      return hasZeroOrOneGuardForVar(UO->getSubExpr(), LHSVar, C);
++    }
++
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      BinaryOperatorKind Op = BO->getOpcode();
++      if (Op == BO_LAnd || Op == BO_LOr) {
++        return hasZeroOrOneGuardForVar(BO->getLHS(), LHSVar, C) ||
++               hasZeroOrOneGuardForVar(BO->getRHS(), LHSVar, C);
++      }
++
++      const Expr *L = BO->getLHS()->IgnoreParenImpCasts();
++      const Expr *R = BO->getRHS()->IgnoreParenImpCasts();
++
++      auto checkVarZero = [&](const Expr *VarSide, const Expr *OtherSide, BinaryOperatorKind Op2) -> bool {
++        if (!sameReferencedVar(VarSide, LHSVar))
++          return false;
++        if (Op2 == BO_EQ && isIntLiteralEqual(OtherSide, 0))
++          return true;
++        if (Op2 == BO_LE && isIntLiteralEqual(OtherSide, 0))
++          return true;
++        if (Op2 == BO_LT && isIntLiteralEqual(OtherSide, 1))
++          return true;
++        return false;
++      };
++
++      if (checkVarZero(L, R, Op) || checkVarZero(R, L, Op))
++        return true;
++
++      return hasZeroOrOneGuardForVar(BO->getLHS(), LHSVar, C) ||
++             hasZeroOrOneGuardForVar(BO->getRHS(), LHSVar, C);
++    }
++
++    if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
++      return hasZeroOrOneGuardForVar(CO->getCond(), LHSVar, C) ||
++             hasZeroOrOneGuardForVar(CO->getTrueExpr(), LHSVar, C) ||
++             hasZeroOrOneGuardForVar(CO->getFalseExpr(), LHSVar, C);
++    }
++
++    return false;
++  }
++
+   // Enhanced to use RHS context for range-endpoint suppression.
+   static bool isLikelyIndexExpr(const Expr *E, const Expr *RHSForContext = nullptr, CheckerContext *PCtx = nullptr) {
+     E = E ? E->IgnoreParenCasts() : nullptr;
+@@ -544,20 +635,27 @@     if (isa<IntegerLiteral>(E))
+       return false;
+
++    // Array indexing is always index-like.
++    if (isa<ArraySubscriptExpr>(E))
++      return true;
++
+     StringRef Name = getIdentNameFromExpr(E);
+-    if (!Name.empty() && nameLooksLikeLengthOrSize(Name))
+-      return false;
+-
+-    // If LHS name looks like a range "min/start/lo" endpoint, and RHS is max-like, suppress.
+-    if (!Name.empty() && nameHasTokenMin(Name)) {
+-      if (RHSForContext) {
+-        // If RHS looks max-like in name or text, treat LHS as not index.
+-        if (rhsHasMaxTokenOrText(RHSForContext, *PCtx))
+-          return false;
++    if (!Name.empty()) {
++      if (nameLooksLikeLengthOrSize(Name))
++        return false;
++      // New: exclude count/ordinal-like names from being treated as indices.
++      if (looksLikeCountOrOrdinalName(Name))
++        return false;
++      // If LHS name looks like a range "min/start/lo" endpoint, and RHS is max-like, suppress.
++      if (nameHasTokenMin(Name)) {
++        if (RHSForContext && PCtx) {
++          if (rhsHasMaxTokenOrText(RHSForContext, *PCtx))
++            return false;
++        }
+       }
+     }
+
+-    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E) || isa<ArraySubscriptExpr>(E))
++    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E))
+       return true;
+
+     return false;
+@@ -618,6 +716,10 @@
+   for (const BinaryOperator *BO : GtComps) {
+     if (!isCandidateGtComparison(BO, C))
++      continue;
++
++    // Suppress the common 1-based ordinal check: (!x || x == 0/<=0/<1) || (x > Bound)
++    if (hasZeroOrOneGuardForVar(CondE, BO->getLHS(), C))
+       continue;
+
+     ExplodedNode *N = C.generateNonFatalErrorNode();

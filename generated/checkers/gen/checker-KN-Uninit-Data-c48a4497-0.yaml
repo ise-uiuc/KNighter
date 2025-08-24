@@ -1,0 +1,315 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: c48a4497356f701f94f1951626637ae240af909e
+commit_type: Uninit-Data
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track out-params (e.g.,\
+  \ 'fw') passed to request_firmware() when the return\n// value is ignored. We map\
+  \ the variable's MemRegion to a boolean marker.\nREGISTER_MAP_WITH_PROGRAMSTATE(OutParamNeedingRetCheck,\
+  \ const MemRegion*, bool)\n\nnamespace {\n/* The checker callbacks are to be decided.\
+  \ */\nclass SAGenTestChecker : public Checker<check::PostCall, check::PreCall, check::Location>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Uninitialized firmware pointer use\", \"API Misuse\"\
+  )) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n    \
+  \  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;\n\
+  \n   private:\n\n      // Helpers\n      static bool isRequestFirmware(const CallEvent\
+  \ &Call, CheckerContext &C);\n      static bool isReleaseFirmware(const CallEvent\
+  \ &Call, CheckerContext &C);\n      static bool isCallResultIgnored(const CallEvent\
+  \ &Call, CheckerContext &C);\n\n      static const MemRegion *getOutParamRegionFromArg0(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static const MemRegion *getVarRegionFromDeclRefExpr(const\
+  \ Expr *E, CheckerContext &C);\n\n      void reportUse(const MemRegion *MR, CheckerContext\
+  \ &C, const Stmt *S) const;\n      void reportRelease(const MemRegion *MR, CheckerContext\
+  \ &C, const CallEvent &Call) const;\n};\n\n// Check function name via source text\
+  \ for accuracy.\nbool SAGenTestChecker::isRequestFirmware(const CallEvent &Call,\
+  \ CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n\
+  \    return false;\n  return ExprHasName(Origin, \"request_firmware\", C);\n}\n\n\
+  bool SAGenTestChecker::isReleaseFirmware(const CallEvent &Call, CheckerContext &C)\
+  \ {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\
+  \  return ExprHasName(Origin, \"release_firmware\", C);\n}\n\n// Determine if the\
+  \ return value of the call is ignored (bare statement).\nbool SAGenTestChecker::isCallResultIgnored(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // If the call is directly used in a condition,\
+  \ assignment, declaration\n  // (with initializer), or return, we consider it not\
+  \ ignored.\n  if (findSpecificTypeInParents<IfStmt>(Origin, C))\n    return false;\n\
+  \n  if (const auto *BO = findSpecificTypeInParents<BinaryOperator>(Origin, C)) {\n\
+  \    if (BO->isAssignmentOp())\n      return false;\n  }\n\n  if (findSpecificTypeInParents<DeclStmt>(Origin,\
+  \ C))\n    return false;\n\n  if (findSpecificTypeInParents<ReturnStmt>(Origin,\
+  \ C))\n    return false;\n\n  return true;\n}\n\n// Get the MemRegion of the out-parameter\
+  \ (variable region) from arg0 (&fw).\nconst MemRegion *SAGenTestChecker::getOutParamRegionFromArg0(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  // First try via the SVal of the first\
+  \ argument, which should be &fw (address of the variable).\n  SVal Arg0 = Call.getArgSVal(0);\n\
+  \  if (const MemRegion *R = Arg0.getAsRegion()) {\n    R = R->getBaseRegion();\n\
+  \    if (R)\n      return R;\n  }\n\n  // Fallback: find a DeclRefExpr inside arg0\
+  \ and get its variable region.\n  const Expr *ArgE = Call.getArgExpr(0);\n  if (!ArgE)\n\
+  \    return nullptr;\n  const DeclRefExpr *DRE = findSpecificTypeInChildren<DeclRefExpr>(ArgE);\n\
+  \  if (!DRE)\n    return nullptr;\n\n  return getVarRegionFromDeclRefExpr(DRE, C);\n\
+  }\n\n// Obtain the VarRegion corresponding to a DeclRefExpr of a variable.\nconst\
+  \ MemRegion *SAGenTestChecker::getVarRegionFromDeclRefExpr(const Expr *E, CheckerContext\
+  \ &C) {\n  if (!E)\n    return nullptr;\n  const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenCasts());\n\
+  \  if (!DRE)\n    return nullptr;\n  const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \  if (!VD)\n    return nullptr;\n\n  SVal LV = C.getSValBuilder().getLValue(VD,\
+  \ C.getLocationContext());\n  const MemRegion *MR = LV.getAsRegion();\n  if (!MR)\n\
+  \    return nullptr;\n  return MR->getBaseRegion();\n}\n\n// After calling request_firmware(&fw,\
+  \ ...), if the return is ignored,\n// mark 'fw' as requiring a return-code check\
+  \ before use.\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (!isRequestFirmware(Call, C))\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  const MemRegion *OutR = getOutParamRegionFromArg0(Call,\
+  \ C);\n  if (!OutR)\n    return;\n\n  if (isCallResultIgnored(Call, C)) {\n    State\
+  \ = State->set<OutParamNeedingRetCheck>(OutR, true);\n    C.addTransition(State);\n\
+  \  }\n}\n\n// Before calling release_firmware(fw), report if 'fw' came from a\n\
+  // request_firmware() whose return was ignored.\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isReleaseFirmware(Call, C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n\n  const Expr *Arg0E =\
+  \ Call.getArgExpr(0);\n  if (!Arg0E)\n    return;\n\n  const DeclRefExpr *DRE =\
+  \ findSpecificTypeInChildren<DeclRefExpr>(Arg0E);\n  const MemRegion *VarR = nullptr;\n\
+  \  if (DRE)\n    VarR = getVarRegionFromDeclRefExpr(DRE, C);\n\n  if (!VarR)\n \
+  \   return;\n\n  VarR = VarR->getBaseRegion();\n  const bool *Marked = State->get<OutParamNeedingRetCheck>(VarR);\n\
+  \  if (Marked && *Marked) {\n    reportRelease(VarR, C, Call);\n    // Erase to\
+  \ avoid duplicate reports along this path.\n    State = State->remove<OutParamNeedingRetCheck>(VarR);\n\
+  \    C.addTransition(State);\n  }\n}\n\n// When the firmware out-param variable\
+  \ is read (e.g., if (!fw)),\n// report if the earlier request_firmware() return\
+  \ was ignored.\nvoid SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const\
+  \ Stmt *S, CheckerContext &C) const {\n  if (!IsLoad)\n    return;\n\n  const MemRegion\
+  \ *R = Loc.getAsRegion();\n  if (!R)\n    return;\n\n  R = R->getBaseRegion();\n\
+  \  ProgramStateRef State = C.getState();\n  const bool *Marked = State->get<OutParamNeedingRetCheck>(R);\n\
+  \  if (Marked && *Marked) {\n    reportUse(R, C, S);\n    State = State->remove<OutParamNeedingRetCheck>(R);\n\
+  \    C.addTransition(State);\n  }\n}\n\nvoid SAGenTestChecker::reportUse(const MemRegion\
+  \ *MR, CheckerContext &C, const Stmt *S) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"request_firmware() return ignored; using firmware out-parameter\"\
+  , N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::reportRelease(const MemRegion *MR, CheckerContext &C,\
+  \ const CallEvent &Call) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"request_firmware() return ignored; releasing uninitialized firmware\
+  \ pointer\", N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects ignoring request_firmware return and using/releasing the out-parameter\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nASoC: sma1307: fix uninitialized variable refence\n\
+  \nWhen firmware loading is disabled, gcc warns that the local\n'fw' variable fails\
+  \ to get initialized:\n\nsound/soc/codecs/sma1307.c: In function 'sma1307_setting_loaded.isra':\n\
+  sound/soc/codecs/sma1307.c:1717:12: error: 'fw' is used uninitialized [-Werror=uninitialized]\n\
+  \ 1717 |         if (!fw) {\n      |            ^\nsound/soc/codecs/sma1307.c:1712:32:\
+  \ note: 'fw' was declared here\n 1712 |         const struct firmware *fw;\n\nCheck\
+  \ the return code from request_firmware() to ensure that the\nfirmware is correctly\
+  \ set, and drop the incorrect release_firmware()\non that uninitialized data.\n\n\
+  Fixes: 576c57e6b4c1 (\"ASoC: sma1307: Add driver for Iron Device SMA1307\")\nSigned-off-by:\
+  \ Arnd Bergmann <arnd@arndb.de>\nLink: https://patch.msgid.link/20241113175734.2443315-1-arnd@kernel.org\n\
+  Signed-off-by: Mark Brown <broonie@kernel.org>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ sma1307_setting_loaded in sound/soc/codecs/sma1307.c\nstatic void sma1307_setting_loaded(struct\
+  \ sma1307_priv *sma1307, const char *file)\n{\n\tconst struct firmware *fw;\n\t\
+  int *data, size, offset, num_mode;\n\n\trequest_firmware(&fw, file, sma1307->dev);\n\
+  \n\tif (!fw) {\n\t\tdev_err(sma1307->dev, \"%s: failed to read \\\"%s\\\"\\n\",\n\
+  \t\t\t__func__, setting_file);\n\t\trelease_firmware(fw);\n\t\tsma1307->set.status\
+  \ = false;\n\t\treturn;\n\t} else if ((fw->size) < SMA1307_SETTING_HEADER_SIZE)\
+  \ {\n\t\tdev_err(sma1307->dev, \"%s: Invalid file\\n\", __func__);\n\t\trelease_firmware(fw);\n\
+  \t\tsma1307->set.status = false;\n\t\treturn;\n\t}\n\n\tdata = kzalloc(fw->size,\
+  \ GFP_KERNEL);\n\tsize = fw->size >> 2;\n\tmemcpy(data, fw->data, fw->size);\n\n\
+  \trelease_firmware(fw);\n\n\t/* HEADER */\n\tsma1307->set.header_size = SMA1307_SETTING_HEADER_SIZE;\n\
+  \tsma1307->set.checksum = data[sma1307->set.header_size - 2];\n\tsma1307->set.num_mode\
+  \ = data[sma1307->set.header_size - 1];\n\tnum_mode = sma1307->set.num_mode;\n\t\
+  sma1307->set.header = devm_kzalloc(sma1307->dev,\n\t\t\t\t\t   sma1307->set.header_size,\n\
+  \t\t\t\t\t   GFP_KERNEL);\n\tmemcpy(sma1307->set.header, data,\n\t       sma1307->set.header_size\
+  \ * sizeof(int));\n\n\tif ((sma1307->set.checksum >> 8) != SMA1307_SETTING_CHECKSUM)\
+  \ {\n\t\tdev_err(sma1307->dev, \"%s: failed by dismatch \\\"%s\\\"\\n\",\n\t\t\t\
+  __func__, setting_file);\n\t\tsma1307->set.status = false;\n\t\treturn;\n\t}\n\n\
+  \t/* DEFAULT */\n\tsma1307->set.def_size = SMA1307_SETTING_DEFAULT_SIZE;\n\tsma1307->set.def\n\
+  \t    = devm_kzalloc(sma1307->dev,\n\t\t\t   sma1307->set.def_size * sizeof(int),\
+  \ GFP_KERNEL);\n\tmemcpy(sma1307->set.def,\n\t       &data[sma1307->set.header_size],\n\
+  \t       sma1307->set.def_size * sizeof(int));\n\n\t/* MODE */\n\toffset = sma1307->set.header_size\
+  \ + sma1307->set.def_size;\n\tsma1307->set.mode_size = DIV_ROUND_CLOSEST(size -\
+  \ offset, num_mode + 1);\n\tfor (int i = 0; i < num_mode; i++) {\n\t\tsma1307->set.mode_set[i]\n\
+  \t\t    = devm_kzalloc(sma1307->dev,\n\t\t\t\t   sma1307->set.mode_size * 2 * sizeof(int),\n\
+  \t\t\t\t   GFP_KERNEL);\n\t\tfor (int j = 0; j < sma1307->set.mode_size; j++) {\n\
+  \t\t\tsma1307->set.mode_set[i][2 * j]\n\t\t\t    = data[offset + ((num_mode + 1)\
+  \ * j)];\n\t\t\tsma1307->set.mode_set[i][2 * j + 1]\n\t\t\t    = data[offset + ((num_mode\
+  \ + 1) * j + i + 1)];\n\t\t}\n\t}\n\n\tkfree(data);\n\tsma1307->set.status = true;\n\
+  \n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/sound/soc/codecs/sma1307.c\
+  \ b/sound/soc/codecs/sma1307.c\nindex 81638768ac12..f2cea6186d98 100644\n--- a/sound/soc/codecs/sma1307.c\n\
+  +++ b/sound/soc/codecs/sma1307.c\n@@ -1711,13 +1711,13 @@ static void sma1307_setting_loaded(struct\
+  \ sma1307_priv *sma1307, const char *fil\n {\n \tconst struct firmware *fw;\n \t\
+  int *data, size, offset, num_mode;\n+\tint ret;\n \n-\trequest_firmware(&fw, file,\
+  \ sma1307->dev);\n+\tret = request_firmware(&fw, file, sma1307->dev);\n \n-\tif\
+  \ (!fw) {\n-\t\tdev_err(sma1307->dev, \"%s: failed to read \\\"%s\\\"\\n\",\n-\t\
+  \t\t__func__, setting_file);\n-\t\trelease_firmware(fw);\n+\tif (ret) {\n+\t\tdev_err(sma1307->dev,\
+  \ \"%s: failed to read \\\"%s\\\": %pe\\n\",\n+\t\t\t__func__, setting_file, ERR_PTR(ret));\n\
+  \ \t\tsma1307->set.status = false;\n \t\treturn;\n \t} else if ((fw->size) < SMA1307_SETTING_HEADER_SIZE)\
+  \ {\n```\n"
+pattern: "## Bug Pattern\n\nIgnoring the return value of a function that populates\
+  \ an out-parameter and instead using/freeing the out-parameter directly. Specifically,\
+  \ calling request_firmware(&fw, ...) and then checking or releasing fw without verifying\
+  \ the function\u2019s return code. In configurations where request_firmware() fails\
+  \ or is a stub that doesn\u2019t initialize the out-pointer, fw remains uninitialized,\
+  \ leading to use of an uninitialized pointer and invalid release:\n\nconst struct\
+  \ firmware *fw;\nrequest_firmware(&fw, file, dev);\nif (!fw) {            // fw\
+  \ may be uninitialized if request_firmware() failed/stubbed\n    release_firmware(fw);\
+  \  // invalid free on uninitialized pointer\n    ...\n}"
+plan: "1) Program state\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(OutParamNeedingRetCheck,\
+  \ const MemRegion*, bool)\n  - Meaning: an out-parameter variable (the firmware\
+  \ handle) was passed to request_firmware(), but the function\u2019s return value\
+  \ was ignored. Any subsequent read/use of that variable before a proper status check\
+  \ is suspicious.\n\nThis single map is enough for the core pattern in the target\
+  \ patch: \u201Crequest_firmware return ignored, then code checks/uses fw.\u201D\n\
+  \n\n2) Helper detection utilities\n\n- bool isRequestFirmware(const CallEvent &Call)\n\
+  \  - Match callee name \u201Crequest_firmware\u201D. Optionally include \u201Crequest_firmware_direct\u201D\
+  /\u201Cfirmware_request_nowait\u201D only if you want to extend coverage; keep it\
+  \ to \u201Crequest_firmware\u201D to stay focused.\n\n- bool isReleaseFirmware(const\
+  \ CallEvent &Call)\n  - Match callee name \u201Crelease_firmware\u201D.\n\n- const\
+  \ MemRegion* getOutParamRegionFromArg0(const CallEvent &Call, CheckerContext &C)\n\
+  \  - Arg0 is \u201C&fw\u201D. Retrieve the DeclRefExpr child within Call.getArgExpr(0)\
+  \ via findSpecificTypeInChildren<DeclRefExpr>. Then call getMemRegionFromExpr on\
+  \ it to get the VarRegion for \u201Cfw\u201D.\n\n- bool isCallResultIgnored(const\
+  \ CallEvent &Call, CheckerContext &C)\n  - Using findSpecificTypeInParents on Call.getOriginExpr():\n\
+  \    - If parent is an IfStmt and the Call is inside its condition, return false\
+  \ (result is being checked inline).\n    - If parent is a BinaryOperator that is\
+  \ an assignment, return false (result captured).\n    - If parent is a DeclStmt\
+  \ with an initializer, return false (result captured).\n    - Otherwise, return\
+  \ true (most common \u201Cbare call\u201D statement -> return value ignored).\n\n\
+  \n3) Callbacks and logic\n\n- checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C)\n  - If !isRequestFirmware(Call), return.\n  - const MemRegion* OutR = getOutParamRegionFromArg0(Call,\
+  \ C); if !OutR, return.\n  - If isCallResultIgnored(Call, C):\n    - State = State->set<OutParamNeedingRetCheck>(OutR,\
+  \ true);\n    - C.addTransition(State).\n  - Else do nothing (we assume they at\
+  \ least captured/checked ret). Keep it simple to reduce false positives.\n\n- checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C)\n  - We use this to catch\
+  \ \u201Cif (!fw) \u2026\u201D and other reads of fw.\n  - If !IsLoad, return.\n\
+  \  - If Loc is a MemRegionVal, get its region R. If State->contains<OutParamNeedingRetCheck>(R):\n\
+  \    - Report: \u201Crequest_firmware() return ignored; using firmware out-parameter\u201D\
+  \n    - Erase the map entry for R to avoid duplicates on the same path and transition\
+  \ state.\n\n- checkPreCall(const CallEvent &Call, CheckerContext &C)\n  - First,\
+  \ handle release_firmware explicitly:\n    - If isReleaseFirmware(Call):\n     \
+  \ - Get the first argument\u2019s region (DeclRefExpr child in Arg0). If it exists\
+  \ in OutParamNeedingRetCheck:\n        - Report: \u201Crequest_firmware() return\
+  \ ignored; releasing uninitialized firmware pointer\u201D\n        - Erase entry\
+  \ and transition.\n  - Optionally, use functionKnownToDeref(Call, DerefParams) to\
+  \ catch other dereferencing uses:\n    - For each index in DerefParams, get the\
+  \ argument\u2019s region. If any region is in OutParamNeedingRetCheck, report similar\
+  \ message and erase.\n\n- checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C)\n  - Not strictly necessary, but you may clear residual map entries (no report).\
+  \ The important reports already happen at the point of first misuse.\n\nNo other\
+  \ callbacks are needed for the core pattern.\n\n\n4) Bug reporting\n\n- Create a\
+  \ checker-specific BugType like \u201CUninitialized firmware pointer use\u201D.\n\
+  - Messages should be short and clear:\n  - For loads/conditions: \u201Crequest_firmware()\
+  \ return ignored; using firmware out-parameter\u201D\n  - For release: \u201Crequest_firmware()\
+  \ return ignored; releasing uninitialized firmware pointer\u201D\n- Use generateNonFatalErrorNode\
+  \ and std::make_unique<PathSensitiveBugReport>.\n\n\n5) Notes to reduce false positives\n\
+  \n- Only mark a variable in OutParamNeedingRetCheck when the request_firmware call\u2019\
+  s return is ignored. This matches the target bug very closely.\n- If later you want\
+  \ broader coverage, you can extend the checker to track a captured ret value:\n\
+  \  - In checkBind, when RHS\u2019s symbol is the call\u2019s return and LHS is a\
+  \ VarRegion, record that variable name and clear the map only when a branch condition\
+  \ mentions that variable (using ExprHasName), but this is optional and not required\
+  \ for the target patch.\n- Keep the function name list tight (\u201Crequest_firmware\u201D\
+  , \u201Crelease_firmware\u201D) to remain precise."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\
+  \n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/AST/RecursiveASTVisitor.h\"\
+  \n#include \"clang/AST/StmtVisitor.h\"\n#include \"llvm/Support/raw_ostream.h\"\n\
+  #include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/Expr.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Track out-params (e.g., 'fw') passed to request_firmware()\
+  \ when the return\n// value is ignored. We map the variable's MemRegion to a boolean\
+  \ marker.\nREGISTER_MAP_WITH_PROGRAMSTATE(OutParamNeedingRetCheck, const MemRegion*,\
+  \ bool)\n\nnamespace {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker\
+  \ : public Checker<check::PostCall, check::PreCall, check::Location> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Uninitialized firmware pointer use\", \"API Misuse\")) {}\n\n\
+  \      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n   \
+  \   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n      void\
+  \ checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;\n\
+  \n   private:\n\n      // Helpers\n      static bool isRequestFirmware(const CallEvent\
+  \ &Call, CheckerContext &C);\n      static bool isReleaseFirmware(const CallEvent\
+  \ &Call, CheckerContext &C);\n      static bool isCallResultIgnored(const CallEvent\
+  \ &Call, CheckerContext &C);\n\n      static const MemRegion *getOutParamRegionFromArg0(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static const MemRegion *getVarRegionFromDeclRefExpr(const\
+  \ Expr *E, CheckerContext &C);\n\n      void reportUse(const MemRegion *MR, CheckerContext\
+  \ &C, const Stmt *S) const;\n      void reportRelease(const MemRegion *MR, CheckerContext\
+  \ &C, const CallEvent &Call) const;\n};\n\n// Check function name via source text\
+  \ for accuracy.\nbool SAGenTestChecker::isRequestFirmware(const CallEvent &Call,\
+  \ CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n\
+  \    return false;\n  return ExprHasName(Origin, \"request_firmware\", C);\n}\n\n\
+  bool SAGenTestChecker::isReleaseFirmware(const CallEvent &Call, CheckerContext &C)\
+  \ {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\
+  \  return ExprHasName(Origin, \"release_firmware\", C);\n}\n\n// Determine if the\
+  \ return value of the call is ignored (bare statement).\nbool SAGenTestChecker::isCallResultIgnored(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // If the call is directly used in a condition,\
+  \ assignment, declaration\n  // (with initializer), or return, we consider it not\
+  \ ignored.\n  if (findSpecificTypeInParents<IfStmt>(Origin, C))\n    return false;\n\
+  \n  if (const auto *BO = findSpecificTypeInParents<BinaryOperator>(Origin, C)) {\n\
+  \    if (BO->isAssignmentOp())\n      return false;\n  }\n\n  if (findSpecificTypeInParents<DeclStmt>(Origin,\
+  \ C))\n    return false;\n\n  if (findSpecificTypeInParents<ReturnStmt>(Origin,\
+  \ C))\n    return false;\n\n  return true;\n}\n\n// Get the MemRegion of the out-parameter\
+  \ (variable region) from arg0 (&fw).\nconst MemRegion *SAGenTestChecker::getOutParamRegionFromArg0(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  // First try via the SVal of the first\
+  \ argument, which should be &fw (address of the variable).\n  SVal Arg0 = Call.getArgSVal(0);\n\
+  \  if (const MemRegion *R = Arg0.getAsRegion()) {\n    R = R->getBaseRegion();\n\
+  \    if (R)\n      return R;\n  }\n\n  // Fallback: find a DeclRefExpr inside arg0\
+  \ and get its variable region.\n  const Expr *ArgE = Call.getArgExpr(0);\n  if (!ArgE)\n\
+  \    return nullptr;\n  const DeclRefExpr *DRE = findSpecificTypeInChildren<DeclRefExpr>(ArgE);\n\
+  \  if (!DRE)\n    return nullptr;\n\n  return getVarRegionFromDeclRefExpr(DRE, C);\n\
+  }\n\n// Obtain the VarRegion corresponding to a DeclRefExpr of a variable.\nconst\
+  \ MemRegion *SAGenTestChecker::getVarRegionFromDeclRefExpr(const Expr *E, CheckerContext\
+  \ &C) {\n  if (!E)\n    return nullptr;\n  const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenCasts());\n\
+  \  if (!DRE)\n    return nullptr;\n  const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \  if (!VD)\n    return nullptr;\n\n  MemRegionManager &MRMgr = C.getSValBuilder().getRegionManager();\n\
+  \  const MemRegion *MR = MRMgr.getVarRegion(VD, C.getLocationContext());\n  if (!MR)\n\
+  \    return nullptr;\n  return MR->getBaseRegion();\n}\n\n// After calling request_firmware(&fw,\
+  \ ...), if the return is ignored,\n// mark 'fw' as requiring a return-code check\
+  \ before use.\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (!isRequestFirmware(Call, C))\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  const MemRegion *OutR = getOutParamRegionFromArg0(Call,\
+  \ C);\n  if (!OutR)\n    return;\n\n  if (isCallResultIgnored(Call, C)) {\n    State\
+  \ = State->set<OutParamNeedingRetCheck>(OutR, true);\n    C.addTransition(State);\n\
+  \  }\n}\n\n// Before calling release_firmware(fw), report if 'fw' came from a\n\
+  // request_firmware() whose return was ignored.\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isReleaseFirmware(Call, C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n\n  const Expr *Arg0E =\
+  \ Call.getArgExpr(0);\n  if (!Arg0E)\n    return;\n\n  const DeclRefExpr *DRE =\
+  \ findSpecificTypeInChildren<DeclRefExpr>(Arg0E);\n  const MemRegion *VarR = nullptr;\n\
+  \  if (DRE)\n    VarR = getVarRegionFromDeclRefExpr(DRE, C);\n\n  if (!VarR)\n \
+  \   return;\n\n  VarR = VarR->getBaseRegion();\n  const bool *Marked = State->get<OutParamNeedingRetCheck>(VarR);\n\
+  \  if (Marked && *Marked) {\n    reportRelease(VarR, C, Call);\n    // Erase to\
+  \ avoid duplicate reports along this path.\n    State = State->remove<OutParamNeedingRetCheck>(VarR);\n\
+  \    C.addTransition(State);\n  }\n}\n\n// When the firmware out-param variable\
+  \ is read (e.g., if (!fw)),\n// report if the earlier request_firmware() return\
+  \ was ignored.\nvoid SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const\
+  \ Stmt *S, CheckerContext &C) const {\n  if (!IsLoad)\n    return;\n\n  const MemRegion\
+  \ *R = Loc.getAsRegion();\n  if (!R)\n    return;\n\n  R = R->getBaseRegion();\n\
+  \  ProgramStateRef State = C.getState();\n  const bool *Marked = State->get<OutParamNeedingRetCheck>(R);\n\
+  \  if (Marked && *Marked) {\n    reportUse(R, C, S);\n    State = State->remove<OutParamNeedingRetCheck>(R);\n\
+  \    C.addTransition(State);\n  }\n}\n\nvoid SAGenTestChecker::reportUse(const MemRegion\
+  \ *MR, CheckerContext &C, const Stmt *S) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"request_firmware() return ignored; using firmware out-parameter\"\
+  , N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::reportRelease(const MemRegion *MR, CheckerContext &C,\
+  \ const CallEvent &Call) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"request_firmware() return ignored; releasing uninitialized firmware\
+  \ pointer\", N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects ignoring request_firmware return and using/releasing the out-parameter\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

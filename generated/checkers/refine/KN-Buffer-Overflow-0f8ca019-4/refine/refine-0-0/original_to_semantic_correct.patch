@@ -1,0 +1,85 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -28,8 +28,11 @@ // Forward declarations of helpers
+ static bool evalInt(const ASTContext &Ctx, const Expr *E, llvm::APSInt &Res);
+ static bool containsDeclRefToVar(const Expr *E, const VarDecl *V);
++static bool indexIsDirectLoopVar(const Expr *Idx, const VarDecl *IVar);
+ static bool getArrayConstSizeFromBase(const ASTContext &Ctx, const Expr *Base, uint64_t &CapOut);
+ static bool stmtContains(const Stmt *Root, const Stmt *Target);
++static bool parseGuardCondition(const ASTContext &Ctx, const Expr *Cond, const VarDecl *IVar,
++                                uint64_t Cap, bool &IsLTorLE, bool &IsGEorGT);
+ static bool isGuardedByEnclosingIfLtCap(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+                                         const VarDecl *IVar, uint64_t Cap);
+ static bool isGuardedByPrevIfGeBreak(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+@@ -91,6 +94,27 @@   LocalVisitor Vst(V);
+   Vst.TraverseStmt(const_cast<Expr*>(E));
+   return Vst.Found;
++}
++
++// Strict filter: Only accept index expressions that are directly the loop variable.
++static bool indexIsDirectLoopVar(const Expr *Idx, const VarDecl *IVar) {
++  if (!Idx || !IVar)
++    return false;
++  const Expr *E = Idx->IgnoreParenImpCasts();
++  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
++    return DRE->getDecl() == IVar;
++
++  // Allow trivial unary plus on the variable (rare in C, but harmless).
++  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    if (UO->getOpcode() == UO_Plus) {
++      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
++      if (const auto *SDRE = dyn_cast<DeclRefExpr>(Sub))
++        return SDRE->getDecl() == IVar;
++    }
++  }
++
++  // Do not accept composite/mapped indices like arr[map[i].field] or arr[i + k].
++  return false;
+ }
+
+ static bool getArrayConstSizeFromBase(const ASTContext &Ctx, const Expr *Base, uint64_t &CapOut) {
+@@ -240,7 +264,7 @@   }
+   if (!ContainerChild) return false;
+
+-  // Scan previous statements for if (i >= Cap) { break; } or return;
++  // Scan previous statements for if (i >= Cap) { break; } or return; or continue;
+   Index = 0;
+   for (const Stmt *Child : CS->body()) {
+     if (Index >= FoundIndex) break;
+@@ -259,17 +283,16 @@     const Stmt *Then = IS->getThen();
+     if (!Then) continue;
+
+-    // Look for a BreakStmt or ReturnStmt inside the then-branch.
+-    bool HasBreakOrReturn = false;
++    // Look for a BreakStmt, ContinueStmt or ReturnStmt inside the then-branch.
+     struct FindTerminator : public RecursiveASTVisitor<FindTerminator> {
+       bool Found = false;
+       bool VisitBreakStmt(BreakStmt *) { Found = true; return false; }
++      bool VisitContinueStmt(ContinueStmt *) { Found = true; return false; }
+       bool VisitReturnStmt(ReturnStmt *) { Found = true; return false; }
+     } Finder;
+     Finder.TraverseStmt(const_cast<Stmt*>(Then));
+-    HasBreakOrReturn = Finder.Found;
+-
+-    if (HasBreakOrReturn)
++
++    if (Finder.Found)
+       return true;
+   }
+
+@@ -283,7 +306,7 @@   if (isGuardedByEnclosingIfLtCap(Ctx, ASE, IVar, Cap))
+     return true;
+
+-  // 2) Just before ASE in the same block, there is if (i >= Cap) { break; } or return;
++  // 2) Just before ASE in the same block, there is if (i >= Cap) { break; } or return; or continue;
+   if (isGuardedByPrevIfGeBreak(Ctx, ASE, IVar, Cap))
+     return true;
+
+@@ -394,7 +417,9 @@     bool VisitArraySubscriptExpr(ArraySubscriptExpr *ASE) {
+       const Expr *Idx = ASE->getIdx();
+       if (!Idx) return true;
+-      if (!containsDeclRefToVar(Idx, IVar))
++
++      // Only consider subscripts where the index is directly the loop variable.
++      if (!indexIsDirectLoopVar(Idx, IVar))
+         return true;
+
+       uint64_t Cap = 0;

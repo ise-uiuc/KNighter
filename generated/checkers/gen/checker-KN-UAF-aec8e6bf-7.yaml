@@ -1,0 +1,468 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: aec8e6bf839101784f3ef037dcdb9432c3f32343
+commit_type: UAF
+index: 7
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/Type.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Program state set to record released member pointer\
+  \ regions (FieldRegion).\nREGISTER_SET_WITH_PROGRAMSTATE(ReleasedMembers, const\
+  \ MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n    check::PostCall,\n\
+  \    check::PreCall,\n    check::BranchCondition,\n    check::Bind\n  > {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Use-after-free/double-release\", \"Memory Management\")) {}\n\n\
+  \      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n   \
+  \   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n      void\
+  \ checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n      void\
+  \ checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;\n\n\
+  \   private:\n      // Helpers\n      static bool callHasName(const CallEvent &Call,\
+  \ StringRef Name, CheckerContext &C);\n      static bool isReleaseLikeFunction(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static bool isKnownObjectMemberReleaser(const\
+  \ CallEvent &Call,\n                                              SmallVectorImpl<StringRef>\
+  \ &ReleasedFields,\n                                              CheckerContext\
+  \ &C);\n\n      static const FieldRegion *stripToFieldRegion(const MemRegion *R);\n\
+  \      static const FieldRegion *getFieldRegionFromExpr(const Expr *E, CheckerContext\
+  \ &C);\n      static const FieldRegion *getFieldRegionFromObjectAndName(const Expr\
+  \ *ObjArg,\n                                                                StringRef\
+  \ FieldName,\n                                                                CheckerContext\
+  \ &C);\n      static bool isNullSVal(SVal V);\n\n      void report(CheckerContext\
+  \ &C, const Stmt *S, StringRef Msg) const;\n};\n\nbool SAGenTestChecker::callHasName(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C) {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE)\n    return false;\n  return ExprHasName(OE, Name, C);\n}\n\nbool SAGenTestChecker::isReleaseLikeFunction(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  // Exact matches for known release/put/free\
+  \ functions\n  static const char *Exact[] = {\n    \"fput\", \"kfree\", \"kvfree\"\
+  , \"filp_close\", \"blkdev_put\", \"bio_put\", \"sock_release\", \"put_device\"\n\
+  \  };\n  for (const char *N : Exact) {\n    if (callHasName(Call, N, C))\n     \
+  \ return true;\n  }\n\n  // Conservative heuristic: names that contain \"free\"\
+  \ or end with \"put\".\n  // To avoid noise, only accept if first arg syntactically\
+  \ looks like a member (MemberExpr).\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE)\n    return false;\n  // Extract callee source text and apply heuristic\n\
+  \  const SourceManager &SM = C.getSourceManager();\n  const LangOptions &LangOpts\
+  \ = C.getLangOpts();\n  CharSourceRange Range = CharSourceRange::getTokenRange(OE->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, LangOpts);\n  bool NameLooksRelease\
+  \ = Text.contains_lower(\"free(\") || Text.endswith_lower(\"put)\") || Text.contains_lower(\"\
+  put(\");\n  if (!NameLooksRelease)\n    return false;\n\n  if (Call.getNumArgs()\
+  \ > 0) {\n    if (const Expr *A0 = Call.getArgExpr(0)) {\n      const Expr *IE =\
+  \ A0->IgnoreParenImpCasts();\n      if (isa<MemberExpr>(IE))\n        return true;\n\
+  \    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isKnownObjectMemberReleaser(const\
+  \ CallEvent &Call,\n                                                   SmallVectorImpl<StringRef>\
+  \ &ReleasedFields,\n                                                   CheckerContext\
+  \ &C) {\n  // For our target bug, btrfs_close_bdev(device) releases device->bdev_file\n\
+  \  if (callHasName(Call, \"btrfs_close_bdev\", C)) {\n    ReleasedFields.push_back(\"\
+  bdev_file\");\n    return true;\n  }\n  return false;\n}\n\nconst FieldRegion *SAGenTestChecker::stripToFieldRegion(const\
+  \ MemRegion *R) {\n  if (!R)\n    return nullptr;\n\n  const MemRegion *Cur = R;\n\
+  \  // Walk up through subregions until we find a FieldRegion\n  while (Cur) {\n\
+  \    if (const auto *FR = dyn_cast<FieldRegion>(Cur))\n      return FR;\n    if\
+  \ (const auto *SR = dyn_cast<SubRegion>(Cur)) {\n      Cur = SR->getSuperRegion();\n\
+  \      continue;\n    }\n    break;\n  }\n  return nullptr;\n}\n\nconst FieldRegion\
+  \ *SAGenTestChecker::getFieldRegionFromExpr(const Expr *E, CheckerContext &C) {\n\
+  \  if (!E)\n    return nullptr;\n  // Do not IgnoreImplicit before calling getMemRegionFromExpr\
+  \ (per suggestion)\n  const MemRegion *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n\
+  \    return nullptr;\n\n  // Always fetch base region as per suggestion (not used\
+  \ for FR extraction but to respect guideline)\n  (void)MR->getBaseRegion();\n\n\
+  \  // Try to find a FieldRegion by going up the region chain\n  return stripToFieldRegion(MR);\n\
+  }\n\nconst FieldRegion *SAGenTestChecker::getFieldRegionFromObjectAndName(const\
+  \ Expr *ObjArg,\n                                                              \
+  \       StringRef FieldName,\n                                                 \
+  \                    CheckerContext &C) {\n  if (!ObjArg)\n    return nullptr;\n\
+  \n  ProgramStateRef State = C.getState();\n  const LocationContext *LCtx = C.getLocationContext();\n\
+  \n  // Acquire the value of the object pointer\n  SVal ObjV = State->getSVal(ObjArg,\
+  \ LCtx);\n  const MemRegion *ObjReg = ObjV.getAsRegion();\n\n  // If we couldn't\
+  \ get a region, try to create a symbolic region from a symbol\n  if (!ObjReg) {\n\
+  \    if (SymbolRef Sym = ObjV.getAsSymbol()) {\n      MemRegionManager &MRMgr =\
+  \ C.getSValBuilder().getRegionManager();\n      ObjReg = MRMgr.getSymbolicRegion(Sym);\n\
+  \    }\n  }\n  if (!ObjReg)\n    return nullptr;\n\n  // We need the pointee type's\
+  \ record to find the field decl\n  QualType ObjTy = ObjArg->getType();\n  if (ObjTy.isNull())\n\
+  \    return nullptr;\n  QualType Pointee = ObjTy->getPointeeType();\n  if (Pointee.isNull())\n\
+  \    return nullptr;\n\n  const RecordType *RT = Pointee->getAs<RecordType>();\n\
+  \  if (!RT)\n    return nullptr;\n\n  const RecordDecl *RD = RT->getDecl();\n  if\
+  \ (!RD)\n    return nullptr;\n\n  const FieldDecl *TargetFD = nullptr;\n  for (const\
+  \ FieldDecl *FD : RD->fields()) {\n    if (FD->getName() == FieldName) {\n     \
+  \ TargetFD = FD;\n      break;\n    }\n  }\n  if (!TargetFD)\n    return nullptr;\n\
+  \n  // Create a FieldRegion on top of the (symbolic) object region\n  const SubRegion\
+  \ *Super = dyn_cast<SubRegion>(ObjReg);\n  if (!Super) {\n    // If ObjReg is not\
+  \ a subregion, wrap it into a symbolic region (fallback)\n    if (const auto *BR\
+  \ = dyn_cast<MemSpaceRegion>(ObjReg)) {\n      (void)BR; // unlikely\n      return\
+  \ nullptr;\n    }\n    // Try creating a symbolic super region if possible using\
+  \ the region's symbol\n    // Otherwise, we cannot safely construct the field region.\n\
+  \    return nullptr;\n  }\n\n  MemRegionManager &MRMgr = C.getSValBuilder().getRegionManager();\n\
+  \  const FieldRegion *FR = MRMgr.getFieldRegion(TargetFD, Super);\n  return FR;\n\
+  }\n\nbool SAGenTestChecker::isNullSVal(SVal V) {\n  if (auto DV = V.getAs<DefinedSVal>())\
+  \ {\n    if (auto CI = DV->getAs<nonloc::ConcreteInt>())\n      return CI->getValue().isNullValue();\n\
+  \    if (auto LCI = DV->getAs<loc::ConcreteInt>())\n      return LCI->getValue().isZero();\n\
+  \  }\n  return false;\n}\n\nvoid SAGenTestChecker::report(CheckerContext &C, const\
+  \ Stmt *S, StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// PostCall: mark member pointers that are released, and model known releasers.\n\
+  void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  ProgramStateRef State = C.getState();\n\n  // Case A: Direct release/free/put-like\
+  \ calls on a member pointer argument.\n  if (isReleaseLikeFunction(Call, C)) {\n\
+  \    if (Call.getNumArgs() > 0) {\n      if (const Expr *ArgE = Call.getArgExpr(0))\
+  \ {\n        const FieldRegion *FR = getFieldRegionFromExpr(ArgE, C);\n        if\
+  \ (FR) {\n          State = State->add<ReleasedMembers>(FR);\n          C.addTransition(State);\n\
+  \          return;\n        }\n      }\n    }\n  }\n\n  // Case B: Known object-member\
+  \ releasers, e.g., btrfs_close_bdev(device) releases device->bdev_file\n  SmallVector<StringRef,\
+  \ 2> ReleasedFields;\n  if (isKnownObjectMemberReleaser(Call, ReleasedFields, C))\
+  \ {\n    if (Call.getNumArgs() > 0) {\n      const Expr *ObjE = Call.getArgExpr(0);\n\
+  \      for (StringRef FName : ReleasedFields) {\n        const FieldRegion *FR =\
+  \ getFieldRegionFromObjectAndName(ObjE, FName, C);\n        if (FR) {\n        \
+  \  State = State->add<ReleasedMembers>(FR);\n        }\n      }\n      C.addTransition(State);\n\
+  \    }\n  }\n}\n\n// PreCall: detect double release and use-after-free via known\
+  \ deref functions.\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Double-release: calling\
+  \ release-like function again on the same member pointer\n  if (isReleaseLikeFunction(Call,\
+  \ C)) {\n    if (Call.getNumArgs() > 0) {\n      if (const Expr *ArgE = Call.getArgExpr(0))\
+  \ {\n        const FieldRegion *FR = getFieldRegionFromExpr(ArgE, C);\n        if\
+  \ (FR && State->contains<ReleasedMembers>(FR)) {\n          report(C, Call.getOriginExpr(),\
+  \ \"Double release of a member pointer; set it to NULL after releasing.\");\n  \
+  \        return;\n        }\n      }\n    }\n  }\n\n  // UAF via passing to a function\
+  \ that dereferences given params\n  llvm::SmallVector<unsigned, 4> DerefParams;\n\
+  \  if (functionKnownToDeref(Call, DerefParams)) {\n    for (unsigned Idx : DerefParams)\
+  \ {\n      if (Idx >= Call.getNumArgs())\n        continue;\n      const Expr *ArgE\
+  \ = Call.getArgExpr(Idx);\n      const FieldRegion *FR = getFieldRegionFromExpr(ArgE,\
+  \ C);\n      if (FR && State->contains<ReleasedMembers>(FR)) {\n        report(C,\
+  \ Call.getOriginExpr(), \"Use-after-free: released member pointer passed to a function\
+  \ that dereferences it.\");\n        return;\n      }\n    }\n  }\n}\n\n// Detect\
+  \ \"if (obj->member)\" or similar null checks on already released member pointers.\n\
+  void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE) {\n    C.addTransition(State);\n    return;\n  }\n\n  // Try to find\
+  \ a MemberExpr in the condition\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(CondE);\n\
+  \  if (!ME) {\n    C.addTransition(State);\n    return;\n  }\n\n  const FieldRegion\
+  \ *FR = getFieldRegionFromExpr(ME, C);\n  if (FR && State->contains<ReleasedMembers>(FR))\
+  \ {\n    report(C, Condition, \"Dangling member pointer used in condition after\
+  \ release.\");\n    return;\n  }\n\n  C.addTransition(State);\n}\n\n// Clear released\
+  \ state when the field is set to NULL (the fix pattern), or overwritten.\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  const MemRegion *LReg = Loc.getAsRegion();\n  if (!LReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n\n  // Always get base region\
+  \ per guideline\n  (void)LReg->getBaseRegion();\n\n  const FieldRegion *FR = stripToFieldRegion(LReg);\n\
+  \  if (!FR) {\n    C.addTransition(State);\n    return;\n  }\n\n  if (State->contains<ReleasedMembers>(FR))\
+  \ {\n    // If assigned NULL => clear. If overwritten with something else => also\
+  \ clear.\n    State = State->remove<ReleasedMembers>(FR);\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects use-after-free/double-release\
+  \ when a released member pointer is not cleared to NULL\",\n      \"\");\n}\n\n\
+  extern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbtrfs: fix use-after-free of block device file in\
+  \ __btrfs_free_extra_devids()\n\nMounting btrfs from two images (which have the\
+  \ same one fsid and two\ndifferent dev_uuids) in certain executing order may trigger\
+  \ an UAF for\nvariable 'device->bdev_file' in __btrfs_free_extra_devids(). And\n\
+  following are the details:\n\n1. Attach image_1 to loop0, attach image_2 to loop1,\
+  \ and scan btrfs\n   devices by ioctl(BTRFS_IOC_SCAN_DEV):\n\n             /  btrfs_device_1\
+  \ \u2192 loop0\n   fs_device\n             \\  btrfs_device_2 \u2192 loop1\n2. mount\
+  \ /dev/loop0 /mnt\n   btrfs_open_devices\n    btrfs_device_1->bdev_file = btrfs_get_bdev_and_sb(loop0)\n\
+  \    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n   btrfs_fill_super\n\
+  \    open_ctree\n     fail: btrfs_close_devices // -ENOMEM\n\t    btrfs_close_bdev(btrfs_device_1)\n\
+  \             fput(btrfs_device_1->bdev_file)\n\t      // btrfs_device_1->bdev_file\
+  \ is freed\n\t    btrfs_close_bdev(btrfs_device_2)\n             fput(btrfs_device_2->bdev_file)\n\
+  \n3. mount /dev/loop1 /mnt\n   btrfs_open_devices\n    btrfs_get_bdev_and_sb(&bdev_file)\n\
+  \     // EIO, btrfs_device_1->bdev_file is not assigned,\n     // which points to\
+  \ a freed memory area\n    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n\
+  \   btrfs_fill_super\n    open_ctree\n     btrfs_free_extra_devids\n      if (btrfs_device_1->bdev_file)\n\
+  \       fput(btrfs_device_1->bdev_file) // UAF !\n\nFix it by setting 'device->bdev_file'\
+  \ as 'NULL' after closing the\nbtrfs_device in btrfs_close_one_device().\n\nFixes:\
+  \ 142388194191 (\"btrfs: do not background blkdev_put()\")\nCC: stable@vger.kernel.org\
+  \ # 4.19+\nLink: https://bugzilla.kernel.org/show_bug.cgi?id=219408\nSigned-off-by:\
+  \ Zhihao Cheng <chengzhihao1@huawei.com>\nReviewed-by: David Sterba <dsterba@suse.com>\n\
+  Signed-off-by: David Sterba <dsterba@suse.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ btrfs_close_one_device in fs/btrfs/volumes.c\nstatic void btrfs_close_one_device(struct\
+  \ btrfs_device *device)\n{\n\tstruct btrfs_fs_devices *fs_devices = device->fs_devices;\n\
+  \n\tif (test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) &&\n\t    device->devid\
+  \ != BTRFS_DEV_REPLACE_DEVID) {\n\t\tlist_del_init(&device->dev_alloc_list);\n\t\
+  \tfs_devices->rw_devices--;\n\t}\n\n\tif (device->devid == BTRFS_DEV_REPLACE_DEVID)\n\
+  \t\tclear_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);\n\n\tif (test_bit(BTRFS_DEV_STATE_MISSING,\
+  \ &device->dev_state)) {\n\t\tclear_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state);\n\
+  \t\tfs_devices->missing_devices--;\n\t}\n\n\tbtrfs_close_bdev(device);\n\tif (device->bdev)\
+  \ {\n\t\tfs_devices->open_devices--;\n\t\tdevice->bdev = NULL;\n\t}\n\tclear_bit(BTRFS_DEV_STATE_WRITEABLE,\
+  \ &device->dev_state);\n\tbtrfs_destroy_dev_zone_info(device);\n\n\tdevice->fs_info\
+  \ = NULL;\n\tatomic_set(&device->dev_stats_ccnt, 0);\n\textent_io_tree_release(&device->alloc_state);\n\
+  \n\t/*\n\t * Reset the flush error record. We might have a transient flush error\n\
+  \t * in this mount, and if so we aborted the current transaction and set\n\t * the\
+  \ fs to an error state, guaranteeing no super blocks can be further\n\t * committed.\
+  \ However that error might be transient and if we unmount the\n\t * filesystem and\
+  \ mount it again, we should allow the mount to succeed\n\t * (btrfs_check_rw_degradable()\
+  \ should not fail) - if after mounting the\n\t * filesystem again we still get flush\
+  \ errors, then we will again abort\n\t * any transaction and set the error state,\
+  \ guaranteeing no commits of\n\t * unsafe super blocks.\n\t */\n\tdevice->last_flush_error\
+  \ = 0;\n\n\t/* Verify the device is back in a pristine state  */\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_FLUSH_SENT,\
+  \ &device->dev_state));\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state));\n\
+  \tWARN_ON(!list_empty(&device->dev_alloc_list));\n\tWARN_ON(!list_empty(&device->post_commit_list));\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c\n\
+  index 8f340ad1d938..eb51b609190f 100644\n--- a/fs/btrfs/volumes.c\n+++ b/fs/btrfs/volumes.c\n\
+  @@ -1105,6 +1105,7 @@ static void btrfs_close_one_device(struct btrfs_device *device)\n\
+  \ \tif (device->bdev) {\n \t\tfs_devices->open_devices--;\n \t\tdevice->bdev = NULL;\n\
+  +\t\tdevice->bdev_file = NULL;\n \t}\n \tclear_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state);\n\
+  \ \tbtrfs_destroy_dev_zone_info(device);\n```\n"
+pattern: "## Bug Pattern\n\nResource pointer not cleared after being released: a member\
+  \ pointer (e.g., device->bdev_file) is freed/put by a close/release routine but\
+  \ left non-NULL, and later cleanup code uses a truthy pointer check to perform another\
+  \ put/free, causing use-after-free.\n\nExample:\n- close_fn(obj):\n    fput(obj->file);\
+  \  // releases file\n    // obj->file still holds stale non-NULL pointer\n- later:\n\
+  \    if (obj->file)\n        fput(obj->file);  // UAF/double-put\n\nCorrect pattern\
+  \ is to set the pointer to NULL immediately after releasing it to prevent subsequent\
+  \ conditional frees from using a dangling pointer."
+plan: "Plan to detect \u201Creleased member pointer not cleared to NULL, later used/double-freed\u201D\
+  \n\n1) Program state\n- REGISTER_SET_WITH_PROGRAMSTATE(ReleasedMembers, const MemRegion*)\n\
+  \  - Tracks member pointer regions (FieldRegion) that have been released/put and\
+  \ not yet cleared to NULL.\n- No alias map is required to keep the checker simple\
+  \ and robust.\n\n2) Helper classification functions\n- isReleaseLikeFunction(const\
+  \ CallEvent &Call):\n  - Identify release/put/free-like APIs by callee name (exact-match\
+  \ table, with a conservative suffix heuristic).\n  - Suggested exact names: \"fput\"\
+  , \"kfree\", \"kvfree\", \"filp_close\", \"blkdev_put\", \"bio_put\", \"sock_release\"\
+  , \"put_device\".\n  - Optional heuristic: name contains \"free\" or ends with \"\
+  put\", but only use if the arg is a pointer to a resource-like type to avoid noise.\n\
+  - isKnownObjectMemberReleaser(const CallEvent &Call, SmallVectorImpl<StringRef>\
+  \ &ReleasedFields):\n  - A small table of functions that release specific member\
+  \ fields of their first parameter (object pointer), e.g.:\n    - \"btrfs_close_bdev\"\
+  \ releases [\"bdev_file\"] (and possibly \"bdev\" if desired).\n  - This lets us\
+  \ model releases that happen inside callee (the exact pattern from the patch).\n\
+  - getFieldRegionFromObjectAndName(const Expr *ObjArg, StringRef FieldName, CheckerContext\
+  \ &C):\n  - Given an object expression (e.g., device) and a field name (e.g., \"\
+  bdev_file\"), obtain the FieldRegion for Obj->Field.\n  - Implementation: retrieve\
+  \ base MemRegion for the object pointer; fetch pointee RecordDecl; find FieldDecl\
+  \ by name; use State->getLValue(FieldDecl, baseRegion) and extract the MemRegion.\n\
+  - isNullSVal(SVal V):\n  - Returns true if V is a null/zero constant.\n- getFieldRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C):\n  - Use getMemRegionFromExpr(E, C). Only consider\
+  \ regions that dyn_cast to FieldRegion (member pointers).\n- Shortcuts to use provided\
+  \ utilities:\n  - ExprHasName(Call.getOriginExpr()->getCallee(), \"name\", C) to\
+  \ match names when appropriate.\n  - functionKnownToDeref(Call, DerefParams) to\
+  \ flag UAF when a released pointer is passed to a function that dereferences that\
+  \ param.\n\n3) checkPostCall\n- Purpose: Mark member pointers as released.\n- Steps:\n\
+  \  - Case A: Direct release/put/free\n    - If isReleaseLikeFunction(Call):\n  \
+  \    - For each parameter index of interest (typically 0), obtain the argument expression\
+  \ and its region via getFieldRegionFromExpr(argExpr, C).\n      - If region is a\
+  \ FieldRegion, add it to ReleasedMembers.\n  - Case B: Release happening in the\
+  \ callee on an object parameter (btrfs_close_bdev)\n    - If isKnownObjectMemberReleaser(Call,\
+  \ ReleasedFields):\n      - Take the first argument as the object expression.\n\
+  \      - For each field name in ReleasedFields, get the field region with getFieldRegionFromObjectAndName(ObjArg,\
+  \ FieldName, C).\n      - Add those field regions to ReleasedMembers.\n- Notes:\n\
+  \  - Skip non-member regions to keep the checker focused on the target pattern.\n\
+  \  - Do not emit reports here.\n\n4) checkPreCall\n- Purpose: Detect double release\
+  \ and UAF through calls that dereference.\n- Steps:\n  - If isReleaseLikeFunction(Call):\n\
+  \    - Get the member pointer region for the relevant argument as above.\n    -\
+  \ If that region exists in ReleasedMembers, report:\n      - Message: \"Double release\
+  \ of a member pointer; set it to NULL after releasing.\"\n  - If functionKnownToDeref(Call,\
+  \ DerefParams):\n    - For each param index in DerefParams, get the region.\n  \
+  \  - If any region is in ReleasedMembers, report:\n      - Message: \"Use-after-free:\
+  \ released member pointer passed to a function that dereferences it.\"\n- Reporting:\n\
+  \  - Use generateNonFatalErrorNode and std::make_unique<PathSensitiveBugReport>.\n\
+  \  - Keep message short. Do not auto-remove state on report; let normal flow continue.\n\
+  \n5) checkLocation\n- Purpose: Catch dereference of released pointers in code (e.g.,\
+  \ *ptr, ptr->field).\n- Steps:\n  - If IsLoad or store on a location Loc and the\
+  \ base region of Loc corresponds to a member pointer region found in ReleasedMembers\
+  \ (either the FieldRegion itself or a region derived from it), emit:\n    - Message:\
+  \ \"Use-after-free: released member pointer dereferenced.\"\n- Implementation detail:\n\
+  \  - Extract the MemRegion from Loc. If it\u2019s a FieldRegion included in ReleasedMembers\
+  \ (or derived from that pointer), warn.\n\n6) checkBranchCondition\n- Purpose: Detect\
+  \ \u201Cif (member_ptr)\u201D style gates on released pointers that commonly guard\
+  \ a second put/free.\n- Steps:\n  - Examine Condition:\n    - If it contains a MemberExpr\
+  \ representing a pointer field; get its region via getFieldRegionFromExpr(findSpecificTypeInChildren<MemberExpr>(Condition),\
+  \ C).\n    - Also handle comparisons against NULL or unary ! pattern.\n  - If the\
+  \ region is in ReleasedMembers, issue a warning at the condition:\n    - Message:\
+  \ \"Dangling member pointer used in condition after release.\"\n  - Optional refinement\
+  \ (if you want fewer false positives):\n    - Try to find in the corresponding 'then'\
+  \ branch a call to a release-like function on the same member pointer using a shallow\
+  \ child scan. If found, prefer a more specific message:\n      - \"Double release:\
+  \ conditionally freeing a released member pointer.\"\n    - Use findSpecificTypeInChildren\
+  \ to find CallExprs and match arguments.\n\n7) checkBind\n- Purpose: Clear the \u201C\
+  released\u201D mark once the member pointer is set to NULL; also clear if it\u2019\
+  s overwritten.\n- Steps:\n  - If Loc corresponds to a FieldRegion (member) and that\
+  \ region is in ReleasedMembers:\n    - If Val is NULL (isNullSVal(Val)), remove\
+  \ the region from ReleasedMembers.\n    - Else if Val is a non-null pointer or Unknown,\
+  \ conservatively remove it as well (the code overwrote the stale pointer, so it\u2019\
+  s no longer a dangling reference).\n- This models \u201Cdevice->bdev_file = NULL;\u201D\
+  \ which is the fix in the patch.\n\n8) checkRegionChanges\n- Purpose: Clean up state\
+  \ on invalidation.\n- Steps:\n  - When regions are invalidated (due to calls/scope\
+  \ exit), remove any matching regions from ReleasedMembers where either the field\
+  \ itself or its base object is part of ExplicitRegions/Regions.\n\n9) Optional:\
+  \ checkEndFunction\n- Not required. To keep the checker focused and low-noise, do\
+  \ not emit style warnings like \u201Creleased member pointer not set to NULL\u201D\
+  \ at function exit.\n- The harmful patterns are already caught at the points of\
+  \ use (second free or deref/condition).\n\n10) Notes on matching the target patch\
+  \ precisely\n- Ensure isKnownObjectMemberReleaser includes:\n  - { Name: \"btrfs_close_bdev\"\
+  , ReleasedFields: [\"bdev_file\"] }\n- This allows the checker to mark device->bdev_file\
+  \ as released right after btrfs_close_bdev(device) returns. If later code performs:\n\
+  \  - if (device->bdev_file) fput(device->bdev_file);\n  - The checker will flag\
+  \ it either at the condition (checkBranchCondition) or at fput\u2019s pre-call (checkPreCall)\
+  \ as a double release / UAF.\n- The correct pattern (as in the patch) \u201Cdevice->bdev_file\
+  \ = NULL;\u201D is recognized by checkBind and clears the released state, preventing\
+  \ false positives.\n\n11) Bug report messages\n- Double release: \"Double release\
+  \ of a member pointer; set it to NULL after releasing.\"\n- Use-after-free on call:\
+  \ \"Use-after-free: released member pointer passed to a function that dereferences\
+  \ it.\"\n- Use-after-free on deref: \"Use-after-free: released member pointer dereferenced.\"\
+  \n- Condition on released pointer: \"Dangling member pointer used in condition after\
+  \ release.\"\n\n12) Summary of used callbacks\n- checkPostCall: mark released member\
+  \ pointers (direct release calls and known object-member releasers).\n- checkPreCall:\
+  \ report double release and UAF via functions known to dereference.\n- checkLocation:\
+  \ report dereferences on released pointers.\n- checkBranchCondition: report boolean\
+  \ checks on released pointers (commonly guard second frees).\n- checkBind: clear\
+  \ the released mark when pointer fields are set to NULL or overwritten.\n- checkRegionChanges:\
+  \ cleanup state on region invalidation."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/Type.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include <string>\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\n// Program state set to record\
+  \ released member pointer regions (FieldRegion).\nREGISTER_SET_WITH_PROGRAMSTATE(ReleasedMembers,\
+  \ const MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n\
+  \    check::PostCall,\n    check::PreCall,\n    check::BranchCondition,\n    check::Bind\n\
+  \  > {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Use-after-free/double-release\", \"Memory Management\"\
+  )) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n    \
+  \  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C)\
+  \ const;\n\n   private:\n      // Helpers\n      static bool callHasName(const CallEvent\
+  \ &Call, StringRef Name, CheckerContext &C);\n      static bool isReleaseLikeFunction(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static bool isKnownObjectMemberReleaser(const\
+  \ CallEvent &Call,\n                                              SmallVectorImpl<StringRef>\
+  \ &ReleasedFields,\n                                              CheckerContext\
+  \ &C);\n\n      static const FieldRegion *stripToFieldRegion(const MemRegion *R);\n\
+  \      static const FieldRegion *getFieldRegionFromExpr(const Expr *E, CheckerContext\
+  \ &C);\n      static const FieldRegion *getFieldRegionFromObjectAndName(const Expr\
+  \ *ObjArg,\n                                                                StringRef\
+  \ FieldName,\n                                                                CheckerContext\
+  \ &C);\n      static bool isNullSVal(SVal V);\n\n      void report(CheckerContext\
+  \ &C, const Stmt *S, StringRef Msg) const;\n};\n\nbool SAGenTestChecker::callHasName(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C) {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE)\n    return false;\n  return ExprHasName(OE, Name, C);\n}\n\nbool SAGenTestChecker::isReleaseLikeFunction(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  // Exact matches for known release/put/free\
+  \ functions\n  static const char *Exact[] = {\n    \"fput\", \"kfree\", \"kvfree\"\
+  , \"filp_close\", \"blkdev_put\", \"bio_put\", \"sock_release\", \"put_device\"\n\
+  \  };\n  for (const char *N : Exact) {\n    if (callHasName(Call, N, C))\n     \
+  \ return true;\n  }\n\n  // Conservative heuristic: names that contain \"free\"\
+  \ or end with \"put\".\n  // To avoid noise, only accept if first arg syntactically\
+  \ looks like a member (MemberExpr).\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE)\n    return false;\n  // Extract callee source text and apply heuristic\n\
+  \  const SourceManager &SM = C.getSourceManager();\n  const LangOptions &LangOpts\
+  \ = C.getLangOpts();\n  CharSourceRange Range = CharSourceRange::getTokenRange(OE->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, LangOpts);\n  std::string LowerText\
+  \ = Text.lower();\n  bool NameLooksRelease =\n      (LowerText.find(\"free(\") !=\
+  \ std::string::npos) ||\n      (LowerText.find(\"put(\") != std::string::npos) ||\n\
+  \      (LowerText.size() >= 4 && LowerText.compare(LowerText.size() - 4, 4, \"put)\"\
+  ) == 0);\n  if (!NameLooksRelease)\n    return false;\n\n  if (Call.getNumArgs()\
+  \ > 0) {\n    if (const Expr *A0 = Call.getArgExpr(0)) {\n      const Expr *IE =\
+  \ A0->IgnoreParenImpCasts();\n      if (isa<MemberExpr>(IE))\n        return true;\n\
+  \    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isKnownObjectMemberReleaser(const\
+  \ CallEvent &Call,\n                                                   SmallVectorImpl<StringRef>\
+  \ &ReleasedFields,\n                                                   CheckerContext\
+  \ &C) {\n  // For our target bug, btrfs_close_bdev(device) releases device->bdev_file\n\
+  \  if (callHasName(Call, \"btrfs_close_bdev\", C)) {\n    ReleasedFields.push_back(\"\
+  bdev_file\");\n    return true;\n  }\n  return false;\n}\n\nconst FieldRegion *SAGenTestChecker::stripToFieldRegion(const\
+  \ MemRegion *R) {\n  if (!R)\n    return nullptr;\n\n  const MemRegion *Cur = R;\n\
+  \  // Walk up through subregions until we find a FieldRegion\n  while (Cur) {\n\
+  \    if (const auto *FR = dyn_cast<FieldRegion>(Cur))\n      return FR;\n    if\
+  \ (const auto *SR = dyn_cast<SubRegion>(Cur)) {\n      Cur = SR->getSuperRegion();\n\
+  \      continue;\n    }\n    break;\n  }\n  return nullptr;\n}\n\nconst FieldRegion\
+  \ *SAGenTestChecker::getFieldRegionFromExpr(const Expr *E, CheckerContext &C) {\n\
+  \  if (!E)\n    return nullptr;\n  // Do not IgnoreImplicit before calling getMemRegionFromExpr\
+  \ (per suggestion)\n  const MemRegion *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n\
+  \    return nullptr;\n\n  // Always fetch base region as per suggestion (not used\
+  \ for FR extraction but to respect guideline)\n  (void)MR->getBaseRegion();\n\n\
+  \  // Try to find a FieldRegion by going up the region chain\n  return stripToFieldRegion(MR);\n\
+  }\n\nconst FieldRegion *SAGenTestChecker::getFieldRegionFromObjectAndName(const\
+  \ Expr *ObjArg,\n                                                              \
+  \       StringRef FieldName,\n                                                 \
+  \                    CheckerContext &C) {\n  if (!ObjArg)\n    return nullptr;\n\
+  \n  ProgramStateRef State = C.getState();\n  const LocationContext *LCtx = C.getLocationContext();\n\
+  \n  // Acquire the value of the object pointer\n  SVal ObjV = State->getSVal(ObjArg,\
+  \ LCtx);\n  const MemRegion *ObjReg = ObjV.getAsRegion();\n\n  // If we couldn't\
+  \ get a region, try to create a symbolic region from a symbol\n  if (!ObjReg) {\n\
+  \    if (SymbolRef Sym = ObjV.getAsSymbol()) {\n      MemRegionManager &MRMgr =\
+  \ C.getSValBuilder().getRegionManager();\n      ObjReg = MRMgr.getSymbolicRegion(Sym);\n\
+  \    }\n  }\n  if (!ObjReg)\n    return nullptr;\n\n  // We need the pointee type's\
+  \ record to find the field decl\n  QualType ObjTy = ObjArg->getType();\n  if (ObjTy.isNull())\n\
+  \    return nullptr;\n  QualType Pointee = ObjTy->getPointeeType();\n  if (Pointee.isNull())\n\
+  \    return nullptr;\n\n  const RecordType *RT = Pointee->getAs<RecordType>();\n\
+  \  if (!RT)\n    return nullptr;\n\n  const RecordDecl *RD = RT->getDecl();\n  if\
+  \ (!RD)\n    return nullptr;\n\n  const FieldDecl *TargetFD = nullptr;\n  for (const\
+  \ FieldDecl *FD : RD->fields()) {\n    if (FD->getName() == FieldName) {\n     \
+  \ TargetFD = FD;\n      break;\n    }\n  }\n  if (!TargetFD)\n    return nullptr;\n\
+  \n  // Create a FieldRegion on top of the (symbolic) object region\n  const SubRegion\
+  \ *Super = dyn_cast<SubRegion>(ObjReg);\n  if (!Super) {\n    // If ObjReg is not\
+  \ a subregion, wrap it into a symbolic region (fallback)\n    if (const auto *BR\
+  \ = dyn_cast<MemSpaceRegion>(ObjReg)) {\n      (void)BR; // unlikely\n      return\
+  \ nullptr;\n    }\n    // Try creating a symbolic super region if possible using\
+  \ the region's symbol\n    // Otherwise, we cannot safely construct the field region.\n\
+  \    return nullptr;\n  }\n\n  MemRegionManager &MRMgr = C.getSValBuilder().getRegionManager();\n\
+  \  const FieldRegion *FR = MRMgr.getFieldRegion(TargetFD, Super);\n  return FR;\n\
+  }\n\nbool SAGenTestChecker::isNullSVal(SVal V) {\n  if (auto DV = V.getAs<DefinedSVal>())\
+  \ {\n    if (auto CI = DV->getAs<nonloc::ConcreteInt>())\n      return CI->getValue().isZero();\n\
+  \    if (auto LCI = DV->getAs<loc::ConcreteInt>())\n      return LCI->getValue().isZero();\n\
+  \  }\n  return false;\n}\n\nvoid SAGenTestChecker::report(CheckerContext &C, const\
+  \ Stmt *S, StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// PostCall: mark member pointers that are released, and model known releasers.\n\
+  void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  ProgramStateRef State = C.getState();\n\n  // Case A: Direct release/free/put-like\
+  \ calls on a member pointer argument.\n  if (isReleaseLikeFunction(Call, C)) {\n\
+  \    if (Call.getNumArgs() > 0) {\n      if (const Expr *ArgE = Call.getArgExpr(0))\
+  \ {\n        const FieldRegion *FR = getFieldRegionFromExpr(ArgE, C);\n        if\
+  \ (FR) {\n          State = State->add<ReleasedMembers>(FR);\n          C.addTransition(State);\n\
+  \          return;\n        }\n      }\n    }\n  }\n\n  // Case B: Known object-member\
+  \ releasers, e.g., btrfs_close_bdev(device) releases device->bdev_file\n  SmallVector<StringRef,\
+  \ 2> ReleasedFields;\n  if (isKnownObjectMemberReleaser(Call, ReleasedFields, C))\
+  \ {\n    if (Call.getNumArgs() > 0) {\n      const Expr *ObjE = Call.getArgExpr(0);\n\
+  \      for (StringRef FName : ReleasedFields) {\n        const FieldRegion *FR =\
+  \ getFieldRegionFromObjectAndName(ObjE, FName, C);\n        if (FR) {\n        \
+  \  State = State->add<ReleasedMembers>(FR);\n        }\n      }\n      C.addTransition(State);\n\
+  \    }\n  }\n}\n\n// PreCall: detect double release and use-after-free via known\
+  \ deref functions.\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Double-release: calling\
+  \ release-like function again on the same member pointer\n  if (isReleaseLikeFunction(Call,\
+  \ C)) {\n    if (Call.getNumArgs() > 0) {\n      if (const Expr *ArgE = Call.getArgExpr(0))\
+  \ {\n        const FieldRegion *FR = getFieldRegionFromExpr(ArgE, C);\n        if\
+  \ (FR && State->contains<ReleasedMembers>(FR)) {\n          report(C, Call.getOriginExpr(),\
+  \ \"Double release of a member pointer; set it to NULL after releasing.\");\n  \
+  \        return;\n        }\n      }\n    }\n  }\n\n  // UAF via passing to a function\
+  \ that dereferences given params\n  llvm::SmallVector<unsigned, 4> DerefParams;\n\
+  \  if (functionKnownToDeref(Call, DerefParams)) {\n    for (unsigned Idx : DerefParams)\
+  \ {\n      if (Idx >= Call.getNumArgs())\n        continue;\n      const Expr *ArgE\
+  \ = Call.getArgExpr(Idx);\n      const FieldRegion *FR = getFieldRegionFromExpr(ArgE,\
+  \ C);\n      if (FR && State->contains<ReleasedMembers>(FR)) {\n        report(C,\
+  \ Call.getOriginExpr(), \"Use-after-free: released member pointer passed to a function\
+  \ that dereferences it.\");\n        return;\n      }\n    }\n  }\n}\n\n// Detect\
+  \ \"if (obj->member)\" or similar null checks on already released member pointers.\n\
+  void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE) {\n    C.addTransition(State);\n    return;\n  }\n\n  // Try to find\
+  \ a MemberExpr in the condition\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(CondE);\n\
+  \  if (!ME) {\n    C.addTransition(State);\n    return;\n  }\n\n  const FieldRegion\
+  \ *FR = getFieldRegionFromExpr(ME, C);\n  if (FR && State->contains<ReleasedMembers>(FR))\
+  \ {\n    report(C, Condition, \"Dangling member pointer used in condition after\
+  \ release.\");\n    return;\n  }\n\n  C.addTransition(State);\n}\n\n// Clear released\
+  \ state when the field is set to NULL (the fix pattern), or overwritten.\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  const MemRegion *LReg = Loc.getAsRegion();\n  if (!LReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n\n  // Always get base region\
+  \ per guideline\n  (void)LReg->getBaseRegion();\n\n  const FieldRegion *FR = stripToFieldRegion(LReg);\n\
+  \  if (!FR) {\n    C.addTransition(State);\n    return;\n  }\n\n  if (State->contains<ReleasedMembers>(FR))\
+  \ {\n    // If assigned NULL => clear. If overwritten with something else => also\
+  \ clear.\n    State = State->remove<ReleasedMembers>(FR);\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects use-after-free/double-release\
+  \ when a released member pointer is not cleared to NULL\",\n      \"\");\n}\n\n\
+  extern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

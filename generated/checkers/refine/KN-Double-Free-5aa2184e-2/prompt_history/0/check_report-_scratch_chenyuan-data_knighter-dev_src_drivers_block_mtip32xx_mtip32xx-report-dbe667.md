@@ -1,0 +1,355 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Unconditional cleanup via a shared error label frees resources that are not guaranteed to be allocated/owned at that point. Specifically, jumping to a label that does kfree(mt->fc) even when hws_definer_conv_match_params_to_hl() failed (and may have already freed or never allocated mt->fc) leads to a double free. The root cause is using a single error path to free callee-managed/conditionally allocated memory, instead of separating cleanup by resource lifetime and ownership.
+
+## Bug Pattern
+
+Unconditional cleanup via a shared error label frees resources that are not guaranteed to be allocated/owned at that point. Specifically, jumping to a label that does kfree(mt->fc) even when hws_definer_conv_match_params_to_hl() failed (and may have already freed or never allocated mt->fc) leads to a double free. The root cause is using a single error path to free callee-managed/conditionally allocated memory, instead of separating cleanup by resource lifetime and ownership.
+
+# Report
+
+### Report Summary
+
+File:| drivers/block/mtip32xx/mtip32xx.c
+---|---
+Warning:| line 2847, column 2
+Freeing unowned field in shared error label; possible double free
+
+### Annotated Source Code
+
+
+2283  |  return -1;
+2284  | 	}
+2285  |
+2286  | 	debugfs_create_file("flags", 0444, dd->dfs_node, dd, &mtip_flags_fops);
+2287  | 	debugfs_create_file("registers", 0444, dd->dfs_node, dd,
+2288  | 			    &mtip_regs_fops);
+2289  |
+2290  |  return 0;
+2291  | }
+2292  |
+2293  | static void mtip_hw_debugfs_exit(struct driver_data *dd)
+2294  | {
+2295  |  debugfs_remove_recursive(dd->dfs_node);
+2296  | }
+2297  |
+2298  | /*
+2299  |  * Perform any init/resume time hardware setup
+2300  |  *
+2301  |  * @dd Pointer to the driver data structure.
+2302  |  *
+2303  |  * return value
+2304  |  *	None
+2305  |  */
+2306  | static inline void hba_setup(struct driver_data *dd)
+2307  | {
+2308  | 	u32 hwdata;
+2309  | 	hwdata = readl(dd->mmio + HOST_HSORG);
+2310  |
+2311  |  /* interrupt bug workaround: use only 1 IS bit.*/
+2312  |  writel(hwdata |
+2313  |  HSORG_DISABLE_SLOTGRP_INTR |
+2314  |  HSORG_DISABLE_SLOTGRP_PXIS,
+2315  | 		dd->mmio + HOST_HSORG);
+2316  | }
+2317  |
+2318  | static int mtip_device_unaligned_constrained(struct driver_data *dd)
+2319  | {
+2320  |  return (dd->pdev->device == P420M_DEVICE_ID ? 1 : 0);
+2321  | }
+2322  |
+2323  | /*
+2324  |  * Detect the details of the product, and store anything needed
+2325  |  * into the driver data structure.  This includes product type and
+2326  |  * version and number of slot groups.
+2327  |  *
+2328  |  * @dd Pointer to the driver data structure.
+2329  |  *
+2330  |  * return value
+2331  |  *	None
+2332  |  */
+2333  | static void mtip_detect_product(struct driver_data *dd)
+2334  | {
+2335  | 	u32 hwdata;
+2336  |  unsigned int rev, slotgroups;
+2337  |
+2338  |  /*
+2339  |  * HBA base + 0xFC [15:0] - vendor-specific hardware interface
+2340  |  * info register:
+2341  |  * [15:8] hardware/software interface rev#
+2342  |  * [   3] asic-style interface
+2343  |  * [ 2:0] number of slot groups, minus 1 (only valid for asic-style).
+2344  |  */
+2345  | 	hwdata = readl(dd->mmio + HOST_HSORG);
+2346  |
+2347  | 	dd->product_type = MTIP_PRODUCT_UNKNOWN;
+2348  | 	dd->slot_groups = 1;
+2349  |
+2350  |  if (hwdata & 0x8) {
+2351  | 		dd->product_type = MTIP_PRODUCT_ASICFPGA;
+2352  | 		rev = (hwdata & HSORG_HWREV) >> 8;
+2353  | 		slotgroups = (hwdata & HSORG_SLOTGROUPS) + 1;
+2354  |  dev_info(&dd->pdev->dev,
+2355  |  "ASIC-FPGA design, HS rev 0x%x, "
+2356  |  "%i slot groups [%i slots]\n",
+2357  |  rev,
+2358  |  slotgroups,
+2359  |  slotgroups * 32);
+2360  |
+2361  |  if (slotgroups > MTIP_MAX_SLOT_GROUPS) {
+2362  |  dev_warn(&dd->pdev->dev,
+2363  |  "Warning: driver only supports "
+2364  |  "%i slot groups.\n", MTIP_MAX_SLOT_GROUPS);
+2365  | 			slotgroups = MTIP_MAX_SLOT_GROUPS;
+2366  | 		}
+2367  | 		dd->slot_groups = slotgroups;
+2368  |  return;
+2369  | 	}
+2370  |
+2371  |  dev_warn(&dd->pdev->dev, "Unrecognized product id\n");
+2372  | }
+2373  |
+2374  | /*
+2375  |  * Blocking wait for FTL rebuild to complete
+2376  |  *
+2377  |  * @dd Pointer to the DRIVER_DATA structure.
+2378  |  *
+2379  |  * return value
+2380  |  *	0	FTL rebuild completed successfully
+2381  |  *	-EFAULT FTL rebuild error/timeout/interruption
+2382  |  */
+2383  | static int mtip_ftl_rebuild_poll(struct driver_data *dd)
+2384  | {
+2385  |  unsigned long timeout, cnt = 0, start;
+2386  |
+2387  |  dev_warn(&dd->pdev->dev,
+2388  |  "FTL rebuild in progress. Polling for completion.\n");
+2389  |
+2390  | 	start = jiffies;
+2391  | 	timeout = jiffies + msecs_to_jiffies(MTIP_FTL_REBUILD_TIMEOUT_MS);
+2392  |
+2393  |  do {
+2394  |  if (unlikely(test_bit(MTIP_DDF_REMOVE_PENDING_BIT,
+2395  |  &dd->dd_flag)))
+2396  |  return -EFAULT;
+2397  |  if (mtip_check_surprise_removal(dd))
+2398  |  return -EFAULT;
+2399  |
+2400  |  if (mtip_get_identify(dd->port, NULL) < 0)
+2401  |  return -EFAULT;
+2663  | 	mtip_dump_identify(dd->port);
+2664  |
+2665  |  /* check write protect, over temp and rebuild statuses */
+2666  | 	rv = mtip_read_log_page(dd->port, ATA_LOG_SATA_NCQ,
+2667  | 				dd->port->log_buf,
+2668  | 				dd->port->log_buf_dma, 1);
+2669  |  if (rv) {
+2670  |  dev_warn(&dd->pdev->dev,
+2671  |  "Error in READ LOG EXT (10h) command\n");
+2672  |  /* non-critical error, don't fail the load */
+2673  | 	} else {
+2674  | 		buf = (unsigned char *)dd->port->log_buf;
+2675  |  if (buf[259] & 0x1) {
+2676  |  dev_info(&dd->pdev->dev,
+2677  |  "Write protect bit is set.\n");
+2678  | 			set_bit(MTIP_DDF_WRITE_PROTECT_BIT, &dd->dd_flag);
+2679  | 		}
+2680  |  if (buf[288] == 0xF7) {
+2681  |  dev_info(&dd->pdev->dev,
+2682  |  "Exceeded Tmax, drive in thermal shutdown.\n");
+2683  | 			set_bit(MTIP_DDF_OVER_TEMP_BIT, &dd->dd_flag);
+2684  | 		}
+2685  |  if (buf[288] == 0xBF) {
+2686  |  dev_info(&dd->pdev->dev,
+2687  |  "Drive indicates rebuild has failed.\n");
+2688  | 			set_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag);
+2689  | 		}
+2690  | 	}
+2691  |
+2692  |  /* get write protect progess */
+2693  |  memset(&attr242, 0, sizeof(struct smart_attr));
+2694  |  if (mtip_get_smart_attr(dd->port, 242, &attr242))
+2695  |  dev_warn(&dd->pdev->dev,
+2696  |  "Unable to check write protect progress\n");
+2697  |  else
+2698  |  dev_info(&dd->pdev->dev,
+2699  |  "Write protect progress: %u%% (%u blocks)\n",
+2700  |  attr242.cur, le32_to_cpu(attr242.data));
+2701  |
+2702  |  return rv;
+2703  | }
+2704  |
+2705  | /*
+2706  |  * Called once for each card.
+2707  |  *
+2708  |  * @dd Pointer to the driver data structure.
+2709  |  *
+2710  |  * return value
+2711  |  *	0 on success, else an error code.
+2712  |  */
+2713  | static int mtip_hw_init(struct driver_data *dd)
+2714  | {
+2715  |  int i;
+2716  |  int rv;
+2717  |  unsigned long timeout, timetaken;
+2718  |
+2719  | 	dd->mmio = pcim_iomap_table(dd->pdev)[MTIP_ABAR];
+2720  |
+2721  | 	mtip_detect_product(dd);
+2722  |  if (dd->product_type0.1Field 'product_type' is equal to MTIP_PRODUCT_UNKNOWN == MTIP_PRODUCT_UNKNOWN) {
+    1Taking true branch→
+2723  |  rv = -EIO;
+2724  |  goto out1;
+    2←Control jumps to line 2847→
+2725  | 	}
+2726  |
+2727  | 	hba_setup(dd);
+2728  |
+2729  | 	dd->port = kzalloc_node(sizeof(struct mtip_port), GFP_KERNEL,
+2730  | 				dd->numa_node);
+2731  |  if (!dd->port)
+2732  |  return -ENOMEM;
+2733  |
+2734  |  /* Continue workqueue setup */
+2735  |  for (i = 0; i < MTIP_MAX_SLOT_GROUPS; i++)
+2736  | 		dd->work[i].port = dd->port;
+2737  |
+2738  |  /* Enable unaligned IO constraints for some devices */
+2739  |  if (mtip_device_unaligned_constrained(dd))
+2740  | 		dd->unal_qdepth = MTIP_MAX_UNALIGNED_SLOTS;
+2741  |  else
+2742  | 		dd->unal_qdepth = 0;
+2743  |
+2744  | 	atomic_set(&dd->port->cmd_slot_unal, dd->unal_qdepth);
+2745  |
+2746  |  /* Spinlock to prevent concurrent issue */
+2747  |  for (i = 0; i < MTIP_MAX_SLOT_GROUPS; i++)
+2748  |  spin_lock_init(&dd->port->cmd_issue_lock[i]);
+2749  |
+2750  |  /* Set the port mmio base address. */
+2751  | 	dd->port->mmio	= dd->mmio + PORT_OFFSET;
+2752  | 	dd->port->dd	= dd;
+2753  |
+2754  |  /* DMA allocations */
+2795  |  dev_err(&dd->pdev->dev,
+2796  |  "Card did not reset within timeout\n");
+2797  | 			rv = -EIO;
+2798  |  goto out2;
+2799  | 		}
+2800  | 	} else {
+2801  |  /* Clear any pending interrupts on the HBA */
+2802  |  writel(readl(dd->mmio + HOST_IRQ_STAT),
+2803  | 			dd->mmio + HOST_IRQ_STAT);
+2804  | 	}
+2805  |
+2806  | 	mtip_init_port(dd->port);
+2807  | 	mtip_start_port(dd->port);
+2808  |
+2809  |  /* Setup the ISR and enable interrupts. */
+2810  | 	rv = request_irq(dd->pdev->irq, mtip_irq_handler, IRQF_SHARED,
+2811  | 			 dev_driver_string(&dd->pdev->dev), dd);
+2812  |  if (rv) {
+2813  |  dev_err(&dd->pdev->dev,
+2814  |  "Unable to allocate IRQ %d\n", dd->pdev->irq);
+2815  |  goto out2;
+2816  | 	}
+2817  | 	irq_set_affinity_hint(dd->pdev->irq, get_cpu_mask(dd->isr_binding));
+2818  |
+2819  |  /* Enable interrupts on the HBA. */
+2820  |  writel(readl(dd->mmio + HOST_CTL) | HOST_IRQ_EN,
+2821  | 					dd->mmio + HOST_CTL);
+2822  |
+2823  |  init_waitqueue_head(&dd->port->svc_wait);
+2824  |
+2825  |  if (test_bit(MTIP_DDF_REMOVE_PENDING_BIT, &dd->dd_flag)) {
+2826  | 		rv = -EFAULT;
+2827  |  goto out3;
+2828  | 	}
+2829  |
+2830  |  return rv;
+2831  |
+2832  | out3:
+2833  |  /* Disable interrupts on the HBA. */
+2834  |  writel(readl(dd->mmio + HOST_CTL) & ~HOST_IRQ_EN,
+2835  | 			dd->mmio + HOST_CTL);
+2836  |
+2837  |  /* Release the IRQ. */
+2838  | 	irq_set_affinity_hint(dd->pdev->irq, NULL);
+2839  | 	free_irq(dd->pdev->irq, dd);
+2840  |
+2841  | out2:
+2842  | 	mtip_deinit_port(dd->port);
+2843  | 	mtip_dma_free(dd);
+2844  |
+2845  | out1:
+2846  |  /* Free the memory allocated for the for structure. */
+2847  |  kfree(dd->port);
+    3←Freeing unowned field in shared error label; possible double free
+2848  |
+2849  |  return rv;
+2850  | }
+2851  |
+2852  | static int mtip_standby_drive(struct driver_data *dd)
+2853  | {
+2854  |  int rv = 0;
+2855  |
+2856  |  if (dd->sr || !dd->port)
+2857  |  return -ENODEV;
+2858  |  /*
+2859  |  * Send standby immediate (E0h) to the drive so that it
+2860  |  * saves its state.
+2861  |  */
+2862  |  if (!test_bit(MTIP_PF_REBUILD_BIT, &dd->port->flags) &&
+2863  | 	    !test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag) &&
+2864  | 	    !test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag)) {
+2865  | 		rv = mtip_standby_immediate(dd->port);
+2866  |  if (rv)
+2867  |  dev_warn(&dd->pdev->dev,
+2868  |  "STANDBY IMMEDIATE failed\n");
+2869  | 	}
+2870  |  return rv;
+2871  | }
+2872  |
+2873  | /*
+2874  |  * Called to deinitialize an interface.
+2875  |  *
+2876  |  * @dd Pointer to the driver data structure.
+2877  |  *
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

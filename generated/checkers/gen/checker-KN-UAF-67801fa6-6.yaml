@@ -1,0 +1,313 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 67801fa67b94ebd0e4da7a77ac2d9f321b75fbe0
+commit_type: UAF
+index: 6
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/ASTContext.h\"\n#include \"\
+  clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program states to track published objects and already-warned ones\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(PublishedObjSet, const MemRegion*)\nREGISTER_SET_WITH_PROGRAMSTATE(AlreadyWarnedSet,\
+  \ const MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n\
+  \    check::PostCall,\n    check::PreCall,\n    check::Bind\n  > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Premature\
+  \ ID allocation\", \"Concurrency\")) {}\n\n      void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const;\n\n   private:\n      static bool isPublishAPI(const\
+  \ CallEvent &Call, CheckerContext &C, unsigned &EntryArgIdx);\n      void reportPublishBeforeInit(const\
+  \ Stmt *S, const MemRegion *BaseReg, CheckerContext &C) const;\n\n      static const\
+  \ MemRegion *getBaseFromExpr(const Expr *E, CheckerContext &C);\n      static const\
+  \ MemRegion *getBaseFromLocSVal(SVal Loc);\n};\n\n/// Determine if this call is\
+  \ to xa_alloc/idr_alloc-family and provide the index\n/// of the entry pointer parameter.\n\
+  bool SAGenTestChecker::isPublishAPI(const CallEvent &Call, CheckerContext &C,\n\
+  \                                    unsigned &EntryArgIdx) {\n  EntryArgIdx = UINT_MAX;\n\
+  \n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\
+  \n  bool IsXA = ExprHasName(Origin, \"xa_alloc\", C);\n  bool IsIDR = ExprHasName(Origin,\
+  \ \"idr_alloc\", C) ||\n               ExprHasName(Origin, \"idr_alloc_u32\", C)\
+  \ ||\n               ExprHasName(Origin, \"idr_alloc_range\", C);\n\n  if (!IsXA\
+  \ && !IsIDR) {\n    // Fallback to identifier check if available\n    if (const\
+  \ IdentifierInfo *II = Call.getCalleeIdentifier()) {\n      StringRef N = II->getName();\n\
+  \      IsXA = (N == \"xa_alloc\");\n      IsIDR = (N == \"idr_alloc\" || N == \"\
+  idr_alloc_u32\" || N == \"idr_alloc_range\");\n    }\n  }\n\n  if (IsXA) {\n   \
+  \ // xa_alloc(xa, id, entry, ...) -> entry at index 2\n    if (Call.getNumArgs()\
+  \ > 2) {\n      EntryArgIdx = 2;\n      return true;\n    }\n    return false;\n\
+  \  }\n\n  if (IsIDR) {\n    // idr_alloc*(idr, ptr, ...) -> ptr at index 1\n   \
+  \ if (Call.getNumArgs() > 1) {\n      EntryArgIdx = 1;\n      return true;\n   \
+  \ }\n    return false;\n  }\n\n  return false;\n}\n\nconst MemRegion *SAGenTestChecker::getBaseFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n\
+  }\n\nconst MemRegion *SAGenTestChecker::getBaseFromLocSVal(SVal Loc) {\n  const\
+  \ MemRegion *MR = Loc.getAsRegion();\n  if (!MR)\n    return nullptr;\n  return\
+  \ MR->getBaseRegion();\n}\n\nvoid SAGenTestChecker::reportPublishBeforeInit(const\
+  \ Stmt *S,\n                                               const MemRegion *BaseReg,\n\
+  \                                               CheckerContext &C) const {\n  if\
+  \ (!BaseReg)\n    return;\n\n  ProgramStateRef State = C.getState();\n  // Avoid\
+  \ duplicate reports on the same path for the same base region\n  if (State->contains<AlreadyWarnedSet>(BaseReg))\n\
+  \    return;\n\n  State = State->add<AlreadyWarnedSet>(BaseReg);\n\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode(State);\n  if (!N)\n    return;\n\n  auto R =\
+  \ std::make_unique<PathSensitiveBugReport>(\n      *BT, \"ID allocated before finishing\
+  \ init; move xa_alloc/idr_alloc to the end\", N);\n\n  if (S)\n    R->addRange(S->getSourceRange());\n\
+  \n  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  unsigned ArgIdx = UINT_MAX;\n  if (!isPublishAPI(Call, C, ArgIdx))\n    return;\n\
+  \n  if (ArgIdx >= Call.getNumArgs())\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(ArgIdx);\n\
+  \  const MemRegion *BaseReg = getBaseFromExpr(ArgE, C);\n  if (!BaseReg)\n    return;\n\
+  \n  // Record that this object's pointer has been published into a global ID store\n\
+  \  State = State->add<PublishedObjSet>(BaseReg);\n  C.addTransition(State);\n}\n\
+  \nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  // Optionally detect post-publish writes hidden behind helper calls\
+  \ that\n  // dereference fields.\n  llvm::SmallVector<unsigned, 4> DerefParams;\n\
+  \  if (!functionKnownToDeref(Call, DerefParams))\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  for (unsigned Idx : DerefParams) {\n    if (Idx >=\
+  \ Call.getNumArgs())\n      continue;\n\n    const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \    const MemRegion *BaseReg = getBaseFromExpr(ArgE, C);\n    if (!BaseReg)\n \
+  \     continue;\n\n    if (State->contains<PublishedObjSet>(BaseReg) &&\n      \
+  \  !State->contains<AlreadyWarnedSet>(BaseReg)) {\n      reportPublishBeforeInit(Call.getOriginExpr(),\
+  \ BaseReg, C);\n      // State transition is done inside report (adds AlreadyWarnedSet).\n\
+  \      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal\
+  \ /*Val*/, const Stmt *S, CheckerContext &C) const {\n  // Triggered on stores like\
+  \ q->field = ...\n  const MemRegion *BaseReg = getBaseFromLocSVal(Loc);\n  if (!BaseReg)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  if (!State->contains<PublishedObjSet>(BaseReg))\n\
+  \    return;\n\n  if (State->contains<AlreadyWarnedSet>(BaseReg))\n    return;\n\
+  \n  reportPublishBeforeInit(S, BaseReg, C);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects publishing objects via xa_alloc/idr_alloc\
+  \ before finishing initialization\",\n      \"\");\n}\n\nextern \"C\" const char\
+  \ clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ndrm/xe/queue: move xa_alloc to prevent UAF\n\nEvil\
+  \ user can guess the next id of the queue before the ioctl completes\nand then call\
+  \ queue destroy ioctl to trigger UAF since create ioctl is\nstill referencing the\
+  \ same queue. Move the xa_alloc all the way to the end\nto prevent this.\n\nv2:\n\
+  \ - Rebase\n\nFixes: 2149ded63079 (\"drm/xe: Fix use after free when client stats\
+  \ are captured\")\nSigned-off-by: Matthew Auld <matthew.auld@intel.com>\nCc: Matthew\
+  \ Brost <matthew.brost@intel.com>\nReviewed-by: Nirmoy Das <nirmoy.das@intel.com>\n\
+  Reviewed-by: Matthew Brost <matthew.brost@intel.com>\nLink: https://patchwork.freedesktop.org/patch/msgid/20240925071426.144015-4-matthew.auld@intel.com\n\
+  (cherry picked from commit 16536582ddbebdbdf9e1d7af321bbba2bf955a87)\nSigned-off-by:\
+  \ Lucas De Marchi <lucas.demarchi@intel.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ xe_exec_queue_create_ioctl in drivers/gpu/drm/xe/xe_exec_queue.c\nint xe_exec_queue_create_ioctl(struct\
+  \ drm_device *dev, void *data,\n\t\t\t       struct drm_file *file)\n{\n\tstruct\
+  \ xe_device *xe = to_xe_device(dev);\n\tstruct xe_file *xef = to_xe_file(file);\n\
+  \tstruct drm_xe_exec_queue_create *args = data;\n\tstruct drm_xe_engine_class_instance\
+  \ eci[XE_HW_ENGINE_MAX_INSTANCE];\n\tstruct drm_xe_engine_class_instance __user\
+  \ *user_eci =\n\t\tu64_to_user_ptr(args->instances);\n\tstruct xe_hw_engine *hwe;\n\
+  \tstruct xe_vm *vm;\n\tstruct xe_gt *gt;\n\tstruct xe_tile *tile;\n\tstruct xe_exec_queue\
+  \ *q = NULL;\n\tu32 logical_mask;\n\tu32 id;\n\tu32 len;\n\tint err;\n\n\tif (XE_IOCTL_DBG(xe,\
+  \ args->flags) ||\n\t    XE_IOCTL_DBG(xe, args->reserved[0] || args->reserved[1]))\n\
+  \t\treturn -EINVAL;\n\n\tlen = args->width * args->num_placements;\n\tif (XE_IOCTL_DBG(xe,\
+  \ !len || len > XE_HW_ENGINE_MAX_INSTANCE))\n\t\treturn -EINVAL;\n\n\terr = __copy_from_user(eci,\
+  \ user_eci,\n\t\t\t       sizeof(struct drm_xe_engine_class_instance) *\n\t\t\t\
+  \       len);\n\tif (XE_IOCTL_DBG(xe, err))\n\t\treturn -EFAULT;\n\n\tif (XE_IOCTL_DBG(xe,\
+  \ eci[0].gt_id >= xe->info.gt_count))\n\t\treturn -EINVAL;\n\n\tif (eci[0].engine_class\
+  \ == DRM_XE_ENGINE_CLASS_VM_BIND) {\n\t\tif (XE_IOCTL_DBG(xe, args->width != 1)\
+  \ ||\n\t\t    XE_IOCTL_DBG(xe, args->num_placements != 1) ||\n\t\t    XE_IOCTL_DBG(xe,\
+  \ eci[0].engine_instance != 0))\n\t\t\treturn -EINVAL;\n\n\t\tfor_each_tile(tile,\
+  \ xe, id) {\n\t\t\tstruct xe_exec_queue *new;\n\t\t\tu32 flags = EXEC_QUEUE_FLAG_VM;\n\
+  \n\t\t\tif (id)\n\t\t\t\tflags |= EXEC_QUEUE_FLAG_BIND_ENGINE_CHILD;\n\n\t\t\tnew\
+  \ = xe_exec_queue_create_bind(xe, tile, flags,\n\t\t\t\t\t\t\targs->extensions);\n\
+  \t\t\tif (IS_ERR(new)) {\n\t\t\t\terr = PTR_ERR(new);\n\t\t\t\tif (q)\n\t\t\t\t\t\
+  goto put_exec_queue;\n\t\t\t\treturn err;\n\t\t\t}\n\t\t\tif (id == 0)\n\t\t\t\t\
+  q = new;\n\t\t\telse\n\t\t\t\tlist_add_tail(&new->multi_gt_list,\n\t\t\t\t\t   \
+  \   &q->multi_gt_link);\n\t\t}\n\t} else {\n\t\tgt = xe_device_get_gt(xe, eci[0].gt_id);\n\
+  \t\tlogical_mask = calc_validate_logical_mask(xe, gt, eci,\n\t\t\t\t\t\t\t  args->width,\n\
+  \t\t\t\t\t\t\t  args->num_placements);\n\t\tif (XE_IOCTL_DBG(xe, !logical_mask))\n\
+  \t\t\treturn -EINVAL;\n\n\t\thwe = xe_hw_engine_lookup(xe, eci[0]);\n\t\tif (XE_IOCTL_DBG(xe,\
+  \ !hwe))\n\t\t\treturn -EINVAL;\n\n\t\tvm = xe_vm_lookup(xef, args->vm_id);\n\t\t\
+  if (XE_IOCTL_DBG(xe, !vm))\n\t\t\treturn -ENOENT;\n\n\t\terr = down_read_interruptible(&vm->lock);\n\
+  \t\tif (err) {\n\t\t\txe_vm_put(vm);\n\t\t\treturn err;\n\t\t}\n\n\t\tif (XE_IOCTL_DBG(xe,\
+  \ xe_vm_is_closed_or_banned(vm))) {\n\t\t\tup_read(&vm->lock);\n\t\t\txe_vm_put(vm);\n\
+  \t\t\treturn -ENOENT;\n\t\t}\n\n\t\tq = xe_exec_queue_create(xe, vm, logical_mask,\n\
+  \t\t\t\t\t args->width, hwe, 0,\n\t\t\t\t\t args->extensions);\n\t\tup_read(&vm->lock);\n\
+  \t\txe_vm_put(vm);\n\t\tif (IS_ERR(q))\n\t\t\treturn PTR_ERR(q);\n\n\t\tif (xe_vm_in_preempt_fence_mode(vm))\
+  \ {\n\t\t\tq->lr.context = dma_fence_context_alloc(1);\n\n\t\t\terr = xe_vm_add_compute_exec_queue(vm,\
+  \ q);\n\t\t\tif (XE_IOCTL_DBG(xe, err))\n\t\t\t\tgoto put_exec_queue;\n\t\t}\n\n\
+  \t\tif (q->vm && q->hwe->hw_engine_group) {\n\t\t\terr = xe_hw_engine_group_add_exec_queue(q->hwe->hw_engine_group,\
+  \ q);\n\t\t\tif (err)\n\t\t\t\tgoto put_exec_queue;\n\t\t}\n\t}\n\n\terr = xa_alloc(&xef->exec_queue.xa,\
+  \ &id, q, xa_limit_32b, GFP_KERNEL);\n\tif (err)\n\t\tgoto kill_exec_queue;\n\n\t\
+  args->exec_queue_id = id;\n\tq->xef = xe_file_get(xef);\n\n\treturn 0;\n\nkill_exec_queue:\n\
+  \txe_exec_queue_kill(q);\nput_exec_queue:\n\txe_exec_queue_put(q);\n\treturn err;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/gpu/drm/xe/xe_exec_queue.c\
+  \ b/drivers/gpu/drm/xe/xe_exec_queue.c\nindex 7743ebdcbf4b..d098d2dd1b2d 100644\n\
+  --- a/drivers/gpu/drm/xe/xe_exec_queue.c\n+++ b/drivers/gpu/drm/xe/xe_exec_queue.c\n\
+  @@ -635,12 +635,14 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void\
+  \ *data,\n \t\t}\n \t}\n \n+\tq->xef = xe_file_get(xef);\n+\n+\t/* user id alloc\
+  \ must always be last in ioctl to prevent UAF */\n \terr = xa_alloc(&xef->exec_queue.xa,\
+  \ &id, q, xa_limit_32b, GFP_KERNEL);\n \tif (err)\n \t\tgoto kill_exec_queue;\n\
+  \ \n \targs->exec_queue_id = id;\n-\tq->xef = xe_file_get(xef);\n \n \treturn 0;\n\
+  \ \n```\n"
+pattern: '## Bug Pattern
+
+
+  Publishing a newly created object to a globally visible ID store (xarray/idr via
+  xa_alloc/idr_alloc) before the create path is fully finalized and ownership/refcounting
+  is established. Because the ID is predictable, another thread can issue a destroy/lookup
+  by that ID while the creator still holds only a raw pointer or the object is partially
+  initialized, leading to a race and use-after-free. The correct pattern is to defer
+  ID allocation/registration until the very end of the ioctl, after all initialization
+  and reference ownership (e.g., q->xef = xe_file_get(xef)) is set.'
+plan: "1) Program state\n\n- REGISTER_SET_WITH_PROGRAMSTATE(PublishedObjSet, const\
+  \ MemRegion*)\n  - Holds the pointee-region of objects that have been \u201Cpublished\u201D\
+  \ to a global ID store (xarray/idr) within the current path.\n\n- REGISTER_SET_WITH_PROGRAMSTATE(AlreadyWarnedSet,\
+  \ const MemRegion*)\n  - Tracks published objects we already warned about to avoid\
+  \ duplicate reports along the same path.\n\nNo other traits are strictly necessary.\
+  \ We will not maintain a separate alias map because CSA location regions on field\
+  \ writes already carry the pointee base region we need to compare against.\n\n\n\
+  2) Callbacks and how to implement them\n\nA) checkPostCall (detect \u201Cpublish\u201D\
+  \ calls and mark the object)\n\n- Goal: When the code calls xa_alloc/idr_alloc-family\
+  \ functions, mark the object pointer being published.\n- Steps:\n  - Identify publish\
+  \ APIs by callee name:\n    - xa_alloc: the 3rd parameter (index 2) is the entry\
+  \ pointer being published.\n    - idr_alloc, idr_alloc_u32, idr_alloc_range: the\
+  \ 2nd parameter (index 1) is the entry pointer being published.\n  - Use Call.getCalleeIdentifier()->getName()\
+  \ to check for: \"xa_alloc\", \"idr_alloc\", \"idr_alloc_u32\", \"idr_alloc_range\"\
+  .\n    - If getCalleeIdentifier() is null, optionally fallback to ExprHasName(Call.getOriginExpr(),\
+  \ \"xa_alloc\") etc.\n  - Fetch the corresponding argument Expr by index and obtain\
+  \ its pointee MemRegion using getMemRegionFromExpr(ArgExpr, C).\n    - Note: For\
+  \ a pointer variable like \u2018q\u2019, getMemRegionFromExpr returns the pointee\
+  \ region (a SymbolicRegion), which is what we want.\n  - If a region was found,\
+  \ insert it into PublishedObjSet in the current state.\n  - Do nothing else here.\n\
+  \nRationale: Publishing registers the object id globally. Any further initialization\
+  \ or ownership/refcount establishes after this point is suspect.\n\n\nB) checkBind\
+  \ (detect stores to the published object after \u201Cpublish\u201D)\n\n- Goal: Catch\
+  \ any initialization or refcount/ownership setup happening to the object after it\
+  \ has been published.\n- Trigger: CSA invokes checkBind when a value is stored into\
+  \ a location (e.g., q->xef = ..., q->field = ..., etc.).\n- Steps:\n  - If Loc is\
+  \ not a location or not a region, return.\n  - Extract the MemRegion from Loc. If\
+  \ it is a FieldRegion or ElementRegion, climb to its base/super region until you\
+  \ reach the \u201Cbase object\u201D region that represents the pointee (e.g., the\
+  \ SymbolicRegion behind \u2018q\u2019). Use Region->getSuperRegion() repeatedly\
+  \ until you find a base region that is not a FieldRegion/ElementRegion.\n  - Check\
+  \ whether this base region is present in PublishedObjSet.\n    - If not present,\
+  \ return (not a \u201Cwrite after publish\u201D).\n    - If present and not in AlreadyWarnedSet,\
+  \ we have a \u201Cpublish-before-finish\u201D pattern.\n  - Reporting:\n    - Create\
+  \ a non-fatal error node and a PathSensitiveBugReport with a short message such\
+  \ as:\n      \"ID allocated before finishing init; move xa_alloc/idr_alloc to the\
+  \ end.\"\n    - Add the base region to AlreadyWarnedSet to avoid duplicate reports\
+  \ on the same path.\n- Notes:\n  - This directly matches the fixed pattern in the\
+  \ patch: xa_alloc executed, then a store to q->xef happens after. We flag exactly\
+  \ that.\n\n\nC) checkPreCall (optional, catch post-publish writes via functions\
+  \ that dereference fields)\n\n- Goal: Some initialization may occur by passing addresses\
+  \ of the object\u2019s fields into helper functions that dereference them (e.g.,\
+  \ list_add_tail(&q->link, ...)). We want to flag these too if they occur after publish.\n\
+  - Steps:\n  - Use functionKnownToDeref(Call, DerefParams) to obtain indices of parameters\
+  \ that are known to be dereferenced.\n  - For each deref parameter:\n    - Get the\
+  \ argument Expr and its region via getMemRegionFromExpr.\n    - If the region is\
+  \ a FieldRegion or ElementRegion, climb to the base region as described above.\n\
+  \    - If the base region is in PublishedObjSet and not yet in AlreadyWarnedSet,\
+  \ report the same bug and mark it in AlreadyWarnedSet.\n- This step broadens coverage\
+  \ while keeping the logic simple, leveraging the provided utility.\n\n\n3) Additional\
+  \ details and filters\n\n- Only warn after a publish call has actually occurred\
+  \ along the current path. CSA\u2019s path-sensitivity ensures we don\u2019t report\
+  \ stores that happen on paths where no publish happened.\n- We do not need to special-case\
+  \ the function type (e.g., \u201Cioctl\u201D or \u201Ccreate\u201D) because the\
+  \ core pattern is generic: publishing to a global ID store before finishing initialization.\n\
+  - We intentionally do not require matching a specific field name (like q->xef).\
+  \ Any write to the object after publish is evidence that publishing was not the\
+  \ last step.\n- The checker does not need to track pointer-variable aliases manually:\
+  \ the store location\u2019s region in checkBind resolves to the base pointee region,\
+  \ which will match the entry region tracked in PublishedObjSet.\n\n\n4) Summary\
+  \ of minimal steps to implement\n\n- Program states:\n  - REGISTER_SET_WITH_PROGRAMSTATE(PublishedObjSet,\
+  \ const MemRegion*)\n  - REGISTER_SET_WITH_PROGRAMSTATE(AlreadyWarnedSet, const\
+  \ MemRegion*)\n\n- checkPostCall:\n  - If callee in {\"xa_alloc\", \"idr_alloc\"\
+  , \"idr_alloc_u32\", \"idr_alloc_range\"}:\n    - Get entry pointer argument index:\
+  \ xa_alloc -> 2, others -> 1.\n    - Extract pointee MemRegion via getMemRegionFromExpr.\n\
+  \    - Add region to PublishedObjSet.\n\n- checkBind:\n  - On every store:\n   \
+  \ - Get Loc\u2019s region and climb to base pointee region.\n    - If base region\
+  \ \u2208 PublishedObjSet and not \u2208 AlreadyWarnedSet:\n      - Report: \"ID\
+  \ allocated before finishing init; move xa_alloc/idr_alloc to the end.\"\n     \
+  \ - Insert base region into AlreadyWarnedSet.\n\n- checkPreCall (optional, recommended):\n\
+  \  - If functionKnownToDeref(Call, DerefParams) returns true:\n    - For each deref\
+  \ param, get region, climb to base region.\n    - If base region \u2208 PublishedObjSet\
+  \ and not \u2208 AlreadyWarnedSet:\n      - Report same bug and mark AlreadyWarnedSet.\n\
+  \nThis plan directly flags the exact anti-pattern in the provided patch: calling\
+  \ xa_alloc (publishing) before finalizing initialization/refcount (e.g., q->xef\
+  \ = xe_file_get(xef)), and it remains simple, path-sensitive, and low-noise."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/ASTContext.h\"\n#include \"\
+  clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program states to track published objects and already-warned ones\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(PublishedObjSet, const MemRegion*)\nREGISTER_SET_WITH_PROGRAMSTATE(AlreadyWarnedSet,\
+  \ const MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n\
+  \    check::PostCall,\n    check::PreCall,\n    check::Bind\n  > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Premature\
+  \ ID allocation\", \"Concurrency\")) {}\n\n      void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const;\n\n   private:\n      static bool isPublishAPI(const\
+  \ CallEvent &Call, CheckerContext &C, unsigned &EntryArgIdx);\n      void reportPublishBeforeInit(const\
+  \ Stmt *S, const MemRegion *BaseReg, CheckerContext &C) const;\n\n      static const\
+  \ MemRegion *getBaseFromExpr(const Expr *E, CheckerContext &C);\n      static const\
+  \ MemRegion *getBaseFromLocSVal(SVal Loc);\n};\n\n/// Determine if this call is\
+  \ to xa_alloc/idr_alloc-family and provide the index\n/// of the entry pointer parameter.\n\
+  bool SAGenTestChecker::isPublishAPI(const CallEvent &Call, CheckerContext &C,\n\
+  \                                    unsigned &EntryArgIdx) {\n  EntryArgIdx = UINT_MAX;\n\
+  \n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\
+  \n  bool IsXA = ExprHasName(Origin, \"xa_alloc\", C);\n  bool IsIDR = ExprHasName(Origin,\
+  \ \"idr_alloc\", C) ||\n               ExprHasName(Origin, \"idr_alloc_u32\", C)\
+  \ ||\n               ExprHasName(Origin, \"idr_alloc_range\", C);\n\n  if (!IsXA\
+  \ && !IsIDR) {\n    // Fallback to identifier check if available\n    if (const\
+  \ IdentifierInfo *II = Call.getCalleeIdentifier()) {\n      StringRef N = II->getName();\n\
+  \      IsXA = (N == \"xa_alloc\");\n      IsIDR = (N == \"idr_alloc\" || N == \"\
+  idr_alloc_u32\" || N == \"idr_alloc_range\");\n    }\n  }\n\n  if (IsXA) {\n   \
+  \ // xa_alloc(xa, id, entry, ...) -> entry at index 2\n    if (Call.getNumArgs()\
+  \ > 2) {\n      EntryArgIdx = 2;\n      return true;\n    }\n    return false;\n\
+  \  }\n\n  if (IsIDR) {\n    // idr_alloc*(idr, ptr, ...) -> ptr at index 1\n   \
+  \ if (Call.getNumArgs() > 1) {\n      EntryArgIdx = 1;\n      return true;\n   \
+  \ }\n    return false;\n  }\n\n  return false;\n}\n\nconst MemRegion *SAGenTestChecker::getBaseFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n\
+  }\n\nconst MemRegion *SAGenTestChecker::getBaseFromLocSVal(SVal Loc) {\n  const\
+  \ MemRegion *MR = Loc.getAsRegion();\n  if (!MR)\n    return nullptr;\n  return\
+  \ MR->getBaseRegion();\n}\n\nvoid SAGenTestChecker::reportPublishBeforeInit(const\
+  \ Stmt *S,\n                                               const MemRegion *BaseReg,\n\
+  \                                               CheckerContext &C) const {\n  if\
+  \ (!BaseReg)\n    return;\n\n  ProgramStateRef State = C.getState();\n  // Avoid\
+  \ duplicate reports on the same path for the same base region\n  if (State->contains<AlreadyWarnedSet>(BaseReg))\n\
+  \    return;\n\n  State = State->add<AlreadyWarnedSet>(BaseReg);\n\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode(State);\n  if (!N)\n    return;\n\n  auto R =\
+  \ std::make_unique<PathSensitiveBugReport>(\n      *BT, \"ID allocated before finishing\
+  \ init; move xa_alloc/idr_alloc to the end\", N);\n\n  if (S)\n    R->addRange(S->getSourceRange());\n\
+  \n  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  unsigned ArgIdx = UINT_MAX;\n  if (!isPublishAPI(Call, C, ArgIdx))\n    return;\n\
+  \n  if (ArgIdx >= Call.getNumArgs())\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(ArgIdx);\n\
+  \  const MemRegion *BaseReg = getBaseFromExpr(ArgE, C);\n  if (!BaseReg)\n    return;\n\
+  \n  // Record that this object's pointer has been published into a global ID store\n\
+  \  State = State->add<PublishedObjSet>(BaseReg);\n  C.addTransition(State);\n}\n\
+  \nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  // Optionally detect post-publish writes hidden behind helper calls\
+  \ that\n  // dereference fields.\n  llvm::SmallVector<unsigned, 4> DerefParams;\n\
+  \  if (!functionKnownToDeref(Call, DerefParams))\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  for (unsigned Idx : DerefParams) {\n    if (Idx >=\
+  \ Call.getNumArgs())\n      continue;\n\n    const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \    const MemRegion *BaseReg = getBaseFromExpr(ArgE, C);\n    if (!BaseReg)\n \
+  \     continue;\n\n    if (State->contains<PublishedObjSet>(BaseReg) &&\n      \
+  \  !State->contains<AlreadyWarnedSet>(BaseReg)) {\n      reportPublishBeforeInit(Call.getOriginExpr(),\
+  \ BaseReg, C);\n      // State transition is done inside report (adds AlreadyWarnedSet).\n\
+  \      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal\
+  \ /*Val*/, const Stmt *S, CheckerContext &C) const {\n  // Triggered on stores like\
+  \ q->field = ...\n  const MemRegion *BaseReg = getBaseFromLocSVal(Loc);\n  if (!BaseReg)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  if (!State->contains<PublishedObjSet>(BaseReg))\n\
+  \    return;\n\n  if (State->contains<AlreadyWarnedSet>(BaseReg))\n    return;\n\
+  \n  reportPublishBeforeInit(S, BaseReg, C);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects publishing objects via xa_alloc/idr_alloc\
+  \ before finishing initialization\",\n      \"\");\n}\n\nextern \"C\" const char\
+  \ clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

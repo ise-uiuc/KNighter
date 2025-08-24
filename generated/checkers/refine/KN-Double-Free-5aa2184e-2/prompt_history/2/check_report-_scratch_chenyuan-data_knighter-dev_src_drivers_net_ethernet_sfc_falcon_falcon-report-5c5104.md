@@ -1,0 +1,505 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Unconditional cleanup via a shared error label frees resources that are not guaranteed to be allocated/owned at that point. Specifically, jumping to a label that does kfree(mt->fc) even when hws_definer_conv_match_params_to_hl() failed (and may have already freed or never allocated mt->fc) leads to a double free. The root cause is using a single error path to free callee-managed/conditionally allocated memory, instead of separating cleanup by resource lifetime and ownership.
+
+## Bug Pattern
+
+Unconditional cleanup via a shared error label frees resources that are not guaranteed to be allocated/owned at that point. Specifically, jumping to a label that does kfree(mt->fc) even when hws_definer_conv_match_params_to_hl() failed (and may have already freed or never allocated mt->fc) leads to a double free. The root cause is using a single error path to free callee-managed/conditionally allocated memory, instead of separating cleanup by resource lifetime and ownership.
+
+# Report
+
+### Report Summary
+
+File:| drivers/net/ethernet/sfc/falcon/falcon.c
+---|---
+Warning:| line 2421, column 2
+Freeing unowned field in shared error label; possible double free
+
+### Annotated Source Code
+
+
+1730  |  return 0;
+1731  | }
+1732  |
+1733  | static void falcon_remove_port(struct ef4_nic *efx)
+1734  | {
+1735  | 	efx->phy_op->remove(efx);
+1736  | 	ef4_nic_free_buffer(efx, &efx->stats_buffer);
+1737  | }
+1738  |
+1739  | /* Global events are basically PHY events */
+1740  | static bool
+1741  | falcon_handle_global_event(struct ef4_channel *channel, ef4_qword_t *event)
+1742  | {
+1743  |  struct ef4_nic *efx = channel->efx;
+1744  |  struct falcon_nic_data *nic_data = efx->nic_data;
+1745  |
+1746  |  if (EF4_QWORD_FIELD(*event, FSF_AB_GLB_EV_G_PHY0_INTR) ||
+1747  |  EF4_QWORD_FIELD(*event, FSF_AB_GLB_EV_XG_PHY0_INTR) ||
+1748  |  EF4_QWORD_FIELD(*event, FSF_AB_GLB_EV_XFP_PHY0_INTR))
+1749  |  /* Ignored */
+1750  |  return true;
+1751  |
+1752  |  if ((ef4_nic_rev(efx) == EF4_REV_FALCON_B0) &&
+1753  |  EF4_QWORD_FIELD(*event, FSF_BB_GLB_EV_XG_MGT_INTR)) {
+1754  | 		nic_data->xmac_poll_required = true;
+1755  |  return true;
+1756  | 	}
+1757  |
+1758  |  if (ef4_nic_rev(efx) <= EF4_REV_FALCON_A1 ?
+1759  |  EF4_QWORD_FIELD(*event, FSF_AA_GLB_EV_RX_RECOVERY) :
+1760  |  EF4_QWORD_FIELD(*event, FSF_BB_GLB_EV_RX_RECOVERY)) {
+1761  |  netif_err(efx, rx_err, efx->net_dev,
+1762  |  "channel %d seen global RX_RESET event. Resetting.\n",
+1763  |  channel->channel);
+1764  |
+1765  | 		atomic_inc(&efx->rx_reset);
+1766  | 		ef4_schedule_reset(efx, EF4_WORKAROUND_6555(efx) ?
+1767  | 				   RESET_TYPE_RX_RECOVERY : RESET_TYPE_DISABLE);
+1768  |  return true;
+1769  | 	}
+1770  |
+1771  |  return false;
+1772  | }
+1773  |
+1774  | /**************************************************************************
+1775  |  *
+1776  |  * Falcon test code
+1777  |  *
+1778  |  **************************************************************************/
+1779  |
+1780  | static int
+1781  | falcon_read_nvram(struct ef4_nic *efx, struct falcon_nvconfig *nvconfig_out)
+1782  | {
+1783  |  struct falcon_nic_data *nic_data = efx->nic_data;
+1784  |  struct falcon_nvconfig *nvconfig;
+1785  |  struct falcon_spi_device *spi;
+1786  |  void *region;
+1787  |  int rc, magic_num, struct_ver;
+1788  | 	__le16 *word, *limit;
+1789  | 	u32 csum;
+1790  |
+1791  |  if (falcon_spi_present(&nic_data->spi_flash))
+1792  | 		spi = &nic_data->spi_flash;
+1793  |  else if (falcon_spi_present(&nic_data->spi_eeprom))
+1794  | 		spi = &nic_data->spi_eeprom;
+1795  |  else
+1796  |  return -EINVAL;
+1797  |
+1798  | 	region = kmalloc(FALCON_NVCONFIG_END, GFP_KERNEL);
+1799  |  if (!region)
+1800  |  return -ENOMEM;
+1801  | 	nvconfig = region + FALCON_NVCONFIG_OFFSET;
+1802  |
+1803  |  mutex_lock(&nic_data->spi_lock);
+1804  | 	rc = falcon_spi_read(efx, spi, 0, FALCON_NVCONFIG_END, NULL, region);
+1805  | 	mutex_unlock(&nic_data->spi_lock);
+1806  |  if (rc) {
+1807  |  netif_err(efx, hw, efx->net_dev, "Failed to read %s\n",
+1808  |  falcon_spi_present(&nic_data->spi_flash) ?
+1809  |  "flash" : "EEPROM");
+1810  | 		rc = -EIO;
+1811  |  goto out;
+1812  | 	}
+1813  |
+1814  | 	magic_num = le16_to_cpu(nvconfig->board_magic_num);
+1815  | 	struct_ver = le16_to_cpu(nvconfig->board_struct_ver);
+1816  |
+1817  | 	rc = -EINVAL;
+1818  |  if (magic_num != FALCON_NVCONFIG_BOARD_MAGIC_NUM) {
+1819  |  netif_err(efx, hw, efx->net_dev,
+1820  |  "NVRAM bad magic 0x%x\n", magic_num);
+1821  |  goto out;
+1822  | 	}
+1823  |  if (struct_ver < 2) {
+1824  |  netif_err(efx, hw, efx->net_dev,
+1825  |  "NVRAM has ancient version 0x%x\n", struct_ver);
+1826  |  goto out;
+2127  |
+2128  |  /* Wait for SRAM reset to complete */
+2129  | 	count = 0;
+2130  |  do {
+2131  |  netif_dbg(efx, hw, efx->net_dev,
+2132  |  "waiting for SRAM reset (attempt %d)...\n", count);
+2133  |
+2134  |  /* SRAM reset is slow; expect around 16ms */
+2135  | 		schedule_timeout_uninterruptible(HZ / 50);
+2136  |
+2137  |  /* Check for reset complete */
+2138  | 		ef4_reado(efx, &srm_cfg_reg_ker, FR_AZ_SRM_CFG);
+2139  |  if (!EF4_OWORD_FIELD(srm_cfg_reg_ker, FRF_AZ_SRM_INIT_EN)) {
+2140  |  netif_dbg(efx, hw, efx->net_dev,
+2141  |  "SRAM reset complete\n");
+2142  |
+2143  |  return 0;
+2144  | 		}
+2145  | 	} while (++count < 20);	/* wait up to 0.4 sec */
+2146  |
+2147  |  netif_err(efx, hw, efx->net_dev, "timed out waiting for SRAM reset\n");
+2148  |  return -ETIMEDOUT;
+2149  | }
+2150  |
+2151  | static void falcon_spi_device_init(struct ef4_nic *efx,
+2152  |  struct falcon_spi_device *spi_device,
+2153  |  unsigned int device_id, u32 device_type)
+2154  | {
+2155  |  if (device_type != 0) {
+2156  | 		spi_device->device_id = device_id;
+2157  | 		spi_device->size =
+2158  | 			1 << SPI_DEV_TYPE_FIELD(device_type, SPI_DEV_TYPE_SIZE);
+2159  | 		spi_device->addr_len =
+2160  |  SPI_DEV_TYPE_FIELD(device_type, SPI_DEV_TYPE_ADDR_LEN);
+2161  | 		spi_device->munge_address = (spi_device->size == 1 << 9 &&
+2162  | 					     spi_device->addr_len == 1);
+2163  | 		spi_device->erase_command =
+2164  |  SPI_DEV_TYPE_FIELD(device_type, SPI_DEV_TYPE_ERASE_CMD);
+2165  | 		spi_device->erase_size =
+2166  | 			1 << SPI_DEV_TYPE_FIELD(device_type,
+2167  |  SPI_DEV_TYPE_ERASE_SIZE);
+2168  | 		spi_device->block_size =
+2169  | 			1 << SPI_DEV_TYPE_FIELD(device_type,
+2170  |  SPI_DEV_TYPE_BLOCK_SIZE);
+2171  | 	} else {
+2172  | 		spi_device->size = 0;
+2173  | 	}
+2174  | }
+2175  |
+2176  | /* Extract non-volatile configuration */
+2177  | static int falcon_probe_nvconfig(struct ef4_nic *efx)
+2178  | {
+2179  |  struct falcon_nic_data *nic_data = efx->nic_data;
+2180  |  struct falcon_nvconfig *nvconfig;
+2181  |  int rc;
+2182  |
+2183  | 	nvconfig = kmalloc(sizeof(*nvconfig), GFP_KERNEL);
+2184  |  if (!nvconfig)
+2185  |  return -ENOMEM;
+2186  |
+2187  | 	rc = falcon_read_nvram(efx, nvconfig);
+2188  |  if (rc)
+2189  |  goto out;
+2190  |
+2191  | 	efx->phy_type = nvconfig->board_v2.port0_phy_type;
+2192  | 	efx->mdio.prtad = nvconfig->board_v2.port0_phy_addr;
+2193  |
+2194  |  if (le16_to_cpu(nvconfig->board_struct_ver) >= 3) {
+2195  | 		falcon_spi_device_init(
+2196  | 			efx, &nic_data->spi_flash, FFE_AB_SPI_DEVICE_FLASH,
+2197  |  le32_to_cpu(nvconfig->board_v3
+2198  |  .spi_device_type[FFE_AB_SPI_DEVICE_FLASH]));
+2199  | 		falcon_spi_device_init(
+2200  | 			efx, &nic_data->spi_eeprom, FFE_AB_SPI_DEVICE_EEPROM,
+2201  |  le32_to_cpu(nvconfig->board_v3
+2202  |  .spi_device_type[FFE_AB_SPI_DEVICE_EEPROM]));
+2203  | 	}
+2204  |
+2205  |  /* Read the MAC addresses */
+2206  | 	ether_addr_copy(efx->net_dev->perm_addr, nvconfig->mac_address[0]);
+2207  |
+2208  |  netif_dbg(efx, probe, efx->net_dev, "PHY is %d phy_id %d\n",
+2209  |  efx->phy_type, efx->mdio.prtad);
+2210  |
+2211  | 	rc = falcon_probe_board(efx,
+2212  |  le16_to_cpu(nvconfig->board_v2.board_revision));
+2213  | out:
+2214  | 	kfree(nvconfig);
+2215  |  return rc;
+2216  | }
+2217  |
+2218  | static int falcon_dimension_resources(struct ef4_nic *efx)
+2219  | {
+2220  | 	efx->rx_dc_base = 0x20000;
+2221  | 	efx->tx_dc_base = 0x26000;
+2222  |  return 0;
+2223  | }
+2224  |
+2225  | /* Probe all SPI devices on the NIC */
+2226  | static void falcon_probe_spi_devices(struct ef4_nic *efx)
+2227  | {
+2228  |  struct falcon_nic_data *nic_data = efx->nic_data;
+2229  | 	ef4_oword_t nic_stat, gpio_ctl, ee_vpd_cfg;
+2230  |  int boot_dev;
+2231  |
+2232  | 	ef4_reado(efx, &gpio_ctl, FR_AB_GPIO_CTL);
+2233  | 	ef4_reado(efx, &nic_stat, FR_AB_NIC_STAT);
+2234  | 	ef4_reado(efx, &ee_vpd_cfg, FR_AB_EE_VPD_CFG0);
+2235  |
+2236  |  if (EF4_OWORD_FIELD(gpio_ctl, FRF_AB_GPIO3_PWRUP_VALUE)) {
+2237  | 		boot_dev = (EF4_OWORD_FIELD(nic_stat, FRF_AB_SF_PRST) ?
+2238  |  FFE_AB_SPI_DEVICE_FLASH : FFE_AB_SPI_DEVICE_EEPROM);
+2239  |  netif_dbg(efx, probe, efx->net_dev, "Booted from %s\n",
+2240  |  boot_dev == FFE_AB_SPI_DEVICE_FLASH ?
+2241  |  "flash" : "EEPROM");
+2242  | 	} else {
+2243  |  /* Disable VPD and set clock dividers to safe
+2244  |  * values for initial programming. */
+2245  | 		boot_dev = -1;
+2246  |  netif_dbg(efx, probe, efx->net_dev,
+2247  |  "Booted from internal ASIC settings;"
+2248  |  " setting SPI config\n");
+2249  |  EF4_POPULATE_OWORD_3(ee_vpd_cfg, FRF_AB_EE_VPD_EN, 0,
+2250  |  /* 125 MHz / 7 ~= 20 MHz */
+2251  |  FRF_AB_EE_SF_CLOCK_DIV, 7,
+2252  |  /* 125 MHz / 63 ~= 2 MHz */
+2253  |  FRF_AB_EE_EE_CLOCK_DIV, 63);
+2254  | 		ef4_writeo(efx, &ee_vpd_cfg, FR_AB_EE_VPD_CFG0);
+2255  | 	}
+2256  |
+2257  |  mutex_init(&nic_data->spi_lock);
+2258  |
+2259  |  if (boot_dev == FFE_AB_SPI_DEVICE_FLASH)
+2260  | 		falcon_spi_device_init(efx, &nic_data->spi_flash,
+2261  |  FFE_AB_SPI_DEVICE_FLASH,
+2262  | 				       default_flash_type);
+2263  |  if (boot_dev == FFE_AB_SPI_DEVICE_EEPROM)
+2264  | 		falcon_spi_device_init(efx, &nic_data->spi_eeprom,
+2265  |  FFE_AB_SPI_DEVICE_EEPROM,
+2266  | 				       large_eeprom_type);
+2267  | }
+2268  |
+2269  | static unsigned int falcon_a1_mem_map_size(struct ef4_nic *efx)
+2270  | {
+2271  |  return 0x20000;
+2272  | }
+2273  |
+2274  | static unsigned int falcon_b0_mem_map_size(struct ef4_nic *efx)
+2275  | {
+2276  |  /* Map everything up to and including the RSS indirection table.
+2277  |  * The PCI core takes care of mapping the MSI-X tables.
+2278  |  */
+2279  |  return FR_BZ_RX_INDIRECTION_TBL +
+2280  |  FR_BZ_RX_INDIRECTION_TBL_STEP * FR_BZ_RX_INDIRECTION_TBL_ROWS;
+2281  | }
+2282  |
+2283  | static int falcon_probe_nic(struct ef4_nic *efx)
+2284  | {
+2285  |  struct falcon_nic_data *nic_data;
+2286  |  struct falcon_board *board;
+2287  |  int rc;
+2288  |
+2289  | 	efx->primary = efx; /* only one usable function per controller */
+2290  |
+2291  |  /* Allocate storage for hardware specific data */
+2292  | 	nic_data = kzalloc(sizeof(*nic_data), GFP_KERNEL);
+2293  |  if (!nic_data)
+    1Assuming 'nic_data' is non-null→
+    2←Taking false branch→
+2294  |  return -ENOMEM;
+2295  |  efx->nic_data = nic_data;
+2296  | 	nic_data->efx = efx;
+2297  |
+2298  | 	rc = -ENODEV;
+2299  |
+2300  |  if (ef4_farch_fpga_ver(efx) != 0) {
+    3←Assuming the condition is false→
+    4←Taking false branch→
+2301  |  netif_err(efx, probe, efx->net_dev,
+2302  |  "Falcon FPGA not supported\n");
+2303  |  goto fail1;
+2304  | 	}
+2305  |
+2306  |  if (ef4_nic_rev(efx) <= EF4_REV_FALCON_A1) {
+    5←Assuming the condition is false→
+    6←Taking false branch→
+2307  | 		ef4_oword_t nic_stat;
+2308  |  struct pci_dev *dev;
+2309  | 		u8 pci_rev = efx->pci_dev->revision;
+2310  |
+2311  |  if ((pci_rev == 0xff) || (pci_rev == 0)) {
+2312  |  netif_err(efx, probe, efx->net_dev,
+2313  |  "Falcon rev A0 not supported\n");
+2314  |  goto fail1;
+2315  | 		}
+2316  | 		ef4_reado(efx, &nic_stat, FR_AB_NIC_STAT);
+2317  |  if (EF4_OWORD_FIELD(nic_stat, FRF_AB_STRAP_10G) == 0) {
+2318  |  netif_err(efx, probe, efx->net_dev,
+2319  |  "Falcon rev A1 1G not supported\n");
+2320  |  goto fail1;
+2321  | 		}
+2322  |  if (EF4_OWORD_FIELD(nic_stat, FRF_AA_STRAP_PCIE) == 0) {
+2323  |  netif_err(efx, probe, efx->net_dev,
+2324  |  "Falcon rev A1 PCI-X not supported\n");
+2325  |  goto fail1;
+2326  | 		}
+2327  |
+2328  | 		dev = pci_dev_get(efx->pci_dev);
+2329  |  while ((dev = pci_get_device(PCI_VENDOR_ID_SOLARFLARE,
+2330  |  PCI_DEVICE_ID_SOLARFLARE_SFC4000A_1,
+2331  | 					     dev))) {
+2332  |  if (dev->bus == efx->pci_dev->bus &&
+2333  | 			    dev->devfn == efx->pci_dev->devfn + 1) {
+2334  | 				nic_data->pci_dev2 = dev;
+2335  |  break;
+2336  | 			}
+2337  | 		}
+2338  |  if (!nic_data->pci_dev2) {
+2339  |  netif_err(efx, probe, efx->net_dev,
+2340  |  "failed to find secondary function\n");
+2341  | 			rc = -ENODEV;
+2342  |  goto fail2;
+2343  | 		}
+2344  | 	}
+2345  |
+2346  |  /* Now we can reset the NIC */
+2347  |  rc = __falcon_reset_hw(efx, RESET_TYPE_ALL);
+2348  |  if (rc) {
+    7←Assuming 'rc' is 0→
+    8←Taking false branch→
+2349  |  netif_err(efx, probe, efx->net_dev, "failed to reset NIC\n");
+2350  |  goto fail3;
+2351  | 	}
+2352  |
+2353  |  /* Allocate memory for INT_KER */
+2354  |  rc = ef4_nic_alloc_buffer(efx, &efx->irq_status, sizeof(ef4_oword_t),
+2355  |  GFP_KERNEL);
+2356  |  if (rc)
+    9←Assuming 'rc' is 0→
+    10←Taking false branch→
+2357  |  goto fail4;
+2358  |  BUG_ON(efx->irq_status.dma_addr & 0x0f);
+    11←Assuming the condition is true→
+    12←Taking false branch→
+    13←Loop condition is false.  Exiting loop→
+2359  |
+2360  |  netif_dbg(efx, probe, efx->net_dev,
+    14←Assuming the condition is false→
+    15←Taking false branch→
+    16←Loop condition is false.  Exiting loop→
+2361  |  "INT_KER at %llx (virt %p phys %llx)\n",
+2362  |  (u64)efx->irq_status.dma_addr,
+2363  |  efx->irq_status.addr,
+2364  |  (u64)virt_to_phys(efx->irq_status.addr));
+2365  |
+2366  |  falcon_probe_spi_devices(efx);
+2367  |
+2368  |  /* Read in the non-volatile configuration */
+2369  | 	rc = falcon_probe_nvconfig(efx);
+2370  |  if (rc16.1'rc' is -22) {
+    17←Taking true branch→
+2371  |  if (rc == -EINVAL)
+    18←Taking true branch→
+2372  |  netif_err(efx, probe, efx->net_dev, "NVRAM is invalid\n");
+    19←Assuming the condition is false→
+    20←Taking false branch→
+    21←Loop condition is false.  Exiting loop→
+2373  |  goto fail5;
+    22←Control jumps to line 2412→
+2374  | 	}
+2375  |
+2376  | 	efx->max_channels = (ef4_nic_rev(efx) <= EF4_REV_FALCON_A1 ? 4 :
+2377  |  EF4_MAX_CHANNELS);
+2378  | 	efx->max_tx_channels = efx->max_channels;
+2379  | 	efx->timer_quantum_ns = 4968; /* 621 cycles */
+2380  | 	efx->timer_max_ns = efx->type->timer_period_max *
+2381  | 			    efx->timer_quantum_ns;
+2382  |
+2383  |  /* Initialise I2C adapter */
+2384  | 	board = falcon_board(efx);
+2385  | 	board->i2c_adap.owner = THIS_MODULE;
+2386  | 	board->i2c_data = falcon_i2c_bit_operations;
+2387  | 	board->i2c_data.data = efx;
+2388  | 	board->i2c_adap.algo_data = &board->i2c_data;
+2389  | 	board->i2c_adap.dev.parent = &efx->pci_dev->dev;
+2390  |  strscpy(board->i2c_adap.name, "SFC4000 GPIO",
+2391  |  sizeof(board->i2c_adap.name));
+2392  | 	rc = i2c_bit_add_bus(&board->i2c_adap);
+2393  |  if (rc)
+2394  |  goto fail5;
+2395  |
+2396  | 	rc = falcon_board(efx)->type->init(efx);
+2397  |  if (rc) {
+2398  |  netif_err(efx, probe, efx->net_dev,
+2399  |  "failed to initialise board\n");
+2400  |  goto fail6;
+2401  | 	}
+2402  |
+2403  | 	nic_data->stats_disable_count = 1;
+2404  |  timer_setup(&nic_data->stats_timer, falcon_stats_timer_func, 0);
+2405  |
+2406  |  return 0;
+2407  |
+2408  |  fail6:
+2409  | 	i2c_del_adapter(&board->i2c_adap);
+2410  |  memset(&board->i2c_adap, 0, sizeof(board->i2c_adap));
+2411  |  fail5:
+2412  |  ef4_nic_free_buffer(efx, &efx->irq_status);
+2413  |  fail4:
+2414  |  fail3:
+2415  |  if (nic_data->pci_dev2) {
+    23←Assuming field 'pci_dev2' is null→
+    24←Taking false branch→
+2416  | 		pci_dev_put(nic_data->pci_dev2);
+2417  | 		nic_data->pci_dev2 = NULL;
+2418  | 	}
+2419  |  fail2:
+2420  |  fail1:
+2421  |  kfree(efx->nic_data);
+    25←Freeing unowned field in shared error label; possible double free
+2422  |  return rc;
+2423  | }
+2424  |
+2425  | static void falcon_init_rx_cfg(struct ef4_nic *efx)
+2426  | {
+2427  |  /* RX control FIFO thresholds (32 entries) */
+2428  |  const unsigned ctrl_xon_thr = 20;
+2429  |  const unsigned ctrl_xoff_thr = 25;
+2430  | 	ef4_oword_t reg;
+2431  |
+2432  | 	ef4_reado(efx, ®, FR_AZ_RX_CFG);
+2433  |  if (ef4_nic_rev(efx) <= EF4_REV_FALCON_A1) {
+2434  |  /* Data FIFO size is 5.5K.  The RX DMA engine only
+2435  |  * supports scattering for user-mode queues, but will
+2436  |  * split DMA writes at intervals of RX_USR_BUF_SIZE
+2437  |  * (32-byte units) even for kernel-mode queues.  We
+2438  |  * set it to be so large that that never happens.
+2439  |  */
+2440  |  EF4_SET_OWORD_FIELD(reg, FRF_AA_RX_DESC_PUSH_EN, 0);
+2441  |  EF4_SET_OWORD_FIELD(reg, FRF_AA_RX_USR_BUF_SIZE,
+2442  |  (3 * 4096) >> 5);
+2443  |  EF4_SET_OWORD_FIELD(reg, FRF_AA_RX_XON_MAC_TH, 512 >> 8);
+2444  |  EF4_SET_OWORD_FIELD(reg, FRF_AA_RX_XOFF_MAC_TH, 2048 >> 8);
+2445  |  EF4_SET_OWORD_FIELD(reg, FRF_AA_RX_XON_TX_TH, ctrl_xon_thr);
+2446  |  EF4_SET_OWORD_FIELD(reg, FRF_AA_RX_XOFF_TX_TH, ctrl_xoff_thr);
+2447  | 	} else {
+2448  |  /* Data FIFO size is 80K; register fields moved */
+2449  |  EF4_SET_OWORD_FIELD(reg, FRF_BZ_RX_DESC_PUSH_EN, 0);
+2450  |  EF4_SET_OWORD_FIELD(reg, FRF_BZ_RX_USR_BUF_SIZE,
+2451  |  EF4_RX_USR_BUF_SIZE >> 5);
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

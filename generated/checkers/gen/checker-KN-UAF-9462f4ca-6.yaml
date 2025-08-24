@@ -1,0 +1,408 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 9462f4ca56e7d2430fdb6dcc8498244acbfc4489
+commit_type: UAF
+index: 6
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"clang/AST/ASTContext.h\"\n#include\
+  \ \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/ParentMapContext.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n#include \"llvm/ADT/StringRef.h\"\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nnamespace {\n\
+  /* The checker callbacks are to be decided. */\nclass SAGenTestChecker : public\
+  \ Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Freeing shared gsm tx list without\
+  \ tx_lock\", \"Concurrency\")) {}\n\n      void checkASTCodeBody(const Decl *D,\
+  \ AnalysisManager &Mgr, BugReporter &BR) const;\n\n   private:\n\n      // --- Helpers\
+  \ for text and matching ---\n      static std::string getNodeText(const Stmt *S,\
+  \ ASTContext &AC);\n      static std::string getNodeText(const Expr *E, ASTContext\
+  \ &AC);\n\n      static bool isCallNamed(const CallExpr *CE, StringRef Name);\n\
+  \      static bool stmtContainsText(const Stmt *S, StringRef Sub, ASTContext &AC);\n\
+  \n      static bool memberExprHasField(const MemberExpr *ME, StringRef FieldName);\n\
+  \n      static const MemberExpr *findMemberExprWithField(const Stmt *S,\n      \
+  \                                                 ArrayRef<StringRef> FieldNames);\n\
+  \      static const CallExpr *findCallInStmtByName(const Stmt *S, StringRef Name);\n\
+  \n      static void collectAllCalls(const Stmt *S, llvm::SmallVectorImpl<const CallExpr*>\
+  \ &Out);\n\n      static bool stmtHasSpinLockAcquireOnTxLock(const Stmt *S, StringRef\
+  \ BaseText, ASTContext &AC);\n\n      static const CompoundStmt *findNearestCompoundAncestor(ASTContext\
+  \ &AC, const Stmt *S);\n      static bool compoundHasPrecedingLock(const CompoundStmt\
+  \ *CS, const Stmt *Child,\n                                           StringRef\
+  \ BaseText, ASTContext &AC);\n\n      static bool loopOrContextHasTxLock(const ForStmt\
+  \ *FS, const Expr *Base, ASTContext &AC);\n\n      // Main per-ForStmt analysis\n\
+  \      void analyzeForStmt(const ForStmt *FS, const Decl *D,\n                 \
+  \         AnalysisManager &Mgr, BugReporter &BR) const;\n};\n\n// --------- Implementation\
+  \ ----------\n\nstd::string SAGenTestChecker::getNodeText(const Stmt *S, ASTContext\
+  \ &AC) {\n  if (!S) return std::string();\n  const SourceManager &SM = AC.getSourceManager();\n\
+  \  CharSourceRange Range = CharSourceRange::getTokenRange(S->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, AC.getLangOpts());\n  return\
+  \ Text.str();\n}\n\nstd::string SAGenTestChecker::getNodeText(const Expr *E, ASTContext\
+  \ &AC) {\n  return getNodeText(static_cast<const Stmt *>(E), AC);\n}\n\nbool SAGenTestChecker::isCallNamed(const\
+  \ CallExpr *CE, StringRef Name) {\n  if (!CE) return false;\n  const FunctionDecl\
+  \ *FD = CE->getDirectCallee();\n  if (!FD) return false;\n  if (const IdentifierInfo\
+  \ *II = FD->getIdentifier())\n    return II->getName() == Name;\n  return false;\n\
+  }\n\nbool SAGenTestChecker::stmtContainsText(const Stmt *S, StringRef Sub, ASTContext\
+  \ &AC) {\n  if (!S) return false;\n  std::string Txt = getNodeText(S, AC);\n  return\
+  \ StringRef(Txt).contains(Sub);\n}\n\nbool SAGenTestChecker::memberExprHasField(const\
+  \ MemberExpr *ME, StringRef FieldName) {\n  if (!ME) return false;\n  return ME->getMemberNameInfo().getAsString()\
+  \ == FieldName;\n}\n\nconst MemberExpr *SAGenTestChecker::findMemberExprWithField(const\
+  \ Stmt *S,\n                                                            ArrayRef<StringRef>\
+  \ FieldNames) {\n  if (!S) return nullptr;\n\n  // Simple recursive walk\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(S)) {\n    for (auto FN : FieldNames) {\n    \
+  \  if (memberExprHasField(ME, FN))\n        return ME;\n    }\n  }\n\n  for (const\
+  \ Stmt *Child : S->children()) {\n    if (const MemberExpr *Found = findMemberExprWithField(Child,\
+  \ FieldNames))\n      return Found;\n  }\n  return nullptr;\n}\n\nconst CallExpr\
+  \ *SAGenTestChecker::findCallInStmtByName(const Stmt *S, StringRef Name) {\n  if\
+  \ (!S) return nullptr;\n\n  if (const auto *CE = dyn_cast<CallExpr>(S)) {\n    if\
+  \ (isCallNamed(CE, Name))\n      return CE;\n  }\n\n  for (const Stmt *Child : S->children())\
+  \ {\n    if (const CallExpr *Found = findCallInStmtByName(Child, Name))\n      return\
+  \ Found;\n  }\n  return nullptr;\n}\n\nvoid SAGenTestChecker::collectAllCalls(const\
+  \ Stmt *S, llvm::SmallVectorImpl<const CallExpr*> &Out) {\n  if (!S) return;\n \
+  \ if (const auto *CE = dyn_cast<CallExpr>(S))\n    Out.push_back(CE);\n  for (const\
+  \ Stmt *Child : S->children())\n    collectAllCalls(Child, Out);\n}\n\nbool SAGenTestChecker::stmtHasSpinLockAcquireOnTxLock(const\
+  \ Stmt *S, StringRef BaseText, ASTContext &AC) {\n  if (!S) return false;\n\n  //\
+  \ First, source-text based guard(...) detection.\n  if (!BaseText.empty()) {\n \
+  \   if (stmtContainsText(S, \"guard(\", AC) &&\n        stmtContainsText(S, \"->tx_lock\"\
+  , AC) &&\n        stmtContainsText(S, BaseText, AC)) {\n      return true;\n   \
+  \ }\n  }\n\n  // Then, look for known spin_lock calls and verify first argument\
+  \ targets base->tx_lock.\n  llvm::SmallVector<const CallExpr*, 8> Calls;\n  collectAllCalls(S,\
+  \ Calls);\n\n  for (const CallExpr *CE : Calls) {\n    if (!CE) continue;\n    if\
+  \ (!(isCallNamed(CE, \"spin_lock\") ||\n          isCallNamed(CE, \"spin_lock_irqsave\"\
+  ) ||\n          isCallNamed(CE, \"spin_lock_bh\")))\n      continue;\n\n    if (CE->getNumArgs()\
+  \ == 0)\n      continue;\n\n    const Expr *Arg0 = CE->getArg(0);\n    if (!Arg0)\
+  \ continue;\n\n    std::string ArgText = getNodeText(Arg0, AC);\n    // Require\
+  \ both the base text and ->tx_lock to be present to reduce false positives.\n  \
+  \  if (!BaseText.empty() &&\n        StringRef(ArgText).contains(BaseText) &&\n\
+  \        StringRef(ArgText).contains(\"->tx_lock\")) {\n      return true;\n   \
+  \ }\n  }\n\n  return false;\n}\n\nconst CompoundStmt *SAGenTestChecker::findNearestCompoundAncestor(ASTContext\
+  \ &AC, const Stmt *S) {\n  if (!S) return nullptr;\n  const Stmt *Cur = S;\n  while\
+  \ (Cur) {\n    auto Parents = AC.getParents(*Cur);\n    if (Parents.empty())\n \
+  \     return nullptr;\n    const DynTypedNode &DN = Parents[0];\n    if (const auto\
+  \ *CS = DN.get<CompoundStmt>())\n      return CS;\n    if (const Stmt *P = DN.get<Stmt>())\
+  \ {\n      Cur = P;\n      continue;\n    }\n    // Hit a non-statement parent (e.g.,\
+  \ Decl), stop.\n    break;\n  }\n  return nullptr;\n}\n\nbool SAGenTestChecker::compoundHasPrecedingLock(const\
+  \ CompoundStmt *CS, const Stmt *Child,\n                                       \
+  \         StringRef BaseText, ASTContext &AC) {\n  if (!CS || !Child) return false;\n\
+  \n  // Find Child index in CS body\n  unsigned Idx = 0;\n  bool Found = false;\n\
+  \  for (const Stmt *S : CS->body()) {\n    if (S == Child) { Found = true; break;\
+  \ }\n    ++Idx;\n  }\n  if (!Found) return false;\n\n  // Scan statements before\
+  \ the child\n  unsigned Cur = 0;\n  for (const Stmt *S : CS->body()) {\n    if (Cur++\
+  \ >= Idx) break;\n    if (stmtHasSpinLockAcquireOnTxLock(S, BaseText, AC))\n   \
+  \   return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::loopOrContextHasTxLock(const\
+  \ ForStmt *FS, const Expr *Base, ASTContext &AC) {\n  if (!FS) return false;\n\n\
+  \  std::string BaseText = Base ? getNodeText(Base, AC) : std::string();\n\n  //\
+  \ 1) Search inside loop body\n  if (const Stmt *Body = FS->getBody()) {\n    if\
+  \ (stmtHasSpinLockAcquireOnTxLock(Body, BaseText, AC))\n      return true;\n  }\n\
+  \n  // 2) Search preceding statements in the nearest compound ancestor\n  const\
+  \ CompoundStmt *CS = findNearestCompoundAncestor(AC, FS);\n  if (compoundHasPrecedingLock(CS,\
+  \ FS, BaseText, AC))\n    return true;\n\n  return false;\n}\n\nvoid SAGenTestChecker::analyzeForStmt(const\
+  \ ForStmt *FS, const Decl *D,\n                                      AnalysisManager\
+  \ &Mgr, BugReporter &BR) const {\n  if (!FS) return;\n\n  ASTContext &AC = Mgr.getASTContext();\n\
+  \n  // Check whether this loop touches gsm->tx_ctrl_list or gsm->tx_data_list\n\
+  \  const MemberExpr *MEList =\n      findMemberExprWithField(FS,\n        {StringRef(\"\
+  tx_ctrl_list\"), StringRef(\"tx_data_list\")});\n  if (!MEList)\n    return;\n\n\
+  \  const Expr *Base = MEList->getBase();\n  if (!Base)\n    return;\n  Base = Base->IgnoreParenImpCasts();\n\
+  \n  // Verify that this loop frees entries (i.e., calls kfree inside the body)\n\
+  \  const Stmt *Body = FS->getBody();\n  if (!Body)\n    return;\n\n  const CallExpr\
+  \ *KFreeCall = findCallInStmtByName(Body, \"kfree\");\n  if (!KFreeCall)\n    return;\n\
+  \n  // Optional tightening: ensure this looks like a list_for_each_entry* macro\
+  \ loop\n  // (do not require this strictly to avoid missing the target bug)\n  bool\
+  \ LooksLikeLinuxList = stmtContainsText(FS, \"list_for_each_entry\", AC) ||\n  \
+  \                          stmtContainsText(FS, \"list_for_each_entry_safe\", AC);\n\
+  \  // Not strictly required, so we won't return if false.\n\n  // Check whether\
+  \ protecting tx_lock is held in this context\n  if (!loopOrContextHasTxLock(FS,\
+  \ Base, AC)) {\n    // Report bug\n    PathDiagnosticLocation Loc;\n    if (KFreeCall)\
+  \ {\n      Loc = PathDiagnosticLocation::createBegin(KFreeCall, Mgr.getSourceManager(),\n\
+  \                                                Mgr.getAnalysisDeclContext(D));\n\
+  \    } else {\n      Loc = PathDiagnosticLocation::createBegin(FS, Mgr.getSourceManager(),\n\
+  \                                                Mgr.getAnalysisDeclContext(D));\n\
+  \    }\n\n    auto R = std::make_unique<BasicBugReport>(\n        *BT,\n       \
+  \ \"Freeing gsm tx_* list without holding tx_lock; may cause use-after-free\",\n\
+  \        Loc);\n    if (KFreeCall)\n      R->addRange(KFreeCall->getSourceRange());\n\
+  \    BR.emitReport(std::move(R));\n  }\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD)\n    return;\n  if (!FD->hasBody())\n    return;\n\n  const Stmt *Body\
+  \ = FD->getBody();\n  if (!Body)\n    return;\n\n  // Traverse to find ForStmt nodes\n\
+  \  struct LocalVisitor : public RecursiveASTVisitor<LocalVisitor> {\n    const SAGenTestChecker\
+  \ *Checker;\n    const Decl *D;\n    AnalysisManager &Mgr;\n    BugReporter &BR;\n\
+  \    LocalVisitor(const SAGenTestChecker *C, const Decl *D, AnalysisManager &Mgr,\
+  \ BugReporter &BR)\n        : Checker(C), D(D), Mgr(Mgr), BR(BR) {}\n\n    bool\
+  \ VisitForStmt(ForStmt *FS) {\n      Checker->analyzeForStmt(FS, D, Mgr, BR);\n\
+  \      return true;\n    }\n  };\n\n  LocalVisitor V(this, D, Mgr, BR);\n  V.TraverseStmt(const_cast<Stmt*>(Body));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing of gsm tx_ctrl_list/tx_data_list entries without holding\
+  \ tx_lock\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ntty: n_gsm: Fix use-after-free in gsm_cleanup_mux\n\
+  \nBUG: KASAN: slab-use-after-free in gsm_cleanup_mux+0x77b/0x7b0\ndrivers/tty/n_gsm.c:3160\
+  \ [n_gsm]\nRead of size 8 at addr ffff88815fe99c00 by task poc/3379\nCPU: 0 UID:\
+  \ 0 PID: 3379 Comm: poc Not tainted 6.11.0+ #56\nHardware name: VMware, Inc. VMware\
+  \ Virtual Platform/440BX\nDesktop Reference Platform, BIOS 6.00 11/12/2020\nCall\
+  \ Trace:\n <TASK>\n gsm_cleanup_mux+0x77b/0x7b0 drivers/tty/n_gsm.c:3160 [n_gsm]\n\
+  \ __pfx_gsm_cleanup_mux+0x10/0x10 drivers/tty/n_gsm.c:3124 [n_gsm]\n __pfx_sched_clock_cpu+0x10/0x10\
+  \ kernel/sched/clock.c:389\n update_load_avg+0x1c1/0x27b0 kernel/sched/fair.c:4500\n\
+  \ __pfx_min_vruntime_cb_rotate+0x10/0x10 kernel/sched/fair.c:846\n __rb_insert_augmented+0x492/0xbf0\
+  \ lib/rbtree.c:161\n gsmld_ioctl+0x395/0x1450 drivers/tty/n_gsm.c:3408 [n_gsm]\n\
+  \ _raw_spin_lock_irqsave+0x92/0xf0 arch/x86/include/asm/atomic.h:107\n __pfx_gsmld_ioctl+0x10/0x10\
+  \ drivers/tty/n_gsm.c:3822 [n_gsm]\n ktime_get+0x5e/0x140 kernel/time/timekeeping.c:195\n\
+  \ ldsem_down_read+0x94/0x4e0 arch/x86/include/asm/atomic64_64.h:79\n __pfx_ldsem_down_read+0x10/0x10\
+  \ drivers/tty/tty_ldsem.c:338\n __pfx_do_vfs_ioctl+0x10/0x10 fs/ioctl.c:805\n tty_ioctl+0x643/0x1100\
+  \ drivers/tty/tty_io.c:2818\n\nAllocated by task 65:\n gsm_data_alloc.constprop.0+0x27/0x190\
+  \ drivers/tty/n_gsm.c:926 [n_gsm]\n gsm_send+0x2c/0x580 drivers/tty/n_gsm.c:819\
+  \ [n_gsm]\n gsm1_receive+0x547/0xad0 drivers/tty/n_gsm.c:3038 [n_gsm]\n gsmld_receive_buf+0x176/0x280\
+  \ drivers/tty/n_gsm.c:3609 [n_gsm]\n tty_ldisc_receive_buf+0x101/0x1e0 drivers/tty/tty_buffer.c:391\n\
+  \ tty_port_default_receive_buf+0x61/0xa0 drivers/tty/tty_port.c:39\n flush_to_ldisc+0x1b0/0x750\
+  \ drivers/tty/tty_buffer.c:445\n process_scheduled_works+0x2b0/0x10d0 kernel/workqueue.c:3229\n\
+  \ worker_thread+0x3dc/0x950 kernel/workqueue.c:3391\n kthread+0x2a3/0x370 kernel/kthread.c:389\n\
+  \ ret_from_fork+0x2d/0x70 arch/x86/kernel/process.c:147\n ret_from_fork_asm+0x1a/0x30\
+  \ arch/x86/entry/entry_64.S:257\n\nFreed by task 3367:\n kfree+0x126/0x420 mm/slub.c:4580\n\
+  \ gsm_cleanup_mux+0x36c/0x7b0 drivers/tty/n_gsm.c:3160 [n_gsm]\n gsmld_ioctl+0x395/0x1450\
+  \ drivers/tty/n_gsm.c:3408 [n_gsm]\n tty_ioctl+0x643/0x1100 drivers/tty/tty_io.c:2818\n\
+  \n[Analysis]\ngsm_msg on the tx_ctrl_list or tx_data_list of gsm_mux\ncan be freed\
+  \ by multi threads through ioctl,which leads\nto the occurrence of uaf. Protect\
+  \ it by gsm tx lock.\n\nSigned-off-by: Longlong Xia <xialonglong@kylinos.cn>\nCc:\
+  \ stable <stable@kernel.org>\nSuggested-by: Jiri Slaby <jirislaby@kernel.org>\n\
+  Link: https://lore.kernel.org/r/20240926130213.531959-1-xialonglong@kylinos.cn\n\
+  Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>\n\n## Buggy Code\n\
+  \n```c\n// Function: gsm_cleanup_mux in drivers/tty/n_gsm.c\nstatic void gsm_cleanup_mux(struct\
+  \ gsm_mux *gsm, bool disc)\n{\n\tint i;\n\tstruct gsm_dlci *dlci;\n\tstruct gsm_msg\
+  \ *txq, *ntxq;\n\n\tgsm->dead = true;\n\tmutex_lock(&gsm->mutex);\n\n\tdlci = gsm->dlci[0];\n\
+  \tif (dlci) {\n\t\tif (disc && dlci->state != DLCI_CLOSED) {\n\t\t\tgsm_dlci_begin_close(dlci);\n\
+  \t\t\twait_event(gsm->event, dlci->state == DLCI_CLOSED);\n\t\t}\n\t\tdlci->dead\
+  \ = true;\n\t}\n\n\t/* Finish outstanding timers, making sure they are done */\n\
+  \tdel_timer_sync(&gsm->kick_timer);\n\tdel_timer_sync(&gsm->t2_timer);\n\tdel_timer_sync(&gsm->ka_timer);\n\
+  \n\t/* Finish writing to ldisc */\n\tflush_work(&gsm->tx_work);\n\n\t/* Free up\
+  \ any link layer users and finally the control channel */\n\tif (gsm->has_devices)\
+  \ {\n\t\tgsm_unregister_devices(gsm_tty_driver, gsm->num);\n\t\tgsm->has_devices\
+  \ = false;\n\t}\n\tfor (i = NUM_DLCI - 1; i >= 0; i--)\n\t\tif (gsm->dlci[i])\n\t\
+  \t\tgsm_dlci_release(gsm->dlci[i]);\n\tmutex_unlock(&gsm->mutex);\n\t/* Now wipe\
+  \ the queues */\n\ttty_ldisc_flush(gsm->tty);\n\tlist_for_each_entry_safe(txq, ntxq,\
+  \ &gsm->tx_ctrl_list, list)\n\t\tkfree(txq);\n\tINIT_LIST_HEAD(&gsm->tx_ctrl_list);\n\
+  \tlist_for_each_entry_safe(txq, ntxq, &gsm->tx_data_list, list)\n\t\tkfree(txq);\n\
+  \tINIT_LIST_HEAD(&gsm->tx_data_list);\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff\
+  \ --git a/drivers/tty/n_gsm.c b/drivers/tty/n_gsm.c\nindex 5d37a0984916..252849910588\
+  \ 100644\n--- a/drivers/tty/n_gsm.c\n+++ b/drivers/tty/n_gsm.c\n@@ -3157,6 +3157,8\
+  \ @@ static void gsm_cleanup_mux(struct gsm_mux *gsm, bool disc)\n \tmutex_unlock(&gsm->mutex);\n\
+  \ \t/* Now wipe the queues */\n \ttty_ldisc_flush(gsm->tty);\n+\n+\tguard(spinlock_irqsave)(&gsm->tx_lock);\n\
+  \ \tlist_for_each_entry_safe(txq, ntxq, &gsm->tx_ctrl_list, list)\n \t\tkfree(txq);\n\
+  \ \tINIT_LIST_HEAD(&gsm->tx_ctrl_list);\n```\n"
+pattern: "## Bug Pattern\n\nIterating over and freeing nodes of a shared kernel list\
+  \ without holding the list\u2019s protecting lock, allowing concurrent threads to\
+  \ modify/free the same entries and causing use-after-free. Specifically, in n_gsm,\
+  \ traversing and kfree\u2019ing gsm->tx_ctrl_list / gsm->tx_data_list without taking\
+  \ gsm->tx_lock, even with list_for_each_entry_safe, leads to UAF because other contexts\
+  \ (e.g., ioctl paths/tx work) may concurrently access or free those gsm_msg entries."
+plan: "Plan\n\n1. Program state\n- No custom program state is needed. This checker\
+  \ is purely AST-based and looks for a structural pattern: iterating a shared Linux\
+  \ list and freeing entries without holding the protecting lock.\n\n2. Callbacks\
+  \ to use\n- checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR)\
+  \ const\n  - Walk the function body to find \u201Cfor\u201D-loops that iterate a\
+  \ known gsm tx list and free entries, then verify that the protecting spinlock is\
+  \ held. Emit a report if not.\n\n3. Detailed steps in checkASTCodeBody\n- Prepare\
+  \ small internal helpers (simple functions in the checker):\n  - getExprText(const\
+  \ Expr *E, CheckerContext &C): same approach as ExprHasName but returns the full\
+  \ text of the expression using Lexer::getSourceText.\n  - isCallNamed(const CallExpr\
+  \ *CE, StringRef Name): return true if callee identifier equals Name.\n  - containsText(const\
+  \ Stmt *S, StringRef Sub, CheckerContext &C): get source text for S->getSourceRange()\
+  \ and check if it contains Sub.\n  - findFirstChildOfType<T>(const Stmt *S): a thin\
+  \ wrapper that repeatedly calls the provided findSpecificTypeInChildren<T>(S) until\
+  \ it returns nullptr or we found what we need; or just call provided findSpecificTypeInChildren<T>(S)\
+  \ if one instance is enough.\n  - findAllChildrenCalls(const Stmt *S, SmallVectorImpl<const\
+  \ CallExpr*> &Out): recursively collect all CallExpr inside S (you can write a tiny\
+  \ recursive walker in this checker).\n  - memberExprHasField(const MemberExpr *ME,\
+  \ StringRef FieldName): check if ME->getMemberNameInfo().getAsString() == FieldName.\n\
+  \  - stmtHasSpinLockAcquireOnTxLock(const Stmt *S, StringRef BaseText, CheckerContext\
+  \ &C): return true if S has a call to spin_lock / spin_lock_irqsave / spin_lock_bh\
+  \ whose first argument contains both \u201C->tx_lock\u201D and BaseText. Also return\
+  \ true if S\u2019s source text contains \u201Cguard(\u201D and \u201C->tx_lock\u201D\
+  \ and BaseText (to catch guard(spinlock_irqsave)(&X->tx_lock)).\n  - loopOrContextHasTxLock(const\
+  \ ForStmt *FS, const Expr *Base, CheckerContext &C):\n    - Get BaseText = getExprText(Base,\
+  \ C). Example: \u201Cgsm\u201D.\n    - 1) Check inside FS->getBody(): scan all CallExpr;\
+  \ if any matches stmtHasSpinLockAcquireOnTxLock(Stmt, BaseText, C), return true.\n\
+  \    - 2) Find parent CompoundStmt CS = findSpecificTypeInParents<CompoundStmt>(FS,\
+  \ C). If found:\n      - Iterate CS->body() in order; locate the index idx where\
+  \ body[idx] == FS.\n      - Scan statements from 0 to idx-1; if any stmtHasSpinLockAcquireOnTxLock(body[i],\
+  \ BaseText, C) is true, return true.\n    - Otherwise, return false.\n\n- Walk each\
+  \ function body\u2019s statements and find ForStmt nodes:\n  - For each ForStmt\
+  \ FS:\n    - Identify if it iterates a gsm tx list:\n      - Search FS\u2019s subtree\
+  \ for a MemberExpr ME where memberExprHasField(ME, \"tx_ctrl_list\") or memberExprHasField(ME,\
+  \ \"tx_data_list\") is true. If none found, skip this loop.\n      - Record MEList\
+  \ = that MemberExpr (first we find is enough). Let Base = MEList->getBase()->IgnoreParenImpCasts().\n\
+  \    - Confirm that the loop frees nodes (the risky part):\n      - Look for a call\
+  \ to kfree inside the loop body: find a CallExpr CE in FS->getBody() where isCallNamed(CE,\
+  \ \"kfree\") is true. If not found, skip.\n    - Optional: Tighten to linux list\
+  \ macro style:\n      - If desired, further reduce false positives by checking source\
+  \ text of FS or its init/cond/inc contains \u201Clist_for_each_entry\u201D using\
+  \ containsText(FS, \"list_for_each_entry\", C). This is optional but recommended.\n\
+  \    - Check whether the protecting lock is held:\n      - Call loopOrContextHasTxLock(FS,\
+  \ Base, C).\n      - If false: report a bug.\n\n4. Bug reporting\n- When loopOrContextHasTxLock\
+  \ returns false:\n  - Create a PathSensitiveBugReport or BasicBugReport with a short\
+  \ message:\n    - \u201CFreeing gsm tx_* list without tx_lock; may cause use-after-free.\u201D\
+  \n  - Point the report location to FS->getForLoc() or the kfree CallExpr location\
+  \ (if available).\n  - Emit with BR.emitReport.\n\n5. Matching the fix pattern precisely\
+  \ (to reduce false positives)\n- This checker is tuned for the n_gsm bug pattern:\n\
+  \  - Only flag loops that:\n    - Reference MemberExpr with field name \u201Ctx_ctrl_list\u201D\
+  \ or \u201Ctx_data_list\u201D.\n    - Call \u201Ckfree\u201D inside the loop body.\n\
+  \    - Do not acquire \u201Ctx_lock\u201D via:\n      - spin_lock(&<Base>->tx_lock)\n\
+  \      - spin_lock_irqsave(&<Base>->tx_lock, \u2026)\n      - spin_lock_bh(&<Base>->tx_lock)\n\
+  \      - guard(spinlock_irqsave)(&<Base>->tx_lock)\n- Ensure BaseText consistency:\n\
+  \  - The lock acquisition must reference the same owner as the list, i.e., both\
+  \ use the same base expression text (e.g., both contain \u201Cgsm->\u201D).\n\n\
+  6. Utility functions usage\n- Use provided helpers where applicable:\n  - findSpecificTypeInParents<CompoundStmt>(FS,\
+  \ C) to find the surrounding block to scan for preceding lock acquisition.\n  -\
+  \ findSpecificTypeInChildren<CallExpr>(FS->getBody()) to quickly detect a kfree\
+  \ call inside the loop (if multiple calls are present, one is enough).\n  - ExprHasName\
+  \ on call arguments to quickly detect \u201Ctx_lock\u201D and BaseText presence.\n\
+  - For source text checks on Stmt, replicate ExprHasName\u2019s logic with Lexer::getSourceText\
+  \ over Stmt->getSourceRange().\n\n7. Notes\n- We do not track lock lifetimes or\
+  \ unlocking; the heuristic is simple: the presence of an acquisition call or guard\
+  \ on the same tx_lock in the same compound block before the loop (or inside the\
+  \ loop) suffices.\n- This is intentionally scoped to the specific n_gsm pattern\
+  \ (tx_ctrl_list/tx_data_list protected by tx_lock) to keep noise low and focus on\
+  \ the UAF pattern fixed by adding guard(spinlock_irqsave)(&gsm->tx_lock)."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"clang/AST/ASTContext.h\"\n#include\
+  \ \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/ParentMapContext.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n#include \"llvm/ADT/StringRef.h\"\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nnamespace {\n\
+  /* The checker callbacks are to be decided. */\nclass SAGenTestChecker : public\
+  \ Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Freeing shared gsm tx list without\
+  \ tx_lock\", \"Concurrency\")) {}\n\n      void checkASTCodeBody(const Decl *D,\
+  \ AnalysisManager &Mgr, BugReporter &BR) const;\n\n   private:\n\n      // --- Helpers\
+  \ for text and matching ---\n      static std::string getNodeText(const Stmt *S,\
+  \ ASTContext &AC);\n      static std::string getNodeText(const Expr *E, ASTContext\
+  \ &AC);\n\n      static bool isCallNamed(const CallExpr *CE, StringRef Name);\n\
+  \      static bool stmtContainsText(const Stmt *S, StringRef Sub, ASTContext &AC);\n\
+  \n      static bool memberExprHasField(const MemberExpr *ME, StringRef FieldName);\n\
+  \n      static const MemberExpr *findMemberExprWithField(const Stmt *S,\n      \
+  \                                                 ArrayRef<StringRef> FieldNames);\n\
+  \      static const CallExpr *findCallInStmtByName(const Stmt *S, StringRef Name);\n\
+  \n      static void collectAllCalls(const Stmt *S, llvm::SmallVectorImpl<const CallExpr*>\
+  \ &Out);\n\n      static bool stmtHasSpinLockAcquireOnTxLock(const Stmt *S, StringRef\
+  \ BaseText, ASTContext &AC);\n\n      static const CompoundStmt *findNearestCompoundAncestor(ASTContext\
+  \ &AC, const Stmt *S);\n      static bool compoundHasPrecedingLock(const CompoundStmt\
+  \ *CS, const Stmt *Child,\n                                           StringRef\
+  \ BaseText, ASTContext &AC);\n\n      static bool loopOrContextHasTxLock(const ForStmt\
+  \ *FS, const Expr *Base, ASTContext &AC);\n\n      // Main per-ForStmt analysis\n\
+  \      void analyzeForStmt(const ForStmt *FS, const Decl *D,\n                 \
+  \         AnalysisManager &Mgr, BugReporter &BR) const;\n};\n\n// --------- Implementation\
+  \ ----------\n\nstd::string SAGenTestChecker::getNodeText(const Stmt *S, ASTContext\
+  \ &AC) {\n  if (!S) return std::string();\n  const SourceManager &SM = AC.getSourceManager();\n\
+  \  CharSourceRange Range = CharSourceRange::getTokenRange(S->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, AC.getLangOpts());\n  return\
+  \ Text.str();\n}\n\nstd::string SAGenTestChecker::getNodeText(const Expr *E, ASTContext\
+  \ &AC) {\n  return getNodeText(static_cast<const Stmt *>(E), AC);\n}\n\nbool SAGenTestChecker::isCallNamed(const\
+  \ CallExpr *CE, StringRef Name) {\n  if (!CE) return false;\n  const FunctionDecl\
+  \ *FD = CE->getDirectCallee();\n  if (!FD) return false;\n  if (const IdentifierInfo\
+  \ *II = FD->getIdentifier())\n    return II->getName() == Name;\n  return false;\n\
+  }\n\nbool SAGenTestChecker::stmtContainsText(const Stmt *S, StringRef Sub, ASTContext\
+  \ &AC) {\n  if (!S) return false;\n  std::string Txt = getNodeText(S, AC);\n  return\
+  \ StringRef(Txt).contains(Sub);\n}\n\nbool SAGenTestChecker::memberExprHasField(const\
+  \ MemberExpr *ME, StringRef FieldName) {\n  if (!ME) return false;\n  return ME->getMemberNameInfo().getAsString()\
+  \ == FieldName;\n}\n\nconst MemberExpr *SAGenTestChecker::findMemberExprWithField(const\
+  \ Stmt *S,\n                                                            ArrayRef<StringRef>\
+  \ FieldNames) {\n  if (!S) return nullptr;\n\n  // Simple recursive walk\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(S)) {\n    for (auto FN : FieldNames) {\n    \
+  \  if (memberExprHasField(ME, FN))\n        return ME;\n    }\n  }\n\n  for (const\
+  \ Stmt *Child : S->children()) {\n    if (const MemberExpr *Found = findMemberExprWithField(Child,\
+  \ FieldNames))\n      return Found;\n  }\n  return nullptr;\n}\n\nconst CallExpr\
+  \ *SAGenTestChecker::findCallInStmtByName(const Stmt *S, StringRef Name) {\n  if\
+  \ (!S) return nullptr;\n\n  if (const auto *CE = dyn_cast<CallExpr>(S)) {\n    if\
+  \ (isCallNamed(CE, Name))\n      return CE;\n  }\n\n  for (const Stmt *Child : S->children())\
+  \ {\n    if (const CallExpr *Found = findCallInStmtByName(Child, Name))\n      return\
+  \ Found;\n  }\n  return nullptr;\n}\n\nvoid SAGenTestChecker::collectAllCalls(const\
+  \ Stmt *S, llvm::SmallVectorImpl<const CallExpr*> &Out) {\n  if (!S) return;\n \
+  \ if (const auto *CE = dyn_cast<CallExpr>(S))\n    Out.push_back(CE);\n  for (const\
+  \ Stmt *Child : S->children())\n    collectAllCalls(Child, Out);\n}\n\nbool SAGenTestChecker::stmtHasSpinLockAcquireOnTxLock(const\
+  \ Stmt *S, StringRef BaseText, ASTContext &AC) {\n  if (!S) return false;\n\n  //\
+  \ First, source-text based guard(...) detection.\n  if (!BaseText.empty()) {\n \
+  \   if (stmtContainsText(S, \"guard(\", AC) &&\n        stmtContainsText(S, \"->tx_lock\"\
+  , AC) &&\n        stmtContainsText(S, BaseText, AC)) {\n      return true;\n   \
+  \ }\n  }\n\n  // Then, look for known spin_lock calls and verify first argument\
+  \ targets base->tx_lock.\n  llvm::SmallVector<const CallExpr*, 8> Calls;\n  collectAllCalls(S,\
+  \ Calls);\n\n  for (const CallExpr *CE : Calls) {\n    if (!CE) continue;\n    if\
+  \ (!(isCallNamed(CE, \"spin_lock\") ||\n          isCallNamed(CE, \"spin_lock_irqsave\"\
+  ) ||\n          isCallNamed(CE, \"spin_lock_bh\")))\n      continue;\n\n    if (CE->getNumArgs()\
+  \ == 0)\n      continue;\n\n    const Expr *Arg0 = CE->getArg(0);\n    if (!Arg0)\
+  \ continue;\n\n    std::string ArgText = getNodeText(Arg0, AC);\n    // Require\
+  \ both the base text and ->tx_lock to be present to reduce false positives.\n  \
+  \  if (!BaseText.empty() &&\n        StringRef(ArgText).contains(BaseText) &&\n\
+  \        StringRef(ArgText).contains(\"->tx_lock\")) {\n      return true;\n   \
+  \ }\n  }\n\n  return false;\n}\n\nconst CompoundStmt *SAGenTestChecker::findNearestCompoundAncestor(ASTContext\
+  \ &AC, const Stmt *S) {\n  if (!S) return nullptr;\n  const Stmt *Cur = S;\n  while\
+  \ (Cur) {\n    auto Parents = AC.getParents(*Cur);\n    if (Parents.empty())\n \
+  \     return nullptr;\n    const DynTypedNode &DN = Parents[0];\n    if (const auto\
+  \ *CS = DN.get<CompoundStmt>())\n      return CS;\n    if (const Stmt *P = DN.get<Stmt>())\
+  \ {\n      Cur = P;\n      continue;\n    }\n    // Hit a non-statement parent (e.g.,\
+  \ Decl), stop.\n    break;\n  }\n  return nullptr;\n}\n\nbool SAGenTestChecker::compoundHasPrecedingLock(const\
+  \ CompoundStmt *CS, const Stmt *Child,\n                                       \
+  \         StringRef BaseText, ASTContext &AC) {\n  if (!CS || !Child) return false;\n\
+  \n  // Find Child index in CS body\n  unsigned Idx = 0;\n  bool Found = false;\n\
+  \  for (const Stmt *S : CS->body()) {\n    if (S == Child) { Found = true; break;\
+  \ }\n    ++Idx;\n  }\n  if (!Found) return false;\n\n  // Scan statements before\
+  \ the child\n  unsigned Cur = 0;\n  for (const Stmt *S : CS->body()) {\n    if (Cur++\
+  \ >= Idx) break;\n    if (stmtHasSpinLockAcquireOnTxLock(S, BaseText, AC))\n   \
+  \   return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::loopOrContextHasTxLock(const\
+  \ ForStmt *FS, const Expr *Base, ASTContext &AC) {\n  if (!FS) return false;\n\n\
+  \  std::string BaseText = Base ? getNodeText(Base, AC) : std::string();\n\n  //\
+  \ 1) Search inside loop body\n  if (const Stmt *Body = FS->getBody()) {\n    if\
+  \ (stmtHasSpinLockAcquireOnTxLock(Body, BaseText, AC))\n      return true;\n  }\n\
+  \n  // 2) Search preceding statements in the nearest compound ancestor\n  const\
+  \ CompoundStmt *CS = findNearestCompoundAncestor(AC, FS);\n  if (compoundHasPrecedingLock(CS,\
+  \ FS, BaseText, AC))\n    return true;\n\n  return false;\n}\n\nvoid SAGenTestChecker::analyzeForStmt(const\
+  \ ForStmt *FS, const Decl *D,\n                                      AnalysisManager\
+  \ &Mgr, BugReporter &BR) const {\n  if (!FS) return;\n\n  ASTContext &AC = Mgr.getASTContext();\n\
+  \n  // Check whether this loop touches gsm->tx_ctrl_list or gsm->tx_data_list\n\
+  \  const MemberExpr *MEList =\n      findMemberExprWithField(FS,\n        {StringRef(\"\
+  tx_ctrl_list\"), StringRef(\"tx_data_list\")});\n  if (!MEList)\n    return;\n\n\
+  \  const Expr *Base = MEList->getBase();\n  if (!Base)\n    return;\n  Base = Base->IgnoreParenImpCasts();\n\
+  \n  // Verify that this loop frees entries (i.e., calls kfree inside the body)\n\
+  \  const Stmt *Body = FS->getBody();\n  if (!Body)\n    return;\n\n  const CallExpr\
+  \ *KFreeCall = findCallInStmtByName(Body, \"kfree\");\n  if (!KFreeCall)\n    return;\n\
+  \n  // Optional tightening: ensure this looks like a list_for_each_entry* macro\
+  \ loop\n  // (do not require this strictly to avoid missing the target bug)\n  bool\
+  \ LooksLikeLinuxList = stmtContainsText(FS, \"list_for_each_entry\", AC) ||\n  \
+  \                          stmtContainsText(FS, \"list_for_each_entry_safe\", AC);\n\
+  \  // Not strictly required, so we won't return if false.\n\n  // Check whether\
+  \ protecting tx_lock is held in this context\n  if (!loopOrContextHasTxLock(FS,\
+  \ Base, AC)) {\n    // Report bug\n    PathDiagnosticLocation Loc;\n    if (KFreeCall)\
+  \ {\n      Loc = PathDiagnosticLocation::createBegin(KFreeCall, Mgr.getSourceManager(),\n\
+  \                                                Mgr.getAnalysisDeclContext(D));\n\
+  \    } else {\n      Loc = PathDiagnosticLocation::createBegin(FS, Mgr.getSourceManager(),\n\
+  \                                                Mgr.getAnalysisDeclContext(D));\n\
+  \    }\n\n    auto R = std::make_unique<BasicBugReport>(\n        *BT,\n       \
+  \ \"Freeing gsm tx_* list without holding tx_lock; may cause use-after-free\",\n\
+  \        Loc);\n    if (KFreeCall)\n      R->addRange(KFreeCall->getSourceRange());\n\
+  \    BR.emitReport(std::move(R));\n  }\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD)\n    return;\n  if (!FD->hasBody())\n    return;\n\n  const Stmt *Body\
+  \ = FD->getBody();\n  if (!Body)\n    return;\n\n  // Traverse to find ForStmt nodes\n\
+  \  struct LocalVisitor : public RecursiveASTVisitor<LocalVisitor> {\n    const SAGenTestChecker\
+  \ *Checker;\n    const Decl *D;\n    AnalysisManager &Mgr;\n    BugReporter &BR;\n\
+  \    LocalVisitor(const SAGenTestChecker *C, const Decl *D, AnalysisManager &Mgr,\
+  \ BugReporter &BR)\n        : Checker(C), D(D), Mgr(Mgr), BR(BR) {}\n\n    bool\
+  \ VisitForStmt(ForStmt *FS) {\n      Checker->analyzeForStmt(FS, D, Mgr, BR);\n\
+  \      return true;\n    }\n  };\n\n  LocalVisitor V(this, D, Mgr, BR);\n  V.TraverseStmt(const_cast<Stmt*>(Body));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing of gsm tx_ctrl_list/tx_data_list entries without holding\
+  \ tx_lock\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

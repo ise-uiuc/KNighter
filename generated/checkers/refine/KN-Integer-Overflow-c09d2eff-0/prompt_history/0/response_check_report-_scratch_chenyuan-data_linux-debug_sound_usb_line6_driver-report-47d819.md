@@ -1,0 +1,6 @@
+- Decision: NotABug
+- Reason: The warning points to a 32-bit multiply in the condition: count > line6->max_packet_size * LINE6_RAW_MESSAGES_MAXCOUNT. While the comparison promotes the product to 64-bit only after the multiply, overflow in the 32-bit multiply is not feasible here:
+  - USB endpoint wMaxPacketSize is tightly bounded by the USB spec (typically ≤ 1024; even with HS isoch “mult” ≤ 3, effective ≤ 3072). For bulk/interrupt endpoints (used for control/messages), practical maxima are even smaller (≤ 512/64).
+  - LINE6_RAW_MESSAGES_MAXCOUNT is an internal constant limiting message batching; by design it’s a small number (dozens to at most a few hundred). Even assuming a very large hypothetical value (e.g., 65535), 3072 × 65535 = 201,326,592, which still fits in 32-bit signed int and cannot overflow.
+  - Therefore, no 32-bit overflow occurs before widening, and the comparison is correct on both 32-bit and 64-bit architectures.
+  - Additionally, this instance does not match the target bug pattern strictly, which involves assigning the 32-bit product to a 64-bit variable; here the product is only compared against a long without any assignment.

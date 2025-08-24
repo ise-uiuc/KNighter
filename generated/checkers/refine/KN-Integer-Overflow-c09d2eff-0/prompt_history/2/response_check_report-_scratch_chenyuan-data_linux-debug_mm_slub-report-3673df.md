@@ -1,0 +1,8 @@
+- Decision: NotABug
+- Reason: The warning points to size * MAX_OBJS_PER_PAGE in calculate_order(), claiming 32-bit multiplication that widens after the multiply. However:
+  - This does not match the target pattern, which requires two 32-bit operands being multiplied with the result then assigned to a 64-bit variable (u64). Here, the product is passed to get_order(), not assigned to a u64.
+  - More importantly, overflow is not feasible in this specific control flow. The branch is taken only when order_objects(min_order, size) > MAX_OBJS_PER_PAGE, i.e., ((PAGE_SIZE << min_order) / size) > MAX_OBJS_PER_PAGE. This implies size * MAX_OBJS_PER_PAGE < slab_size = ((unsigned int)PAGE_SIZE << min_order). Since slab_size is computed as an unsigned int, it is bounded by UINT_MAX, so size * MAX_OBJS_PER_PAGE < 2^32. Therefore, the 32-bit multiplication cannot overflow here.
+  - Concretely, with MAX_OBJS_PER_PAGE typically 32767, for a 32-bit multiply to overflow you’d need size > floor(2^32 / 32767) ≈ 131072. But if size ≥ 131072, achieving order_objects(min_order, size) > 32767 would require slab_size > ~4.29 GB, which is impossible given slab_size is computed as a 32-bit value. Hence, the condition ensuring this path is taken simultaneously ensures the product fits in 32 bits.
+  - Even on 64-bit architectures (where get_order takes an unsigned long), the multiplication still occurs safely in 32 bits due to the precondition above; there is no overflow before widening.
+
+Given both the mismatch to the target bug pattern and the proven infeasibility of overflow on this path, this is a false positive and not a real bug.

@@ -1,0 +1,440 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ca93bf607a44c1f009283dac4af7df0d9ae5e357
+commit_type: Memory-Leak
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program state customizations\nREGISTER_SET_WITH_PROGRAMSTATE(MustFreeTemps,\
+  \ const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(AllocSiteMap, const MemRegion*,\
+  \ const Stmt*)\nREGISTER_SET_WITH_PROGRAMSTATE(DevmReallocDstSet, const MemRegion*)\n\
+  \nnamespace {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker\
+  \ : public Checker<\n  check::PostCall,\n  check::Bind,\n  check::PreStmt<ReturnStmt>\n\
+  > {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Memory leak on devm_krealloc failure\", \"Resource Leak\"\
+  )) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \      void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;\n\n   private:\n\
+  \n      // Helpers to classify calls\n      bool isTempAllocLike(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      bool isFreeLike(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      bool isDevmKrealloc(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n\n      // Find LHS region of an assignment or init surrounding a\
+  \ call expression\n      const MemRegion* getLHSRegionOfEnclosingAssignmentOrInit(const\
+  \ CallEvent &Call,\n                                                           \
+  \    CheckerContext &C) const;\n\n      // Parse a null check condition. Returns\
+  \ true if recognized.\n      bool parseNullCheck(const Stmt *Cond, CheckerContext\
+  \ &C,\n                          const Expr *&TestedExpr, bool &NullOnThen) const;\n\
+  \n      // Utility: check whether Parent subtree contains Child\n      bool containsStmt(const\
+  \ Stmt *Parent, const Stmt *Child) const;\n\n      // Helper to check if the given\
+  \ CallExpr is a devm_krealloc\n      bool callExprIsDevmKrealloc(const CallExpr\
+  \ *CE, CheckerContext &C) const;\n\n      void reportLeak(const IfStmt *IS, const\
+  \ ReturnStmt *RS,\n                      const MemRegion *TmpMR, const Stmt *AllocSite,\n\
+  \                      CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isTempAllocLike(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  // Minimum handling: nvmem_cell_read. Optionally include\
+  \ more alloc-like routines.\n  return ExprHasName(E, \"nvmem_cell_read\", C) ||\n\
+  \         ExprHasName(E, \"kmalloc\", C) ||\n         ExprHasName(E, \"kcalloc\"\
+  , C) ||\n         ExprHasName(E, \"krealloc\", C) ||\n         ExprHasName(E, \"\
+  kstrdup\", C) ||\n         ExprHasName(E, \"kvmalloc\", C);\n}\n\nbool SAGenTestChecker::isFreeLike(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"kfree\", C);\n}\n\nbool SAGenTestChecker::isDevmKrealloc(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"devm_krealloc\", C);\n}\n\n\
+  const MemRegion* SAGenTestChecker::getLHSRegionOfEnclosingAssignmentOrInit(const\
+  \ CallEvent &Call,\n                                                           \
+  \                CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return nullptr;\n\n  // Case 1: assignment like \"LHS = call(...)\"\
+  \n  if (const auto *BO = findSpecificTypeInParents<BinaryOperator>(Origin, C)) {\n\
+  \    if (BO->isAssignmentOp()) {\n      const Expr *LHS = BO->getLHS();\n      if\
+  \ (!LHS)\n        return nullptr;\n      const MemRegion *MR = getMemRegionFromExpr(LHS,\
+  \ C);\n      if (!MR)\n        return nullptr;\n      return MR->getBaseRegion();\n\
+  \    }\n  }\n\n  // Case 2: declaration with initializer: \"type var = call(...);\"\
+  \n  if (const auto *DS = findSpecificTypeInParents<DeclStmt>(Origin, C)) {\n   \
+  \ if (DS->isSingleDecl()) {\n      if (const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl()))\
+  \ {\n        if (VD->hasInit()) {\n          ProgramStateRef State = C.getState();\n\
+  \          const LocationContext *LCtx = C.getLocationContext();\n          SVal\
+  \ LVal = State->getLValue(VD, LCtx);\n          if (const MemRegion *MR = LVal.getAsRegion())\
+  \ {\n            return MR->getBaseRegion();\n          }\n        }\n      }\n\
+  \    }\n  }\n\n  return nullptr;\n}\n\nbool SAGenTestChecker::parseNullCheck(const\
+  \ Stmt *Cond, CheckerContext &C,\n                                      const Expr\
+  \ *&TestedExpr, bool &NullOnThen) const {\n  TestedExpr = nullptr;\n  NullOnThen\
+  \ = false;\n\n  if (!Cond)\n    return false;\n\n  const Expr *E = dyn_cast<Expr>(Cond);\n\
+  \  if (!E)\n    return false;\n\n  E = E->IgnoreParenCasts();\n\n  // if (!X)\n\
+  \  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode() ==\
+  \ UO_LNot) {\n      TestedExpr = UO->getSubExpr();\n      NullOnThen = true;\n \
+  \     return true;\n    }\n  }\n\n  // if (X == NULL) or (X != NULL) or with 0\n\
+  \  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {\n    BinaryOperator::Opcode\
+  \ Op = BO->getOpcode();\n    if (Op == BO_EQ || Op == BO_NE) {\n      const Expr\
+  \ *LHS = BO->getLHS()->IgnoreParenCasts();\n      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n\
+  \n      bool LHSIsNull = LHS->isNullPointerConstant(C.getASTContext(),\n       \
+  \                                           Expr::NPC_ValueDependentIsNull);\n \
+  \     bool RHSIsNull = RHS->isNullPointerConstant(C.getASTContext(),\n         \
+  \                                         Expr::NPC_ValueDependentIsNull);\n\n \
+  \     if (LHSIsNull && !RHSIsNull) {\n        TestedExpr = RHS;\n        NullOnThen\
+  \ = (Op == BO_EQ);\n        return true;\n      }\n      if (RHSIsNull && !LHSIsNull)\
+  \ {\n        TestedExpr = LHS;\n        NullOnThen = (Op == BO_EQ);\n        return\
+  \ true;\n      }\n    }\n  }\n\n  // if (X)  -> then is non-null branch\n  if (isa<DeclRefExpr>(E)\
+  \ || isa<MemberExpr>(E) || isa<UnaryOperator>(E) || isa<ArraySubscriptExpr>(E))\
+  \ {\n    TestedExpr = E;\n    NullOnThen = false;\n    return true;\n  }\n\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::containsStmt(const Stmt *Parent, const Stmt\
+  \ *Child) const {\n  if (!Parent || !Child)\n    return false;\n  if (Parent ==\
+  \ Child)\n    return true;\n  for (const Stmt *S : Parent->children()) {\n    if\
+  \ (S && containsStmt(S, Child))\n      return true;\n  }\n  return false;\n}\n\n\
+  bool SAGenTestChecker::callExprIsDevmKrealloc(const CallExpr *CE, CheckerContext\
+  \ &C) const {\n  if (!CE) return false;\n  return ExprHasName(CE, \"devm_krealloc\"\
+  , C);\n}\n\nvoid SAGenTestChecker::reportLeak(const IfStmt *IS, const ReturnStmt\
+  \ *RS,\n                                  const MemRegion *TmpMR, const Stmt *AllocSite,\n\
+  \                                  CheckerContext &C) const {\n  ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Missing kfree of temporary buffer when devm_krealloc fails\", N);\n\
+  \n  if (RS)\n    R->addRange(RS->getSourceRange());\n\n  const SourceManager &SM\
+  \ = C.getSourceManager();\n  const LocationContext *LCtx = C.getLocationContext();\n\
+  \n  if (AllocSite) {\n    PathDiagnosticLocation Loc = PathDiagnosticLocation::createBegin(AllocSite,\
+  \ SM, LCtx);\n    R->addNote(\"temporary buffer allocated here\", Loc);\n  }\n\n\
+  \  if (IS && IS->getCond()) {\n    PathDiagnosticLocation Loc2 = PathDiagnosticLocation::createBegin(IS->getCond(),\
+  \ SM, LCtx);\n    R->addNote(\"devm_krealloc NULL-check here\", Loc2);\n  }\n\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Track temporary allocations: nvmem_cell_read / kmalloc-like\n  if (isTempAllocLike(Call,\
+  \ C)) {\n    const MemRegion *LHSReg = getLHSRegionOfEnclosingAssignmentOrInit(Call,\
+  \ C);\n    if (LHSReg) {\n      // Track that this region holds a temp that must\
+  \ be freed\n      State = State->add<MustFreeTemps>(LHSReg);\n      // Remember\
+  \ alloc site for notes\n      if (const Stmt *S = Call.getOriginExpr())\n      \
+  \  State = State->set<AllocSiteMap>(LHSReg, S);\n      C.addTransition(State);\n\
+  \      return;\n    }\n  }\n\n  // Track frees: kfree(arg)\n  if (isFreeLike(Call,\
+  \ C)) {\n    if (Call.getNumArgs() >= 1) {\n      SVal Arg0 = Call.getArgSVal(0);\n\
+  \      if (const MemRegion *MR = Arg0.getAsRegion()) {\n        MR = MR->getBaseRegion();\n\
+  \        if (MR) {\n          // Remove from MustFreeTemps and AllocSiteMap if present\n\
+  \          if (State->contains<MustFreeTemps>(MR))\n            State = State->remove<MustFreeTemps>(MR);\n\
+  \          if (State->get<AllocSiteMap>(MR))\n            State = State->remove<AllocSiteMap>(MR);\n\
+  \          C.addTransition(State);\n          return;\n        }\n      }\n    }\n\
+  \  }\n\n  // Track devm_krealloc destinations\n  if (isDevmKrealloc(Call, C)) {\n\
+  \    const MemRegion *DstReg = getLHSRegionOfEnclosingAssignmentOrInit(Call, C);\n\
+  \    if (DstReg) {\n      State = State->add<DevmReallocDstSet>(DstReg);\n     \
+  \ C.addTransition(State);\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  // If LHS\
+  \ was marked as a recent devm_krealloc destination,\n  // keep it only if this store\
+  \ is also a devm_krealloc call; otherwise, erase.\n  if (State->contains<DevmReallocDstSet>(LHSReg))\
+  \ {\n    bool Keep = false;\n    if (S) {\n      // Find a CallExpr in the RHS of\
+  \ this store\n      if (const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S))\
+  \ {\n        if (callExprIsDevmKrealloc(CE, C))\n          Keep = true;\n      }\n\
+  \    }\n    if (!Keep) {\n      State = State->remove<DevmReallocDstSet>(LHSReg);\n\
+  \    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreStmt(const\
+  \ ReturnStmt *RS, CheckerContext &C) const {\n  if (!RS)\n    return;\n\n  // Find\
+  \ enclosing IfStmt\n  const IfStmt *IS = findSpecificTypeInParents<IfStmt>(RS, C);\n\
+  \  if (!IS)\n    return;\n\n  // Identify which branch contains the return\n  bool\
+  \ InThen = containsStmt(IS->getThen(), RS);\n  bool InElse = containsStmt(IS->getElse(),\
+  \ RS);\n  if (!InThen && !InElse)\n    return;\n\n  // Parse condition to see if\
+  \ it's a null-check\n  const Expr *Tested = nullptr;\n  bool NullOnThen = false;\n\
+  \  if (!parseNullCheck(IS->getCond(), C, Tested, NullOnThen))\n    return;\n\n \
+  \ // Are we in the NULL branch?\n  bool InNullBranch = (InThen && NullOnThen) ||\
+  \ (InElse && !NullOnThen);\n  if (!InNullBranch)\n    return;\n\n  // Get the region\
+  \ being tested (must be the devm_krealloc destination)\n  const MemRegion *TestedReg\
+  \ = getMemRegionFromExpr(Tested, C);\n  if (!TestedReg)\n    return;\n  TestedReg\
+  \ = TestedReg->getBaseRegion();\n  if (!TestedReg)\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  // Ensure the tested region is a destination of a recent\
+  \ devm_krealloc\n  if (!State->contains<DevmReallocDstSet>(TestedReg))\n    return;\n\
+  \n  // There must be at least one live temp that must be freed\n  auto Temps = State->get<MustFreeTemps>();\n\
+  \  if (!Temps || Temps->isEmpty())\n    return;\n\n  // Report a leak for one of\
+  \ the temps (reduce noise)\n  const MemRegion *LeakMR = nullptr;\n  for (auto It\
+  \ = Temps->begin(); It != Temps->end(); ++It) {\n    LeakMR = *It;\n    break;\n\
+  \  }\n  if (!LeakMR)\n    return;\n\n  const Stmt *AllocSite = nullptr;\n  if (const\
+  \ Stmt *SAlloc = State->get<AllocSiteMap>(LeakMR))\n    AllocSite = SAlloc;\n\n\
+  \  reportLeak(IS, RS, LeakMR, AllocSite, C);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects memory leak of temporary buffers\
+  \ when devm_krealloc fails without freeing the temp\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nthermal/drivers/mediatek/lvts_thermal: Fix a memory\
+  \ leak in an error handling path\n\nIf devm_krealloc() fails, then 'efuse' is leaking.\n\
+  So free it to avoid a leak.\n\nFixes: f5f633b18234 (\"thermal/drivers/mediatek:\
+  \ Add the Low Voltage Thermal Sensor driver\")\nSigned-off-by: Christophe JAILLET\
+  \ <christophe.jaillet@wanadoo.fr>\nReviewed-by: Matthias Brugger <matthias.bgg@gmail.com>\n\
+  Reviewed-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>\n\
+  Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>\nLink: https://lore.kernel.org/r/481d345233862d58c3c305855a93d0dbc2bbae7e.1706431063.git.christophe.jaillet@wanadoo.fr\n\
+  \n## Buggy Code\n\n```c\n// Function: lvts_calibration_read in drivers/thermal/mediatek/lvts_thermal.c\n\
+  static int lvts_calibration_read(struct device *dev, struct lvts_domain *lvts_td,\n\
+  \t\t\t\t\tconst struct lvts_data *lvts_data)\n{\n\tstruct device_node *np = dev_of_node(dev);\n\
+  \tstruct nvmem_cell *cell;\n\tstruct property *prop;\n\tconst char *cell_name;\n\
+  \n\tof_property_for_each_string(np, \"nvmem-cell-names\", prop, cell_name) {\n\t\
+  \tsize_t len;\n\t\tu8 *efuse;\n\n\t\tcell = of_nvmem_cell_get(np, cell_name);\n\t\
+  \tif (IS_ERR(cell)) {\n\t\t\tdev_err(dev, \"Failed to get cell '%s'\\n\", cell_name);\n\
+  \t\t\treturn PTR_ERR(cell);\n\t\t}\n\n\t\tefuse = nvmem_cell_read(cell, &len);\n\
+  \n\t\tnvmem_cell_put(cell);\n\n\t\tif (IS_ERR(efuse)) {\n\t\t\tdev_err(dev, \"Failed\
+  \ to read cell '%s'\\n\", cell_name);\n\t\t\treturn PTR_ERR(efuse);\n\t\t}\n\n\t\
+  \tlvts_td->calib = devm_krealloc(dev, lvts_td->calib,\n\t\t\t\t\t       lvts_td->calib_len\
+  \ + len, GFP_KERNEL);\n\t\tif (!lvts_td->calib)\n\t\t\treturn -ENOMEM;\n\n\t\tmemcpy(lvts_td->calib\
+  \ + lvts_td->calib_len, efuse, len);\n\n\t\tlvts_td->calib_len += len;\n\n\t\tkfree(efuse);\n\
+  \t}\n\n\treturn 0;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/thermal/mediatek/lvts_thermal.c\
+  \ b/drivers/thermal/mediatek/lvts_thermal.c\nindex 98d9c80bd4c6..fd4bd650c77a 100644\n\
+  --- a/drivers/thermal/mediatek/lvts_thermal.c\n+++ b/drivers/thermal/mediatek/lvts_thermal.c\n\
+  @@ -719,8 +719,10 @@ static int lvts_calibration_read(struct device *dev, struct\
+  \ lvts_domain *lvts_td\n \n \t\tlvts_td->calib = devm_krealloc(dev, lvts_td->calib,\n\
+  \ \t\t\t\t\t       lvts_td->calib_len + len, GFP_KERNEL);\n-\t\tif (!lvts_td->calib)\n\
+  +\t\tif (!lvts_td->calib) {\n+\t\t\tkfree(efuse);\n \t\t\treturn -ENOMEM;\n+\t\t\
+  }\n \n \t\tmemcpy(lvts_td->calib + lvts_td->calib_len, efuse, len);\n \n```\n"
+pattern: "## Bug Pattern\n\nAllocating a temporary buffer (e.g., via nvmem_cell_read/kmalloc)\
+  \ and then performing a devm_krealloc on another pointer; if devm_krealloc fails,\
+  \ returning immediately without freeing the temporary buffer, causing a memory leak.\n\
+  \nExample pattern:\n- tmp = kmalloc(...);\n- dst = devm_krealloc(dev, dst, new_size,\
+  \ GFP_KERNEL);\n- if (!dst) return -ENOMEM;  // missing kfree(tmp) here\n\nIn this\
+  \ case: efuse (kmalloc\u2019ed by nvmem_cell_read) is not freed when devm_krealloc\
+  \ for lvts_td->calib fails."
+plan: "Plan\n\n1) Program state customizations\n- REGISTER_SET_WITH_PROGRAMSTATE(MustFreeTemps,\
+  \ const MemRegion*)\n  - Tracks live temporary buffers that must be freed with kfree\
+  \ (e.g., results of nvmem_cell_read/kmalloc-like).\n- REGISTER_MAP_WITH_PROGRAMSTATE(AllocSiteMap,\
+  \ const MemRegion*, const Stmt*)\n  - Remembers the allocation call statement for\
+  \ each temp (for precise bug locations/notes).\n- REGISTER_SET_WITH_PROGRAMSTATE(DevmReallocDstSet,\
+  \ const MemRegion*)\n  - Marks pointer variables/fields that were just assigned\
+  \ from devm_krealloc and are subsequently checked against NULL.\n- (Optional) REGISTER_SET_WITH_PROGRAMSTATE(FreedSet,\
+  \ const MemRegion*)\n  - Not strictly necessary, but can be used to debounce double-removal.\
+  \ You can skip it for simplicity.\n\n2) Helper identification functions\n- bool\
+  \ isTempAllocLike(const CallEvent &Call)\n  - Return true if callee in {\"nvmem_cell_read\"\
+  , \"kmalloc\", \"kcalloc\", \"krealloc\", \"kstrdup\", \"kvmalloc\"}.\n  - For this\
+  \ bug pattern, handling at least \"nvmem_cell_read\" is sufficient.\n- bool isFreeLike(const\
+  \ CallEvent &Call)\n  - Return true if callee is \"kfree\".\n- bool isDevmKrealloc(const\
+  \ CallEvent &Call)\n  - Return true if callee is \"devm_krealloc\".\n- const MemRegion*\
+  \ getLHSRegionOfEnclosingAssignmentOrInit(const CallEvent &Call, CheckerContext\
+  \ &C)\n  - Walk upwards from Call.getOriginExpr() via findSpecificTypeInParents:\n\
+  \    - If BinaryOperator (assignment), get LHS expr and return getMemRegionFromExpr(LHS,\
+  \ C).\n    - Else if in DeclStmt with initializer, get the single VarDecl and return\
+  \ its region (via State->getLValue(VarDecl, LCtx).getAsRegion()).\n  - Return nullptr\
+  \ if not found.\n- bool parseNullCheck(const Stmt *Cond, CheckerContext &C, const\
+  \ Expr *&TestedExpr, bool &NullOnThen)\n  - Recognize:\n    - if (!X): TestedExpr\
+  \ = X, NullOnThen = true\n    - if (X == NULL or X == 0): TestedExpr = X, NullOnThen\
+  \ = true\n    - if (NULL == X or 0 == X): TestedExpr = X, NullOnThen = true\n  \
+  \  - if (X != NULL or X != 0): TestedExpr = X, NullOnThen = false\n  - Return true\
+  \ if a NULL-check recognized, else false.\n\n3) Callbacks and logic\n\nA) checkPostCall\n\
+  - Track temporary allocations:\n  - If isTempAllocLike(Call):\n    - Find the LHS/destination\
+  \ region with getLHSRegionOfEnclosingAssignmentOrInit.\n    - If found:\n      -\
+  \ State = State->add<MustFreeTemps>(MR)\n      - State = State->set<AllocSiteMap>(MR,\
+  \ Call.getOriginExpr())  // for reporting\n- Track frees:\n  - If isFreeLike(Call):\n\
+  \    - Get pointer argument Expr (arg0), get its region MR via getMemRegionFromExpr.\n\
+  \    - If MR: remove from MustFreeTemps and AllocSiteMap (if present).\n- Track\
+  \ devm_krealloc assignment targets:\n  - If isDevmKrealloc(Call):\n    - Find the\
+  \ destination region MR with getLHSRegionOfEnclosingAssignmentOrInit.\n    - If\
+  \ found: State = State->add<DevmReallocDstSet>(MR)\n\nB) checkBind\n- Keep DevmReallocDstSet\
+  \ fresh:\n  - When a store happens, if the LHS region MR is in DevmReallocDstSet\
+  \ but the RHS is not a devm_krealloc call, erase MR from DevmReallocDstSet.\n  -\
+  \ Implementation detail:\n    - S is typically a BinaryOperator for assignments.\
+  \ Use findSpecificTypeInChildren<CallExpr>(S) to see if RHS is a call, and if so,\
+  \ check isDevmKrealloc on it. If no such call or not devm_krealloc, erase MR from\
+  \ DevmReallocDstSet.\n  - This prevents stale \u201Crecent devm_krealloc\u201D markers\
+  \ after other writes.\n\nC) checkPreStmt(const ReturnStmt *RS)\n- Detect the specific\
+  \ error path and report:\n  - Go upwards to IfStmt with findSpecificTypeInParents<IfStmt>(RS,\
+  \ C).\n  - If found:\n    - Let IfS = that IfStmt. Determine whether RS is in IfS->getThen()\
+  \ or IfS->getElse() (check subtree membership).\n    - Use parseNullCheck(IfS->getCond(),\
+  \ ...) to get TestedExpr and NullOnThen.\n    - Determine whether RS is in the null-branch:\n\
+  \      - If RS is under Then and NullOnThen == true, or\n      - If RS is under\
+  \ Else and NullOnThen == false,\n      - then we are in the \u201CNULL branch\u201D\
+  .\n    - Compute MR_tested = getMemRegionFromExpr(TestedExpr, C).\n    - If MR_tested\
+  \ is null, return.\n    - Check if MR_tested is in DevmReallocDstSet. If not, return\
+  \ (not a devm_krealloc failure path).\n    - Now check for leaking temps:\n    \
+  \  - If MustFreeTemps set is empty, return.\n      - For each MR_tmp in MustFreeTemps:\n\
+  \        - Emit a bug (one per MR_tmp) or just the first to reduce noise.\n    \
+  \    - Build a PathSensitiveBugReport with a short message:\n          - \"Memory\
+  \ leak: missing kfree of temporary buffer on devm_krealloc failure\"\n        -\
+  \ Add notes (if available):\n          - Allocation site: AllocSiteMap[MR_tmp] as\
+  \ a note location \u201Ctemporary buffer allocated here\u201D.\n          - devm_krealloc\
+  \ site: the Call.getOriginExpr() you saved for MR_tested, if you kept it; otherwise,\
+  \ the IfStmt condition location is good enough.\n        - generateNonFatalErrorNode()\
+  \ and C.emitReport(...).\n\nD) checkPreCall (optional alternative to track frees\
+  \ early)\n- Same as in checkPostCall for kfree, but you may implement in PreCall\
+  \ instead. Either is fine; keep only one to avoid duplication.\n\n4) Important details\
+  \ and simplifications\n- Scope and aliasing:\n  - For this checker keep it simple:\
+  \ do not implement alias tracking. Most kernel patterns keep the temp in a single\
+  \ local variable (e.g., efuse). This avoids complexity and is sufficient for the\
+  \ target bug.\n- What counts as a \u201Ctemporary\u201D:\n  - At minimum handle\
+  \ nvmem_cell_read (as in the provided patch) and free with kfree.\n  - You may optionally\
+  \ include kmalloc/kcalloc/krealloc/kstrdup/kvmalloc to find similar patterns.\n\
+  - Avoid false positives:\n  - Only warn if:\n    - The ReturnStmt is inside a branch\
+  \ that checks a pointer against NULL.\n    - The checked pointer was the destination\
+  \ of the most recent devm_krealloc (DevmReallocDstSet contains it).\n    - There\
+  \ exists at least one currently-live temporary in MustFreeTemps (i.e., not freed\
+  \ yet).\n  - This ties the leak specifically to the devm_krealloc failure path.\n\
+  - Cleanup of state:\n  - On function end, CSA discards state; no special cleanup\
+  \ required.\n\n5) Callback summary\n- checkPostCall:\n  - Populate MustFreeTemps\
+  \ and AllocSiteMap for nvmem_cell_read/kmalloc-like.\n  - Remove from MustFreeTemps\
+  \ on kfree.\n  - Mark DevmReallocDstSet for the LHS region on devm_krealloc.\n-\
+  \ checkBind:\n  - If LHS region is in DevmReallocDstSet and RHS is not devm_krealloc\
+  \ call, erase it from DevmReallocDstSet.\n- checkPreStmt(ReturnStmt):\n  - If in\
+  \ the NULL-branch of an If that tests a region in DevmReallocDstSet, and MustFreeTemps\
+  \ non-empty, report leak.\n\n6) Utility functions usage\n- Use getMemRegionFromExpr\
+  \ to get regions from LHS expressions and condition expressions.\n- Use findSpecificTypeInParents\
+  \ to:\n  - Get the BinaryOperator/DeclStmt that captures the result of a call in\
+  \ checkPostCall.\n  - Get the enclosing IfStmt for ReturnStmt in checkPreStmt.\n\
+  - Use findSpecificTypeInChildren to:\n  - Inspect the RHS of an assignment in checkBind\
+  \ to see if it is a devm_krealloc call.\n- Use ExprHasName only if you need a fallback\
+  \ textual check; not necessary with the AST approach above.\n\n7) Report format\n\
+  - Use std::make_unique<PathSensitiveBugReport>.\n- Title: \"Memory leak on devm_krealloc\
+  \ failure\"\n- Message (short): \"Missing kfree of temporary buffer when devm_krealloc\
+  \ fails\"\n- Attach allocation site of the temporary (AllocSiteMap[MR_tmp]) and\
+  \ the If condition location or the devm_krealloc call site as path notes."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program state customizations\nREGISTER_SET_WITH_PROGRAMSTATE(MustFreeTemps,\
+  \ const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(AllocSiteMap, const MemRegion*,\
+  \ const Stmt*)\nREGISTER_SET_WITH_PROGRAMSTATE(DevmReallocDstSet, const MemRegion*)\n\
+  \nnamespace {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker\
+  \ : public Checker<\n  check::PostCall,\n  check::Bind,\n  check::PreStmt<ReturnStmt>\n\
+  > {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Memory leak on devm_krealloc failure\", \"Resource Leak\"\
+  )) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \      void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;\n\n   private:\n\
+  \n      // Helpers to classify calls\n      bool isTempAllocLike(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      bool isFreeLike(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      bool isDevmKrealloc(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n\n      // Find LHS region of an assignment or init surrounding a\
+  \ call expression\n      const MemRegion* getLHSRegionOfEnclosingAssignmentOrInit(const\
+  \ CallEvent &Call,\n                                                           \
+  \    CheckerContext &C) const;\n\n      // Parse a null check condition. Returns\
+  \ true if recognized.\n      bool parseNullCheck(const Stmt *Cond, CheckerContext\
+  \ &C,\n                          const Expr *&TestedExpr, bool &NullOnThen) const;\n\
+  \n      // Utility: check whether Parent subtree contains Child\n      bool containsStmt(const\
+  \ Stmt *Parent, const Stmt *Child) const;\n\n      // Helper to check if the given\
+  \ CallExpr is a devm_krealloc\n      bool callExprIsDevmKrealloc(const CallExpr\
+  \ *CE, CheckerContext &C) const;\n\n      void reportLeak(const IfStmt *IS, const\
+  \ ReturnStmt *RS,\n                      const MemRegion *TmpMR, const Stmt *AllocSite,\n\
+  \                      CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isTempAllocLike(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  // Minimum handling: nvmem_cell_read. Optionally include\
+  \ more alloc-like routines.\n  return ExprHasName(E, \"nvmem_cell_read\", C) ||\n\
+  \         ExprHasName(E, \"kmalloc\", C) ||\n         ExprHasName(E, \"kcalloc\"\
+  , C) ||\n         ExprHasName(E, \"krealloc\", C) ||\n         ExprHasName(E, \"\
+  kstrdup\", C) ||\n         ExprHasName(E, \"kvmalloc\", C);\n}\n\nbool SAGenTestChecker::isFreeLike(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"kfree\", C);\n}\n\nbool SAGenTestChecker::isDevmKrealloc(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"devm_krealloc\", C);\n}\n\n\
+  const MemRegion* SAGenTestChecker::getLHSRegionOfEnclosingAssignmentOrInit(const\
+  \ CallEvent &Call,\n                                                           \
+  \                CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return nullptr;\n\n  // Case 1: assignment like \"LHS = call(...)\"\
+  \n  if (const auto *BO = findSpecificTypeInParents<BinaryOperator>(Origin, C)) {\n\
+  \    if (BO->isAssignmentOp()) {\n      const Expr *LHS = BO->getLHS();\n      if\
+  \ (!LHS)\n        return nullptr;\n      const MemRegion *MR = getMemRegionFromExpr(LHS,\
+  \ C);\n      if (!MR)\n        return nullptr;\n      return MR->getBaseRegion();\n\
+  \    }\n  }\n\n  // Case 2: declaration with initializer: \"type var = call(...);\"\
+  \n  if (const auto *DS = findSpecificTypeInParents<DeclStmt>(Origin, C)) {\n   \
+  \ if (DS->isSingleDecl()) {\n      if (const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl()))\
+  \ {\n        if (VD->hasInit()) {\n          ProgramStateRef State = C.getState();\n\
+  \          const LocationContext *LCtx = C.getLocationContext();\n          SVal\
+  \ LVal = State->getLValue(VD, LCtx);\n          if (const MemRegion *MR = LVal.getAsRegion())\
+  \ {\n            return MR->getBaseRegion();\n          }\n        }\n      }\n\
+  \    }\n  }\n\n  return nullptr;\n}\n\nbool SAGenTestChecker::parseNullCheck(const\
+  \ Stmt *Cond, CheckerContext &C,\n                                      const Expr\
+  \ *&TestedExpr, bool &NullOnThen) const {\n  TestedExpr = nullptr;\n  NullOnThen\
+  \ = false;\n\n  if (!Cond)\n    return false;\n\n  const Expr *E = dyn_cast<Expr>(Cond);\n\
+  \  if (!E)\n    return false;\n\n  E = E->IgnoreParenCasts();\n\n  // if (!X)\n\
+  \  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode() ==\
+  \ UO_LNot) {\n      TestedExpr = UO->getSubExpr();\n      NullOnThen = true;\n \
+  \     return true;\n    }\n  }\n\n  // if (X == NULL) or (X != NULL) or with 0\n\
+  \  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {\n    BinaryOperator::Opcode\
+  \ Op = BO->getOpcode();\n    if (Op == BO_EQ || Op == BO_NE) {\n      const Expr\
+  \ *LHS = BO->getLHS()->IgnoreParenCasts();\n      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n\
+  \n      bool LHSIsNull = LHS->isNullPointerConstant(C.getASTContext(),\n       \
+  \                                           Expr::NPC_ValueDependentIsNull);\n \
+  \     bool RHSIsNull = RHS->isNullPointerConstant(C.getASTContext(),\n         \
+  \                                         Expr::NPC_ValueDependentIsNull);\n\n \
+  \     if (LHSIsNull && !RHSIsNull) {\n        TestedExpr = RHS;\n        NullOnThen\
+  \ = (Op == BO_EQ);\n        return true;\n      }\n      if (RHSIsNull && !LHSIsNull)\
+  \ {\n        TestedExpr = LHS;\n        NullOnThen = (Op == BO_EQ);\n        return\
+  \ true;\n      }\n    }\n  }\n\n  // if (X)  -> then is non-null branch\n  if (isa<DeclRefExpr>(E)\
+  \ || isa<MemberExpr>(E) || isa<UnaryOperator>(E) || isa<ArraySubscriptExpr>(E))\
+  \ {\n    TestedExpr = E;\n    NullOnThen = false;\n    return true;\n  }\n\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::containsStmt(const Stmt *Parent, const Stmt\
+  \ *Child) const {\n  if (!Parent || !Child)\n    return false;\n  if (Parent ==\
+  \ Child)\n    return true;\n  for (const Stmt *S : Parent->children()) {\n    if\
+  \ (S && containsStmt(S, Child))\n      return true;\n  }\n  return false;\n}\n\n\
+  bool SAGenTestChecker::callExprIsDevmKrealloc(const CallExpr *CE, CheckerContext\
+  \ &C) const {\n  if (!CE) return false;\n  return ExprHasName(CE, \"devm_krealloc\"\
+  , C);\n}\n\nvoid SAGenTestChecker::reportLeak(const IfStmt *IS, const ReturnStmt\
+  \ *RS,\n                                  const MemRegion *TmpMR, const Stmt *AllocSite,\n\
+  \                                  CheckerContext &C) const {\n  ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Missing kfree of temporary buffer when devm_krealloc fails\", N);\n\
+  \n  if (RS)\n    R->addRange(RS->getSourceRange());\n\n  const SourceManager &SM\
+  \ = C.getSourceManager();\n  const LocationContext *LCtx = C.getLocationContext();\n\
+  \n  if (AllocSite) {\n    PathDiagnosticLocation Loc = PathDiagnosticLocation::createBegin(AllocSite,\
+  \ SM, LCtx);\n    R->addNote(\"temporary buffer allocated here\", Loc);\n  }\n\n\
+  \  if (IS && IS->getCond()) {\n    PathDiagnosticLocation Loc2 = PathDiagnosticLocation::createBegin(IS->getCond(),\
+  \ SM, LCtx);\n    R->addNote(\"devm_krealloc NULL-check here\", Loc2);\n  }\n\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Track temporary allocations: nvmem_cell_read / kmalloc-like\n  if (isTempAllocLike(Call,\
+  \ C)) {\n    const MemRegion *LHSReg = getLHSRegionOfEnclosingAssignmentOrInit(Call,\
+  \ C);\n    if (LHSReg) {\n      // Track that this region holds a temp that must\
+  \ be freed\n      State = State->add<MustFreeTemps>(LHSReg);\n      // Remember\
+  \ alloc site for notes\n      if (const Stmt *S = Call.getOriginExpr())\n      \
+  \  State = State->set<AllocSiteMap>(LHSReg, S);\n      C.addTransition(State);\n\
+  \      return;\n    }\n  }\n\n  // Track frees: kfree(arg)\n  if (isFreeLike(Call,\
+  \ C)) {\n    if (Call.getNumArgs() >= 1) {\n      SVal Arg0 = Call.getArgSVal(0);\n\
+  \      if (const MemRegion *MR = Arg0.getAsRegion()) {\n        MR = MR->getBaseRegion();\n\
+  \        if (MR) {\n          // Remove from MustFreeTemps and AllocSiteMap if present\n\
+  \          if (State->contains<MustFreeTemps>(MR))\n            State = State->remove<MustFreeTemps>(MR);\n\
+  \          if (State->get<AllocSiteMap>(MR))\n            State = State->remove<AllocSiteMap>(MR);\n\
+  \          C.addTransition(State);\n          return;\n        }\n      }\n    }\n\
+  \  }\n\n  // Track devm_krealloc destinations\n  if (isDevmKrealloc(Call, C)) {\n\
+  \    const MemRegion *DstReg = getLHSRegionOfEnclosingAssignmentOrInit(Call, C);\n\
+  \    if (DstReg) {\n      State = State->add<DevmReallocDstSet>(DstReg);\n     \
+  \ C.addTransition(State);\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  // If LHS\
+  \ was marked as a recent devm_krealloc destination,\n  // keep it only if this store\
+  \ is also a devm_krealloc call; otherwise, erase.\n  if (State->contains<DevmReallocDstSet>(LHSReg))\
+  \ {\n    bool Keep = false;\n    if (S) {\n      // Find a CallExpr in the RHS of\
+  \ this store\n      if (const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S))\
+  \ {\n        if (callExprIsDevmKrealloc(CE, C))\n          Keep = true;\n      }\n\
+  \    }\n    if (!Keep) {\n      State = State->remove<DevmReallocDstSet>(LHSReg);\n\
+  \    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreStmt(const\
+  \ ReturnStmt *RS, CheckerContext &C) const {\n  if (!RS)\n    return;\n\n  // Find\
+  \ enclosing IfStmt\n  const IfStmt *IS = findSpecificTypeInParents<IfStmt>(RS, C);\n\
+  \  if (!IS)\n    return;\n\n  // Identify which branch contains the return\n  bool\
+  \ InThen = containsStmt(IS->getThen(), RS);\n  bool InElse = containsStmt(IS->getElse(),\
+  \ RS);\n  if (!InThen && !InElse)\n    return;\n\n  // Parse condition to see if\
+  \ it's a null-check\n  const Expr *Tested = nullptr;\n  bool NullOnThen = false;\n\
+  \  if (!parseNullCheck(IS->getCond(), C, Tested, NullOnThen))\n    return;\n\n \
+  \ // Are we in the NULL branch?\n  bool InNullBranch = (InThen && NullOnThen) ||\
+  \ (InElse && !NullOnThen);\n  if (!InNullBranch)\n    return;\n\n  // Get the region\
+  \ being tested (must be the devm_krealloc destination)\n  const MemRegion *TestedReg\
+  \ = getMemRegionFromExpr(Tested, C);\n  if (!TestedReg)\n    return;\n  TestedReg\
+  \ = TestedReg->getBaseRegion();\n  if (!TestedReg)\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  // Ensure the tested region is a destination of a recent\
+  \ devm_krealloc\n  if (!State->contains<DevmReallocDstSet>(TestedReg))\n    return;\n\
+  \n  // There must be at least one live temp that must be freed\n  auto Temps = State->get<MustFreeTemps>();\n\
+  \  if (Temps.isEmpty())\n    return;\n\n  // Report a leak for one of the temps\
+  \ (reduce noise)\n  const MemRegion *LeakMR = nullptr;\n  for (auto It = Temps.begin();\
+  \ It != Temps.end(); ++It) {\n    LeakMR = *It;\n    break;\n  }\n  if (!LeakMR)\n\
+  \    return;\n\n  const Stmt *AllocSite = nullptr;\n  if (const Stmt *const *SAlloc\
+  \ = State->get<AllocSiteMap>(LeakMR))\n    AllocSite = *SAlloc;\n\n  reportLeak(IS,\
+  \ RS, LeakMR, AllocSite, C);\n}\n\n} // end anonymous namespace\n\nextern \"C\"\
+  \ void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects memory leak of temporary buffers\
+  \ when devm_krealloc fails without freeing the temp\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

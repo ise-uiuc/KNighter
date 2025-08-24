@@ -1,0 +1,7 @@
+- Decision: NotABug
+- Reason: The reported cleanup in map_write() does not match the target bug pattern. The target pattern involves an unconditional shared error path freeing memory that may be callee-managed and already freed (leading to a double free). Here:
+  - new_map is a local struct, zero-initialized (forward/reverse start as NULL).
+  - Memory for new_map.forward/new_map.reverse is conditionally allocated by sort_idmaps() only when new_map.nr_extents > UID_GID_MAP_MAX_BASE_EXTENTS.
+  - On error, the out label conditionally frees new_map.forward/reverse only when nr_extents exceeds the base threshold. kfree(NULL) is safe, so freeing when they were never allocated is harmless.
+  - Ownership remains with this function until the “Install the map” step; on success, pointers are transferred to map->forward/reverse and the error-path free is skipped. On failure, it is the caller’s responsibility to free any partial allocations. There is no evidence of another free of these pointers on the same path, so no double free arises.
+  - This does not exhibit the “callee already freed” hazard described in the target bug pattern, nor is the cleanup unconditional.

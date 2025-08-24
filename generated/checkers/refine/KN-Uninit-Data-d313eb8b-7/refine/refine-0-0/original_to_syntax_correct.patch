@@ -1,0 +1,112 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -17,6 +17,7 @@ #include "clang/AST/Decl.h"
+ #include "clang/AST/Expr.h"
+ #include "clang/AST/Type.h"
++#include "clang/AST/RecordLayout.h"
+ #include "clang/Lex/Lexer.h"
+ #include <memory>
+
+@@ -55,6 +56,8 @@       enum ZeroKind { ZK_None = 0, ZK_Memset, ZK_MemzeroExplicit, ZK_Bzero };
+       static ZeroKind getZeroingKind(const CallEvent &Call, unsigned &PtrIdx, unsigned &LenIdx, CheckerContext &C);
+
++      static bool hasImplicitPadding(QualType QT, ASTContext &Ctx);
++
+       void markZeroCleared(ProgramStateRef &State, const VarDecl *VD) const;
+       void markPartiallyInit(ProgramStateRef &State, const VarDecl *VD) const;
+
+@@ -201,6 +204,61 @@   return ZK_None;
+ }
+
++// Detect if a record type has implicit padding/holes (including tail padding).
++// Conservative rules applied:
++//  - Any union is treated as having padding.
++//  - Any bitfield presence is treated as having padding.
++//  - Otherwise, check inter-field gaps and tail padding using ASTRecordLayout.
++//  - Packed attributes are respected by the layout.
++bool SAGenTestChecker::hasImplicitPadding(QualType QT, ASTContext &Ctx) {
++  const RecordType *RT = QT->getAs<RecordType>();
++  if (!RT)
++    return false;
++
++  const RecordDecl *RD = RT->getDecl();
++  if (!RD)
++    return false;
++
++  RD = RD->getDefinition();
++  if (!RD)
++    return false;
++
++  if (RD->isUnion())
++    return true; // conservative: a smaller active member leaves extra bytes
++
++  const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
++
++  uint64_t PrevEndBits = 0;
++  bool First = true;
++  unsigned Index = 0;
++
++  for (const FieldDecl *FD : RD->fields()) {
++    // Any bit-field implies potential unused bits.
++    if (FD->isBitField())
++      return true;
++
++    uint64_t FieldOffsetBits = Layout.getFieldOffset(Index);
++
++    if (!First) {
++      if (FieldOffsetBits > PrevEndBits)
++        return true; // gap between fields
++    }
++
++    uint64_t FieldSizeBits = Ctx.getTypeSize(FD->getType());
++    PrevEndBits = FieldOffsetBits + FieldSizeBits;
++
++    ++Index;
++    First = false;
++  }
++
++  // Tail padding check
++  uint64_t TotalBits = Ctx.getTypeSize(QT);
++  if (!First && PrevEndBits < TotalBits)
++    return true;
++
++  return false;
++}
++
+ void SAGenTestChecker::markZeroCleared(ProgramStateRef &State, const VarDecl *VD) const {
+   if (!VD) return;
+   State = State->add<ZeroCleared>(VD);
+@@ -242,15 +300,20 @@     if (!ILE)
+       continue;
+
+-    if (isNonZeroingInitList(ILE)) {
+-      ProgramStateRef NewState = State->set<PartiallyInitAgg>(VD, 1);
++    // If zero-brace init, mark cleared regardless of padding.
++    if (isZeroBraceInit(ILE)) {
++      ProgramStateRef NewState = State->add<ZeroCleared>(VD);
+       if (NewState != State) {
+         State = NewState;
+         Changed = true;
+       }
+-    } else {
+-      // Zero brace init like {} or {0} considered cleared
+-      ProgramStateRef NewState = State->add<ZeroCleared>(VD);
++      continue;
++    }
++
++    // Non-zeroing init-list: only interesting if the type actually has padding.
++    if (isNonZeroingInitList(ILE) &&
++        hasImplicitPadding(VD->getType(), C.getASTContext())) {
++      ProgramStateRef NewState = State->set<PartiallyInitAgg>(VD, 1);
+       if (NewState != State) {
+         State = NewState;
+         Changed = true;
+@@ -309,6 +372,11 @@   if (!sizeofCoversVar(VD, LenE, C))
+     return;
+
++  // If the record type has no implicit padding/holes, exporting it cannot leak
++  // uninitialized padding bytes. Do not warn.
++  if (!hasImplicitPadding(VD->getType(), C.getASTContext()))
++    return;
++
+   ProgramStateRef State = C.getState();
+
+   // If explicitly zero-cleared, it's safe

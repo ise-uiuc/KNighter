@@ -1,0 +1,314 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -19,6 +19,10 @@ #include <cstdint>
+ #include <algorithm>
+ #include <memory>
++#include <optional>
++
++// Additional includes for region/type queries
++#include "clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h"
+
+ using namespace clang;
+ using namespace ento;
+@@ -27,7 +31,7 @@ // Program state maps
+ // 0 = Unknown/not tracked, 1 = Zeroed allocation (kzalloc/kcalloc), 2 = Possibly-uninitialized (kmalloc/*)
+ REGISTER_MAP_WITH_PROGRAMSTATE(AllocKindMap, const MemRegion*, unsigned)
+-// Records last known initialized byte size via memset/memzero_explicit for the base region.
++// Records last known zero-initialized byte size via memset/memzero_explicit for the base region.
+ REGISTER_MAP_WITH_PROGRAMSTATE(ZeroInitSizeMap, const MemRegion*, uint64_t)
+ // Tracks pointer aliases.
+ REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)
+@@ -35,6 +39,10 @@ REGISTER_MAP_WITH_PROGRAMSTATE(ProducerLenSymMap, const MemRegion*, SymbolRef)
+ // Tracks producer-initialized buffers: buffer -> symbol of status/return value of producer call.
+ REGISTER_MAP_WITH_PROGRAMSTATE(ProducerStatusSymMap, const MemRegion*, SymbolRef)
++// Tracks a conservative contiguous initialized prefix (in bytes) from the start of the region.
++REGISTER_MAP_WITH_PROGRAMSTATE(InitPrefixMap, const MemRegion*, uint64_t)
++// Counts the number of distinct write operations observed into the region (heuristic for structured init).
++REGISTER_MAP_WITH_PROGRAMSTATE(WriteCountMap, const MemRegion*, unsigned)
+
+ // Utility function declarations (provided externally in the prompt)
+ template <typename T>
+@@ -84,6 +92,13 @@       bool functionKnownToInitLenIsReturn(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const;
+       SymbolRef getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const;
+       bool isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
++
++      // New initialization tracking helpers
++      void markBytesWrittenToRegion(const MemRegion *SubR, uint64_t Len, CheckerContext &C) const;
++      void tryRecordDirectStore(const MemRegion *StoreR, CheckerContext &C) const;
++      bool getRegionOffsetAndBase(const MemRegion *R, const MemRegion *&Base, uint64_t &ByteOffset) const;
++      uint64_t getTypeSizeInBytes(QualType T, ASTContext &ASTC) const;
++      void noteWriteCallWithLen(const CallEvent &Call, CheckerContext &C, unsigned PtrArgIdx, unsigned LenArgIdx) const;
+ };
+
+ const MemRegion *SAGenTestChecker::canonical(ProgramStateRef State, const MemRegion *R) const {
+@@ -119,9 +134,12 @@   State = State->set<AllocKindMap>(Canon, Kind);
+   // Reset any previous explicit-init info; a fresh allocation supersedes it.
+   State = State->remove<ZeroInitSizeMap>(Canon);
+-  // Also clear producer-derived initialization info to avoid stale mapping across re-allocations.
++  // Clear producer-derived initialization info to avoid stale mapping across re-allocations.
+   State = State->remove<ProducerLenSymMap>(Canon);
+   State = State->remove<ProducerStatusSymMap>(Canon);
++  // Clear observed write/initialized-prefix tracking.
++  State = State->remove<InitPrefixMap>(Canon);
++  State = State->remove<WriteCountMap>(Canon);
+   return State;
+ }
+
+@@ -150,6 +168,18 @@   return canonical(State, MR);
+ }
+
++uint64_t SAGenTestChecker::getTypeSizeInBytes(QualType T, ASTContext &ASTC) const {
++  if (T.isNull())
++    return 0;
++  // Incomplete or variable-length types might return 0.
++  if (T->isIncompleteType())
++    return 0;
++  CharUnits CU = ASTC.getTypeSizeInChars(T);
++  if (CU.isNegative())
++    return 0;
++  return (uint64_t)CU.getQuantity();
++}
++
+ void SAGenTestChecker::noteExplicitInitLen(const CallEvent &Call, CheckerContext &C,
+                                            unsigned PtrArgIndex, unsigned LenArgIndex) const {
+   ProgramStateRef State = C.getState();
+@@ -170,6 +200,13 @@   const uint64_t *Old = State->get<ZeroInitSizeMap>(DstReg);
+   uint64_t NewLen = Old ? std::max(*Old, Len) : Len;
+   State = State->set<ZeroInitSizeMap>(DstReg, NewLen);
++
++  // Also treat this as generic initialization coverage.
++  const uint64_t *OldP = State->get<InitPrefixMap>(DstReg);
++  uint64_t NewP = OldP ? std::max(*OldP, Len) : Len;
++  State = State->set<InitPrefixMap>(DstReg, NewP);
++
++  // Clear producer symbols
+   State = State->remove<ProducerLenSymMap>(DstReg);
+   State = State->remove<ProducerStatusSymMap>(DstReg);
+   C.addTransition(State);
+@@ -188,7 +225,6 @@ }
+
+ // Recognize known producer that fills an output buffer up to length returned in len-pointer on success.
+-// For this false positive, we need to recognize efi.get_variable(name, guid, attr, data_size_ptr, data_ptr).
+ bool SAGenTestChecker::functionKnownToInitBuffer(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx, unsigned &LenPtrParamIdx) const {
+   if (const Expr *Origin = Call.getOriginExpr()) {
+     if (ExprHasName(Origin, "get_variable", C)) {
+@@ -268,6 +304,111 @@   return true;
+ }
+
++// Compute offset to base and base region for a subregion.
++bool SAGenTestChecker::getRegionOffsetAndBase(const MemRegion *R, const MemRegion *&Base, uint64_t &ByteOffset) const {
++  if (!R)
++    return false;
++  const auto *SR = dyn_cast<SubRegion>(R);
++  if (!SR)
++    return false;
++  std::optional<RegionOffset> RO = SR->getAsOffset();
++  if (!RO.has_value())
++    return false;
++  Base = RO->getRegion();
++  int64_t BitOff = RO->getOffset();
++  if (BitOff < 0)
++    return false;
++  ByteOffset = (uint64_t)BitOff / 8;
++  // Ignore bitfield writes (non-byte-aligned)
++  if ((uint64_t)BitOff % 8 != 0)
++    return false;
++  return true;
++}
++
++// Record that [Offset, Offset+Len) bytes in the base region have been written,
++// and update the contiguous initialized prefix if applicable. Also increments a write count.
++void SAGenTestChecker::markBytesWrittenToRegion(const MemRegion *SubR, uint64_t Len, CheckerContext &C) const {
++  if (!SubR || Len == 0)
++    return;
++  ProgramStateRef State = C.getState();
++
++  const MemRegion *Base = nullptr;
++  uint64_t Off = 0;
++  if (!getRegionOffsetAndBase(SubR, Base, Off))
++    return;
++
++  const MemRegion *CanonBase = canonical(State, Base ? Base->getBaseRegion() : nullptr);
++  if (!CanonBase)
++    return;
++
++  const unsigned *Kind = State->get<AllocKindMap>(CanonBase);
++  if (!Kind || *Kind != 2) // only track possibly-uninitialized kmalloc regions
++    return;
++
++  const uint64_t *OldP = State->get<InitPrefixMap>(CanonBase);
++  uint64_t Prefix = OldP ? *OldP : 0;
++
++  if (Off <= Prefix) {
++    uint64_t NewEnd = Off + Len;
++    if (NewEnd > Prefix) {
++      State = State->set<InitPrefixMap>(CanonBase, NewEnd);
++    }
++  }
++
++  const unsigned *OldCnt = State->get<WriteCountMap>(CanonBase);
++  unsigned NewCnt = OldCnt ? (*OldCnt + 1) : 1u;
++  State = State->set<WriteCountMap>(CanonBase, NewCnt);
++
++  C.addTransition(State);
++}
++
++// Try to record a direct store's effect on initialized-prefix based on the LHS region type and offset.
++void SAGenTestChecker::tryRecordDirectStore(const MemRegion *StoreR, CheckerContext &C) const {
++  if (!StoreR)
++    return;
++
++  // Skip bit-field stores; they won't give us full-byte coverage.
++  if (const auto *FR = dyn_cast<FieldRegion>(StoreR)) {
++    if (FR->getDecl()->isBitField())
++      return;
++  }
++
++  QualType VT;
++  if (const auto *TVR = dyn_cast<TypedValueRegion>(StoreR)) {
++    VT = TVR->getValueType();
++  }
++  if (VT.isNull())
++    return;
++
++  uint64_t SizeBytes = getTypeSizeInBytes(VT, C.getASTContext());
++  if (SizeBytes == 0)
++    return;
++
++  markBytesWrittenToRegion(StoreR, SizeBytes, C);
++}
++
++// Note a write-by-call pattern like memcpy/memmove where len is provided explicitly.
++void SAGenTestChecker::noteWriteCallWithLen(const CallEvent &Call, CheckerContext &C, unsigned PtrArgIdx, unsigned LenArgIdx) const {
++  SVal DstSV = Call.getArgSVal(PtrArgIdx);
++  const MemRegion *DstR = DstSV.getAsRegion();
++  if (!DstR)
++    return;
++
++  const Expr *LenE = Call.getArgExpr(LenArgIdx);
++  if (!LenE)
++    return;
++
++  llvm::APSInt EvalRes;
++  if (!EvaluateExprToInt(EvalRes, LenE, C))
++    return;
++
++  uint64_t Len = EvalRes.getZExtValue();
++  if (Len == 0)
++    return;
++
++  markBytesWrittenToRegion(DstR, Len, C);
++}
++
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+
+@@ -315,6 +456,19 @@     // memzero_explicit(ptr, len)
+     noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/1);
+     return;
++  }
++
++  // Treat memcpy/memmove as generic initialization of destination (not zeroed).
++  if (callNamed(Call, C, "memcpy") || callNamed(Call, C, "memmove")) {
++    // memcpy(dst, src, len)
++    noteWriteCallWithLen(Call, C, /*PtrArgIdx=*/0, /*LenArgIdx=*/2);
++    return;
++  }
++
++  // Some wrappers may still appear as direct calls; be permissive for bacpy if not inlined.
++  if (callNamed(Call, C, "bacpy")) {
++    // bacpy(dst, src) - usually memcpy of 6 bytes; we can't get the size here if not inlined.
++    // Skip if we cannot evaluate size; most kernels inline bacpy to memcpy so above path handles it.
+   }
+
+   // Producer initialization modeling (len via out-pointer)
+@@ -377,10 +531,10 @@   if (isFalsePositiveDueToProducer(Call, C, FromReg))
+     return;
+
+-  // Evaluate length if possible
+-  const Expr *LenE = Call.getArgExpr(2);
++  // Evaluate the length if possible.
+   uint64_t CopyLen = 0;
+   bool LenKnown = false;
++  const Expr *LenE = Call.getArgExpr(2);
+   if (LenE) {
+     llvm::APSInt EvalRes;
+     if (EvaluateExprToInt(EvalRes, LenE, C)) {
+@@ -390,17 +544,46 @@   }
+
+   const uint64_t *ZeroedBytes = State->get<ZeroInitSizeMap>(FromReg);
++  const uint64_t *InitPrefix = State->get<InitPrefixMap>(FromReg);
++  const unsigned *WriteCnt   = State->get<WriteCountMap>(FromReg);
++
++  // If copy length is symbolic, try to infer a safe upper bound.
++  if (!LenKnown) {
++    SVal LenSV = Call.getArgSVal(2);
++    if (SymbolRef Sym = LenSV.getAsSymbol()) {
++      if (const llvm::APSInt *MaxV = inferSymbolMaxVal(Sym, C)) {
++        CopyLen = MaxV->getZExtValue();
++        LenKnown = true;
++      }
++    }
++  }
++
+   if (LenKnown) {
+-    if (ZeroedBytes && *ZeroedBytes >= CopyLen)
+-      return; // Fully initialized by memset/memzero_explicit
++    if ((ZeroedBytes && *ZeroedBytes >= CopyLen) ||
++        (InitPrefix && *InitPrefix >= CopyLen)) {
++      return; // Fully initialized (zeroed or written)
++    }
+     reportLeak(Call, C, FromReg);
+     return;
+-  } else {
+-    if (!ZeroedBytes) {
+-      reportLeak(Call, C, FromReg);
+-    }
+-    return;
+-  }
++  }
++
++  // Fallback: If we can't reason about exact len, be conservative but avoid known structured-initialization false positives.
++  // Heuristic: if we initialized strictly beyond the header size and observed multiple distinct writes, suppress.
++  uint64_t HeaderSize = 0;
++  if (const Expr *FromE = Call.getArgExpr(1)) {
++    QualType PT = FromE->getType();
++    if (!PT.isNull() && PT->isPointerType()) {
++      QualType Pointee = PT->getPointeeType();
++      HeaderSize = getTypeSizeInBytes(Pointee, C.getASTContext());
++    }
++  }
++
++  if (InitPrefix && *InitPrefix > HeaderSize && WriteCnt && *WriteCnt >= 3) {
++    return; // Appears to be a fully populated struct/array; avoid false positive.
++  }
++
++  // No evidence that the copied bytes are fully initialized.
++  reportLeak(Call, C, FromReg);
+ }
+
+ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {
+@@ -409,18 +592,20 @@   const MemRegion *LHS = Loc.getAsRegion();
+   if (!LHS)
+     return;
+-  LHS = LHS->getBaseRegion();
+-  if (!LHS)
+-    return;
+-
++
++  // Record direct store to subregions (fields/elements) to update initialized prefix.
++  tryRecordDirectStore(LHS, C);
++
++  // Track pointer aliasing for future canonicalization.
++  const MemRegion *LBase = LHS->getBaseRegion();
+   const MemRegion *RHS = Val.getAsRegion();
+-  if (!RHS)
++  if (!LBase || !RHS)
+     return;
+   RHS = RHS->getBaseRegion();
+   if (!RHS)
+     return;
+
+-  const MemRegion *LC = canonical(State, LHS);
++  const MemRegion *LC = canonical(State, LBase);
+   const MemRegion *RC = canonical(State, RHS);
+   if (!LC || !RC)
+     return;

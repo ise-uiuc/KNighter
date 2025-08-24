@@ -1,0 +1,400 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: e61dd678601eac53d501dda1eb1bcffec7b11bd6
+commit_type: Double-Free
+index: 6
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Decl.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/DenseMap.h\"\n#include \"\
+  llvm/ADT/DenseSet.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include <string>\n\n\
+  using namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nnamespace\
+  \ {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker : public\
+  \ Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\n   //\
+  \ Summary: function -> vector of (param index, field freed)\n   struct FreedFieldEntry\
+  \ {\n     unsigned ParamIndex = 0;\n     const FieldDecl *Field = nullptr;\n   };\n\
+  \n   // Helper function summaries (persist across functions in the TU)\n   mutable\
+  \ llvm::DenseMap<const FunctionDecl*, llvm::SmallVector<FreedFieldEntry, 4>> HelperSummary;\n\
+  \   mutable llvm::DenseSet<const FunctionDecl*> Summarized;\n\n   public:\n    \
+  \  SAGenTestChecker() : BT(new BugType(this, \"Double free of struct member via\
+  \ helper\", \"Memory Management\")) {}\n\n      void checkASTCodeBody(const Decl\
+  \ *D, AnalysisManager &Mgr, BugReporter &BR) const;\n\n   private:\n\n      // Summarization\
+  \ utilities\n      void summarizeHelper(const FunctionDecl *FD, ASTContext &Ctx)\
+  \ const;\n      const llvm::SmallVector<FreedFieldEntry, 4> *getHelperSummary(const\
+  \ FunctionDecl *FD, ASTContext &Ctx) const;\n\n      // Matching utilities\n   \
+  \   static bool isKfreeLike(const CallExpr *CE);\n      static bool extractFreedMemberFromArg(const\
+  \ Expr *Arg, const FieldDecl *&FDOut, const Expr *&BaseOut);\n      static std::string\
+  \ getBaseIdentName(const Expr *E);\n\n      // Reporting\n      void reportDoubleFree(const\
+  \ CallExpr *ManualFreeCE, const CallExpr *HelperCallCE,\n                      \
+  \      const FieldDecl *FD, const FunctionDecl *HelperFD,\n                    \
+  \        BugReporter &BR, AnalysisDeclContext *ADC) const;\n\n      // Visitors\n\
+  \      class HelperBodyVisitor;\n      class FunctionBodyScanner;\n};\n\nclass SAGenTestChecker::HelperBodyVisitor\
+  \ : public RecursiveASTVisitor<HelperBodyVisitor> {\n  const FunctionDecl *FD;\n\
+  \  ASTContext &Ctx;\n  llvm::SmallVector<FreedFieldEntry, 4> &Out;\npublic:\n  HelperBodyVisitor(const\
+  \ FunctionDecl *FD, ASTContext &Ctx,\n                    llvm::SmallVector<FreedFieldEntry,\
+  \ 4> &Out)\n      : FD(FD), Ctx(Ctx), Out(Out) {}\n\n  bool VisitCallExpr(CallExpr\
+  \ *CE) {\n    if (!SAGenTestChecker::isKfreeLike(CE))\n      return true;\n\n  \
+  \  if (CE->getNumArgs() < 1)\n      return true;\n\n    const Expr *Arg = CE->getArg(0);\n\
+  \    const FieldDecl *FreedField = nullptr;\n    const Expr *BaseExpr = nullptr;\n\
+  \    if (!SAGenTestChecker::extractFreedMemberFromArg(Arg, FreedField, BaseExpr))\n\
+  \      return true;\n\n    if (!FreedField || !BaseExpr)\n      return true;\n\n\
+  \    // Ensure base expr originates from a parameter of FD\n    const Expr *Base\
+  \ = BaseExpr;\n    while (true) {\n      Base = Base->IgnoreParenImpCasts();\n \
+  \     if (const auto *UO = dyn_cast<UnaryOperator>(Base)) {\n        if (UO->getOpcode()\
+  \ == UO_Deref || UO->getOpcode() == UO_AddrOf) {\n          Base = UO->getSubExpr();\n\
+  \          continue;\n        }\n      }\n      break;\n    }\n\n    const ParmVarDecl\
+  \ *PVD = nullptr;\n    if (const auto *DRE = dyn_cast<DeclRefExpr>(Base)) {\n  \
+  \    PVD = dyn_cast<ParmVarDecl>(DRE->getDecl());\n    }\n    if (!PVD)\n      return\
+  \ true;\n\n    // Find param index\n    unsigned Index = 0;\n    bool Found = false;\n\
+  \    for (const ParmVarDecl *Param : FD->parameters()) {\n      if (Param == PVD)\
+  \ {\n        Found = true;\n        break;\n      }\n      ++Index;\n    }\n   \
+  \ if (!Found)\n      return true;\n\n    // Avoid duplicates\n    for (const auto\
+  \ &E : Out) {\n      if (E.ParamIndex == Index && E.Field == FreedField)\n     \
+  \   return true;\n    }\n    FreedFieldEntry Entry;\n    Entry.ParamIndex = Index;\n\
+  \    Entry.Field = FreedField;\n    Out.push_back(Entry);\n    return true;\n  }\n\
+  };\n\nclass SAGenTestChecker::FunctionBodyScanner : public RecursiveASTVisitor<FunctionBodyScanner>\
+  \ {\n  const FunctionDecl *CurFD;\n  ASTContext &Ctx;\n  BugReporter &BR;\n  AnalysisDeclContext\
+  \ *ADC;\n  SAGenTestChecker &Checker;\n\n  struct FreedRecord {\n    const FieldDecl\
+  \ *Field = nullptr;\n    std::string BaseName;\n    const CallExpr *Call = nullptr;\n\
+  \    SourceLocation Loc;\n  };\n\n  llvm::SmallVector<FreedRecord, 8> ManualFrees;\n\
+  \  llvm::SmallVector<FreedRecord, 8> HelperFrees;\n\npublic:\n  FunctionBodyScanner(const\
+  \ FunctionDecl *FD, ASTContext &Ctx, BugReporter &BR,\n                      AnalysisDeclContext\
+  \ *ADC, SAGenTestChecker &Checker)\n      : CurFD(FD), Ctx(Ctx), BR(BR), ADC(ADC),\
+  \ Checker(Checker) {}\n\n  bool VisitCallExpr(CallExpr *CE) {\n    if (!CE)\n  \
+  \    return true;\n\n    // Manual kfree-like\n    if (SAGenTestChecker::isKfreeLike(CE))\
+  \ {\n      if (CE->getNumArgs() >= 1) {\n        const FieldDecl *FreedField = nullptr;\n\
+  \        const Expr *BaseExpr = nullptr;\n        if (SAGenTestChecker::extractFreedMemberFromArg(CE->getArg(0),\
+  \ FreedField, BaseExpr) &&\n            FreedField && BaseExpr) {\n          FreedRecord\
+  \ R;\n          R.Field = FreedField;\n          R.BaseName = SAGenTestChecker::getBaseIdentName(BaseExpr);\n\
+  \          R.Call = CE;\n          R.Loc = CE->getExprLoc();\n\n          // Check\
+  \ if there was a helper earlier that also frees this field of same base\n      \
+  \    for (const auto &HF : HelperFrees) {\n            if (HF.Field == R.Field &&\
+  \ !HF.BaseName.empty() && HF.BaseName == R.BaseName) {\n              // Report:\
+  \ helper then manual\n              const FunctionDecl *HelperFD = nullptr;\n  \
+  \            if (const auto *Callee = HF.Call->getDirectCallee())\n            \
+  \    HelperFD = Callee;\n              Checker.reportDoubleFree(R.Call, HF.Call,\
+  \ R.Field, HelperFD, BR, ADC);\n              break;\n            }\n          }\n\
+  \n          ManualFrees.push_back(R);\n        }\n      }\n      return true;\n\
+  \    }\n\n    // Other function calls: see if helper with summary\n    const FunctionDecl\
+  \ *CalleeFD = CE->getDirectCallee();\n    if (!CalleeFD)\n      return true;\n\n\
+  \    // Ensure summary exists (lazy)\n    (void)Checker.getHelperSummary(CalleeFD,\
+  \ Ctx);\n    const auto *Summary = Checker.getHelperSummary(CalleeFD, Ctx);\n  \
+  \  if (!Summary || Summary->empty())\n      return true;\n\n    // For each freed\
+  \ field summary, match against prior manual frees\n    for (const auto &Entry :\
+  \ *Summary) {\n      if (Entry.ParamIndex >= CE->getNumArgs())\n        continue;\n\
+  \      const Expr *ArgE = CE->getArg(Entry.ParamIndex);\n      std::string ArgName\
+  \ = SAGenTestChecker::getBaseIdentName(ArgE);\n      if (ArgName.empty())\n    \
+  \    continue;\n\n      // Check prior manual frees\n      for (const auto &MF :\
+  \ ManualFrees) {\n        if (MF.Field == Entry.Field && !MF.BaseName.empty() &&\
+  \ MF.BaseName == ArgName) {\n          // Report: manual then helper\n         \
+  \ Checker.reportDoubleFree(MF.Call, CE, MF.Field, CalleeFD, BR, ADC);\n        \
+  \  break;\n        }\n      }\n\n      // Record helper freed info for possible\
+  \ later manual frees\n      FreedRecord HR;\n      HR.Field = Entry.Field;\n   \
+  \   HR.BaseName = ArgName;\n      HR.Call = CE;\n      HR.Loc = CE->getExprLoc();\n\
+  \      HelperFrees.push_back(HR);\n    }\n\n    return true;\n  }\n};\n\nvoid SAGenTestChecker::summarizeHelper(const\
+  \ FunctionDecl *FD, ASTContext &Ctx) const {\n  if (!FD)\n    return;\n\n  const\
+  \ FunctionDecl *Canon = FD->getCanonicalDecl();\n  if (Summarized.count(Canon))\n\
+  \    return;\n\n  Summarized.insert(Canon);\n  llvm::SmallVector<FreedFieldEntry,\
+  \ 4> V;\n\n  const Stmt *Body = FD->getBody();\n  if (!Body) {\n    HelperSummary[Canon]\
+  \ = std::move(V);\n    return;\n  }\n\n  HelperBodyVisitor Vst(FD, Ctx, V);\n  const_cast<Stmt\
+  \ *>(Body)->dump(); // No-op in release; can be removed if undesired\n  Vst.TraverseStmt(const_cast<Stmt*>(Body));\n\
+  \  HelperSummary[Canon] = std::move(V);\n}\n\nconst llvm::SmallVector<SAGenTestChecker::FreedFieldEntry,\
+  \ 4> *\nSAGenTestChecker::getHelperSummary(const FunctionDecl *FD, ASTContext &Ctx)\
+  \ const {\n  if (!FD)\n    return nullptr;\n  const FunctionDecl *Canon = FD->getCanonicalDecl();\n\
+  \  if (!Summarized.count(Canon))\n    summarizeHelper(Canon, Ctx);\n  auto It =\
+  \ HelperSummary.find(Canon);\n  if (It == HelperSummary.end())\n    return nullptr;\n\
+  \  return &It->second;\n}\n\nbool SAGenTestChecker::isKfreeLike(const CallExpr *CE)\
+  \ {\n  if (!CE)\n    return false;\n  const FunctionDecl *Callee = CE->getDirectCallee();\n\
+  \  if (!Callee)\n    return false;\n  const IdentifierInfo *II = Callee->getIdentifier();\n\
+  \  if (!II)\n    return false;\n  StringRef Name = II->getName();\n  return Name\
+  \ == \"kfree\" || Name == \"kvfree\";\n}\n\nbool SAGenTestChecker::extractFreedMemberFromArg(const\
+  \ Expr *Arg, const FieldDecl *&FDOut, const Expr *&BaseOut) {\n  FDOut = nullptr;\n\
+  \  BaseOut = nullptr;\n  if (!Arg)\n    return false;\n\n  const Expr *E = Arg->IgnoreParenImpCasts();\n\
+  \  const MemberExpr *ME = dyn_cast<MemberExpr>(E);\n  if (!ME)\n    return false;\n\
+  \n  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n  if (!FD)\n   \
+  \ return false;\n\n  FDOut = FD;\n  BaseOut = ME->getBase();\n  return (FDOut !=\
+  \ nullptr && BaseOut != nullptr);\n}\n\nstd::string SAGenTestChecker::getBaseIdentName(const\
+  \ Expr *E) {\n  if (!E)\n    return std::string();\n  const Expr *Cur = E;\n  while\
+  \ (true) {\n    Cur = Cur->IgnoreParenImpCasts();\n    if (const auto *UO = dyn_cast<UnaryOperator>(Cur))\
+  \ {\n      if (UO->getOpcode() == UO_AddrOf || UO->getOpcode() == UO_Deref) {\n\
+  \        Cur = UO->getSubExpr();\n        continue;\n      }\n    } else if (const\
+  \ auto *ASE = dyn_cast<ArraySubscriptExpr>(Cur)) {\n      Cur = ASE->getBase();\n\
+  \      continue;\n    } else if (const auto *ME = dyn_cast<MemberExpr>(Cur)) {\n\
+  \      Cur = ME->getBase();\n      continue;\n    }\n    break;\n  }\n\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(Cur)) {\n    if (const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()))\n\
+  \      return VD->getNameAsString();\n  }\n  return std::string();\n}\n\nvoid SAGenTestChecker::reportDoubleFree(const\
+  \ CallExpr *ManualFreeCE, const CallExpr *HelperCallCE,\n                      \
+  \                  const FieldDecl *FD, const FunctionDecl *HelperFD,\n        \
+  \                                BugReporter &BR, AnalysisDeclContext *ADC) const\
+  \ {\n  if (!ManualFreeCE || !HelperCallCE || !FD)\n    return;\n\n  std::string\
+  \ FieldName = FD->getNameAsString();\n  std::string HelperName = HelperFD ? HelperFD->getNameAsString()\
+  \ : \"helper\";\n\n  std::string Msg = \"Double free of field '\" + FieldName +\
+  \ \"' via kfree() and '\" + HelperName + \"()'\";\n\n  const SourceManager &SM =\
+  \ BR.getSourceManager();\n  PathDiagnosticLocation Loc = PathDiagnosticLocation::createBegin(ManualFreeCE,\
+  \ SM, ADC);\n\n  auto R = std::make_unique<BasicBugReport>(*BT, Msg, Loc);\n  R->addRange(ManualFreeCE->getSourceRange());\n\
+  \n  PathDiagnosticLocation HelperLoc = PathDiagnosticLocation::createBegin(HelperCallCE,\
+  \ SM, ADC);\n  R->addNote(\"'\" + HelperName + \"()' also frees this field\", HelperLoc);\n\
+  \n  BR.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  ASTContext &Ctx = Mgr.getASTContext();\n\
+  \n  // Pre-summarize current function (in case it's used as helper elsewhere)\n\
+  \  summarizeHelper(FD, Ctx);\n\n  // Scan body for pattern: manual kfree of member\
+  \ + helper that also frees it\n  AnalysisDeclContext *ADC = Mgr.getAnalysisDeclContext(const_cast<Decl*>(D));\n\
+  \  FunctionBodyScanner Scanner(FD, Ctx, BR, ADC, *const_cast<SAGenTestChecker*>(this));\n\
+  \  Scanner.TraverseDecl(const_cast<FunctionDecl*>(FD));\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects double free of struct member: manual kfree and helper also frees\
+  \ the same member\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbcachefs: Fix double free of ca->buckets_nouse\n\n\
+  Reported-by: Dan Carpenter <dan.carpenter@linaro.org>\nFixes: ffcbec6076 (\"bcachefs:\
+  \ Kill opts.buckets_nouse\")\nSigned-off-by: Kent Overstreet <kent.overstreet@linux.dev>\n\
+  \n## Buggy Code\n\n```c\n// Function: bch2_dev_free in fs/bcachefs/super.c\nstatic\
+  \ void bch2_dev_free(struct bch_dev *ca)\n{\n\tcancel_work_sync(&ca->io_error_work);\n\
+  \n\tif (ca->kobj.state_in_sysfs &&\n\t    ca->disk_sb.bdev)\n\t\tsysfs_remove_link(bdev_kobj(ca->disk_sb.bdev),\
+  \ \"bcachefs\");\n\n\tif (ca->kobj.state_in_sysfs)\n\t\tkobject_del(&ca->kobj);\n\
+  \n\tkfree(ca->buckets_nouse);\n\tbch2_free_super(&ca->disk_sb);\n\tbch2_dev_allocator_background_exit(ca);\n\
+  \tbch2_dev_journal_exit(ca);\n\n\tfree_percpu(ca->io_done);\n\tbch2_dev_buckets_free(ca);\n\
+  \tfree_page((unsigned long) ca->sb_read_scratch);\n\n\tbch2_time_stats_quantiles_exit(&ca->io_latency[WRITE]);\n\
+  \tbch2_time_stats_quantiles_exit(&ca->io_latency[READ]);\n\n\tpercpu_ref_exit(&ca->io_ref);\n\
+  #ifndef CONFIG_BCACHEFS_DEBUG\n\tpercpu_ref_exit(&ca->ref);\n#endif\n\tkobject_put(&ca->kobj);\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/bcachefs/super.c b/fs/bcachefs/super.c\n\
+  index 0455a1001fec..e7fa2de35014 100644\n--- a/fs/bcachefs/super.c\n+++ b/fs/bcachefs/super.c\n\
+  @@ -1193,7 +1193,6 @@ static void bch2_dev_free(struct bch_dev *ca)\n \tif (ca->kobj.state_in_sysfs)\n\
+  \ \t\tkobject_del(&ca->kobj);\n \n-\tkfree(ca->buckets_nouse);\n \tbch2_free_super(&ca->disk_sb);\n\
+  \ \tbch2_dev_allocator_background_exit(ca);\n \tbch2_dev_journal_exit(ca);\n```\n"
+pattern: "## Bug Pattern\n\nExplicitly freeing a struct member in a top-level teardown\
+  \ function even though a subsequent cleanup helper invoked in the same path also\
+  \ frees that same member. Concretely: calling kfree(obj->field) in the destructor\
+  \ while later calling another routine (e.g., bch2_dev_buckets_free()) that also\
+  \ kfree\u2019s obj->field, leading to a double free."
+plan: "Plan\n\n1) Program state\n- No custom program states. We can detect this pattern\
+  \ reliably with an AST-only pass over function bodies and a lightweight interprocedural\
+  \ summary of \u201Ccleanup helpers\u201D (functions that free specific members of\
+  \ their pointer parameters).\n\n2) Callback selection\n- Use checkASTCodeBody only.\n\
+  \  - First, summarize \u201Ccleanup helper\u201D functions (callee-side) by inspecting\
+  \ their bodies and extracting which fields of which parameters they kfree.\n  -\
+  \ Second, detect in a function body when there is a manual kfree of obj->field and,\
+  \ later in the same function, a call to a helper that (according to the summary)\
+  \ also frees the same field of the same object.\n\n3) Helper data structures (checker-owned,\
+  \ not in ProgramState)\n- A summary map for free-like side effects:\n  - Map: const\
+  \ FunctionDecl* -> vector of (ParamIndex, const FieldDecl*)\n  - Meaning: This function\
+  \ frees the given FieldDecl of the param at ParamIndex.\n- No per-path maps needed;\
+  \ this is a source-order heuristic sufficient for destructor-like teardown patterns.\n\
+  \n4) Utility helpers\n- isKfreeLike(const CallEvent or CallExpr): returns true if\
+  \ callee is kfree/kvfree (can be extended to vfree if needed).\n- extractFreedMemberFromArg(const\
+  \ Expr* Arg, const FieldDecl*& FD, const Expr*& BaseExpr):\n  - If Arg is a MemberExpr\
+  \ whose member decl is a FieldDecl, set FD and BaseExpr to the MemberExpr\u2019\
+  s base expression (ignoring parens/implicits), return true. Otherwise false.\n-\
+  \ summarizeHelper(const FunctionDecl* FD):\n  - If FD has a body, walk its body\
+  \ to find kfree-like calls.\n  - For each such call, if the freed expression is\
+  \ a MemberExpr whose base originates from a function parameter (DeclRefExpr to ParamVarDecl),\
+  \ record (ParamIndex, FieldDecl*) in the summary map. Do not duplicate entries.\n\
+  \  - This can be called lazily on-demand when we first need the summary of a callee.\n\
+  - sameObjectName(const Expr* A, const Expr* B, CheckerContext& C):\n  - Heuristic\
+  \ equality: use ExprHasName on both sides\u2019 top-level identifiers. For the caller\
+  \ side we match the base object \u201Cname\u201D against the argument expression\
+  \ name for the helper call. This keeps the approach simple without alias tracking.\n\
+  \n5) Summarization phase (inside checkASTCodeBody)\n- For every FunctionDecl with\
+  \ a body that we visit, pre-summarize it as a potential helper using summarizeHelper(FD).\
+  \ This seeds summaries for callees we might use later.\n- Also, implement lazy summarization:\
+  \ when we encounter a call to a callee that is not yet summarized but has a definition,\
+  \ call summarizeHelper on it on-demand.\n\n6) Detection phase (inside checkASTCodeBody)\n\
+  - For each FunctionDecl with body, perform a linear source-order scan of all CallExpr\
+  \ nodes in its body. You can implement this with a RecursiveASTVisitor that:\n \
+  \ - Collects all kfree-like calls encountered so far in this function into a vector\
+  \ of records: ManualFree { FieldDecl* FreedField, const Expr* BaseExpr, SourceLocation\
+  \ Loc }.\n  - When visiting a kfree-like call:\n    - If extractFreedMemberFromArg(Arg,\
+  \ FD, Base) returns true, push a new ManualFree record with FD and Base.\n  - When\
+  \ visiting any CallExpr to a summarized helper H:\n    - Obtain H\u2019s summary\
+  \ entries: vector of (ParamIndex, FreedFieldFD).\n    - For each summary entry:\n\
+  \      - Let ArgExpr = call\u2019s actual argument at ParamIndex.\n      - For each\
+  \ ManualFree recorded earlier in this function (only those with source location\
+  \ before the current call):\n        - If ManualFree.FreedField == FreedFieldFD\
+  \ AND sameObjectName(ManualFree.BaseExpr, ArgExpr, C) is true, then report a double-free:\
+  \ the field was freed manually and will be freed again by the helper.\n    - Note:\
+  \ This naturally handles the concrete pattern: kfree(ca->buckets_nouse); ...; bch2_dev_buckets_free(ca);\n\
+  - Optional, catch the opposite order in the same function (helper first then manual\
+  \ free):\n  - Maintain a HelperFreed list similar to ManualFree but populated when\
+  \ we see a helper call; then if a later kfree-like call frees the same field of\
+  \ the same base, report. This is symmetrical but not necessary for the provided\
+  \ patch; include it for robustness if desired.\n\n7) Matching details\n- Field identity:\
+  \ Compare FieldDecl* pointers (MemberExpr->getMemberDecl() dyn_cast<FieldDecl>).\n\
+  - Object identity: Use the provided ExprHasName helper to check that the helper\
+  \ call\u2019s actual argument contains the same base name as the manual free\u2019\
+  s base expression. Prefer comparing DeclRefExpr of the base if available; fall back\
+  \ to ExprHasName for simplicity.\n\n8) Reporting\n- Create a single BugType for\
+  \ this checker (e.g., \u201CDouble free of struct member via helper\u201D).\n- When\
+  \ a match is found, emit a BasicBugReport:\n  - Short message: \u201CDouble free\
+  \ of <field> via kfree() and <helper>()\u201D.\n  - Primary location: the manual\
+  \ kfree() call.\n  - Add a note location at the helper call: \u201C<helper>() also\
+  \ frees this field.\u201D\n- Use generateNonFatalErrorNode to ensure reporting does\
+  \ not stop analysis.\n\n9) Scope and limitations\n- This checker targets the common\
+  \ teardown pattern within a single function: manual free followed by a helper call\
+  \ that also frees the same member.\n- It relies on intra-TU visibility of helper\
+  \ definitions to build summaries.\n- It uses name-based matching for the object\
+  \ identity to keep the implementation simple and avoid ProgramState/alias tracking\
+  \ as suggested for minimizing steps."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Decl.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/DenseMap.h\"\n#include \"\
+  llvm/ADT/DenseSet.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include <string>\n\n\
+  using namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nnamespace\
+  \ {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker : public\
+  \ Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\n   //\
+  \ Summary: function -> vector of (param index, field freed)\n   struct FreedFieldEntry\
+  \ {\n     unsigned ParamIndex = 0;\n     const FieldDecl *Field = nullptr;\n   };\n\
+  \n   // Helper function summaries (persist across functions in the TU)\n   mutable\
+  \ llvm::DenseMap<const FunctionDecl*, llvm::SmallVector<FreedFieldEntry, 4>> HelperSummary;\n\
+  \   mutable llvm::DenseSet<const FunctionDecl*> Summarized;\n\n   public:\n    \
+  \  SAGenTestChecker() : BT(new BugType(this, \"Double free of struct member via\
+  \ helper\", \"Memory Management\")) {}\n\n      void checkASTCodeBody(const Decl\
+  \ *D, AnalysisManager &Mgr, BugReporter &BR) const;\n\n   private:\n\n      // Summarization\
+  \ utilities\n      void summarizeHelper(const FunctionDecl *FD, ASTContext &Ctx)\
+  \ const;\n      const llvm::SmallVector<FreedFieldEntry, 4> *getHelperSummary(const\
+  \ FunctionDecl *FD, ASTContext &Ctx) const;\n\n      // Matching utilities\n   \
+  \   static bool isKfreeLike(const CallExpr *CE);\n      static bool extractFreedMemberFromArg(const\
+  \ Expr *Arg, const FieldDecl *&FDOut, const Expr *&BaseOut);\n      static std::string\
+  \ getBaseIdentName(const Expr *E);\n\n      // Reporting\n      void reportDoubleFree(const\
+  \ CallExpr *ManualFreeCE, const CallExpr *HelperCallCE,\n                      \
+  \      const FieldDecl *FD, const FunctionDecl *HelperFD,\n                    \
+  \        BugReporter &BR, AnalysisDeclContext *ADC) const;\n\n      // Visitors\n\
+  \      class HelperBodyVisitor;\n      class FunctionBodyScanner;\n};\n\nclass SAGenTestChecker::HelperBodyVisitor\
+  \ : public RecursiveASTVisitor<HelperBodyVisitor> {\n  const FunctionDecl *FD;\n\
+  \  ASTContext &Ctx;\n  llvm::SmallVector<FreedFieldEntry, 4> &Out;\npublic:\n  HelperBodyVisitor(const\
+  \ FunctionDecl *FD, ASTContext &Ctx,\n                    llvm::SmallVector<FreedFieldEntry,\
+  \ 4> &Out)\n      : FD(FD), Ctx(Ctx), Out(Out) {}\n\n  bool VisitCallExpr(CallExpr\
+  \ *CE) {\n    if (!SAGenTestChecker::isKfreeLike(CE))\n      return true;\n\n  \
+  \  if (CE->getNumArgs() < 1)\n      return true;\n\n    const Expr *Arg = CE->getArg(0);\n\
+  \    const FieldDecl *FreedField = nullptr;\n    const Expr *BaseExpr = nullptr;\n\
+  \    if (!SAGenTestChecker::extractFreedMemberFromArg(Arg, FreedField, BaseExpr))\n\
+  \      return true;\n\n    if (!FreedField || !BaseExpr)\n      return true;\n\n\
+  \    // Ensure base expr originates from a parameter of FD\n    const Expr *Base\
+  \ = BaseExpr;\n    while (true) {\n      Base = Base->IgnoreParenImpCasts();\n \
+  \     if (const auto *UO = dyn_cast<UnaryOperator>(Base)) {\n        if (UO->getOpcode()\
+  \ == UO_Deref || UO->getOpcode() == UO_AddrOf) {\n          Base = UO->getSubExpr();\n\
+  \          continue;\n        }\n      }\n      break;\n    }\n\n    const ParmVarDecl\
+  \ *PVD = nullptr;\n    if (const auto *DRE = dyn_cast<DeclRefExpr>(Base)) {\n  \
+  \    PVD = dyn_cast<ParmVarDecl>(DRE->getDecl());\n    }\n    if (!PVD)\n      return\
+  \ true;\n\n    // Find param index\n    unsigned Index = 0;\n    bool Found = false;\n\
+  \    for (const ParmVarDecl *Param : FD->parameters()) {\n      if (Param == PVD)\
+  \ {\n        Found = true;\n        break;\n      }\n      ++Index;\n    }\n   \
+  \ if (!Found)\n      return true;\n\n    // Avoid duplicates\n    for (const auto\
+  \ &E : Out) {\n      if (E.ParamIndex == Index && E.Field == FreedField)\n     \
+  \   return true;\n    }\n    FreedFieldEntry Entry;\n    Entry.ParamIndex = Index;\n\
+  \    Entry.Field = FreedField;\n    Out.push_back(Entry);\n    return true;\n  }\n\
+  };\n\nclass SAGenTestChecker::FunctionBodyScanner : public RecursiveASTVisitor<FunctionBodyScanner>\
+  \ {\n  const FunctionDecl *CurFD;\n  ASTContext &Ctx;\n  BugReporter &BR;\n  AnalysisDeclContext\
+  \ *ADC;\n  SAGenTestChecker &Checker;\n\n  struct FreedRecord {\n    const FieldDecl\
+  \ *Field = nullptr;\n    std::string BaseName;\n    const CallExpr *Call = nullptr;\n\
+  \    SourceLocation Loc;\n  };\n\n  llvm::SmallVector<FreedRecord, 8> ManualFrees;\n\
+  \  llvm::SmallVector<FreedRecord, 8> HelperFrees;\n\npublic:\n  FunctionBodyScanner(const\
+  \ FunctionDecl *FD, ASTContext &Ctx, BugReporter &BR,\n                      AnalysisDeclContext\
+  \ *ADC, SAGenTestChecker &Checker)\n      : CurFD(FD), Ctx(Ctx), BR(BR), ADC(ADC),\
+  \ Checker(Checker) {}\n\n  bool VisitCallExpr(CallExpr *CE) {\n    if (!CE)\n  \
+  \    return true;\n\n    // Manual kfree-like\n    if (SAGenTestChecker::isKfreeLike(CE))\
+  \ {\n      if (CE->getNumArgs() >= 1) {\n        const FieldDecl *FreedField = nullptr;\n\
+  \        const Expr *BaseExpr = nullptr;\n        if (SAGenTestChecker::extractFreedMemberFromArg(CE->getArg(0),\
+  \ FreedField, BaseExpr) &&\n            FreedField && BaseExpr) {\n          FreedRecord\
+  \ R;\n          R.Field = FreedField;\n          R.BaseName = SAGenTestChecker::getBaseIdentName(BaseExpr);\n\
+  \          R.Call = CE;\n          R.Loc = CE->getExprLoc();\n\n          // Check\
+  \ if there was a helper earlier that also frees this field of same base\n      \
+  \    for (const auto &HF : HelperFrees) {\n            if (HF.Field == R.Field &&\
+  \ !HF.BaseName.empty() && HF.BaseName == R.BaseName) {\n              // Report:\
+  \ helper then manual\n              const FunctionDecl *HelperFD = nullptr;\n  \
+  \            if (const auto *Callee = HF.Call->getDirectCallee())\n            \
+  \    HelperFD = Callee;\n              Checker.reportDoubleFree(R.Call, HF.Call,\
+  \ R.Field, HelperFD, BR, ADC);\n              break;\n            }\n          }\n\
+  \n          ManualFrees.push_back(R);\n        }\n      }\n      return true;\n\
+  \    }\n\n    // Other function calls: see if helper with summary\n    const FunctionDecl\
+  \ *CalleeFD = CE->getDirectCallee();\n    if (!CalleeFD)\n      return true;\n\n\
+  \    // Ensure summary exists (lazy)\n    (void)Checker.getHelperSummary(CalleeFD,\
+  \ Ctx);\n    const auto *Summary = Checker.getHelperSummary(CalleeFD, Ctx);\n  \
+  \  if (!Summary || Summary->empty())\n      return true;\n\n    // For each freed\
+  \ field summary, match against prior manual frees\n    for (const auto &Entry :\
+  \ *Summary) {\n      if (Entry.ParamIndex >= CE->getNumArgs())\n        continue;\n\
+  \      const Expr *ArgE = CE->getArg(Entry.ParamIndex);\n      std::string ArgName\
+  \ = SAGenTestChecker::getBaseIdentName(ArgE);\n      if (ArgName.empty())\n    \
+  \    continue;\n\n      // Check prior manual frees\n      for (const auto &MF :\
+  \ ManualFrees) {\n        if (MF.Field == Entry.Field && !MF.BaseName.empty() &&\
+  \ MF.BaseName == ArgName) {\n          // Report: manual then helper\n         \
+  \ Checker.reportDoubleFree(MF.Call, CE, MF.Field, CalleeFD, BR, ADC);\n        \
+  \  break;\n        }\n      }\n\n      // Record helper freed info for possible\
+  \ later manual frees\n      FreedRecord HR;\n      HR.Field = Entry.Field;\n   \
+  \   HR.BaseName = ArgName;\n      HR.Call = CE;\n      HR.Loc = CE->getExprLoc();\n\
+  \      HelperFrees.push_back(HR);\n    }\n\n    return true;\n  }\n};\n\nvoid SAGenTestChecker::summarizeHelper(const\
+  \ FunctionDecl *FD, ASTContext &Ctx) const {\n  if (!FD)\n    return;\n\n  const\
+  \ FunctionDecl *Canon = FD->getCanonicalDecl();\n  if (Summarized.count(Canon))\n\
+  \    return;\n\n  Summarized.insert(Canon);\n  llvm::SmallVector<FreedFieldEntry,\
+  \ 4> V;\n\n  const Stmt *Body = FD->getBody();\n  if (!Body) {\n    HelperSummary[Canon]\
+  \ = std::move(V);\n    return;\n  }\n\n  HelperBodyVisitor Vst(FD, Ctx, V);\n  const_cast<Stmt\
+  \ *>(Body)->dump(); // No-op in release; can be removed if undesired\n  Vst.TraverseStmt(const_cast<Stmt*>(Body));\n\
+  \  HelperSummary[Canon] = std::move(V);\n}\n\nconst llvm::SmallVector<SAGenTestChecker::FreedFieldEntry,\
+  \ 4> *\nSAGenTestChecker::getHelperSummary(const FunctionDecl *FD, ASTContext &Ctx)\
+  \ const {\n  if (!FD)\n    return nullptr;\n  const FunctionDecl *Canon = FD->getCanonicalDecl();\n\
+  \  if (!Summarized.count(Canon))\n    summarizeHelper(Canon, Ctx);\n  auto It =\
+  \ HelperSummary.find(Canon);\n  if (It == HelperSummary.end())\n    return nullptr;\n\
+  \  return &It->second;\n}\n\nbool SAGenTestChecker::isKfreeLike(const CallExpr *CE)\
+  \ {\n  if (!CE)\n    return false;\n  const FunctionDecl *Callee = CE->getDirectCallee();\n\
+  \  if (!Callee)\n    return false;\n  const IdentifierInfo *II = Callee->getIdentifier();\n\
+  \  if (!II)\n    return false;\n  StringRef Name = II->getName();\n  return Name\
+  \ == \"kfree\" || Name == \"kvfree\";\n}\n\nbool SAGenTestChecker::extractFreedMemberFromArg(const\
+  \ Expr *Arg, const FieldDecl *&FDOut, const Expr *&BaseOut) {\n  FDOut = nullptr;\n\
+  \  BaseOut = nullptr;\n  if (!Arg)\n    return false;\n\n  const Expr *E = Arg->IgnoreParenImpCasts();\n\
+  \  const MemberExpr *ME = dyn_cast<MemberExpr>(E);\n  if (!ME)\n    return false;\n\
+  \n  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n  if (!FD)\n   \
+  \ return false;\n\n  FDOut = FD;\n  BaseOut = ME->getBase();\n  return (FDOut !=\
+  \ nullptr && BaseOut != nullptr);\n}\n\nstd::string SAGenTestChecker::getBaseIdentName(const\
+  \ Expr *E) {\n  if (!E)\n    return std::string();\n  const Expr *Cur = E;\n  while\
+  \ (true) {\n    Cur = Cur->IgnoreParenImpCasts();\n    if (const auto *UO = dyn_cast<UnaryOperator>(Cur))\
+  \ {\n      if (UO->getOpcode() == UO_AddrOf || UO->getOpcode() == UO_Deref) {\n\
+  \        Cur = UO->getSubExpr();\n        continue;\n      }\n    } else if (const\
+  \ auto *ASE = dyn_cast<ArraySubscriptExpr>(Cur)) {\n      Cur = ASE->getBase();\n\
+  \      continue;\n    } else if (const auto *ME = dyn_cast<MemberExpr>(Cur)) {\n\
+  \      Cur = ME->getBase();\n      continue;\n    }\n    break;\n  }\n\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(Cur)) {\n    if (const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl()))\n\
+  \      return VD->getNameAsString();\n  }\n  return std::string();\n}\n\nvoid SAGenTestChecker::reportDoubleFree(const\
+  \ CallExpr *ManualFreeCE, const CallExpr *HelperCallCE,\n                      \
+  \                  const FieldDecl *FD, const FunctionDecl *HelperFD,\n        \
+  \                                BugReporter &BR, AnalysisDeclContext *ADC) const\
+  \ {\n  if (!ManualFreeCE || !HelperCallCE || !FD)\n    return;\n\n  std::string\
+  \ FieldName = FD->getNameAsString();\n  std::string HelperName = HelperFD ? HelperFD->getNameAsString()\
+  \ : \"helper\";\n\n  std::string Msg = \"Double free of field '\" + FieldName +\
+  \ \"' via kfree() and '\" + HelperName + \"()'\";\n\n  const SourceManager &SM =\
+  \ BR.getSourceManager();\n  PathDiagnosticLocation Loc = PathDiagnosticLocation::createBegin(ManualFreeCE,\
+  \ SM, ADC);\n\n  auto R = std::make_unique<BasicBugReport>(*BT, Msg, Loc);\n  R->addRange(ManualFreeCE->getSourceRange());\n\
+  \n  PathDiagnosticLocation HelperLoc = PathDiagnosticLocation::createBegin(HelperCallCE,\
+  \ SM, ADC);\n  R->addNote(\"'\" + HelperName + \"()' also frees this field\", HelperLoc);\n\
+  \n  BR.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  ASTContext &Ctx = Mgr.getASTContext();\n\
+  \n  // Pre-summarize current function (in case it's used as helper elsewhere)\n\
+  \  summarizeHelper(FD, Ctx);\n\n  // Scan body for pattern: manual kfree of member\
+  \ + helper that also frees it\n  AnalysisDeclContext *ADC = Mgr.getAnalysisDeclContext(const_cast<Decl*>(D));\n\
+  \  FunctionBodyScanner Scanner(FD, Ctx, BR, ADC, *const_cast<SAGenTestChecker*>(this));\n\
+  \  Scanner.TraverseDecl(const_cast<FunctionDecl*>(FD));\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects double free of struct member: manual kfree and helper also frees\
+  \ the same member\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

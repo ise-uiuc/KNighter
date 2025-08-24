@@ -1,0 +1,162 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -90,6 +90,36 @@     return isa<ParenExpr>(S) || isa<ImplicitCastExpr>(S);
+   }
+
++  static bool isSizeT(QualType T, CheckerContext &C) {
++    ASTContext &AC = C.getASTContext();
++    return AC.hasSameType(AC.getCanonicalType(T),
++                          AC.getCanonicalType(AC.getSizeType()));
++  }
++
++  // Get the "record name" (Identifier) for the record type behind an expression,
++  // following one level of pointer if present.
++  static StringRef getRecordNameFromExprBase(const Expr *E) {
++    if (!E) return StringRef();
++    QualType QT = E->getType();
++    if (const auto *PT = QT->getAs<PointerType>())
++      QT = PT->getPointeeType();
++    if (const auto *RT = QT->getAs<RecordType>()) {
++      const RecordDecl *RD = RT->getDecl();
++      if (const IdentifierInfo *II = RD->getIdentifier())
++        return II->getName();
++    }
++    return StringRef();
++  }
++
++  static StringRef getDeclRefName(const Expr *E) {
++    if (!E) return StringRef();
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts())) {
++      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
++        return VD->getName();
++    }
++    return StringRef();
++  }
++
+   // Helpers to work with state-tracked constant ints.
+   static bool getConstValueFromState(const Expr *E, CheckerContext &C,
+                                      llvm::APSInt &Out) {
+@@ -427,16 +457,119 @@     return false;
+   }
+
++  // Heuristic: detect Linux sysfs bin_attribute.size assignment patterns.
++  bool isLinuxBinAttributeSizeAssignment(const Stmt *UseSiteStmt,
++                                         CheckerContext &C) const {
++    const auto *BO = dyn_cast_or_null<BinaryOperator>(UseSiteStmt);
++    if (!BO || !BO->isAssignmentOp())
++      return false;
++
++    const Expr *LHS = BO->getLHS();
++    if (!LHS)
++      return false;
++
++    LHS = LHS->IgnoreParenImpCasts();
++    if (!isSizeT(LHS->getType(), C))
++      return false;
++
++    const auto *ME = dyn_cast<MemberExpr>(LHS);
++    if (!ME)
++      return false;
++
++    const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());
++    if (!FD)
++      return false;
++
++    // Field name must be "size".
++    if (!FD->getIdentifier() || FD->getName() != "size")
++      return false;
++
++    // Record name should contain "bin_attribute" or "attribute".
++    const RecordDecl *RD = FD->getParent();
++    StringRef RName;
++    if (RD) {
++      if (const IdentifierInfo *II = RD->getIdentifier())
++        RName = II->getName();
++    }
++    if (RName.empty())
++      RName = getRecordNameFromExprBase(ME->getBase());
++
++    if (RName.contains("bin_attribute") || RName.contains("attribute"))
++      return true;
++
++    return false;
++  }
++
++  // Heuristic: whether expression references an "ops" struct member (common in Linux).
++  bool exprComesFromOps(const Expr *E) const {
++    if (!E) return false;
++    E = E->IgnoreParenImpCasts();
++    const auto *ME = dyn_cast<MemberExpr>(E);
++    if (!ME)
++      return false;
++
++    const Expr *Base = ME->getBase();
++    StringRef BaseVarName = getDeclRefName(Base);
++    StringRef RecName = getRecordNameFromExprBase(Base);
++    if (BaseVarName.contains("ops") || RecName.contains("ops"))
++      return true;
++
++    return false;
++  }
++
++  // Additional FP filter: assignment to size_t and operands look like small block-based sizes.
++  bool isLikelySmallBlockComputation(const BinaryOperator *Mul,
++                                     const Stmt *UseSiteStmt,
++                                     CheckerContext &C) const {
++    const auto *BO = dyn_cast_or_null<BinaryOperator>(UseSiteStmt);
++    if (!BO || !BO->isAssignmentOp())
++      return false;
++
++    const Expr *LHS = BO->getLHS();
++    if (!LHS)
++      return false;
++
++    if (!isSizeT(LHS->getType(), C))
++      return false;
++
++    // If either operand is from an "*ops" struct or has "block"-ish names, likely bounded.
++    static const std::initializer_list<StringRef> Blocky = {
++        "block", "blocks", "blk", "sector", "page", "pages"
++    };
++    const Expr *ML = Mul ? Mul->getLHS() : nullptr;
++    const Expr *MR = Mul ? Mul->getRHS() : nullptr;
++    if (!ML || !MR)
++      return false;
++
++    if (exprComesFromOps(ML) || exprComesFromOps(MR))
++      return true;
++
++    if (containsAnyName(ML, C, Blocky) || containsAnyName(MR, C, Blocky))
++      return true;
++
++    return false;
++  }
++
+   bool isFalsePositive(const BinaryOperator *Mul,
+                        const Stmt *UseSiteStmt,
+                        const Decl *UseSiteDecl,
+                        CheckerContext &C) const {
++    // Targeted suppression 1: Linux sysfs bin_attribute.size patterns.
++    if (isLinuxBinAttributeSizeAssignment(UseSiteStmt, C))
++      return true;
++
++    // Targeted suppression 2: size_t destination and "ops"/block-style operands.
++    if (isLikelySmallBlockComputation(Mul, UseSiteStmt, C))
++      return true;
++
+     // If it doesn't look like a size/count computation, suppress.
+     if (!looksLikeSizeContext(UseSiteStmt, UseSiteDecl, Mul, C))
+       return true;
++
+     // Or if it explicitly looks like a non-size encoding context, suppress.
+     if (looksLikeNonSizeEncodingContext(UseSiteStmt, UseSiteDecl, C))
+       return true;
++
+     return false;
+   }
+ };
+@@ -476,7 +609,7 @@   if (productDefinitelyFits(B, C))
+     return;
+
+-  // Semantic filter to avoid non-size/count encodings, e.g., inode/perm/class indices.
++  // Semantic filter and targeted FP filters.
+   if (isFalsePositive(B, UseSiteStmt, UseSiteDecl, C))
+     return;

@@ -1,0 +1,222 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -22,19 +22,40 @@
+ // Map: return-symbol of hwrm_req_init() -> req MemRegion*
+ REGISTER_MAP_WITH_PROGRAMSTATE(PendingInitMap, SymbolRef, const MemRegion *)
+-// Set: Acquired req MemRegion*s that require hwrm_req_drop() before exit
+-REGISTER_SET_WITH_PROGRAMSTATE(AcquiredReqs, const MemRegion *)
++
++// Map: return-symbol of hwrm_req_init() -> owner function Decl where init occurred
++REGISTER_MAP_WITH_PROGRAMSTATE(PendingInitOwnerMap, SymbolRef, const Decl *)
++
++// Map of acquired request MemRegion -> owning function Decl.
++// We only report when returning from (or ending) that owning function.
++REGISTER_MAP_WITH_PROGRAMSTATE(AcquiredReqMap, const MemRegion *, const Decl *)
+
+ namespace {
+
+-static bool isCallTo(const CallEvent &Call, StringRef Name, CheckerContext &C) {
++static bool callIsNamed(const CallEvent &Call, StringRef Name, CheckerContext &C) {
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    return ID->getName() == Name;
++  }
++  // Fallback for macro wrappers or when identifier not directly available.
+   const Expr *Origin = Call.getOriginExpr();
+   if (!Origin)
+     return false;
+   return ExprHasName(Origin, Name, C);
+ }
+
+-/* The checker callbacks are to be decided. */
++static const Decl *getCurrentFunctionDecl(const CheckerContext &C) {
++  const LocationContext *LCtx = C.getLocationContext();
++  const StackFrameContext *SFC = LCtx ? LCtx->getStackFrame() : nullptr;
++  return SFC ? SFC->getDecl() : nullptr;
++}
++
++static bool isInSystemHeader(const Stmt *S, CheckerContext &C) {
++  if (!S)
++    return false;
++  const SourceManager &SM = C.getSourceManager();
++  return SM.isInSystemHeader(S->getBeginLoc());
++}
++
+ class SAGenTestChecker : public Checker<
+     check::PostCall,
+     check::PreStmt<ReturnStmt>,
+@@ -46,7 +67,7 @@       SAGenTestChecker() {
+         BT = std::make_unique<BugType>(
+             this,
+-            "Missing hwrm_req_drop() after hwrm_req_init()",
++            "Missing hwrm_req_drop() after successful hwrm_req_init()",
+             "Resource management");
+       }
+
+@@ -56,16 +77,17 @@       ProgramStateRef evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const;
+
+    private:
+-
+       void reportLeak(CheckerContext &C, const Stmt *S) const;
++
++      static bool hasOutstandingForOwner(ProgramStateRef State, const Decl *Owner);
++      static ProgramStateRef removeAllForOwner(ProgramStateRef State, const Decl *Owner);
+ };
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+
+   // Track hwrm_req_init(bp, req, ...)
+-  if (isCallTo(Call, "hwrm_req_init", C)) {
+-    // Ensure we have at least 2 args: 0: bp, 1: req
++  if (callIsNamed(Call, "hwrm_req_init", C)) {
+     if (Call.getNumArgs() < 2)
+       return;
+
+@@ -84,14 +106,16 @@     if (!RetSym)
+       return;
+
++    const Decl *OwnerD = getCurrentFunctionDecl(C);
+     // Record pending init: we'll determine success in evalAssume
+     State = State->set<PendingInitMap>(RetSym, ReqMR);
++    State = State->set<PendingInitOwnerMap>(RetSym, OwnerD);
+     C.addTransition(State);
+     return;
+   }
+
+   // Track hwrm_req_drop(bp, req)
+-  if (isCallTo(Call, "hwrm_req_drop", C)) {
++  if (callIsNamed(Call, "hwrm_req_drop", C)) {
+     if (Call.getNumArgs() < 2)
+       return;
+
+@@ -106,45 +130,69 @@     if (!ReqMR)
+       return;
+
+-    // On drop, remove from acquired set (if present)
+-    auto Set = State->get<AcquiredReqs>();
+-    if (Set.contains(ReqMR)) {
+-      State = State->remove<AcquiredReqs>(ReqMR);
++    // On drop, remove from acquired map (if present)
++    if (State->get<AcquiredReqMap>(ReqMR)) {
++      State = State->remove<AcquiredReqMap>(ReqMR);
+       C.addTransition(State);
+     }
+     return;
+   }
++}
++
++// Helper: check if there are any acquisitions owned by this function.
++bool SAGenTestChecker::hasOutstandingForOwner(ProgramStateRef State, const Decl *Owner) {
++  if (!Owner)
++    return false;
++  auto Map = State->get<AcquiredReqMap>();
++  for (auto I = Map.begin(), E = Map.end(); I != E; ++I) {
++    if (I->second == Owner)
++      return true;
++  }
++  return false;
++}
++
++// Helper: remove all acquisitions owned by this function (to keep state small).
++ProgramStateRef SAGenTestChecker::removeAllForOwner(ProgramStateRef State, const Decl *Owner) {
++  if (!Owner)
++    return State;
++  auto Map = State->get<AcquiredReqMap>();
++  for (auto I = Map.begin(), E = Map.end(); I != E; ++I) {
++    if (I->second == Owner)
++      State = State->remove<AcquiredReqMap>(I->first);
++  }
++  return State;
+ }
+
+ ProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const {
+   if (!State)
+     return State;
+
+-  // Handle pattern: if (rc) or if (!rc) or if (rc == 0) / if (rc != 0)
++  // Case 1: plain symbolic condition, e.g., if (rc)
+   if (std::optional<NonLoc> NL = Cond.getAs<NonLoc>()) {
+-    // Case 1: plain symbolic value 'rc'
+     if (SymbolRef Sym = NL->getAsSymbol()) {
+       const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
+-      if (PendingReq) {
+-        // if (rc) with Assumption == false means rc == 0 (success)
++      const Decl *const *OwnerD = State->get<PendingInitOwnerMap>(Sym);
++      if (PendingReq && OwnerD) {
++        // For "if (rc)", false branch means rc == 0 (success).
+         if (!Assumption) {
+-          State = State->add<AcquiredReqs>(*PendingReq);
++          State = State->set<AcquiredReqMap>(*PendingReq, *OwnerD);
+         }
+-        // Consume the pending mapping either way
+         State = State->remove<PendingInitMap>(Sym);
++        State = State->remove<PendingInitOwnerMap>(Sym);
+       }
+       return State;
+     }
+
+-    // Case 2: symbolic comparison with integer, usually rc == 0 or rc != 0
++    // Case 2: comparison against integer (rc == 0) or (rc != 0).
+     if (SymbolRef SE = Cond.getAsSymbol()) {
+       if (const auto *SIE = dyn_cast<SymIntExpr>(SE)) {
+         BinaryOperator::Opcode Op = SIE->getOpcode();
+         SymbolRef Sym = SIE->getLHS();
+         const llvm::APSInt &RHS = SIE->getRHS();
+-        if (Sym) {
++        if (Sym && RHS == 0) {
+           const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
+-          if (PendingReq && RHS == 0) {
++          const Decl *const *OwnerD = State->get<PendingInitOwnerMap>(Sym);
++          if (PendingReq && OwnerD) {
+             bool SuccessBranch = false;
+             if (Op == BO_EQ && Assumption)
+               SuccessBranch = true;        // (rc == 0) assumed true
+@@ -152,9 +200,10 @@               SuccessBranch = true;        // (rc != 0) assumed false
+
+             if (SuccessBranch) {
+-              State = State->add<AcquiredReqs>(*PendingReq);
++              State = State->set<AcquiredReqMap>(*PendingReq, *OwnerD);
+             }
+             State = State->remove<PendingInitMap>(Sym);
++            State = State->remove<PendingInitOwnerMap>(Sym);
+           }
+         }
+       }
+@@ -168,18 +217,35 @@   if (!RS)
+     return;
+
++  // Heuristic: don't report from returns inside system headers.
++  if (isInSystemHeader(RS, C))
++    return;
++
+   ProgramStateRef State = C.getState();
+-  // If any acquired req is still live, report a leak.
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
++  const Decl *CurOwner = getCurrentFunctionDecl(C);
++
++  // Only report when returning from the function that owns the outstanding req.
++  if (hasOutstandingForOwner(State, CurOwner)) {
+     reportLeak(C, RS);
+   }
+ }
+
+ void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
+-    reportLeak(C, nullptr);
+-  }
++  const Decl *CurOwner = getCurrentFunctionDecl(C);
++
++  if (hasOutstandingForOwner(State, CurOwner)) {
++    // For functions without an explicit return, still report.
++    reportLeak(C, RS);
++    // Clean up to keep state bounded and avoid cascading reports.
++    State = removeAllForOwner(State, CurOwner);
++    C.addTransition(State);
++  }
++
++  // Also clear any pending init info for return symbols that didn't get assumed.
++  // This prevents stale state flowing out of this function.
++  // We cannot iterate PendingInitMap by owner easily, so leave it; it is harmless
++  // because acquisitions only happen via evalAssume, but we keep Acquired map clean.
+ }
+
+ void SAGenTestChecker::reportLeak(CheckerContext &C, const Stmt *S) const {

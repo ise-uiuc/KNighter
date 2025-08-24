@@ -1,0 +1,195 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -21,8 +21,18 @@ using namespace ento;
+ using namespace taint;
+
+-// No custom program states needed
+-// REGISTER_MAP_WITH_PROGRAMSTATE(...) not required
++// Utility functions provided by the user prompt (assumed available)
++template <typename T>
++const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
++template <typename T>
++const T* findSpecificTypeInChildren(const Stmt *S);
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C);
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C);
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E);
++bool getStringSize(llvm::APInt &StringSize, const Expr *E);
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C);
++bool functionKnownToDeref(const CallEvent &Call, llvm::SmallVectorImpl<unsigned> &DerefParams);
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
+
+ namespace {
+
+@@ -34,20 +44,72 @@         check::PreCall> {
+    mutable std::unique_ptr<BugType> BT;
+
+-   public:
+-      SAGenTestChecker() : BT(new BugType(this, "Narrow shift widened to 64-bit", "Integer")) {}
+-
+-      void checkPostStmt(const DeclStmt *DS, CheckerContext &C) const;
+-      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+-      void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;
+-      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+-
+-   private:
+-      void analyzeAndReportShiftToWide(const Expr *E, QualType DestTy,
+-                                       CheckerContext &C, StringRef Ctx) const;
+-
+-      static const BinaryOperator *findShiftInTree(const Stmt *S);
+-      static bool hasExplicitCastToWide64(const Expr *E, ASTContext &ACtx);
++public:
++  SAGenTestChecker()
++      : BT(new BugType(this, "Narrow shift widened to 64-bit", "Integer")) {}
++
++  void checkPostStmt(const DeclStmt *DS, CheckerContext &C) const;
++  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
++  void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;
++  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
++
++private:
++  void analyzeAndReportShiftToWide(const Expr *E, QualType DestTy,
++                                   CheckerContext &C, StringRef Ctx) const;
++
++  static const BinaryOperator *findShiftInTree(const Stmt *S);
++  static bool hasExplicitCastToWide64(const Expr *E, ASTContext &ACtx);
++
++  // Helpers to refine and reduce false positives.
++  static const Expr *peel(const Expr *E) {
++    return E ? E->IgnoreParenImpCasts() : nullptr;
++  }
++
++  // Report only if the shift is the top-level expression reaching the 64-bit destination.
++  static bool isTopLevelShiftExpr(const Expr *ContainerE, const BinaryOperator *Shl) {
++    if (!ContainerE || !Shl)
++      return false;
++    const Expr *Top = peel(ContainerE);
++    return Top == static_cast<const Expr *>(Shl);
++  }
++
++  // Precise constant-safety check: if both LHS and RHS are constant and the result
++  // provably fits into the LHS bitwidth, we suppress.
++  static bool constantShiftFitsInLHSWidth(const Expr *L, const Expr *R,
++                                          unsigned LHSW, CheckerContext &C) {
++    llvm::APSInt LHSEval, RHSEval;
++    if (!EvaluateExprToInt(LHSEval, L, C))
++      return false;
++    if (!EvaluateExprToInt(RHSEval, R, C))
++      return false;
++
++    // Be conservative for negative LHS.
++    if (LHSEval.isSigned() && LHSEval.isNegative())
++      return false;
++
++    // Active bits of the non-negative LHS.
++    unsigned LBits = LHSEval.getActiveBits(); // 0 if value == 0
++    uint64_t ShiftAmt = RHSEval.getZExtValue();
++
++    // Safe if highest set bit after shifting still fits in LHS width.
++    // LBits == 0 is always safe (0 << n == 0).
++    if (LBits == 0)
++      return true;
++
++    // Example: a 32-bit LHS can hold results where (LBits + ShiftAmt) <= 32.
++    return (uint64_t)LBits + ShiftAmt <= (uint64_t)LHSW;
++  }
++
++  // Centralized FP gate
++  static bool isFalsePositiveContext(const Expr *WholeExpr,
++                                     const BinaryOperator *Shl,
++                                     CheckerContext &C) {
++    // Suppress if the shift isn't the top-level expression being assigned/returned/passed.
++    if (!isTopLevelShiftExpr(WholeExpr, Shl))
++      return true;
++
++    return false;
++  }
+ };
+
+ static const BinaryOperator *asShift(const Stmt *S) {
+@@ -76,7 +138,6 @@   if (!E)
+     return false;
+
+-  // Look for any explicit cast to integer type with width >= 64 within E's subtree.
+   if (const auto *ECE = dyn_cast<ExplicitCastExpr>(E->IgnoreParens())) {
+     QualType ToTy = ECE->getType();
+     if (ToTy->isIntegerType() && ACtx.getIntWidth(ToTy) >= 64)
+@@ -89,14 +150,6 @@     if (const auto *CE = dyn_cast<Expr>(Child)) {
+       if (hasExplicitCastToWide64(CE, ACtx))
+         return true;
+-    } else {
+-      if (const BinaryOperator *B = asShift(Child)) {
+-        (void)B; // not needed here
+-      }
+-      // Continue traversal for safety
+-      if (const BinaryOperator *B2 = findShiftInTree(Child)) {
+-        (void)B2;
+-      }
+     }
+   }
+   return false;
+@@ -116,7 +169,6 @@   if (DestW < 64)
+     return;
+
+-  // Find a left-shift operator within the expression tree.
+   const BinaryOperator *Shl = findShiftInTree(E);
+   if (!Shl || Shl->getOpcode() != BO_Shl)
+     return;
+@@ -134,33 +186,27 @@   if (ShlW >= 64)
+     return; // Shift already performed in 64-bit, OK.
+
+-  // If LHS type is already 64-bit (or wider), no issue.
+-  if (L->getType()->isIntegerType()) {
+-    unsigned LHSW = ACtx.getIntWidth(L->getType());
+-    if (LHSW >= 64)
+-      return;
+-
+-    // If there is an explicit cast to >=64-bit within the LHS subtree, suppress.
+-    if (hasExplicitCastToWide64(L, ACtx))
+-      return;
+-
+-    // Try to evaluate RHS; if it's a constant less than LHS width, suppress to reduce FPs.
+-    llvm::APSInt RHSEval;
+-    if (EvaluateExprToInt(RHSEval, R, C)) {
+-      // Treat negative or very large values conservatively.
+-      if (!RHSEval.isSigned() || !RHSEval.isNegative()) {
+-        uint64_t ShiftAmt = RHSEval.getZExtValue();
+-        if (ShiftAmt < LHSW) {
+-          // Heuristic suppression per plan.
+-          return;
+-        }
+-      }
+-    }
+-  } else {
+-    // Non-integer LHS shouldn't happen for <<, but be safe.
+-    return;
+-  }
+-
++  // LHS must be integer and narrower than 64.
++  if (!L->getType()->isIntegerType())
++    return;
++
++  unsigned LHSW = ACtx.getIntWidth(L->getType());
++  if (LHSW >= 64)
++    return; // LHS is already wide enough.
++
++  // If there is an explicit cast to >=64-bit within the LHS subtree, suppress.
++  if (hasExplicitCastToWide64(L, ACtx))
++    return;
++
++  // Suppress known false-positive contexts.
++  if (isFalsePositiveContext(E, Shl, C))
++    return;
++
++  // Precise constant-bound suppression: only if both sides are constants and safe.
++  if (constantShiftFitsInLHSWidth(L, R, LHSW, C))
++    return;
++
++  // Report
+   ExplodedNode *N = C.generateNonFatalErrorNode();
+   if (!N)
+     return;
+@@ -189,7 +235,6 @@ }
+
+ void SAGenTestChecker::checkBind(SVal, SVal, const Stmt *S, CheckerContext &C) const {
+-  // Only handle assignments: LHS = RHS;
+   const auto *BO = dyn_cast_or_null<BinaryOperator>(S);
+   if (!BO || !BO->isAssignmentOp())
+     return;

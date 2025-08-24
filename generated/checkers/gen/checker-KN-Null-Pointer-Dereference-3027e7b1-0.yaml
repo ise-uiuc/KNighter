@@ -1,0 +1,485 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 3027e7b15b02d2d37e3f82d6b8404f6d37e3b8cf
+commit_type: Null-Pointer-Dereference
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program-state: track pointers returned by devm_kasprintf that might\
+  \ be NULL and unchecked.\n// Key: base MemRegion* of the pointer; Value: false =\
+  \ not checked yet, true = checked.\nREGISTER_MAP_WITH_PROGRAMSTATE(PossibleNullPtrMap,\
+  \ const MemRegion*, bool)\n// Track simple pointer aliases (bidirectional, we store\
+  \ both directions).\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*,\
+  \ const MemRegion*)\n\nnamespace {\n/* The checker callbacks are to be decided.\
+  \ */\nclass SAGenTestChecker : public Checker<\n    check::PostCall,\n    check::PreCall,\n\
+  \    check::BranchCondition,\n    check::Location,\n    check::Bind> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Missing NULL-check after devm_kasprintf()\", \"API Misuse\")))\
+  \ {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n    \
+  \  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\
+  \      void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C)\
+  \ const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext\
+  \ &C) const;\n\n   private:\n\n      // Helpers\n      static bool isDevmKasprintf(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static const MemRegion *getRegionFromSValOrExpr(SVal\
+  \ SV, const Expr *E, CheckerContext &C);\n      static const MemRegion *canonicalize(const\
+  \ MemRegion *R);\n      static ProgramStateRef setChecked(ProgramStateRef State,\
+  \ const MemRegion *R);\n      static bool isUncheckedPossiblyNull(ProgramStateRef\
+  \ State, const MemRegion *R);\n      static ProgramStateRef addAlias(ProgramStateRef\
+  \ State, const MemRegion *Dst, const MemRegion *Src);\n      void report(CheckerContext\
+  \ &C, const Stmt *UseSite, const MemRegion *R, StringRef Why) const;\n\n      //\
+  \ Determine if this call is known to dereference certain param indices.\n      static\
+  \ bool callIsKnownToDeref(const CallEvent &Call,\n                             \
+  \        CheckerContext &C,\n                                     llvm::SmallVectorImpl<unsigned>\
+  \ &Params);\n};\n\n///////////////////////\n// Helper definitions //\n///////////////////////\n\
+  \nbool SAGenTestChecker::isDevmKasprintf(const CallEvent &Call, CheckerContext &C)\
+  \ {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin) return false;\n\
+  \  return ExprHasName(Origin, \"devm_kasprintf\", C);\n}\n\nconst MemRegion *SAGenTestChecker::getRegionFromSValOrExpr(SVal\
+  \ SV, const Expr *E, CheckerContext &C) {\n  const MemRegion *MR = SV.getAsRegion();\n\
+  \  if (!MR && E) {\n    MR = getMemRegionFromExpr(E, C);\n  }\n  if (!MR)\n    return\
+  \ nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion *SAGenTestChecker::canonicalize(const\
+  \ MemRegion *R) {\n  if (!R) return nullptr;\n  return R->getBaseRegion();\n}\n\n\
+  ProgramStateRef SAGenTestChecker::setChecked(ProgramStateRef State, const MemRegion\
+  \ *R) {\n  if (!R) return State;\n  R = R->getBaseRegion();\n  if (!R) return State;\n\
+  \n  if (const bool *Checked = State->get<PossibleNullPtrMap>(R)) {\n    if (!*Checked)\
+  \ {\n      State = State->set<PossibleNullPtrMap>(R, true);\n    }\n  }\n  // Propagate\
+  \ to alias (both directions recorded in map).\n  if (const MemRegion *Alias = State->get<PtrAliasMap>(R))\
+  \ {\n    if (const bool *AliasChecked = State->get<PossibleNullPtrMap>(Alias)) {\n\
+  \      if (!*AliasChecked)\n        State = State->set<PossibleNullPtrMap>(Alias,\
+  \ true);\n    }\n  }\n  return State;\n}\n\nbool SAGenTestChecker::isUncheckedPossiblyNull(ProgramStateRef\
+  \ State, const MemRegion *R) {\n  if (!R) return false;\n  R = R->getBaseRegion();\n\
+  \  if (!R) return false;\n\n  if (const bool *Checked = State->get<PossibleNullPtrMap>(R))\
+  \ {\n    return *Checked == false;\n  }\n\n  // Check alias mapping\n  if (const\
+  \ MemRegion *Alias = State->get<PtrAliasMap>(R)) {\n    if (const bool *CheckedAlias\
+  \ = State->get<PossibleNullPtrMap>(Alias)) {\n      return *CheckedAlias == false;\n\
+  \    }\n  }\n  return false;\n}\n\nProgramStateRef SAGenTestChecker::addAlias(ProgramStateRef\
+  \ State, const MemRegion *Dst, const MemRegion *Src) {\n  if (!Dst || !Src) return\
+  \ State;\n  Dst = Dst->getBaseRegion();\n  Src = Src->getBaseRegion();\n  if (!Dst\
+  \ || !Src) return State;\n  if (Dst == Src) return State;\n  State = State->set<PtrAliasMap>(Dst,\
+  \ Src);\n  State = State->set<PtrAliasMap>(Src, Dst);\n  return State;\n}\n\nvoid\
+  \ SAGenTestChecker::report(CheckerContext &C, const Stmt *UseSite, const MemRegion\
+  \ *R, StringRef Why) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  SmallString<128> Msg;\n  Msg += \"Missing NULL-check after\
+  \ devm_kasprintf(); \";\n  Msg += Why;\n\n  auto Rpt = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (UseSite)\n    Rpt->addRange(UseSite->getSourceRange());\n  C.emitReport(std::move(Rpt));\n\
+  }\n\n// Heuristic: determine known-deref functions and which argument indices are\
+  \ dereferenced.\n// We use source-text matching (ExprHasName) to be robust to macros.\n\
+  bool SAGenTestChecker::callIsKnownToDeref(const CallEvent &Call,\n             \
+  \                             CheckerContext &C,\n                             \
+  \             llvm::SmallVectorImpl<unsigned> &Params) {\n  const Expr *Origin =\
+  \ Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\n  // String and memory\
+  \ functions\n  if (ExprHasName(Origin, \"strlen\", C)) { Params.push_back(0); return\
+  \ true; }\n  if (ExprHasName(Origin, \"strnlen\", C)) { Params.push_back(0); return\
+  \ true; }\n  if (ExprHasName(Origin, \"strcmp\", C)) { Params.push_back(0); Params.push_back(1);\
+  \ return true; }\n  if (ExprHasName(Origin, \"strncmp\", C)) { Params.push_back(0);\
+  \ Params.push_back(1); return true; }\n  if (ExprHasName(Origin, \"strcpy\", C))\
+  \ { Params.push_back(1); return true; }\n  if (ExprHasName(Origin, \"strncpy\",\
+  \ C)) { Params.push_back(1); return true; }\n  if (ExprHasName(Origin, \"strcat\"\
+  , C)) { Params.push_back(1); return true; }\n  if (ExprHasName(Origin, \"strncat\"\
+  , C)) { Params.push_back(1); return true; }\n\n  // Kernel logging helpers: dev_err/dev_warn/dev_info/dev_dbg\
+  \ and printk-like:\n  // We conservatively assume arguments after the format may\
+  \ be dereferenced,\n  // but we include the format itself too.\n  if (ExprHasName(Origin,\
+  \ \"dev_err\", C) ||\n      ExprHasName(Origin, \"dev_warn\", C) ||\n      ExprHasName(Origin,\
+  \ \"dev_info\", C) ||\n      ExprHasName(Origin, \"dev_dbg\", C) ||\n      ExprHasName(Origin,\
+  \ \"printk\", C) ||\n      ExprHasName(Origin, \"pr_err\", C) ||\n      ExprHasName(Origin,\
+  \ \"pr_warn\", C) ||\n      ExprHasName(Origin, \"pr_info\", C) ||\n      ExprHasName(Origin,\
+  \ \"pr_debug\", C)) {\n    unsigned N = Call.getNumArgs();\n    // For dev_*: index\
+  \ 1 is format, >=2 are varargs.\n    // For printk/pr_*: first arg is format, varargs\
+  \ follow.\n    unsigned StartIdx = 0;\n    if (ExprHasName(Origin, \"dev_err\",\
+  \ C) ||\n        ExprHasName(Origin, \"dev_warn\", C) ||\n        ExprHasName(Origin,\
+  \ \"dev_info\", C) ||\n        ExprHasName(Origin, \"dev_dbg\", C))\n      StartIdx\
+  \ = 1;\n    for (unsigned i = StartIdx; i < N; ++i)\n      Params.push_back(i);\n\
+  \    return !Params.empty();\n  }\n\n  // Project-specific helper in the buggy code:\n\
+  \  // int ice_ptp_auxbus_create_id_table(struct ice_pf *pf, char *name);\n  if (ExprHasName(Origin,\
+  \ \"ice_ptp_auxbus_create_id_table\", C)) {\n    if (Call.getNumArgs() >= 2) {\n\
+  \      Params.push_back(1); // 'name' parameter\n      return true;\n    }\n  }\n\
+  \n  // A few formatting helpers\n  if (ExprHasName(Origin, \"snprintf\", C) || ExprHasName(Origin,\
+  \ \"vsnprintf\", C)) {\n    // Format at index 2 for snprintf(char*, size_t, const\
+  \ char*, ...)\n    if (Call.getNumArgs() >= 3) {\n      Params.push_back(2);\n \
+  \     // varargs are possible derefs; include them conservatively\n      for (unsigned\
+  \ i = 3; i < Call.getNumArgs(); ++i)\n        Params.push_back(i);\n      return\
+  \ true;\n    }\n  }\n\n  return false;\n}\n\n//////////////////////\n// Checker\
+  \ callbacks //\n//////////////////////\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isDevmKasprintf(Call, C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n\n  // Track the return\
+  \ value region as possibly NULL and unchecked.\n  SVal Ret = Call.getReturnValue();\n\
+  \  const MemRegion *MR = getRegionFromSValOrExpr(Ret, Call.getOriginExpr(), C);\n\
+  \  if (!MR)\n    return;\n\n  MR = canonicalize(MR);\n  if (!MR)\n    return;\n\n\
+  \  State = State->set<PossibleNullPtrMap>(MR, false);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  llvm::SmallVector<unsigned, 8> DerefParams;\n  if (!callIsKnownToDeref(Call,\
+  \ C, DerefParams))\n    return;\n\n  ProgramStateRef State = C.getState();\n\n \
+  \ for (unsigned Idx : DerefParams) {\n    if (Idx >= Call.getNumArgs())\n      continue;\n\
+  \n    const Expr *ArgE = Call.getArgExpr(Idx);\n    SVal ArgSV = Call.getArgSVal(Idx);\n\
+  \    const MemRegion *MR = getRegionFromSValOrExpr(ArgSV, ArgE, C);\n    MR = canonicalize(MR);\n\
+  \n    if (!MR)\n      continue;\n\n    if (isUncheckedPossiblyNull(State, MR)) {\n\
+  \      report(C, Call.getOriginExpr(), MR, \"pointer may be NULL and is dereferenced\"\
+  );\n      // Optionally mark as checked to avoid duplicate reports on the same path.\n\
+  \      State = setChecked(State, MR);\n      C.addTransition(State);\n      // Do\
+  \ not return early; continue to check other args.\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n  if (!CondE) {\n   \
+  \ C.addTransition(State);\n    return;\n  }\n\n  CondE = CondE->IgnoreParenCasts();\n\
+  \n  // Pattern: if (!ptr)\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      const Expr *SubE = UO->getSubExpr();\n\
+  \      if (SubE) {\n        SVal SubSV = State->getSVal(SubE, C.getLocationContext());\n\
+  \        const MemRegion *MR = getRegionFromSValOrExpr(SubSV, SubE, C);\n      \
+  \  MR = canonicalize(MR);\n        if (MR) {\n          State = setChecked(State,\
+  \ MR);\n        }\n      }\n    }\n  }\n  // Pattern: if (ptr == NULL) or if (ptr\
+  \ != NULL)\n  else if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {\n   \
+  \ BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op == BO_EQ || Op == BO_NE)\
+  \ {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n      const Expr\
+  \ *RHS = BO->getRHS()->IgnoreParenCasts();\n      const ASTContext &ACtx = C.getASTContext();\n\
+  \n      bool LHSIsNull = LHS && LHS->isNullPointerConstant(ACtx, Expr::NPC_ValueDependentIsNull);\n\
+  \      bool RHSIsNull = RHS && RHS->isNullPointerConstant(ACtx, Expr::NPC_ValueDependentIsNull);\n\
+  \n      const Expr *PtrE = nullptr;\n      if (LHSIsNull && !RHSIsNull) PtrE = RHS;\n\
+  \      if (!LHSIsNull && RHSIsNull) PtrE = LHS;\n\n      if (PtrE) {\n        SVal\
+  \ PSV = State->getSVal(PtrE, C.getLocationContext());\n        const MemRegion *MR\
+  \ = getRegionFromSValOrExpr(PSV, PtrE, C);\n        MR = canonicalize(MR);\n   \
+  \     if (MR) {\n          State = setChecked(State, MR);\n        }\n      }\n\
+  \    }\n  }\n  // Pattern: if (ptr)\n  else {\n    SVal CSV = State->getSVal(CondE,\
+  \ C.getLocationContext());\n    const MemRegion *MR = getRegionFromSValOrExpr(CSV,\
+  \ CondE, C);\n    MR = canonicalize(MR);\n    if (MR) {\n      State = setChecked(State,\
+  \ MR);\n    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n\n  const MemRegion *MR = Loc.getAsRegion();\n  if (!MR)\
+  \ return;\n  MR = canonicalize(MR);\n  if (!MR) return;\n\n  if (isUncheckedPossiblyNull(State,\
+  \ MR)) {\n    report(C, S, MR, \"pointer may be NULL and is dereferenced\");\n \
+  \   State = setChecked(State, MR);\n    C.addTransition(State);\n  }\n}\n\nvoid\
+  \ SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,\n        \
+  \                         CheckerContext &C) const {\n  ProgramStateRef State =\
+  \ C.getState();\n\n  const MemRegion *LHS = Loc.getAsRegion();\n  if (!LHS) {\n\
+  \    C.addTransition(State);\n    return;\n  }\n  LHS = canonicalize(LHS);\n\n \
+  \ const MemRegion *RHS = Val.getAsRegion();\n  if (!RHS && StoreE) {\n    if (const\
+  \ Expr *E = dyn_cast<Expr>(StoreE))\n      RHS = getMemRegionFromExpr(E, C);\n \
+  \ }\n  RHS = canonicalize(RHS);\n\n  if (LHS && RHS) {\n    State = addAlias(State,\
+  \ LHS, RHS);\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detect missing NULL-check after devm_kasprintf\
+  \ and subsequent use\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nice: Fix some null pointer dereference issues in ice_ptp.c\n\
+  \ndevm_kasprintf() returns a pointer to dynamically allocated memory\nwhich can\
+  \ be NULL upon failure.\n\nFixes: d938a8cca88a (\"ice: Auxbus devices & driver for\
+  \ E822 TS\")\nCc: Kunwu Chan <kunwu.chan@hotmail.com>\nSuggested-by: Przemek Kitszel\
+  \ <przemyslaw.kitszel@intel.com>\nSigned-off-by: Kunwu Chan <chentao@kylinos.cn>\n\
+  Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>\nReviewed-by: Simon\
+  \ Horman <horms@kernel.org>\nTested-by: Pucha Himasekhar Reddy <himasekharx.reddy.pucha@intel.com>\
+  \ (A Contingent worker at Intel)\nSigned-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: ice_ptp_register_auxbus_driver in drivers/net/ethernet/intel/ice/ice_ptp.c\n\
+  static int ice_ptp_register_auxbus_driver(struct ice_pf *pf)\n{\n\tstruct auxiliary_driver\
+  \ *aux_driver;\n\tstruct ice_ptp *ptp;\n\tstruct device *dev;\n\tchar *name;\n\t\
+  int err;\n\n\tptp = &pf->ptp;\n\tdev = ice_pf_to_dev(pf);\n\taux_driver = &ptp->ports_owner.aux_driver;\n\
+  \tINIT_LIST_HEAD(&ptp->ports_owner.ports);\n\tmutex_init(&ptp->ports_owner.lock);\n\
+  \tname = devm_kasprintf(dev, GFP_KERNEL, \"ptp_aux_dev_%u_%u_clk%u\",\n\t\t\t  \
+  \    pf->pdev->bus->number, PCI_SLOT(pf->pdev->devfn),\n\t\t\t      ice_get_ptp_src_clock_index(&pf->hw));\n\
+  \n\taux_driver->name = name;\n\taux_driver->shutdown = ice_ptp_auxbus_shutdown;\n\
+  \taux_driver->suspend = ice_ptp_auxbus_suspend;\n\taux_driver->remove = ice_ptp_auxbus_remove;\n\
+  \taux_driver->resume = ice_ptp_auxbus_resume;\n\taux_driver->probe = ice_ptp_auxbus_probe;\n\
+  \taux_driver->id_table = ice_ptp_auxbus_create_id_table(pf, name);\n\tif (!aux_driver->id_table)\n\
+  \t\treturn -ENOMEM;\n\n\terr = auxiliary_driver_register(aux_driver);\n\tif (err)\
+  \ {\n\t\tdevm_kfree(dev, aux_driver->id_table);\n\t\tdev_err(dev, \"Failed registering\
+  \ aux_driver, name <%s>\\n\",\n\t\t\tname);\n\t}\n\n\treturn err;\n}\n```\n\n```c\n\
+  // Function: ice_ptp_create_auxbus_device in drivers/net/ethernet/intel/ice/ice_ptp.c\n\
+  static int ice_ptp_create_auxbus_device(struct ice_pf *pf)\n{\n\tstruct auxiliary_device\
+  \ *aux_dev;\n\tstruct ice_ptp *ptp;\n\tstruct device *dev;\n\tchar *name;\n\tint\
+  \ err;\n\tu32 id;\n\n\tptp = &pf->ptp;\n\tid = ptp->port.port_num;\n\tdev = ice_pf_to_dev(pf);\n\
+  \n\taux_dev = &ptp->port.aux_dev;\n\n\tname = devm_kasprintf(dev, GFP_KERNEL, \"\
+  ptp_aux_dev_%u_%u_clk%u\",\n\t\t\t      pf->pdev->bus->number, PCI_SLOT(pf->pdev->devfn),\n\
+  \t\t\t      ice_get_ptp_src_clock_index(&pf->hw));\n\n\taux_dev->name = name;\n\t\
+  aux_dev->id = id;\n\taux_dev->dev.release = ice_ptp_release_auxbus_device;\n\taux_dev->dev.parent\
+  \ = dev;\n\n\terr = auxiliary_device_init(aux_dev);\n\tif (err)\n\t\tgoto aux_err;\n\
+  \n\terr = auxiliary_device_add(aux_dev);\n\tif (err) {\n\t\tauxiliary_device_uninit(aux_dev);\n\
+  \t\tgoto aux_err;\n\t}\n\n\treturn 0;\naux_err:\n\tdev_err(dev, \"Failed to create\
+  \ PTP auxiliary bus device <%s>\\n\", name);\n\tdevm_kfree(dev, name);\n\treturn\
+  \ err;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/net/ethernet/intel/ice/ice_ptp.c\
+  \ b/drivers/net/ethernet/intel/ice/ice_ptp.c\nindex c4fe28017b8d..3b6605c8585e 100644\n\
+  --- a/drivers/net/ethernet/intel/ice/ice_ptp.c\n+++ b/drivers/net/ethernet/intel/ice/ice_ptp.c\n\
+  @@ -2863,6 +2863,8 @@ static int ice_ptp_register_auxbus_driver(struct ice_pf *pf)\n\
+  \ \tname = devm_kasprintf(dev, GFP_KERNEL, \"ptp_aux_dev_%u_%u_clk%u\",\n \t\t\t\
+  \      pf->pdev->bus->number, PCI_SLOT(pf->pdev->devfn),\n \t\t\t      ice_get_ptp_src_clock_index(&pf->hw));\n\
+  +\tif (!name)\n+\t\treturn -ENOMEM;\n \n \taux_driver->name = name;\n \taux_driver->shutdown\
+  \ = ice_ptp_auxbus_shutdown;\n@@ -3109,6 +3111,8 @@ static int ice_ptp_create_auxbus_device(struct\
+  \ ice_pf *pf)\n \tname = devm_kasprintf(dev, GFP_KERNEL, \"ptp_aux_dev_%u_%u_clk%u\"\
+  ,\n \t\t\t      pf->pdev->bus->number, PCI_SLOT(pf->pdev->devfn),\n \t\t\t     \
+  \ ice_get_ptp_src_clock_index(&pf->hw));\n+\tif (!name)\n+\t\treturn -ENOMEM;\n\
+  \ \n \taux_dev->name = name;\n \taux_dev->id = id;\n```\n"
+pattern: '## Bug Pattern
+
+
+  Using devm_kasprintf() to allocate a name string and then immediately using the
+  returned pointer (assigning to struct fields, passing to helper functions, or logging)
+  without checking for NULL. This missing NULL-check can lead to NULL pointer dereferences
+  when the allocation fails.'
+plan: "Plan: Detect missing NULL-check after devm_kasprintf and subsequent use\n\n\
+  1) Program state customizations\n- REGISTER_MAP_WITH_PROGRAMSTATE(PossibleNullPtrMap,\
+  \ const MemRegion*, bool)\n  - Tracks regions returned by devm_kasprintf.\n  - Value\
+  \ false = not NULL-checked yet; true = checked in any branch condition.\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n  - Tracks simple pointer aliasing: Dest\
+  \ -> Source, so we can propagate check status to aliases.\n\n2) Helper utilities\n\
+  - isDevmKasprintf(const CallEvent &Call): returns true when callee name == \"devm_kasprintf\"\
+  .\n- getRegionFromSValOrExpr(SVal SV, const Expr *E, CheckerContext &C):\n  - Prefer\
+  \ SV.getAsRegion(); if null, use getMemRegionFromExpr(E, C). Returns canonical region\
+  \ pointer or null.\n- canonicalize(const MemRegion *R):\n  - If R is ElementRegion/FieldRegion/etc.,\
+  \ return the base region (use getAs<...> and strip casts) to ensure stable map keys.\n\
+  - setChecked(ProgramStateRef State, const MemRegion *R) -> ProgramStateRef:\n  -\
+  \ Mark R as checked (true) in PossibleNullPtrMap.\n  - Propagate to aliases:\n \
+  \   - For every entry (D->S) in PtrAliasMap, if S == R set D checked too.\n    -\
+  \ Also if D == R set S checked (bidirectional propagation).\n- isUncheckedPossiblyNull(ProgramStateRef\
+  \ State, const MemRegion *R) -> bool:\n  - Look up canonicalized R (and its source\
+  \ via PtrAliasMap). Return true if in PossibleNullPtrMap and currently false.\n\
+  - addAlias(ProgramStateRef State, const MemRegion *Dst, const MemRegion *Src) ->\
+  \ ProgramStateRef:\n  - Record PtrAliasMap[Dst] = Src if both are non-null and different.\n\
+  - report(CheckerContext &C, const Stmt *UseSite, const MemRegion *R, StringRef Why):\n\
+  \  - Generate non-fatal error node and emit PathSensitiveBugReport with a short\
+  \ message:\n    - \"Missing NULL-check after devm_kasprintf(); pointer may be NULL\"\
+  \n  - Note: Keep message short and consistent.\n\n3) Known-deref function table\n\
+  - Use provided functionKnownToDeref(Call, DerefParams).\n- Populate its table (DerefTable)\
+  \ with common kernel APIs that dereference string/pointer parameters:\n  - strlen,\
+  \ strnlen, strcmp, strncmp, strcpy, strncpy, snprintf, vsnprintf\n  - kstrdup, kasprintf\n\
+  \  - printk, pr_err, pr_warn, pr_info, pr_debug\n  - dev_err, dev_warn, dev_info,\
+  \ dev_dbg\n  - Any project-specific helpers that will dereference the given pointer\
+  \ (add as needed, e.g., ice_ptp_auxbus_create_id_table with the index of the name\
+  \ parameter).\n- The checker will warn when an unchecked pointer is passed to a\
+  \ function known to dereference that parameter index.\n\n4) Callback: checkPostCall\n\
+  - Goal: record that the return value of devm_kasprintf may be NULL and is unchecked.\n\
+  - Steps:\n  - If !isDevmKasprintf(Call) return.\n  - Obtain the return SVal: SVal\
+  \ Ret = Call.getReturnValue().\n  - Get its region: const MemRegion *R = Ret.getAsRegion();\
+  \ if null, bail (no tracking).\n  - R = canonicalize(R).\n  - State = State->set<PossibleNullPtrMap>(R,\
+  \ false).\n  - Do not mark as checked here.\n- Rationale: After devm_kasprintf we\
+  \ consider the returned pointer possibly NULL until a condition checks it.\n\n5)\
+  \ Callback: checkBranchCondition\n- Goal: detect typical NULL-check patterns and\
+  \ mark the pointer as checked.\n- Patterns to recognize (use AST pattern matching):\n\
+  \  - UnaryOperator '!' applied to a pointer expression: if (!ptr)\n  - BinaryOperator\
+  \ '==' or '!=' comparing a pointer expression with 0/NULL/nullptr: if (ptr == NULL),\
+  \ if (ptr != 0), etc.\n  - Direct pointer-as-condition: if (ptr) or while (ptr)\n\
+  - Implementation details:\n  - Extract the pointer subexpression (use findSpecificTypeInChildren<DeclRefExpr>\
+  \ or inspect the condition recursively).\n  - Ensure the subexpression has pointer\
+  \ type.\n  - Get its MemRegion via getMemRegionFromExpr; canonicalize.\n  - If the\
+  \ region exists, call setChecked(State, R) and Ctx.addTransition(State).\n- Note:\
+  \ We treat any explicit test of the pointer as sufficient \u201Cchecked\u201D, regardless\
+  \ of the branch taken; both arms are considered checked post-condition.\n\n6) Callback:\
+  \ checkPreCall\n- Goal: flag immediate use when the unchecked pointer is passed\
+  \ to a function that dereferences it.\n- Steps:\n  - Determine if callee is known\
+  \ to dereference any params using functionKnownToDeref(Call, DerefParams). If not,\
+  \ return.\n  - For each param index i in DerefParams:\n    - Get the corresponding\
+  \ argument Expr and SVal.\n    - Extract the MemRegion (via SV.getAsRegion() or\
+  \ getMemRegionFromExpr).\n    - Canonicalize it. If null, continue.\n    - If isUncheckedPossiblyNull(State,\
+  \ R) is true:\n      - report(C, Call.getOriginExpr(), R, \"passed to a function\
+  \ that dereferences it\").\n      - Optionally, to reduce duplicate warnings, mark\
+  \ it checked afterward by calling setChecked(State, R); add transition.\n- This\
+  \ covers cases like dev_err(..., \"%s\", name), strlen(name), helper(name), etc.\n\
+  \n7) Callback: checkLocation\n- Goal: catch direct dereferences/loads of the unchecked\
+  \ pointer.\n- Triggered on both loads and stores.\n- Steps:\n  - If IsLoad is false,\
+  \ you can still treat as deref if writing via *ptr; either direction signals deref,\
+  \ but typically IsLoad covers reads; set to act on both loads and stores.\n  - If\
+  \ Loc is a pointer SVal to a region, obtain the base MemRegion being dereferenced\
+  \ (for ElementRegion/fields, strip to base).\n  - Canonicalize it.\n  - If isUncheckedPossiblyNull(State,\
+  \ R) is true:\n    - report(C, S, R, \"dereferenced without NULL-check\").\n   \
+  \ - Optionally mark as checked to avoid repeated reports later in path.\n\n8) Callback:\
+  \ checkBind\n- Goal: maintain aliasing so that checks and uses on aliases are tracked.\n\
+  - Steps:\n  - If Val is a pointer SVal with a MemRegion SVR, and Loc is a MemRegion\
+  \ LVR that stores a pointer:\n    - Canonicalize both.\n    - addAlias(State, LVR,\
+  \ SVR) and add transition.\n  - Do not alter PossibleNullPtrMap here.\n- Examples:\n\
+  \  - name_alias = name;\n  - obj->name = name; (will record alias from the field\
+  \ region to the original pointer region; later use of obj->name can be detected\
+  \ if it flows into a known-deref call or is dereferenced)\n\n9) Optional: checkPreStmt(ReturnStmt)\
+  \ or checkEndFunction\n- Not required. The main logic is already covered by earlier\
+  \ callbacks.\n\n10) Reporting policy\n- Use generateNonFatalErrorNode() and emit\
+  \ a PathSensitiveBugReport.\n- Titles/messages (short and clear):\n  - \"Missing\
+  \ NULL-check after devm_kasprintf()\"\n  - Describe the specific use: \"pointer\
+  \ may be NULL and is dereferenced\" or \"passed to a function that dereferences\
+  \ it\".\n- Point the report location at the use site (call expr or dereference statement).\n\
+  - Do not over-annotate; short message per Suggestions.\n\n11) Precision and false-positive\
+  \ control\n- Only track pointers returned by devm_kasprintf (isDevmKasprintf gate).\n\
+  - Consider a pointer \u201Cchecked\u201D only when it appears in the branch condition\
+  \ patterns described.\n- Use functionKnownToDeref to limit call-site warnings to\
+  \ functions very likely to dereference the argument.\n- Aliasing kept simple with\
+  \ one-hop mapping; setChecked should propagate to aliases both directions to reduce\
+  \ missed checks.\n\n12) Minimal KnownDeref table to seed\n- strlen, strnlen, strcmp,\
+  \ strncmp\n- strcpy, strncpy, strcat, strncat\n- printk, pr_err, pr_warn, pr_info,\
+  \ pr_debug\n- dev_err, dev_warn, dev_info, dev_dbg\n- vsnprintf, snprintf\n- Any\
+  \ project-local helpers known to deref the string parameter (e.g., ice_ptp_auxbus_create_id_table\
+  \ for the \"name\" argument index)\n\nThis plan directly detects the target bug\
+  \ pattern:\n- It tracks devm_kasprintf returns as possibly NULL.\n- It requires\
+  \ an explicit check in a branch condition to mark them safe.\n- It reports when\
+  \ the unchecked pointer is dereferenced or passed into functions that dereference\
+  \ it (including logging and helper calls), matching the missing NULL-check issues\
+  \ fixed by the patch."
+refined_plan: null
+repaired_checker_code: "#include <memory>\n#include \"llvm/ADT/SmallString.h\"\n#include\
+  \ \"llvm/ADT/SmallVector.h\"\n\n#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program-state: track pointers returned by devm_kasprintf that might\
+  \ be NULL and unchecked.\n// Key: base MemRegion* of the pointer; Value: false =\
+  \ not checked yet, true = checked.\nREGISTER_MAP_WITH_PROGRAMSTATE(PossibleNullPtrMap,\
+  \ const MemRegion*, bool)\n// Track simple pointer aliases (bidirectional, we store\
+  \ both directions).\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*,\
+  \ const MemRegion*)\n\nnamespace {\n/* The checker callbacks are to be decided.\
+  \ */\nclass SAGenTestChecker : public Checker<\n    check::PostCall,\n    check::PreCall,\n\
+  \    check::BranchCondition,\n    check::Location,\n    check::Bind> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() {\n     \
+  \   BT = std::make_unique<BugType>(this,\n              \"Missing NULL-check after\
+  \ devm_kasprintf()\", \"API Misuse\");\n      }\n\n      void checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n      void checkLocation(SVal Loc, bool IsLoad, const\
+  \ Stmt *S, CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *StoreE, CheckerContext &C) const;\n\n   private:\n\n      // Helpers\n \
+  \     static bool isDevmKasprintf(const CallEvent &Call, CheckerContext &C);\n \
+  \     static const MemRegion *getRegionFromSValOrExpr(SVal SV, const Expr *E, CheckerContext\
+  \ &C);\n      static const MemRegion *canonicalize(const MemRegion *R);\n      static\
+  \ ProgramStateRef setChecked(ProgramStateRef State, const MemRegion *R);\n     \
+  \ static bool isUncheckedPossiblyNull(ProgramStateRef State, const MemRegion *R);\n\
+  \      static ProgramStateRef addAlias(ProgramStateRef State, const MemRegion *Dst,\
+  \ const MemRegion *Src);\n      void report(CheckerContext &C, const Stmt *UseSite,\
+  \ const MemRegion *R, StringRef Why) const;\n\n      // Determine if this call is\
+  \ known to dereference certain param indices.\n      static bool callIsKnownToDeref(const\
+  \ CallEvent &Call,\n                                     CheckerContext &C,\n  \
+  \                                   llvm::SmallVectorImpl<unsigned> &Params);\n\
+  };\n\n///////////////////////\n// Helper definitions //\n///////////////////////\n\
+  \nbool SAGenTestChecker::isDevmKasprintf(const CallEvent &Call, CheckerContext &C)\
+  \ {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin) return false;\n\
+  \  return ExprHasName(Origin, \"devm_kasprintf\", C);\n}\n\nconst MemRegion *SAGenTestChecker::getRegionFromSValOrExpr(SVal\
+  \ SV, const Expr *E, CheckerContext &C) {\n  const MemRegion *MR = SV.getAsRegion();\n\
+  \  if (!MR && E) {\n    MR = getMemRegionFromExpr(E, C);\n  }\n  if (!MR)\n    return\
+  \ nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion *SAGenTestChecker::canonicalize(const\
+  \ MemRegion *R) {\n  if (!R) return nullptr;\n  return R->getBaseRegion();\n}\n\n\
+  ProgramStateRef SAGenTestChecker::setChecked(ProgramStateRef State, const MemRegion\
+  \ *R) {\n  if (!R) return State;\n  R = R->getBaseRegion();\n  if (!R) return State;\n\
+  \n  if (const bool *Checked = State->get<PossibleNullPtrMap>(R)) {\n    if (!*Checked)\
+  \ {\n      State = State->set<PossibleNullPtrMap>(R, true);\n    }\n  }\n  // Propagate\
+  \ to alias (both directions recorded in map).\n  if (const MemRegion * const *Alias\
+  \ = State->get<PtrAliasMap>(R)) {\n    if (const bool *AliasChecked = State->get<PossibleNullPtrMap>(*Alias))\
+  \ {\n      if (!*AliasChecked)\n        State = State->set<PossibleNullPtrMap>(*Alias,\
+  \ true);\n    }\n  }\n  return State;\n}\n\nbool SAGenTestChecker::isUncheckedPossiblyNull(ProgramStateRef\
+  \ State, const MemRegion *R) {\n  if (!R) return false;\n  R = R->getBaseRegion();\n\
+  \  if (!R) return false;\n\n  if (const bool *Checked = State->get<PossibleNullPtrMap>(R))\
+  \ {\n    return *Checked == false;\n  }\n\n  // Check alias mapping\n  if (const\
+  \ MemRegion * const *Alias = State->get<PtrAliasMap>(R)) {\n    if (const bool *CheckedAlias\
+  \ = State->get<PossibleNullPtrMap>(*Alias)) {\n      return *CheckedAlias == false;\n\
+  \    }\n  }\n  return false;\n}\n\nProgramStateRef SAGenTestChecker::addAlias(ProgramStateRef\
+  \ State, const MemRegion *Dst, const MemRegion *Src) {\n  if (!Dst || !Src) return\
+  \ State;\n  Dst = Dst->getBaseRegion();\n  Src = Src->getBaseRegion();\n  if (!Dst\
+  \ || !Src) return State;\n  if (Dst == Src) return State;\n  State = State->set<PtrAliasMap>(Dst,\
+  \ Src);\n  State = State->set<PtrAliasMap>(Src, Dst);\n  return State;\n}\n\nvoid\
+  \ SAGenTestChecker::report(CheckerContext &C, const Stmt *UseSite, const MemRegion\
+  \ *R, StringRef Why) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  llvm::SmallString<128> Msg;\n  Msg += \"Missing NULL-check\
+  \ after devm_kasprintf(); \";\n  Msg += Why;\n\n  auto Rpt = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (UseSite)\n    Rpt->addRange(UseSite->getSourceRange());\n  C.emitReport(std::move(Rpt));\n\
+  }\n\n// Heuristic: determine known-deref functions and which argument indices are\
+  \ dereferenced.\n// We use source-text matching (ExprHasName) to be robust to macros.\n\
+  bool SAGenTestChecker::callIsKnownToDeref(const CallEvent &Call,\n             \
+  \                             CheckerContext &C,\n                             \
+  \             llvm::SmallVectorImpl<unsigned> &Params) {\n  const Expr *Origin =\
+  \ Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\n  // String and memory\
+  \ functions\n  if (ExprHasName(Origin, \"strlen\", C)) { Params.push_back(0); return\
+  \ true; }\n  if (ExprHasName(Origin, \"strnlen\", C)) { Params.push_back(0); return\
+  \ true; }\n  if (ExprHasName(Origin, \"strcmp\", C)) { Params.push_back(0); Params.push_back(1);\
+  \ return true; }\n  if (ExprHasName(Origin, \"strncmp\", C)) { Params.push_back(0);\
+  \ Params.push_back(1); return true; }\n  if (ExprHasName(Origin, \"strcpy\", C))\
+  \ { Params.push_back(1); return true; }\n  if (ExprHasName(Origin, \"strncpy\",\
+  \ C)) { Params.push_back(1); return true; }\n  if (ExprHasName(Origin, \"strcat\"\
+  , C)) { Params.push_back(1); return true; }\n  if (ExprHasName(Origin, \"strncat\"\
+  , C)) { Params.push_back(1); return true; }\n\n  // Kernel logging helpers: dev_err/dev_warn/dev_info/dev_dbg\
+  \ and printk-like:\n  // We conservatively assume arguments after the format may\
+  \ be dereferenced,\n  // but we include the format itself too.\n  if (ExprHasName(Origin,\
+  \ \"dev_err\", C) ||\n      ExprHasName(Origin, \"dev_warn\", C) ||\n      ExprHasName(Origin,\
+  \ \"dev_info\", C) ||\n      ExprHasName(Origin, \"dev_dbg\", C) ||\n      ExprHasName(Origin,\
+  \ \"printk\", C) ||\n      ExprHasName(Origin, \"pr_err\", C) ||\n      ExprHasName(Origin,\
+  \ \"pr_warn\", C) ||\n      ExprHasName(Origin, \"pr_info\", C) ||\n      ExprHasName(Origin,\
+  \ \"pr_debug\", C)) {\n    unsigned N = Call.getNumArgs();\n    // For dev_*: index\
+  \ 1 is format, >=2 are varargs.\n    // For printk/pr_*: first arg is format, varargs\
+  \ follow.\n    unsigned StartIdx = 0;\n    if (ExprHasName(Origin, \"dev_err\",\
+  \ C) ||\n        ExprHasName(Origin, \"dev_warn\", C) ||\n        ExprHasName(Origin,\
+  \ \"dev_info\", C) ||\n        ExprHasName(Origin, \"dev_dbg\", C))\n      StartIdx\
+  \ = 1;\n    for (unsigned i = StartIdx; i < N; ++i)\n      Params.push_back(i);\n\
+  \    return !Params.empty();\n  }\n\n  // Project-specific helper in the buggy code:\n\
+  \  // int ice_ptp_auxbus_create_id_table(struct ice_pf *pf, char *name);\n  if (ExprHasName(Origin,\
+  \ \"ice_ptp_auxbus_create_id_table\", C)) {\n    if (Call.getNumArgs() >= 2) {\n\
+  \      Params.push_back(1); // 'name' parameter\n      return true;\n    }\n  }\n\
+  \n  // A few formatting helpers\n  if (ExprHasName(Origin, \"snprintf\", C) || ExprHasName(Origin,\
+  \ \"vsnprintf\", C)) {\n    // Format at index 2 for snprintf(char*, size_t, const\
+  \ char*, ...)\n    if (Call.getNumArgs() >= 3) {\n      Params.push_back(2);\n \
+  \     // varargs are possible derefs; include them conservatively\n      for (unsigned\
+  \ i = 3; i < Call.getNumArgs(); ++i)\n        Params.push_back(i);\n      return\
+  \ true;\n    }\n  }\n\n  return false;\n}\n\n//////////////////////\n// Checker\
+  \ callbacks //\n//////////////////////\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isDevmKasprintf(Call, C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n\n  // Track the return\
+  \ value region as possibly NULL and unchecked.\n  SVal Ret = Call.getReturnValue();\n\
+  \  const MemRegion *MR = getRegionFromSValOrExpr(Ret, Call.getOriginExpr(), C);\n\
+  \  if (!MR)\n    return;\n\n  MR = canonicalize(MR);\n  if (!MR)\n    return;\n\n\
+  \  State = State->set<PossibleNullPtrMap>(MR, false);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  llvm::SmallVector<unsigned, 8> DerefParams;\n  if (!callIsKnownToDeref(Call,\
+  \ C, DerefParams))\n    return;\n\n  ProgramStateRef State = C.getState();\n\n \
+  \ for (unsigned Idx : DerefParams) {\n    if (Idx >= Call.getNumArgs())\n      continue;\n\
+  \n    const Expr *ArgE = Call.getArgExpr(Idx);\n    SVal ArgSV = Call.getArgSVal(Idx);\n\
+  \    const MemRegion *MR = getRegionFromSValOrExpr(ArgSV, ArgE, C);\n    MR = canonicalize(MR);\n\
+  \n    if (!MR)\n      continue;\n\n    if (isUncheckedPossiblyNull(State, MR)) {\n\
+  \      report(C, Call.getOriginExpr(), MR, \"pointer may be NULL and is dereferenced\"\
+  );\n      // Optionally mark as checked to avoid duplicate reports on the same path.\n\
+  \      State = setChecked(State, MR);\n      C.addTransition(State);\n      // Do\
+  \ not return early; continue to check other args.\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n  if (!CondE) {\n   \
+  \ C.addTransition(State);\n    return;\n  }\n\n  CondE = CondE->IgnoreParenCasts();\n\
+  \n  // Pattern: if (!ptr)\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      const Expr *SubE = UO->getSubExpr();\n\
+  \      if (SubE) {\n        SVal SubSV = State->getSVal(SubE, C.getLocationContext());\n\
+  \        const MemRegion *MR = getRegionFromSValOrExpr(SubSV, SubE, C);\n      \
+  \  MR = canonicalize(MR);\n        if (MR) {\n          State = setChecked(State,\
+  \ MR);\n        }\n      }\n    }\n  }\n  // Pattern: if (ptr == NULL) or if (ptr\
+  \ != NULL)\n  else if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {\n   \
+  \ BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op == BO_EQ || Op == BO_NE)\
+  \ {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n      const Expr\
+  \ *RHS = BO->getRHS()->IgnoreParenCasts();\n      ASTContext &ACtx = C.getASTContext();\n\
+  \n      bool LHSIsNull = LHS && LHS->isNullPointerConstant(ACtx, Expr::NPC_ValueDependentIsNull);\n\
+  \      bool RHSIsNull = RHS && RHS->isNullPointerConstant(ACtx, Expr::NPC_ValueDependentIsNull);\n\
+  \n      const Expr *PtrE = nullptr;\n      if (LHSIsNull && !RHSIsNull) PtrE = RHS;\n\
+  \      if (!LHSIsNull && RHSIsNull) PtrE = LHS;\n\n      if (PtrE) {\n        SVal\
+  \ PSV = State->getSVal(PtrE, C.getLocationContext());\n        const MemRegion *MR\
+  \ = getRegionFromSValOrExpr(PSV, PtrE, C);\n        MR = canonicalize(MR);\n   \
+  \     if (MR) {\n          State = setChecked(State, MR);\n        }\n      }\n\
+  \    }\n  }\n  // Pattern: if (ptr)\n  else {\n    SVal CSV = State->getSVal(CondE,\
+  \ C.getLocationContext());\n    const MemRegion *MR = getRegionFromSValOrExpr(CSV,\
+  \ CondE, C);\n    MR = canonicalize(MR);\n    if (MR) {\n      State = setChecked(State,\
+  \ MR);\n    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n\n  const MemRegion *MR = Loc.getAsRegion();\n  if (!MR)\
+  \ return;\n  MR = canonicalize(MR);\n  if (!MR) return;\n\n  if (isUncheckedPossiblyNull(State,\
+  \ MR)) {\n    report(C, S, MR, \"pointer may be NULL and is dereferenced\");\n \
+  \   State = setChecked(State, MR);\n    C.addTransition(State);\n  }\n}\n\nvoid\
+  \ SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,\n        \
+  \                         CheckerContext &C) const {\n  ProgramStateRef State =\
+  \ C.getState();\n\n  const MemRegion *LHS = Loc.getAsRegion();\n  if (!LHS) {\n\
+  \    C.addTransition(State);\n    return;\n  }\n  LHS = canonicalize(LHS);\n\n \
+  \ const MemRegion *RHS = Val.getAsRegion();\n  if (!RHS && StoreE) {\n    if (const\
+  \ Expr *E = dyn_cast<Expr>(StoreE))\n      RHS = getMemRegionFromExpr(E, C);\n \
+  \ }\n  RHS = canonicalize(RHS);\n\n  if (LHS && RHS) {\n    State = addAlias(State,\
+  \ LHS, RHS);\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detect missing NULL-check after devm_kasprintf\
+  \ and subsequent use\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

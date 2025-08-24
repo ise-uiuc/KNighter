@@ -1,0 +1,482 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Allocating/initializing an HWRM request with hwrm_req_init() and then, on a subsequent failure (e.g., hwrm_req_replace() error), returning without calling hwrm_req_drop() to release the request buffer.
+
+Pattern example:
+rc = hwrm_req_init(bp, req, ...);
+if (rc)
+    return rc;
+
+rc = hwrm_req_replace(bp, req, ...);
+if (rc)
+    return rc;  // BUG: missing hwrm_req_drop(bp, req) -> leak
+
+Any exit after a successful hwrm_req_init() must call hwrm_req_drop(); missing this cleanup on error paths causes a memory leak.
+
+## Bug Pattern
+
+Allocating/initializing an HWRM request with hwrm_req_init() and then, on a subsequent failure (e.g., hwrm_req_replace() error), returning without calling hwrm_req_drop() to release the request buffer.
+
+Pattern example:
+rc = hwrm_req_init(bp, req, ...);
+if (rc)
+    return rc;
+
+rc = hwrm_req_replace(bp, req, ...);
+if (rc)
+    return rc;  // BUG: missing hwrm_req_drop(bp, req) -> leak
+
+Any exit after a successful hwrm_req_init() must call hwrm_req_drop(); missing this cleanup on error paths causes a memory leak.
+
+# Report
+
+### Report Summary
+
+File:| /scratch/chenyuan-data/linux-
+debug/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
+---|---
+Warning:| line 1130, column 2
+Missing hwrm_req_drop() after successful hwrm_req_init()
+
+### Annotated Source Code
+
+
+63    | 		netdev_err(bp->dev, "Invalid VF id %d\n", vf_id);
+64    |  return -EINVAL;
+65    | 	}
+66    |  return 0;
+67    | }
+68    |
+69    | int bnxt_set_vf_spoofchk(struct net_device *dev, int vf_id, bool setting)
+70    | {
+71    |  struct bnxt *bp = netdev_priv(dev);
+72    |  struct hwrm_func_cfg_input *req;
+73    | 	bool old_setting = false;
+74    |  struct bnxt_vf_info *vf;
+75    | 	u32 func_flags;
+76    |  int rc;
+77    |
+78    |  if (bp->hwrm_spec_code < 0x10701)
+79    |  return -ENOTSUPP;
+80    |
+81    | 	rc = bnxt_vf_ndo_prep(bp, vf_id);
+82    |  if (rc)
+83    |  return rc;
+84    |
+85    | 	vf = &bp->pf.vf[vf_id];
+86    |  if (vf->flags & BNXT_VF_SPOOFCHK)
+87    | 		old_setting = true;
+88    |  if (old_setting == setting)
+89    |  return 0;
+90    |
+91    |  if (setting)
+92    | 		func_flags = FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK_ENABLE;
+93    |  else
+94    | 		func_flags = FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK_DISABLE;
+95    |  /*TODO: if the driver supports VLAN filter on guest VLAN,
+96    |  * the spoof check should also include vlan anti-spoofing
+97    |  */
+98    | 	rc = bnxt_hwrm_func_cfg_short_req_init(bp, &req);
+99    |  if (!rc) {
+100   | 		req->fid = cpu_to_le16(vf->fw_fid);
+101   | 		req->flags = cpu_to_le32(func_flags);
+102   | 		rc = hwrm_req_send(bp, req);
+103   |  if (!rc) {
+104   |  if (setting)
+105   | 				vf->flags |= BNXT_VF_SPOOFCHK;
+106   |  else
+107   | 				vf->flags &= ~BNXT_VF_SPOOFCHK;
+108   | 		}
+109   | 	}
+110   |  return rc;
+111   | }
+112   |
+113   | static int bnxt_hwrm_func_qcfg_flags(struct bnxt *bp, struct bnxt_vf_info *vf)
+114   | {
+115   |  struct hwrm_func_qcfg_output *resp;
+116   |  struct hwrm_func_qcfg_input *req;
+117   |  int rc;
+118   |
+119   | 	rc = hwrm_req_init(bp, req, HWRM_FUNC_QCFG);
+120   |  if (rc)
+121   |  return rc;
+122   |
+123   | 	req->fid = cpu_to_le16(BNXT_PF(bp) ? vf->fw_fid : 0xffff);
+124   | 	resp = hwrm_req_hold(bp, req);
+125   | 	rc = hwrm_req_send(bp, req);
+126   |  if (!rc)
+127   | 		vf->func_qcfg_flags = le16_to_cpu(resp->flags);
+128   | 	hwrm_req_drop(bp, req);
+129   |  return rc;
+130   | }
+131   |
+132   | bool bnxt_is_trusted_vf(struct bnxt *bp, struct bnxt_vf_info *vf)
+133   | {
+134   |  if (BNXT_PF(bp) && !(bp->fw_cap & BNXT_FW_CAP_TRUSTED_VF))
+135   |  return !!(vf->flags & BNXT_VF_TRUST);
+136   |
+137   | 	bnxt_hwrm_func_qcfg_flags(bp, vf);
+138   |  return !!(vf->func_qcfg_flags & FUNC_QCFG_RESP_FLAGS_TRUSTED_VF);
+139   | }
+140   |
+141   | static int bnxt_hwrm_set_trusted_vf(struct bnxt *bp, struct bnxt_vf_info *vf)
+142   | {
+143   |  struct hwrm_func_cfg_input *req;
+144   |  int rc;
+145   |
+146   |  if (!(bp->fw_cap & BNXT_FW_CAP_TRUSTED_VF))
+147   |  return 0;
+148   |
+149   | 	rc = bnxt_hwrm_func_cfg_short_req_init(bp, &req);
+150   |  if (rc)
+151   |  return rc;
+152   |
+153   | 	req->fid = cpu_to_le16(vf->fw_fid);
+154   |  if (vf->flags & BNXT_VF_TRUST)
+155   | 		req->flags = cpu_to_le32(FUNC_CFG_REQ_FLAGS_TRUSTED_VF_ENABLE);
+156   |  else
+157   | 		req->flags = cpu_to_le32(FUNC_CFG_REQ_FLAGS_TRUSTED_VF_DISABLE);
+158   |  return hwrm_req_send(bp, req);
+159   | }
+160   |
+161   | int bnxt_set_vf_trust(struct net_device *dev, int vf_id, bool trusted)
+162   | {
+163   |  struct bnxt *bp = netdev_priv(dev);
+164   |  struct bnxt_vf_info *vf;
+165   |
+166   |  if (bnxt_vf_ndo_prep(bp, vf_id))
+167   |  return -EINVAL;
+168   |
+923   | 		netdev_warn(dev, "Unable to configure SRIOV since some VFs are assigned to VMs.\n");
+924   | 		num_vfs = 0;
+925   |  goto sriov_cfg_exit;
+926   | 	}
+927   |
+928   |  /* Check if enabled VFs is same as requested */
+929   |  if (num_vfs && num_vfs == bp->pf.active_vfs)
+930   |  goto sriov_cfg_exit;
+931   |
+932   |  /* if there are previous existing VFs, clean them up */
+933   | 	bnxt_sriov_disable(bp);
+934   |  if (!num_vfs)
+935   |  goto sriov_cfg_exit;
+936   |
+937   | 	bnxt_sriov_enable(bp, &num_vfs);
+938   |
+939   | sriov_cfg_exit:
+940   | 	bp->sriov_cfg = false;
+941   |  wake_up(&bp->sriov_cfg_wait);
+942   |
+943   |  return num_vfs;
+944   | }
+945   |
+946   | static int bnxt_hwrm_fwd_resp(struct bnxt *bp, struct bnxt_vf_info *vf,
+947   |  void *encap_resp, __le64 encap_resp_addr,
+948   | 			      __le16 encap_resp_cpr, u32 msg_size)
+949   | {
+950   |  struct hwrm_fwd_resp_input *req;
+951   |  int rc;
+952   |
+953   |  if (BNXT_FWD_RESP_SIZE_ERR(msg_size))
+954   |  return -EINVAL;
+955   |
+956   | 	rc = hwrm_req_init(bp, req, HWRM_FWD_RESP);
+957   |  if (!rc) {
+958   |  /* Set the new target id */
+959   | 		req->target_id = cpu_to_le16(vf->fw_fid);
+960   | 		req->encap_resp_target_id = cpu_to_le16(vf->fw_fid);
+961   | 		req->encap_resp_len = cpu_to_le16(msg_size);
+962   | 		req->encap_resp_addr = encap_resp_addr;
+963   | 		req->encap_resp_cmpl_ring = encap_resp_cpr;
+964   |  memcpy(req->encap_resp, encap_resp, msg_size);
+965   |
+966   | 		rc = hwrm_req_send(bp, req);
+967   | 	}
+968   |  if (rc)
+969   | 		netdev_err(bp->dev, "hwrm_fwd_resp failed. rc:%d\n", rc);
+970   |  return rc;
+971   | }
+972   |
+973   | static int bnxt_hwrm_fwd_err_resp(struct bnxt *bp, struct bnxt_vf_info *vf,
+974   | 				  u32 msg_size)
+975   | {
+976   |  struct hwrm_reject_fwd_resp_input *req;
+977   |  int rc;
+978   |
+979   |  if (BNXT_REJ_FWD_RESP_SIZE_ERR(msg_size))
+980   |  return -EINVAL;
+981   |
+982   | 	rc = hwrm_req_init(bp, req, HWRM_REJECT_FWD_RESP);
+983   |  if (!rc) {
+984   |  /* Set the new target id */
+985   | 		req->target_id = cpu_to_le16(vf->fw_fid);
+986   | 		req->encap_resp_target_id = cpu_to_le16(vf->fw_fid);
+987   |  memcpy(req->encap_request, vf->hwrm_cmd_req_addr, msg_size);
+988   |
+989   | 		rc = hwrm_req_send(bp, req);
+990   | 	}
+991   |  if (rc)
+992   | 		netdev_err(bp->dev, "hwrm_fwd_err_resp failed. rc:%d\n", rc);
+993   |  return rc;
+994   | }
+995   |
+996   | static int bnxt_hwrm_exec_fwd_resp(struct bnxt *bp, struct bnxt_vf_info *vf,
+997   | 				   u32 msg_size)
+998   | {
+999   |  struct hwrm_exec_fwd_resp_input *req;
+1000  |  int rc;
+1001  |
+1002  |  if (BNXT_EXEC_FWD_RESP_SIZE_ERR(msg_size))
+1003  |  return -EINVAL;
+1004  |
+1005  | 	rc = hwrm_req_init(bp, req, HWRM_EXEC_FWD_RESP);
+1006  |  if (!rc) {
+1007  |  /* Set the new target id */
+1008  | 		req->target_id = cpu_to_le16(vf->fw_fid);
+1009  | 		req->encap_resp_target_id = cpu_to_le16(vf->fw_fid);
+1010  |  memcpy(req->encap_request, vf->hwrm_cmd_req_addr, msg_size);
+1011  |
+1012  | 		rc = hwrm_req_send(bp, req);
+1013  | 	}
+1014  |  if (rc)
+1015  | 		netdev_err(bp->dev, "hwrm_exec_fw_resp failed. rc:%d\n", rc);
+1016  |  return rc;
+1017  | }
+1018  |
+1019  | static int bnxt_vf_configure_mac(struct bnxt *bp, struct bnxt_vf_info *vf)
+1020  | {
+1021  | 	u32 msg_size = sizeof(struct hwrm_func_vf_cfg_input);
+1022  |  struct hwrm_func_vf_cfg_input *req =
+1023  | 		(struct hwrm_func_vf_cfg_input *)vf->hwrm_cmd_req_addr;
+1024  |
+1025  |  /* Allow VF to set a valid MAC address, if trust is set to on or
+1026  |  * if the PF assigned MAC address is zero
+1027  |  */
+1028  |  if (req->enables & cpu_to_le32(FUNC_VF_CFG_REQ_ENABLES_DFLT_MAC_ADDR)) {
+1029  | 		bool trust = bnxt_is_trusted_vf(bp, vf);
+1030  |
+1031  |  if (is_valid_ether_addr(req->dflt_mac_addr) &&
+1032  | 		    (trust || !is_valid_ether_addr(vf->mac_addr) ||
+1033  | 		     ether_addr_equal(req->dflt_mac_addr, vf->mac_addr))) {
+1034  | 			ether_addr_copy(vf->vf_mac_addr, req->dflt_mac_addr);
+1035  |  return bnxt_hwrm_exec_fwd_resp(bp, vf, msg_size);
+1036  | 		}
+1037  |  return bnxt_hwrm_fwd_err_resp(bp, vf, msg_size);
+1038  | 	}
+1039  |  return bnxt_hwrm_exec_fwd_resp(bp, vf, msg_size);
+1040  | }
+1041  |
+1042  | static int bnxt_vf_validate_set_mac(struct bnxt *bp, struct bnxt_vf_info *vf)
+1043  | {
+1044  | 	u32 msg_size = sizeof(struct hwrm_cfa_l2_filter_alloc_input);
+1045  |  struct hwrm_cfa_l2_filter_alloc_input *req =
+1046  | 		(struct hwrm_cfa_l2_filter_alloc_input *)vf->hwrm_cmd_req_addr;
+1047  | 	bool mac_ok = false;
+1048  |
+1049  |  if (!is_valid_ether_addr((const u8 *)req->l2_addr))
+1050  |  return bnxt_hwrm_fwd_err_resp(bp, vf, msg_size);
+1051  |
+1052  |  /* Allow VF to set a valid MAC address, if trust is set to on.
+1053  |  * Or VF MAC address must first match MAC address in PF's context.
+1054  |  * Otherwise, it must match the VF MAC address if firmware spec >=
+1055  |  * 1.2.2
+1056  |  */
+1057  |  if (bnxt_is_trusted_vf(bp, vf)) {
+1058  | 		mac_ok = true;
+1059  | 	} else if (is_valid_ether_addr(vf->mac_addr)) {
+1060  |  if (ether_addr_equal((const u8 *)req->l2_addr, vf->mac_addr))
+1061  | 			mac_ok = true;
+1062  | 	} else if (is_valid_ether_addr(vf->vf_mac_addr)) {
+1063  |  if (ether_addr_equal((const u8 *)req->l2_addr, vf->vf_mac_addr))
+1064  | 			mac_ok = true;
+1065  | 	} else {
+1066  |  /* There are two cases:
+1067  |  * 1.If firmware spec < 0x10202,VF MAC address is not forwarded
+1068  |  *   to the PF and so it doesn't have to match
+1069  |  * 2.Allow VF to modify it's own MAC when PF has not assigned a
+1070  |  *   valid MAC address and firmware spec >= 0x10202
+1071  |  */
+1072  | 		mac_ok = true;
+1073  | 	}
+1074  |  if (mac_ok)
+1075  |  return bnxt_hwrm_exec_fwd_resp(bp, vf, msg_size);
+1076  |  return bnxt_hwrm_fwd_err_resp(bp, vf, msg_size);
+1077  | }
+1078  |
+1079  | static int bnxt_vf_set_link(struct bnxt *bp, struct bnxt_vf_info *vf)
+1080  | {
+1081  |  int rc = 0;
+1082  |
+1083  |  if (!(vf->flags & BNXT_VF_LINK_FORCED)) {
+    10←Assuming the condition is true→
+    11←Taking true branch→
+1084  |  /* real link */
+1085  |  rc = bnxt_hwrm_exec_fwd_resp(
+1086  |  bp, vf, sizeof(struct hwrm_port_phy_qcfg_input));
+1087  | 	} else {
+1088  |  struct hwrm_port_phy_qcfg_output phy_qcfg_resp = {0};
+1089  |  struct hwrm_port_phy_qcfg_input *phy_qcfg_req;
+1090  |
+1091  | 		phy_qcfg_req =
+1092  | 		(struct hwrm_port_phy_qcfg_input *)vf->hwrm_cmd_req_addr;
+1093  |  mutex_lock(&bp->link_lock);
+1094  |  memcpy(&phy_qcfg_resp, &bp->link_info.phy_qcfg_resp,
+1095  |  sizeof(phy_qcfg_resp));
+1096  | 		mutex_unlock(&bp->link_lock);
+1097  | 		phy_qcfg_resp.resp_len = cpu_to_le16(sizeof(phy_qcfg_resp));
+1098  | 		phy_qcfg_resp.seq_id = phy_qcfg_req->seq_id;
+1099  | 		phy_qcfg_resp.valid = 1;
+1100  |
+1101  |  if (vf->flags & BNXT_VF_LINK_UP) {
+1102  |  /* if physical link is down, force link up on VF */
+1103  |  if (phy_qcfg_resp.link !=
+1104  |  PORT_PHY_QCFG_RESP_LINK_LINK) {
+1105  | 				phy_qcfg_resp.link =
+1106  |  PORT_PHY_QCFG_RESP_LINK_LINK;
+1107  | 				phy_qcfg_resp.link_speed = cpu_to_le16(
+1108  |  PORT_PHY_QCFG_RESP_LINK_SPEED_10GB);
+1109  | 				phy_qcfg_resp.duplex_cfg =
+1110  |  PORT_PHY_QCFG_RESP_DUPLEX_CFG_FULL;
+1111  | 				phy_qcfg_resp.duplex_state =
+1112  |  PORT_PHY_QCFG_RESP_DUPLEX_STATE_FULL;
+1113  | 				phy_qcfg_resp.pause =
+1114  | 					(PORT_PHY_QCFG_RESP_PAUSE_TX |
+1115  |  PORT_PHY_QCFG_RESP_PAUSE_RX);
+1116  | 			}
+1117  | 		} else {
+1118  |  /* force link down */
+1119  | 			phy_qcfg_resp.link = PORT_PHY_QCFG_RESP_LINK_NO_LINK;
+1120  | 			phy_qcfg_resp.link_speed = 0;
+1121  | 			phy_qcfg_resp.duplex_state =
+1122  |  PORT_PHY_QCFG_RESP_DUPLEX_STATE_HALF;
+1123  | 			phy_qcfg_resp.pause = 0;
+1124  | 		}
+1125  | 		rc = bnxt_hwrm_fwd_resp(bp, vf, &phy_qcfg_resp,
+1126  | 					phy_qcfg_req->resp_addr,
+1127  | 					phy_qcfg_req->cmpl_ring,
+1128  |  sizeof(phy_qcfg_resp));
+1129  | 	}
+1130  |  return rc;
+    12←Missing hwrm_req_drop() after successful hwrm_req_init()
+1131  | }
+1132  |
+1133  | static int bnxt_vf_req_validate_snd(struct bnxt *bp, struct bnxt_vf_info *vf)
+1134  | {
+1135  |  int rc = 0;
+1136  |  struct input *encap_req = vf->hwrm_cmd_req_addr;
+1137  | 	u32 req_type = le16_to_cpu(encap_req->req_type);
+1138  |
+1139  |  switch (req_type) {
+    8←Control jumps to 'case 39:'  at line 1153→
+1140  |  case HWRM_FUNC_VF_CFG:
+1141  | 		rc = bnxt_vf_configure_mac(bp, vf);
+1142  |  break;
+1143  |  case HWRM_CFA_L2_FILTER_ALLOC:
+1144  | 		rc = bnxt_vf_validate_set_mac(bp, vf);
+1145  |  break;
+1146  |  case HWRM_FUNC_CFG:
+1147  |  /* TODO Validate if VF is allowed to change mac address,
+1148  |  * mtu, num of rings etc
+1149  |  */
+1150  | 		rc = bnxt_hwrm_exec_fwd_resp(
+1151  | 			bp, vf, sizeof(struct hwrm_func_cfg_input));
+1152  |  break;
+1153  |  case HWRM_PORT_PHY_QCFG:
+1154  |  rc = bnxt_vf_set_link(bp, vf);
+    9←Calling 'bnxt_vf_set_link'→
+1155  |  break;
+1156  |  default:
+1157  |  break;
+1158  | 	}
+1159  |  return rc;
+1160  | }
+1161  |
+1162  | void bnxt_hwrm_exec_fwd_req(struct bnxt *bp)
+1163  | {
+1164  | 	u32 i = 0, active_vfs = bp->pf.active_vfs, vf_id;
+1165  |
+1166  |  /* Scan through VF's and process commands */
+1167  |  while (1) {
+    1Loop condition is true.  Entering loop body→
+    4←Loop condition is true.  Entering loop body→
+1168  |  vf_id = find_next_bit(bp->pf.vf_event_bmap, active_vfs, i);
+1169  |  if (vf_id >= active_vfs)
+    2←Assuming 'vf_id' is < 'active_vfs'→
+    3←Taking false branch→
+    5←Assuming 'vf_id' is < 'active_vfs'→
+    6←Taking false branch→
+1170  |  break;
+1171  |
+1172  |  clear_bit(vf_id, bp->pf.vf_event_bmap);
+1173  |  bnxt_vf_req_validate_snd(bp, &bp->pf.vf[vf_id]);
+    7←Calling 'bnxt_vf_req_validate_snd'→
+1174  |  i = vf_id + 1;
+1175  |  }
+1176  | }
+1177  |
+1178  | int bnxt_approve_mac(struct bnxt *bp, const u8 *mac, bool strict)
+1179  | {
+1180  |  struct hwrm_func_vf_cfg_input *req;
+1181  |  int rc = 0;
+1182  |
+1183  |  if (!BNXT_VF(bp))
+1184  |  return 0;
+1185  |
+1186  |  if (bp->hwrm_spec_code < 0x10202) {
+1187  |  if (is_valid_ether_addr(bp->vf.mac_addr))
+1188  | 			rc = -EADDRNOTAVAIL;
+1189  |  goto mac_done;
+1190  | 	}
+1191  |
+1192  | 	rc = hwrm_req_init(bp, req, HWRM_FUNC_VF_CFG);
+1193  |  if (rc)
+1194  |  goto mac_done;
+1195  |
+1196  | 	req->enables = cpu_to_le32(FUNC_VF_CFG_REQ_ENABLES_DFLT_MAC_ADDR);
+1197  |  memcpy(req->dflt_mac_addr, mac, ETH_ALEN);
+1198  |  if (!strict)
+1199  | 		hwrm_req_flags(bp, req, BNXT_HWRM_CTX_SILENT);
+1200  | 	rc = hwrm_req_send(bp, req);
+1201  | mac_done:
+1202  |  if (rc && strict) {
+1203  | 		rc = -EADDRNOTAVAIL;
+1204  | 		netdev_warn(bp->dev, "VF MAC address %pM not approved by the PF\n",
+1205  | 			    mac);
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

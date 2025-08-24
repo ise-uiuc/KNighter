@@ -1,0 +1,338 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: d8c561741ef83980114b3f7f95ffac54600f3f16
+commit_type: Double-Free
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"clang/AST/ParentMapContext.h\"\n\n\
+  using namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program\
+  \ state customization: track the latest \"late activation step\" result variable\
+  \ and resource.\nREGISTER_MAP_WITH_PROGRAMSTATE(ErrVarToResMap, const MemRegion*,\
+  \ const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(ErrVarToStepKindMap, const MemRegion*,\
+  \ unsigned)\n\nnamespace {\n\nstatic constexpr unsigned LateActivationStep = 1;\n\
+  \n// Helper: strip to the canonical base region (VarRegion/ParmVarRegion/SymbolicRegion)\n\
+  static const MemRegion *stripToBaseVarRegion(const MemRegion *R) {\n  if (!R) return\
+  \ nullptr;\n  const MemRegion *Base = R->getBaseRegion();\n  return Base ? Base\
+  \ : R;\n}\n\n// Helper: check if two regions have the same base.\nstatic bool sameBase(const\
+  \ MemRegion *A, const MemRegion *B) {\n  if (!A || !B) return false;\n  return stripToBaseVarRegion(A)\
+  \ == stripToBaseVarRegion(B);\n}\n\n// Helper: predicate for late activation step\
+  \ call names.\nstatic bool isLateStepCallExpr(const Expr *E, CheckerContext &C)\
+  \ {\n  if (!E) return false;\n  // Use source text contains checks to be robust.\n\
+  \  // Minimal requirement: contains \"set_\" and (\"_rdy\" or \"ready\").\n  //\
+  \ Also accept \"activate\", \"enable\", \"arm\".\n  if (ExprHasName(E, \"activate\"\
+  , C)) return true;\n  if (ExprHasName(E, \"enable\", C)) return true;\n  if (ExprHasName(E,\
+  \ \"arm\", C)) return true;\n  if (ExprHasName(E, \"set_\", C) &&\n      (ExprHasName(E,\
+  \ \"_rdy\", C) || ExprHasName(E, \"ready\", C)))\n    return true;\n  return false;\n\
+  }\n\n// Helper: predicate for high-level close/free/cleanup (not destroy)\nstatic\
+  \ bool isHighLevelCloseCallExpr(const Expr *E, CheckerContext &C) {\n  if (!E) return\
+  \ false;\n  // Avoid proper destroy counterparts.\n  if (ExprHasName(E, \"destroy\"\
+  , C)) return false;\n  if (ExprHasName(E, \"close\", C)) return true;\n  if (ExprHasName(E,\
+  \ \"cleanup\", C)) return true;\n  if (ExprHasName(E, \"free\", C)) return true;\n\
+  \  return false;\n}\n\n// Helper: pick a resource base region from a CallEvent (scan\
+  \ args from last to first).\nstatic const MemRegion *pickResourceBaseRegionFromCall(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  for (unsigned i = Call.getNumArgs();\
+  \ i > 0; --i) {\n    unsigned Idx = i - 1;\n    const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \    if (!ArgE) continue;\n\n    // Skip obvious device-like args to reduce noise.\n\
+  \    if (ExprHasName(ArgE, \"mdev\", C) || ExprHasName(ArgE, \"dev\", C))\n    \
+  \  continue;\n\n    const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n    if\
+  \ (!MR) continue;\n    MR = stripToBaseVarRegion(MR);\n    if (MR) return MR;\n\
+  \  }\n  return nullptr;\n}\n\n// Helper: extract error variable region from condition\
+  \ (e.g., if (err) { ... }).\nstatic const MemRegion *getErrVarRegionFromCond(const\
+  \ Stmt *Cond, CheckerContext &C) {\n  if (!Cond) return nullptr;\n  const DeclRefExpr\
+  \ *DRE = findSpecificTypeInChildren<DeclRefExpr>(Cond);\n  if (!DRE) return nullptr;\n\
+  \  const Expr *E = DRE;\n  const MemRegion *MR = getMemRegionFromExpr(E, C);\n \
+  \ if (!MR) return nullptr;\n  MR = stripToBaseVarRegion(MR);\n  return MR;\n}\n\n\
+  /* The checker callbacks are to be decided. */\nclass SAGenTestChecker : public\
+  \ Checker<check::Bind, check::PreCall> {\n   mutable std::unique_ptr<BugType> BT;\n\
+  \n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Double free in error\
+  \ path\", \"Resource Management\")) {}\n\n      void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\n   private:\n\n      // Identify and record\
+  \ \"err = late_step_call(...)\" and the associated resource.\n      void recordLateStepAssignment(const\
+  \ MemRegion *ErrVarR, const CallExpr *CE, CheckerContext &C) const;\n\n      //\
+  \ Reporting\n      void reportIssue(const CallEvent &Call, CheckerContext &C) const;\n\
+  };\n\nvoid SAGenTestChecker::recordLateStepAssignment(const MemRegion *ErrVarR,\
+  \ const CallExpr *CE, CheckerContext &C) const {\n  if (!ErrVarR || !CE) return;\n\
+  \n  // Verify it looks like a \"late activation step\" call.\n  if (!isLateStepCallExpr(CE,\
+  \ C)) return;\n\n  // Heuristically pick the resource base from the call's args\
+  \ (scan from last).\n  const MemRegion *ResBase = nullptr;\n  for (unsigned i =\
+  \ CE->getNumArgs(); i > 0; --i) {\n    const Expr *ArgE = CE->getArg(i - 1);\n \
+  \   if (!ArgE) continue;\n\n    // Skip common device params.\n    if (ExprHasName(ArgE,\
+  \ \"mdev\", C) || ExprHasName(ArgE, \"dev\", C))\n      continue;\n\n    const MemRegion\
+  \ *MR = getMemRegionFromExpr(ArgE, C);\n    if (!MR) continue;\n    MR = stripToBaseVarRegion(MR);\n\
+  \    if (MR) { ResBase = MR; break; }\n  }\n  if (!ResBase) return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n  State = State->set<ErrVarToResMap>(ErrVarR, ResBase);\n\
+  \  State = State->set<ErrVarToStepKindMap>(ErrVarR, LateActivationStep);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal /*Val*/, const Stmt *S, CheckerContext\
+  \ &C) const {\n  // We are looking for patterns like: err = set_*_rdy(...);\n  const\
+  \ MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg) return;\n  LHSReg = stripToBaseVarRegion(LHSReg);\n\
+  \  if (!LHSReg) return;\n\n  // Only consider top-level variable/parameter bindings.\n\
+  \  if (!(isa<VarRegion>(LHSReg) || isa<ParmVarRegion>(LHSReg)))\n    return;\n\n\
+  \  // Try to find a CallExpr within this statement.\n  const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S);\n\
+  \  if (!CE) return;\n\n  recordLateStepAssignment(LHSReg, CE, C);\n}\n\nvoid SAGenTestChecker::reportIssue(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \   *BT,\n      \"High-level close/free on late-step failure may double free; call\
+  \ destroy_* instead.\",\n      N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin) return;\n\
+  \n  // We only care about high-level close/free/cleanup (but not destroy).\n  if\
+  \ (!isHighLevelCloseCallExpr(Origin, C))\n    return;\n\n  // Determine the resource\
+  \ passed to this cleanup call.\n  const MemRegion *CleanupRes = pickResourceBaseRegionFromCall(Call,\
+  \ C);\n  if (!CleanupRes) return;\n\n  // Find an enclosing if-statement for this\
+  \ call.\n  const IfStmt *If = findSpecificTypeInParents<IfStmt>(Origin, C);\n  if\
+  \ (!If) return;\n\n  // Extract the error variable used in condition: if (err) ...\n\
+  \  const MemRegion *ErrVarR = getErrVarRegionFromCond(If->getCond(), C);\n  if (!ErrVarR)\
+  \ return;\n\n  ProgramStateRef State = C.getState();\n  const MemRegion *TrackedRes\
+  \ = State->get<ErrVarToResMap>(ErrVarR);\n  const unsigned *Step = State->get<ErrVarToStepKindMap>(ErrVarR);\n\
+  \n  if (!TrackedRes || !Step) return;\n  if (*Step != LateActivationStep) return;\n\
+  \n  // Ensure that the resource matches.\n  if (!sameBase(TrackedRes, CleanupRes))\
+  \ return;\n\n  // All matched: report.\n  reportIssue(Call, C);\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect mismatched high-level cleanup on late-step failure that may cause\
+  \ double free; suggest destroy_* instead\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nnet/mlx5: HWS, fixed double-free in error flow of\
+  \ creating SQ\n\nWhen SQ creation fails, call the appropriate mlx5_core destroy\
+  \ function.\n\nThis fixes the following smatch warnings:\n  divers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c:739\n\
+  \    hws_send_ring_open_sq() warn: 'sq->dep_wqe' double freed\n    hws_send_ring_open_sq()\
+  \ warn: 'sq->wq_ctrl.buf.frags' double freed\n    hws_send_ring_open_sq() warn:\
+  \ 'sq->wr_priv' double freed\n\nFixes: 2ca62599aa0b (\"net/mlx5: HWS, added send\
+  \ engine and context handling\")\nReported-by: Dan Carpenter <dan.carpenter@linaro.org>\n\
+  Closes: https://lore.kernel.org/all/e4ebc227-4b25-49bf-9e4c-14b7ea5c6a07@stanley.mountain/\n\
+  Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>\nSigned-off-by: Saeed Mahameed\
+  \ <saeedm@nvidia.com>\n\n## Buggy Code\n\n```c\n// Function: hws_send_ring_create_sq\
+  \ in drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\nstatic\
+  \ int hws_send_ring_create_sq(struct mlx5_core_dev *mdev, u32 pdn,\n\t\t\t\t   void\
+  \ *sqc_data,\n\t\t\t\t   struct mlx5hws_send_engine *queue,\n\t\t\t\t   struct mlx5hws_send_ring_sq\
+  \ *sq,\n\t\t\t\t   struct mlx5hws_send_ring_cq *cq)\n{\n\tvoid *in, *sqc, *wq;\n\
+  \tint inlen, err;\n\tu8 ts_format;\n\n\tinlen = MLX5_ST_SZ_BYTES(create_sq_in) +\n\
+  \t\tsizeof(u64) * sq->wq_ctrl.buf.npages;\n\tin = kvzalloc(inlen, GFP_KERNEL);\n\
+  \tif (!in)\n\t\treturn -ENOMEM;\n\n\tsqc = MLX5_ADDR_OF(create_sq_in, in, ctx);\n\
+  \twq = MLX5_ADDR_OF(sqc, sqc, wq);\n\n\tmemcpy(sqc, sqc_data, MLX5_ST_SZ_BYTES(sqc));\n\
+  \tMLX5_SET(sqc, sqc, cqn, cq->mcq.cqn);\n\n\tMLX5_SET(sqc, sqc, state, MLX5_SQC_STATE_RST);\n\
+  \tMLX5_SET(sqc, sqc, flush_in_error_en, 1);\n\n\tts_format = mlx5_is_real_time_sq(mdev)\
+  \ ? MLX5_TIMESTAMP_FORMAT_REAL_TIME :\n\t\t\t\t\t\t MLX5_TIMESTAMP_FORMAT_FREE_RUNNING;\n\
+  \tMLX5_SET(sqc, sqc, ts_format, ts_format);\n\n\tMLX5_SET(wq, wq, wq_type, MLX5_WQ_TYPE_CYCLIC);\n\
+  \tMLX5_SET(wq, wq, uar_page, mdev->mlx5e_res.hw_objs.bfreg.index);\n\tMLX5_SET(wq,\
+  \ wq, log_wq_pg_sz, sq->wq_ctrl.buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT);\n\tMLX5_SET64(wq,\
+  \ wq, dbr_addr, sq->wq_ctrl.db.dma);\n\n\tmlx5_fill_page_frag_array(&sq->wq_ctrl.buf,\n\
+  \t\t\t\t  (__be64 *)MLX5_ADDR_OF(wq, wq, pas));\n\n\terr = mlx5_core_create_sq(mdev,\
+  \ in, inlen, &sq->sqn);\n\n\tkvfree(in);\n\n\treturn err;\n}\n```\n\n## Bug Fix\
+  \ Patch\n\n```diff\ndiff --git a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\
+  \ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\nindex a1adbb48735c..0c7989184c30\
+  \ 100644\n--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\n\
+  +++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\n@@ -653,6\
+  \ +653,12 @@ static int hws_send_ring_create_sq(struct mlx5_core_dev *mdev, u32\
+  \ pdn,\n \treturn err;\n }\n \n+static void hws_send_ring_destroy_sq(struct mlx5_core_dev\
+  \ *mdev,\n+\t\t\t\t     struct mlx5hws_send_ring_sq *sq)\n+{\n+\tmlx5_core_destroy_sq(mdev,\
+  \ sq->sqn);\n+}\n+\n static int hws_send_ring_set_sq_rdy(struct mlx5_core_dev *mdev,\
+  \ u32 sqn)\n {\n \tvoid *in, *sqc;\n@@ -696,7 +702,7 @@ static int hws_send_ring_create_sq_rdy(struct\
+  \ mlx5_core_dev *mdev, u32 pdn,\n \n \terr = hws_send_ring_set_sq_rdy(mdev, sq->sqn);\n\
+  \ \tif (err)\n-\t\thws_send_ring_close_sq(sq);\n+\t\thws_send_ring_destroy_sq(mdev,\
+  \ sq);\n \n \treturn err;\n }\n```\n"
+pattern: "## Bug Pattern\n\nMismatched teardown in a multi-stage init: on failure\
+  \ of a late step (e.g., setting an SQ to Ready), the code calls a high-level \u201C\
+  close/free-all\u201D routine that releases both HW and SW resources (e.g., dep_wqe,\
+  \ wq_ctrl.buf.frags, wr_priv) instead of invoking the precise inverse of the last\
+  \ successful step (e.g., only destroying the HW SQ). This causes those SW resources\
+  \ to be freed again by the normal unwind path, leading to double-free."
+plan: "Plan\n\n1) Program state customization\n- REGISTER_MAP_WITH_PROGRAMSTATE(ErrVarToResMap,\
+  \ const MemRegion*, const MemRegion*)\n  - Key: the MemRegion of the local error\
+  \ variable (e.g., \u201Cerr\u201D) that stores the return code of the last step\
+  \ call.\n  - Value: the base MemRegion of the resource \u201Cowner\u201D (e.g.,\
+  \ the struct pointer \u2018sq\u2019) associated with that last step.\n- REGISTER_MAP_WITH_PROGRAMSTATE(ErrVarToStepKindMap,\
+  \ const MemRegion*, unsigned)\n  - Key: same error variable MemRegion.\n  - Value:\
+  \ an enum/int StepKind for the last step, we only need one kind: LateActivationStep\
+  \ (e.g., \u201Cset_*_rdy\u201D, \u201C*_ready\u201D, \u201Cactivate\u201D, \u201C\
+  arm\u201D, \u201Cenable\u201D). Use 1 for LateActivationStep.\n\n2) Helper utilities\n\
+  - isLateStepFunctionName(StringRef Name)\n  - Return true if Name contains a \u201C\
+  late activation\u201D pattern, for example:\n    - Name.contains(\"set_\") && (Name.contains(\"\
+  _rdy\") || Name.contains(\"ready\"))\n    - Or Name.contains(\"activate\") || Name.contains(\"\
+  enable\") || Name.contains(\"arm\")\n  - Keep this conservative; the minimal required\
+  \ for the target patch is \"set_\" and (\"_rdy\" or \"ready\").\n- isHighLevelCloseFuncName(StringRef\
+  \ Name)\n  - Return true if Name contains \"close\" or \"free\" or \"cleanup\"\n\
+  \  - Return false if Name.contains(\"destroy\") to avoid warning on proper low-level\
+  \ counterpart.\n- const MemRegion* stripToBaseVarRegion(const MemRegion* R)\n  -\
+  \ Walk super-region chain until you reach a top-level VarRegion/ParmVarRegion/SymbolicRegion\
+  \ representing a concrete base object.\n  - The idea: for an argument like \u201C\
+  sq->sqn\u201D (FieldRegion), this returns the \u201Csq\u201D base region. For \u201C\
+  sq\u201D directly, it returns \u201Csq\u201D.\n- const MemRegion* pickResourceBaseRegionFromCall(const\
+  \ CallEvent &Call, CheckerContext &C)\n  - Iterate call arguments from last to first:\n\
+  \    - const Expr* ArgE = Call.getArgExpr(i);\n    - Use getMemRegionFromExpr(ArgE,\
+  \ C); if null, continue.\n    - Compute Base = stripToBaseVarRegion(Region).\n \
+  \   - Ignore device-like arguments (optional but reduces noise) if ExprHasName(ArgE,\
+  \ \"mdev\") or ExprHasName(ArgE, \"dev\") is true.\n    - Return the first non-null\
+  \ Base that is not filtered out.\n  - If none found, return nullptr.\n- const MemRegion*\
+  \ getErrVarRegionFromCond(const Stmt* Cond, CheckerContext &C)\n  - Try to find\
+  \ a DeclRefExpr in children: findSpecificTypeInChildren<DeclRefExpr>(Cond).\n  -\
+  \ If found and it refers to a VarDecl, obtain the MemRegion via getMemRegionFromExpr(DRE,\
+  \ C).\n  - Return the base (stripToBaseVarRegion) of that region (typically the\
+  \ err variable\u2019s VarRegion).\n- bool sameBase(const MemRegion* A, const MemRegion*\
+  \ B)\n  - Return A == B after applying stripToBaseVarRegion on both.\n\n3) Track\
+  \ the \u201Clate step\u201D assignment to the error variable (checkBind)\n- When\
+  \ a value is bound to a location, we want to catch the idiom: err = late_step_call(...).\n\
+  - In checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C):\n  - If Loc\
+  \ is not a MemRegionVal -> bail.\n  - Extract the LHS region R from Loc; keep only\
+  \ VarRegion/ParmVarRegion (ignore fields).\n  - Try to find if this bind is the\
+  \ result of a call:\n    - const CallExpr* CE = findSpecificTypeInChildren<CallExpr>(S);\
+  \ if null, bail.\n    - From CE, get the callee name (CE->getDirectCallee()->getIdentifier()->getName())\
+  \ and run isLateStepFunctionName.\n    - If not late step, bail.\n  - Determine\
+  \ the resource base region used by this late step:\n    - Wrap CE into a CallEvent\
+  \ or re-implement argument iteration:\n    - For each argument Expr of CE, call\
+  \ getMemRegionFromExpr and stripToBaseVarRegion; pick the first non-null region\
+  \ that isn\u2019t \u201Cmdev/dev\u201D by ExprHasName.\n    - If none found, bail\
+  \ (we need a resource to compare later).\n  - Update program state:\n    - ErrVarToResMap[R]\
+  \ = ResourceBase.\n    - ErrVarToStepKindMap[R] = LateActivationStep (1).\n  - Do\
+  \ not report here.\n\n4) Detect high-level close/free called in the late-step error\
+  \ branch (checkPreCall)\n- Goal: When a call to a high-level \u201Cclose/free/cleanup\u201D\
+  \ happens under an if-condition that checks the late step\u2019s error variable,\
+  \ and the resource matches, report.\n- In checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C):\n  - Get callee name and apply isHighLevelCloseFuncName; if false, return.\n\
+  \  - Find the base resource region used by this cleanup call:\n    - BaseCleanup\
+  \ = pickResourceBaseRegionFromCall(Call, C); if null, return.\n  - Find enclosing\
+  \ IfStmt:\n    - const CallExpr* Origin = dyn_cast_or_null<CallExpr>(Call.getOriginExpr());\
+  \ if null, return.\n    - const IfStmt* If = findSpecificTypeInParents<IfStmt>(Origin,\
+  \ C); if null, return.\n  - Extract error-variable region from If condition:\n \
+  \   - ErrVarR = getErrVarRegionFromCond(If->getCond(), C); if null, return.\n  -\
+  \ Consult state maps:\n    - Look up ErrVarR in ErrVarToResMap and ErrVarToStepKindMap.\n\
+  \    - If not found or StepKind != LateActivationStep, return.\n  - Compare resources:\n\
+  \    - If !sameBase(BaseCleanup, ResBaseFromMap), return.\n  - Report bug:\n   \
+  \ - Create a non-fatal error node and emit PathSensitiveBugReport:\n      - Message:\
+  \ \"High-level close/free on late-step failure may double free; call destroy_* instead.\"\
+  \n      - Location: the cleanup CallExpr.\n- Rationale: This matches the target\
+  \ patch scenario where, after hws_send_ring_set_sq_rdy(...) fails (late step), the\
+  \ code calls hws_send_ring_close_sq(sq) instead of the precise destroy function\
+  \ for that last successful step, causing double-free later.\n\n5) Optional refinements\
+  \ to reduce noise\n- Only consider IfStmt conditions where the DeclRefExpr type\
+  \ is integer and named like err/ret/rc/status (use ExprHasName on the condition\
+  \ to check common names). This is optional; basic approach already works.\n- Exclude\
+  \ cases where the cleanup function name contains \"destroy\" to avoid flagging correct\
+  \ teardown.\n- Clear mappings when entering a new function (not strictly needed;\
+  \ the analyzer state is path-sensitive and scoped).\n\n6) Chosen callbacks and their\
+  \ roles\n- checkBind:\n  - Detect patterns of \u201Cerr = late_step_call(...)\u201D\
+  .\n  - Record mapping from the error variable to the resource base region and mark\
+  \ step kind as LateActivationStep.\n- checkPreCall:\n  - Identify high-level cleanup\
+  \ calls (\u201Cclose/free/cleanup\u201D).\n  - Verify they are inside an If that\
+  \ checks the previously recorded error variable from a late step.\n  - Confirm the\
+  \ resource base region matches between the late step and the cleanup call.\n  -\
+  \ Emit a report when matched.\n- (No need to use other callbacks. We purposely avoid\
+  \ heavy modeling and keep the implementation simple and targeted to this bug pattern.)\n\
+  \n7) Use of provided utilities\n- findSpecificTypeInParents to get the enclosing\
+  \ IfStmt of the cleanup call.\n- findSpecificTypeInChildren to detect when a bind\
+  \ originates from a CallExpr (in checkBind).\n- getMemRegionFromExpr to get regions\
+  \ for call arguments and the condition variable; use region super-chain to get a\
+  \ common base region.\n- ExprHasName to skip common device parameters (e.g., \"\
+  mdev\", \"dev\") in argument scanning and for optional heuristics in conditions.\n\
+  \n8) Report message\n- Keep it short and clear:\n  - \"High-level close/free on\
+  \ late-step failure may double free; call destroy_* instead.\""
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\
+  \n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/AST/RecursiveASTVisitor.h\"\
+  \n#include \"clang/AST/StmtVisitor.h\"\n#include \"llvm/Support/raw_ostream.h\"\n\
+  #include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"clang/AST/ParentMapContext.h\"\n#include <memory>\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state customization:\
+  \ track the latest \"late activation step\" result variable and resource.\nREGISTER_MAP_WITH_PROGRAMSTATE(ErrVarToResMap,\
+  \ const MemRegion*, const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(ErrVarToStepKindMap,\
+  \ const MemRegion*, unsigned)\n\nnamespace {\n\nstatic constexpr unsigned LateActivationStep\
+  \ = 1;\n\n// Helper: strip to the canonical base region (VarRegion/ParmVarRegion/SymbolicRegion)\n\
+  static const MemRegion *stripToBaseVarRegion(const MemRegion *R) {\n  if (!R) return\
+  \ nullptr;\n  const MemRegion *Base = R->getBaseRegion();\n  return Base ? Base\
+  \ : R;\n}\n\n// Helper: check if two regions have the same base.\nstatic bool sameBase(const\
+  \ MemRegion *A, const MemRegion *B) {\n  if (!A || !B) return false;\n  return stripToBaseVarRegion(A)\
+  \ == stripToBaseVarRegion(B);\n}\n\n// Helper: predicate for late activation step\
+  \ call names.\nstatic bool isLateStepCallExpr(const Expr *E, CheckerContext &C)\
+  \ {\n  if (!E) return false;\n  // Use source text contains checks to be robust.\n\
+  \  // Minimal requirement: contains \"set_\" and (\"_rdy\" or \"ready\").\n  //\
+  \ Also accept \"activate\", \"enable\", \"arm\".\n  if (ExprHasName(E, \"activate\"\
+  , C)) return true;\n  if (ExprHasName(E, \"enable\", C)) return true;\n  if (ExprHasName(E,\
+  \ \"arm\", C)) return true;\n  if (ExprHasName(E, \"set_\", C) &&\n      (ExprHasName(E,\
+  \ \"_rdy\", C) || ExprHasName(E, \"ready\", C)))\n    return true;\n  return false;\n\
+  }\n\n// Helper: predicate for high-level close/free/cleanup (not destroy)\nstatic\
+  \ bool isHighLevelCloseCallExpr(const Expr *E, CheckerContext &C) {\n  if (!E) return\
+  \ false;\n  // Avoid proper destroy counterparts.\n  if (ExprHasName(E, \"destroy\"\
+  , C)) return false;\n  if (ExprHasName(E, \"close\", C)) return true;\n  if (ExprHasName(E,\
+  \ \"cleanup\", C)) return true;\n  if (ExprHasName(E, \"free\", C)) return true;\n\
+  \  return false;\n}\n\n// Helper: pick a resource base region from a CallEvent (scan\
+  \ args from last to first).\nstatic const MemRegion *pickResourceBaseRegionFromCall(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  for (unsigned i = Call.getNumArgs();\
+  \ i > 0; --i) {\n    unsigned Idx = i - 1;\n    const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \    if (!ArgE) continue;\n\n    // Skip obvious device-like args to reduce noise.\n\
+  \    if (ExprHasName(ArgE, \"mdev\", C) || ExprHasName(ArgE, \"dev\", C))\n    \
+  \  continue;\n\n    const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n    if\
+  \ (!MR) continue;\n    MR = stripToBaseVarRegion(MR);\n    if (MR) return MR;\n\
+  \  }\n  return nullptr;\n}\n\n// Helper: extract error variable region from condition\
+  \ (e.g., if (err) { ... }).\nstatic const MemRegion *getErrVarRegionFromCond(const\
+  \ Stmt *Cond, CheckerContext &C) {\n  if (!Cond) return nullptr;\n  const DeclRefExpr\
+  \ *DRE = findSpecificTypeInChildren<DeclRefExpr>(Cond);\n  if (!DRE) return nullptr;\n\
+  \  const Expr *E = DRE;\n  const MemRegion *MR = getMemRegionFromExpr(E, C);\n \
+  \ if (!MR) return nullptr;\n  MR = stripToBaseVarRegion(MR);\n  return MR;\n}\n\n\
+  /* The checker callbacks are to be decided. */\nclass SAGenTestChecker : public\
+  \ Checker<check::Bind, check::PreCall> {\n   mutable std::unique_ptr<BugType> BT;\n\
+  \n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Double free in error\
+  \ path\", \"Resource Management\")) {}\n\n      void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\n   private:\n\n      // Identify and record\
+  \ \"err = late_step_call(...)\" and the associated resource.\n      void recordLateStepAssignment(const\
+  \ MemRegion *ErrVarR, const CallExpr *CE, CheckerContext &C) const;\n\n      //\
+  \ Reporting\n      void reportIssue(const CallEvent &Call, CheckerContext &C) const;\n\
+  };\n\nvoid SAGenTestChecker::recordLateStepAssignment(const MemRegion *ErrVarR,\
+  \ const CallExpr *CE, CheckerContext &C) const {\n  if (!ErrVarR || !CE) return;\n\
+  \n  // Verify it looks like a \"late activation step\" call.\n  if (!isLateStepCallExpr(CE,\
+  \ C)) return;\n\n  // Heuristically pick the resource base from the call's args\
+  \ (scan from last).\n  const MemRegion *ResBase = nullptr;\n  for (unsigned i =\
+  \ CE->getNumArgs(); i > 0; --i) {\n    const Expr *ArgE = CE->getArg(i - 1);\n \
+  \   if (!ArgE) continue;\n\n    // Skip common device params.\n    if (ExprHasName(ArgE,\
+  \ \"mdev\", C) || ExprHasName(ArgE, \"dev\", C))\n      continue;\n\n    const MemRegion\
+  \ *MR = getMemRegionFromExpr(ArgE, C);\n    if (!MR) continue;\n    MR = stripToBaseVarRegion(MR);\n\
+  \    if (MR) { ResBase = MR; break; }\n  }\n  if (!ResBase) return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n  State = State->set<ErrVarToResMap>(ErrVarR, ResBase);\n\
+  \  State = State->set<ErrVarToStepKindMap>(ErrVarR, LateActivationStep);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal /*Val*/, const Stmt *S, CheckerContext\
+  \ &C) const {\n  // We are looking for patterns like: err = set_*_rdy(...);\n  const\
+  \ MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg) return;\n  LHSReg = stripToBaseVarRegion(LHSReg);\n\
+  \  if (!LHSReg) return;\n\n  // Only consider top-level variable/parameter bindings.\n\
+  \  if (!isa<VarRegion>(LHSReg))\n    return;\n\n  // Try to find a CallExpr within\
+  \ this statement.\n  const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S);\n\
+  \  if (!CE) return;\n\n  recordLateStepAssignment(LHSReg, CE, C);\n}\n\nvoid SAGenTestChecker::reportIssue(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \   *BT,\n      \"High-level close/free on late-step failure may double free; call\
+  \ destroy_* instead.\",\n      N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin) return;\n\
+  \n  // We only care about high-level close/free/cleanup (but not destroy).\n  if\
+  \ (!isHighLevelCloseCallExpr(Origin, C))\n    return;\n\n  // Determine the resource\
+  \ passed to this cleanup call.\n  const MemRegion *CleanupRes = pickResourceBaseRegionFromCall(Call,\
+  \ C);\n  if (!CleanupRes) return;\n\n  // Find an enclosing if-statement for this\
+  \ call.\n  const IfStmt *If = findSpecificTypeInParents<IfStmt>(Origin, C);\n  if\
+  \ (!If) return;\n\n  // Extract the error variable used in condition: if (err) ...\n\
+  \  const MemRegion *ErrVarR = getErrVarRegionFromCond(If->getCond(), C);\n  if (!ErrVarR)\
+  \ return;\n\n  ProgramStateRef State = C.getState();\n  const MemRegion *const *TrackedResPtr\
+  \ = State->get<ErrVarToResMap>(ErrVarR);\n  const unsigned *Step = State->get<ErrVarToStepKindMap>(ErrVarR);\n\
+  \n  if (!TrackedResPtr || !Step) return;\n  if (*Step != LateActivationStep) return;\n\
+  \n  const MemRegion *TrackedRes = *TrackedResPtr;\n\n  // Ensure that the resource\
+  \ matches.\n  if (!sameBase(TrackedRes, CleanupRes)) return;\n\n  // All matched:\
+  \ report.\n  reportIssue(Call, C);\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detect mismatched high-level cleanup\
+  \ on late-step failure that may cause double free; suggest destroy_* instead\",\n\
+  \      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

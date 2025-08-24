@@ -1,0 +1,451 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: aec8e6bf839101784f3ef037dcdb9432c3f32343
+commit_type: UAF
+index: 5
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state to track\
+  \ which struct variable needs members to be NULLed after close.\nREGISTER_MAP_WITH_PROGRAMSTATE(CloseNeedsNullMap,\
+  \ const VarDecl*, unsigned)\n// Program state to remember where the close was observed\
+  \ (for diagnostics).\nREGISTER_MAP_WITH_PROGRAMSTATE(CloseOriginMap, const VarDecl*,\
+  \ const Stmt*)\n\nnamespace {\n\nstatic constexpr unsigned BIT_BDEV = 0x1;\nstatic\
+  \ constexpr unsigned BIT_BDEV_FILE = 0x2;\n\nclass SAGenTestChecker\n  : public\
+  \ Checker<\n        check::PostCall,\n        check::Bind,\n        check::PreCall,\n\
+  \        check::BranchCondition,\n        check::EndFunction> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Stale member\
+  \ pointer after close\", \"Memory Safety\")) {}\n\n      void checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal\
+  \ Val, const Stmt *S, CheckerContext &C) const;\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n      void checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const;\n\n   private:\n      // Helpers\n      static bool hasCalleeName(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C);\n      static bool isBtrfsCloseBdev(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static const VarDecl* getBaseVarDeclOfExpr(const\
+  \ Expr *E);\n      static bool isNullAssigned(SVal V, const Expr *MaybeRHS, CheckerContext\
+  \ &C);\n      static const MemberExpr* getMemberExprFrom(const Expr *E);\n     \
+  \ static StringRef getFieldNameFromFD(const FieldDecl *FD);\n      void reportImmediateUseAfterClose(const\
+  \ Stmt *UseSite, const VarDecl *VD, StringRef FieldName,\n                     \
+  \                   const Stmt *CloseSite, CheckerContext &C) const;\n      void\
+  \ reportMissingNullAtEnd(const VarDecl *VD, unsigned Mask, const Stmt *CloseSite,\n\
+  \                                  CheckerContext &C) const;\n};\n\n// Helper: check\
+  \ callee name using ExprHasName (robust against aliases/macros).\nbool SAGenTestChecker::hasCalleeName(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C) {\n  const Expr *OriginExpr\
+  \ = Call.getOriginExpr();\n  if (!OriginExpr)\n    return false;\n  return ExprHasName(OriginExpr,\
+  \ Name, C);\n}\n\nbool SAGenTestChecker::isBtrfsCloseBdev(const CallEvent &Call,\
+  \ CheckerContext &C) {\n  // Strict match per patch. Can be extended if needed.\n\
+  \  return hasCalleeName(Call, \"btrfs_close_bdev\", C);\n}\n\n// Extract the base\
+  \ VarDecl* from an expression like \"device\", \"device->field\", \"(*device).field\"\
+  , etc.\nconst VarDecl* SAGenTestChecker::getBaseVarDeclOfExpr(const Expr *E) {\n\
+  \  if (!E)\n    return nullptr;\n\n  E = E->IgnoreParenImpCasts();\n\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n\
+  \      return VD;\n    return nullptr;\n  }\n\n  if (const auto *ME = dyn_cast<MemberExpr>(E))\
+  \ {\n    return getBaseVarDeclOfExpr(ME->getBase());\n  }\n\n  if (const auto *UO\
+  \ = dyn_cast<UnaryOperator>(E)) {\n    // Handle deref like *p\n    if (UO->getOpcode()\
+  \ == UO_Deref)\n      return getBaseVarDeclOfExpr(UO->getSubExpr());\n  }\n\n  //\
+  \ Fallback: try to find a DeclRefExpr in children\n  if (const auto *InnerDRE =\
+  \ findSpecificTypeInChildren<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(InnerDRE->getDecl()))\n\
+  \      return VD;\n  }\n\n  return nullptr;\n}\n\n// Determine if an assignment\
+  \ value represents NULL/0.\nbool SAGenTestChecker::isNullAssigned(SVal V, const\
+  \ Expr *MaybeRHS, CheckerContext &C) {\n  if (V.isZeroConstant())\n    return true;\n\
+  \n  if (MaybeRHS) {\n    llvm::APSInt Res;\n    if (EvaluateExprToInt(Res, MaybeRHS,\
+  \ C)) {\n      if (Res == 0)\n        return true;\n    }\n  }\n\n  return false;\n\
+  }\n\nconst MemberExpr* SAGenTestChecker::getMemberExprFrom(const Expr *E) {\n  if\
+  \ (!E) return nullptr;\n  const Expr *I = E->IgnoreParenCasts();\n  if (const auto\
+  \ *ME = dyn_cast<MemberExpr>(I))\n    return ME;\n  return findSpecificTypeInChildren<MemberExpr>(I);\n\
+  }\n\nStringRef SAGenTestChecker::getFieldNameFromFD(const FieldDecl *FD) {\n  if\
+  \ (!FD) return StringRef();\n  return FD->getName();\n}\n\nvoid SAGenTestChecker::reportImmediateUseAfterClose(const\
+  \ Stmt *UseSite, const VarDecl *VD, StringRef FieldName,\n                     \
+  \                               const Stmt *CloseSite, CheckerContext &C) const\
+  \ {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\
+  \n  std::string Msg = (\"Use-after-free of '\" + VD->getName().str() + \"->\" +\
+  \ FieldName.str() + \"' after close\").str();\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (UseSite)\n    R->addRange(UseSite->getSourceRange());\n  if (CloseSite)\n\
+  \    R->addNote(\"Closed here\", CloseSite->getBeginLoc());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::reportMissingNullAtEnd(const VarDecl *VD, unsigned Mask,\
+  \ const Stmt *CloseSite,\n                                              CheckerContext\
+  \ &C) const {\n  if (!VD) return;\n\n  // We only report for bdev_file as per target\
+  \ patch; but also permit bdev if needed.\n  if (Mask & BIT_BDEV_FILE) {\n    ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n    if (!N)\n      return;\n\n    auto R\
+  \ = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"Member 'bdev_file' not\
+  \ set to NULL after close; may cause use-after-free\", N);\n\n    if (CloseSite)\n\
+  \      R->addNote(\"Closed here\", CloseSite->getBeginLoc());\n    C.emitReport(std::move(R));\n\
+  \  }\n}\n\n// Post-call: after calling btrfs_close_bdev(device), require both device->bdev\
+  \ and device->bdev_file to be set to NULL.\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isBtrfsCloseBdev(Call, C))\n\
+  \    return;\n\n  if (Call.getNumArgs() < 1)\n    return;\n\n  const Expr *Arg0\
+  \ = Call.getArgExpr(0);\n  const VarDecl *VD = getBaseVarDeclOfExpr(Arg0);\n  if\
+  \ (!VD)\n    return;\n\n  ProgramStateRef State = C.getState();\n  State = State->set<CloseNeedsNullMap>(VD,\
+  \ BIT_BDEV | BIT_BDEV_FILE);\n  const Stmt *Origin = Call.getOriginExpr();\n  if\
+  \ (Origin)\n    State = State->set<CloseOriginMap>(VD, Origin);\n\n  C.addTransition(State);\n\
+  }\n\n// Bind: track assignments to device->bdev and device->bdev_file and clear\
+  \ bits if assigned NULL.\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *S, CheckerContext &C) const {\n  const FieldRegion *FR = dyn_cast_or_null<FieldRegion>(Loc.getAsRegion());\n\
+  \  if (!FR)\n    return;\n\n  const FieldDecl *FD = FR->getDecl();\n  if (!FD)\n\
+  \    return;\n\n  StringRef FieldName = getFieldNameFromFD(FD);\n  if (!(FieldName\
+  \ == \"bdev\" || FieldName == \"bdev_file\"))\n    return;\n\n  const BinaryOperator\
+  \ *BO = dyn_cast_or_null<BinaryOperator>(S);\n  const Expr *RHS = BO ? BO->getRHS()\
+  \ : nullptr;\n\n  if (!isNullAssigned(Val, RHS, C))\n    return;\n\n  // Find the\
+  \ MemberExpr on the LHS to get the base VarDecl\n  const MemberExpr *ME = nullptr;\n\
+  \  if (BO) {\n    const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n    ME =\
+  \ dyn_cast<MemberExpr>(LHS);\n    if (!ME)\n      ME = findSpecificTypeInChildren<MemberExpr>(LHS);\n\
+  \  }\n  if (!ME)\n    ME = findSpecificTypeInChildren<MemberExpr>(S);\n\n  const\
+  \ VarDecl *BaseVD = nullptr;\n  if (ME)\n    BaseVD = getBaseVarDeclOfExpr(ME->getBase());\n\
+  \n  if (!BaseVD)\n    return;\n\n  ProgramStateRef State = C.getState();\n  const\
+  \ unsigned *MaskPtr = State->get<CloseNeedsNullMap>(BaseVD);\n  if (!MaskPtr)\n\
+  \    return;\n\n  unsigned Mask = *MaskPtr;\n  bool Changed = false;\n\n  if (FieldName\
+  \ == \"bdev\" && (Mask & BIT_BDEV)) {\n    Mask &= ~BIT_BDEV;\n    Changed = true;\n\
+  \  } else if (FieldName == \"bdev_file\" && (Mask & BIT_BDEV_FILE)) {\n    Mask\
+  \ &= ~BIT_BDEV_FILE;\n    Changed = true;\n  }\n\n  if (!Changed)\n    return;\n\
+  \n  if (Mask == 0) {\n    State = State->remove<CloseNeedsNullMap>(BaseVD);\n  \
+  \  State = State->remove<CloseOriginMap>(BaseVD);\n  } else {\n    State = State->set<CloseNeedsNullMap>(BaseVD,\
+  \ Mask);\n  }\n\n  C.addTransition(State);\n}\n\n// Pre-call: flag immediate uses\
+  \ of device->bdev_file (e.g., fput(device->bdev_file)) after close without NULL\
+  \ reset.\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  // Only handle fput(ptr) here as a definite dereference use.\n\
+  \  if (!hasCalleeName(Call, \"fput\", C))\n    return;\n\n  if (Call.getNumArgs()\
+  \ < 1)\n    return;\n\n  const Expr *Arg0 = Call.getArgExpr(0);\n  const MemberExpr\
+  \ *ME = getMemberExprFrom(Arg0);\n  if (!ME)\n    return;\n\n  const FieldDecl *FD\
+  \ = dyn_cast<FieldDecl>(ME->getMemberDecl());\n  if (!FD)\n    return;\n\n  StringRef\
+  \ FieldName = getFieldNameFromFD(FD);\n  if (FieldName != \"bdev_file\")\n    return;\n\
+  \n  const VarDecl *BaseVD = getBaseVarDeclOfExpr(ME->getBase());\n  if (!BaseVD)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  const unsigned *MaskPtr\
+  \ = State->get<CloseNeedsNullMap>(BaseVD);\n  if (!MaskPtr)\n    return;\n\n  unsigned\
+  \ Mask = *MaskPtr;\n  if (Mask & BIT_BDEV_FILE) {\n    const Stmt *CloseSite = State->get<CloseOriginMap>(BaseVD);\n\
+  \    reportImmediateUseAfterClose(Call.getOriginExpr(), BaseVD, FieldName, CloseSite,\
+  \ C);\n  }\n}\n\n// When 'if (device->bdev_file) ...' appears after close without\
+  \ NULL reset, warn about using freed pointer as flag.\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  const Expr *CondE = dyn_cast<Expr>(Condition);\n\
+  \  if (!CondE)\n    return;\n\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(CondE);\n\
+  \  if (!ME)\n    return;\n\n  const FieldDecl *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FD)\n    return;\n\n  StringRef FieldName = getFieldNameFromFD(FD);\n  if\
+  \ (FieldName != \"bdev_file\")\n    return;\n\n  const VarDecl *BaseVD = getBaseVarDeclOfExpr(ME->getBase());\n\
+  \  if (!BaseVD)\n    return;\n\n  ProgramStateRef State = C.getState();\n  const\
+  \ unsigned *MaskPtr = State->get<CloseNeedsNullMap>(BaseVD);\n  if (!MaskPtr)\n\
+  \    return;\n\n  unsigned Mask = *MaskPtr;\n  if (Mask & BIT_BDEV_FILE) {\n   \
+  \ const Stmt *CloseSite = State->get<CloseOriginMap>(BaseVD);\n    ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n    if (!N)\n      return;\n\n    auto R\
+  \ = std::make_unique<PathSensitiveBugReport>(\n        *BT, \"Freed 'bdev_file'\
+  \ used as open-flag after close; reset it to NULL\", N);\n    R->addRange(Condition->getSourceRange());\n\
+  \    if (CloseSite)\n      R->addNote(\"Closed here\", CloseSite->getBeginLoc());\n\
+  \    C.emitReport(std::move(R));\n  }\n}\n\n// At function end, if btrfs_close_bdev(device)\
+  \ was called but device->bdev_file wasn't set to NULL, report.\nvoid SAGenTestChecker::checkEndFunction(const\
+  \ ReturnStmt *RS, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Iterate over entries\n  auto Map = State->get<CloseNeedsNullMap>();\n  for\
+  \ (auto It = Map.begin(); It != Map.end(); ++It) {\n    const VarDecl *VD = It->first;\n\
+  \    unsigned Mask = It->second;\n\n    if (Mask & BIT_BDEV_FILE) {\n      const\
+  \ Stmt *CloseSite = State->get<CloseOriginMap>(VD);\n      reportMissingNullAtEnd(VD,\
+  \ Mask, CloseSite, C);\n    }\n  }\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects stale member pointer (e.g.,\
+  \ bdev_file) not set to NULL after close, leading to UAF\",\n      \"\");\n}\n\n\
+  extern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbtrfs: fix use-after-free of block device file in\
+  \ __btrfs_free_extra_devids()\n\nMounting btrfs from two images (which have the\
+  \ same one fsid and two\ndifferent dev_uuids) in certain executing order may trigger\
+  \ an UAF for\nvariable 'device->bdev_file' in __btrfs_free_extra_devids(). And\n\
+  following are the details:\n\n1. Attach image_1 to loop0, attach image_2 to loop1,\
+  \ and scan btrfs\n   devices by ioctl(BTRFS_IOC_SCAN_DEV):\n\n             /  btrfs_device_1\
+  \ \u2192 loop0\n   fs_device\n             \\  btrfs_device_2 \u2192 loop1\n2. mount\
+  \ /dev/loop0 /mnt\n   btrfs_open_devices\n    btrfs_device_1->bdev_file = btrfs_get_bdev_and_sb(loop0)\n\
+  \    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n   btrfs_fill_super\n\
+  \    open_ctree\n     fail: btrfs_close_devices // -ENOMEM\n\t    btrfs_close_bdev(btrfs_device_1)\n\
+  \             fput(btrfs_device_1->bdev_file)\n\t      // btrfs_device_1->bdev_file\
+  \ is freed\n\t    btrfs_close_bdev(btrfs_device_2)\n             fput(btrfs_device_2->bdev_file)\n\
+  \n3. mount /dev/loop1 /mnt\n   btrfs_open_devices\n    btrfs_get_bdev_and_sb(&bdev_file)\n\
+  \     // EIO, btrfs_device_1->bdev_file is not assigned,\n     // which points to\
+  \ a freed memory area\n    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n\
+  \   btrfs_fill_super\n    open_ctree\n     btrfs_free_extra_devids\n      if (btrfs_device_1->bdev_file)\n\
+  \       fput(btrfs_device_1->bdev_file) // UAF !\n\nFix it by setting 'device->bdev_file'\
+  \ as 'NULL' after closing the\nbtrfs_device in btrfs_close_one_device().\n\nFixes:\
+  \ 142388194191 (\"btrfs: do not background blkdev_put()\")\nCC: stable@vger.kernel.org\
+  \ # 4.19+\nLink: https://bugzilla.kernel.org/show_bug.cgi?id=219408\nSigned-off-by:\
+  \ Zhihao Cheng <chengzhihao1@huawei.com>\nReviewed-by: David Sterba <dsterba@suse.com>\n\
+  Signed-off-by: David Sterba <dsterba@suse.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ btrfs_close_one_device in fs/btrfs/volumes.c\nstatic void btrfs_close_one_device(struct\
+  \ btrfs_device *device)\n{\n\tstruct btrfs_fs_devices *fs_devices = device->fs_devices;\n\
+  \n\tif (test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) &&\n\t    device->devid\
+  \ != BTRFS_DEV_REPLACE_DEVID) {\n\t\tlist_del_init(&device->dev_alloc_list);\n\t\
+  \tfs_devices->rw_devices--;\n\t}\n\n\tif (device->devid == BTRFS_DEV_REPLACE_DEVID)\n\
+  \t\tclear_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);\n\n\tif (test_bit(BTRFS_DEV_STATE_MISSING,\
+  \ &device->dev_state)) {\n\t\tclear_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state);\n\
+  \t\tfs_devices->missing_devices--;\n\t}\n\n\tbtrfs_close_bdev(device);\n\tif (device->bdev)\
+  \ {\n\t\tfs_devices->open_devices--;\n\t\tdevice->bdev = NULL;\n\t}\n\tclear_bit(BTRFS_DEV_STATE_WRITEABLE,\
+  \ &device->dev_state);\n\tbtrfs_destroy_dev_zone_info(device);\n\n\tdevice->fs_info\
+  \ = NULL;\n\tatomic_set(&device->dev_stats_ccnt, 0);\n\textent_io_tree_release(&device->alloc_state);\n\
+  \n\t/*\n\t * Reset the flush error record. We might have a transient flush error\n\
+  \t * in this mount, and if so we aborted the current transaction and set\n\t * the\
+  \ fs to an error state, guaranteeing no super blocks can be further\n\t * committed.\
+  \ However that error might be transient and if we unmount the\n\t * filesystem and\
+  \ mount it again, we should allow the mount to succeed\n\t * (btrfs_check_rw_degradable()\
+  \ should not fail) - if after mounting the\n\t * filesystem again we still get flush\
+  \ errors, then we will again abort\n\t * any transaction and set the error state,\
+  \ guaranteeing no commits of\n\t * unsafe super blocks.\n\t */\n\tdevice->last_flush_error\
+  \ = 0;\n\n\t/* Verify the device is back in a pristine state  */\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_FLUSH_SENT,\
+  \ &device->dev_state));\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state));\n\
+  \tWARN_ON(!list_empty(&device->dev_alloc_list));\n\tWARN_ON(!list_empty(&device->post_commit_list));\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c\n\
+  index 8f340ad1d938..eb51b609190f 100644\n--- a/fs/btrfs/volumes.c\n+++ b/fs/btrfs/volumes.c\n\
+  @@ -1105,6 +1105,7 @@ static void btrfs_close_one_device(struct btrfs_device *device)\n\
+  \ \tif (device->bdev) {\n \t\tfs_devices->open_devices--;\n \t\tdevice->bdev = NULL;\n\
+  +\t\tdevice->bdev_file = NULL;\n \t}\n \tclear_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state);\n\
+  \ \tbtrfs_destroy_dev_zone_info(device);\n```\n"
+pattern: "## Bug Pattern\n\nA structure member pointer is used as a \u201Cis-open\u201D\
+  \ flag but is not reset to NULL after the object is released. Specifically, after\
+  \ calling a close/put routine that frees the underlying file (fput(device->bdev_file)),\
+  \ the code only clears device->bdev and forgets to clear device->bdev_file. Later\
+  \ code checks \u201Cif (device->bdev_file) fput(device->bdev_file)\u201D and uses\
+  \ the stale, freed pointer, causing a use-after-free."
+plan: "Plan\n\n1. Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(CloseNeedsNullMap,\
+  \ const VarDecl*, unsigned)\n  - Key: the VarDecl* of the struct pointer variable\
+  \ that is closed (e.g., \u201Cdevice\u201D in btrfs_close_one_device).\n  - Value:\
+  \ a 2-bit mask indicating which members must be set to NULL after close:\n    -\
+  \ BIT_BDEV = 0x1\n    - BIT_BDEV_FILE = 0x2\n- REGISTER_MAP_WITH_PROGRAMSTATE(CloseOriginMap,\
+  \ const VarDecl*, const Stmt*)\n  - Records the Stmt* where the \u201Cclose\u201D\
+  \ was observed, to anchor diagnostics.\n\nRationale: We only need to track, within\
+  \ the same function, which struct pointer variables were passed to a specific close\
+  \ API and which of their members must be NULLed afterward. Tracking by VarDecl is\
+  \ the simplest and robust enough for this pattern (no heavy aliasing needed for\
+  \ this case).\n\n2. Helper utilities\n- bool isBtrfsCloseBdev(const CallEvent &Call):\n\
+  \  - Return true if callee name equals \"btrfs_close_bdev\" (or contains \"close_bdev\"\
+  \ if you want a slightly broader match).\n- const VarDecl* getBaseVarDeclOfExpr(const\
+  \ Expr *E):\n  - If E is DeclRefExpr, return E->getDecl() as VarDecl if applicable.\n\
+  \  - Else if E is MemberExpr with isArrow(), check ME->getBase()->IgnoreParenImpCasts().\
+  \ If it\u2019s a DeclRefExpr, return the VarDecl.\n  - Else, attempt findSpecificTypeInChildren<DeclRefExpr>(E)\
+  \ and return the VarDecl from it.\n  - Return nullptr if not found.\n- bool isNullSVal(SVal\
+  \ V):\n  - Return true if V is a DefinedOrUnknownSVal and represents a null/zero\
+  \ constant. If not obvious from SVal, in checkBind use the assignment stmt\u2019\
+  s RHS and EvaluateExprToInt to see whether it is 0.\n- Optional: StringRef getFieldNameFromMemberStmt(const\
+  \ Stmt *S):\n  - Use findSpecificTypeInChildren<MemberExpr>(S) to find the LHS member\
+  \ in an assignment, then return FieldDecl->getNameAsString().\n\n3. checkPostCall\n\
+  - Purpose: mark that after calling the close routine on a struct pointer, specific\
+  \ members must be set to NULL.\n- Steps:\n  - If !isBtrfsCloseBdev(Call), return.\n\
+  \  - Extract argument 0 expression (the closed object).\n  - Get VarDecl* VD = getBaseVarDeclOfExpr(Arg0Expr).\
+  \ If nullptr, return (we only handle simple cases).\n  - State = State->set<CloseNeedsNullMap>(VD,\
+  \ BIT_BDEV | BIT_BDEV_FILE).\n  - State = State->set<CloseOriginMap>(VD, Call.getOriginExpr()\
+  \ or Call.getStmt()).\n  - C.addTransition(State).\n\n4. checkBind\n- Purpose: detect\
+  \ assignments that set the relevant members to NULL, and clear the corresponding\
+  \ bits.\n- Trigger: Called when a value is bound to a location (i.e., an assignment\
+  \ or initialization).\n- Steps:\n  - Extract the bound location region: if it is\
+  \ a FieldRegion, get the FieldDecl* FD and the parent/base expression from the Stmt:\n\
+  \    - Retrieve the assignment statement (BinaryOperator) or the enclosing Stmt\
+  \ via findSpecificTypeInChildren<MemberExpr>(S). Let ME be the member on the LHS.\n\
+  \    - Field name: FD->getNameAsString() (from ME->getMemberDecl()).\n    - Base\
+  \ VarDecl: getBaseVarDeclOfExpr(ME->getBase()).\n  - If Base VarDecl is tracked\
+  \ in CloseNeedsNullMap:\n    - Determine if the assigned value is NULL:\n      -\
+  \ Prefer checking SVal Val via isNullSVal(Val).\n      - If inconclusive, and if\
+  \ Stmt is BinaryOperator BO, try EvaluateExprToInt on BO->getRHS(); 0 means NULL.\n\
+  \    - If assigned to NULL and field name is \"bdev\", clear BIT_BDEV.\n    - If\
+  \ assigned to NULL and field name is \"bdev_file\", clear BIT_BDEV_FILE.\n    -\
+  \ If both bits get cleared, erase VD from CloseNeedsNullMap (also from CloseOriginMap).\n\
+  \    - C.addTransition with updated state if changed.\n\n5. checkPreCall\n- Purpose:\
+  \ early detection of immediate UAF-like use after close (if in the same function),\
+  \ e.g., calling fput on a released member pointer that was not reset to NULL or\
+  \ using it as a param to functions known to deref pointers.\n- Steps:\n  - If callee\
+  \ name equals \"fput\":\n    - Get argument 0 expression and see if it is a MemberExpr.\
+  \ If so get:\n      - Field name and base VarDecl.\n    - If base VarDecl is in\
+  \ CloseNeedsNullMap and field name is \"bdev_file\", and BIT_BDEV_FILE is still\
+  \ set:\n      - Report: \u201CUse-after-free: \u2018<var>->bdev_file\u2019 freed\
+  \ by close, not reset to NULL.\u201D\n      - Create error node via generateNonFatalErrorNode\
+  \ and emit a PathSensitiveBugReport, range at the fput argument, with a note pointing\
+  \ to the close site (from CloseOriginMap if present).\n  - Optional: use functionKnownToDeref(Call,\
+  \ ...) to flag any known deref call on the tracked released field (\u201Cbdev_file\u201D\
+  ) and report similarly.\n\n6. checkBranchCondition\n- Purpose: flag use of the freed\
+  \ member pointer as an \u201Cis-open\u201D flag after it was closed and not nulled.\n\
+  - Steps:\n  - Get the Condition Stmt.\n  - Find a MemberExpr inside via findSpecificTypeInChildren<MemberExpr>(Condition).\n\
+  \  - If that MemberExpr\u2019s field name is \"bdev_file\" and its base VarDecl\
+  \ is tracked with BIT_BDEV_FILE still set:\n    - Emit a warning: \u201CFreed member\
+  \ \u2018bdev_file\u2019 used as open-flag after close; reset it to NULL.\u201D\n\
+  \n7. checkEndFunction\n- Purpose: report missing NULL reset at the end of the function\
+  \ if a close happened but a required member remained non-NULL.\n- Steps:\n  - Iterate\
+  \ CloseNeedsNullMap entries.\n  - For each VD with BIT_BDEV_FILE still set:\n  \
+  \  - Emit a bug report at function end (or better, anchored at CloseOriginMap[VD]\
+  \ if present) with message like:\n      - \u201CMember \u2018bdev_file\u2019 not\
+  \ set to NULL after close; stale pointer may be used, causing UAF.\u201D\n  - Clear\
+  \ the maps for next function automatically by state destruction.\n\n8. Reporting\
+  \ details\n- Use a single BugType, e.g., \u201CStale member pointer after close\u201D\
+  .\n- Reports:\n  - Immediate UAF on fput: short message \u201CUse-after-free of\
+  \ \u2018<var>->bdev_file\u2019 after close.\u201D\n  - Use as a flag in condition:\
+  \ \u201CFreed \u2018bdev_file\u2019 used as open-flag after close.\u201D\n  - Missing\
+  \ nullification at function end: \u201CMember \u2018bdev_file\u2019 not set to NULL\
+  \ after close.\u201D\n- Create PathSensitiveBugReport via std::make_unique<PathSensitiveBugReport>\
+  \ with generateNonFatalErrorNode.\n- Where possible, highlight:\n  - The close call\
+  \ site (from CloseOriginMap).\n  - The assignment to \u2018bdev\u2019 (optional\
+  \ note) if it was cleared while \u2018bdev_file\u2019 remained uncleared, to guide\
+  \ the fix.\n\nNotes and simplifications\n- Scope: The checker targets the concrete\
+  \ pattern in btrfs_close_one_device: after calling btrfs_close_bdev(device), both\
+  \ device->bdev and device->bdev_file are invalidated; clearing only device->bdev\
+  \ and forgetting device->bdev_file is a bug.\n- Aliasing: For simplicity, the plan\
+  \ tracks the VarDecl* of the argument passed to close. This is sufficient in the\
+  \ typical kernel style where the parameter name (device) is used throughout the\
+  \ function. If aliasing is present, this plan can be extended with a PtrAliasMap\
+  \ like REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const VarDecl*, llvm::SmallPtrSet<const\
+  \ VarDecl*, 4>) and checkBind to propagate alias relationships\u2014but it\u2019\
+  s not necessary for this specific pattern and patch.\n- Field detection relies on\
+  \ MemberExpr LHS in assignments and MemberExpr in branch conditions, which matches\
+  \ kernel C style code using -> operator.\n- Utility functions used:\n  - findSpecificTypeInChildren\
+  \ to retrieve MemberExpr or BinaryOperator from the current statement.\n  - EvaluateExprToInt\
+  \ for robust detection of RHS being 0/NULL.\n  - functionKnownToDeref to optionally\
+  \ flag dereferencing calls beyond fput."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include <memory>\n\
+  #include <string>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program state to track which struct variable needs members to be\
+  \ NULLed after close.\nREGISTER_MAP_WITH_PROGRAMSTATE(CloseNeedsNullMap, const VarDecl*,\
+  \ unsigned)\n// Program state to remember where the close was observed (for diagnostics).\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(CloseOriginMap, const VarDecl*, const Stmt*)\n\n\
+  namespace {\n\nstatic constexpr unsigned BIT_BDEV = 0x1;\nstatic constexpr unsigned\
+  \ BIT_BDEV_FILE = 0x2;\n\nclass SAGenTestChecker\n  : public Checker<\n        check::PostCall,\n\
+  \        check::Bind,\n        check::PreCall,\n        check::BranchCondition,\n\
+  \        check::EndFunction> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Stale member pointer after close\"\
+  , \"Memory Safety\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n      void checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const;\n      void checkEndFunction(const ReturnStmt *RS, CheckerContext &C)\
+  \ const;\n\n   private:\n      // Helpers\n      static bool hasCalleeName(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C);\n      static bool isBtrfsCloseBdev(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static const VarDecl* getBaseVarDeclOfExpr(const\
+  \ Expr *E);\n      static bool isNullAssigned(SVal V, const Expr *MaybeRHS, CheckerContext\
+  \ &C);\n      static const MemberExpr* getMemberExprFrom(const Expr *E);\n     \
+  \ static StringRef getFieldNameFromFD(const FieldDecl *FD);\n      void reportImmediateUseAfterClose(const\
+  \ Stmt *UseSite, const VarDecl *VD, StringRef FieldName,\n                     \
+  \                   const Stmt *CloseSite, CheckerContext &C) const;\n      void\
+  \ reportMissingNullAtEnd(const VarDecl *VD, unsigned Mask, const Stmt *CloseSite,\n\
+  \                                  CheckerContext &C) const;\n};\n\n// Helper: check\
+  \ callee name using ExprHasName (robust against aliases/macros).\nbool SAGenTestChecker::hasCalleeName(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C) {\n  const Expr *OriginExpr\
+  \ = Call.getOriginExpr();\n  if (!OriginExpr)\n    return false;\n  return ExprHasName(OriginExpr,\
+  \ Name, C);\n}\n\nbool SAGenTestChecker::isBtrfsCloseBdev(const CallEvent &Call,\
+  \ CheckerContext &C) {\n  // Strict match per patch. Can be extended if needed.\n\
+  \  return hasCalleeName(Call, \"btrfs_close_bdev\", C);\n}\n\n// Extract the base\
+  \ VarDecl* from an expression like \"device\", \"device->field\", \"(*device).field\"\
+  , etc.\nconst VarDecl* SAGenTestChecker::getBaseVarDeclOfExpr(const Expr *E) {\n\
+  \  if (!E)\n    return nullptr;\n\n  E = E->IgnoreParenImpCasts();\n\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n\
+  \      return VD;\n    return nullptr;\n  }\n\n  if (const auto *ME = dyn_cast<MemberExpr>(E))\
+  \ {\n    return getBaseVarDeclOfExpr(ME->getBase());\n  }\n\n  if (const auto *UO\
+  \ = dyn_cast<UnaryOperator>(E)) {\n    // Handle deref like *p\n    if (UO->getOpcode()\
+  \ == UO_Deref)\n      return getBaseVarDeclOfExpr(UO->getSubExpr());\n  }\n\n  //\
+  \ Fallback: try to find a DeclRefExpr in children\n  if (const auto *InnerDRE =\
+  \ findSpecificTypeInChildren<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(InnerDRE->getDecl()))\n\
+  \      return VD;\n  }\n\n  return nullptr;\n}\n\n// Determine if an assignment\
+  \ value represents NULL/0.\nbool SAGenTestChecker::isNullAssigned(SVal V, const\
+  \ Expr *MaybeRHS, CheckerContext &C) {\n  if (V.isZeroConstant())\n    return true;\n\
+  \n  if (MaybeRHS) {\n    llvm::APSInt Res;\n    if (EvaluateExprToInt(Res, MaybeRHS,\
+  \ C)) {\n      if (Res == 0)\n        return true;\n    }\n  }\n\n  return false;\n\
+  }\n\nconst MemberExpr* SAGenTestChecker::getMemberExprFrom(const Expr *E) {\n  if\
+  \ (!E) return nullptr;\n  const Expr *I = E->IgnoreParenCasts();\n  if (const auto\
+  \ *ME = dyn_cast<MemberExpr>(I))\n    return ME;\n  return findSpecificTypeInChildren<MemberExpr>(I);\n\
+  }\n\nStringRef SAGenTestChecker::getFieldNameFromFD(const FieldDecl *FD) {\n  if\
+  \ (!FD) return StringRef();\n  return FD->getName();\n}\n\nvoid SAGenTestChecker::reportImmediateUseAfterClose(const\
+  \ Stmt *UseSite, const VarDecl *VD, StringRef FieldName,\n                     \
+  \                               const Stmt *CloseSite, CheckerContext &C) const\
+  \ {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\
+  \n  std::string Msg = std::string(\"Use-after-free of '\") + VD->getName().str()\
+  \ + \"->\" +\n                    FieldName.str() + \"' after close\";\n  auto R\
+  \ = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);\n  if (UseSite)\n   \
+  \ R->addRange(UseSite->getSourceRange());\n  // Note with explicit location is omitted\
+  \ to avoid unavailable PathDiagnostic headers.\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::reportMissingNullAtEnd(const VarDecl *VD, unsigned Mask,\
+  \ const Stmt *CloseSite,\n                                              CheckerContext\
+  \ &C) const {\n  if (!VD) return;\n\n  // We only report for bdev_file as per target\
+  \ patch; but also permit bdev if needed.\n  if (Mask & BIT_BDEV_FILE) {\n    ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n    if (!N)\n      return;\n\n    auto R\
+  \ = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"Member 'bdev_file' not\
+  \ set to NULL after close; may cause use-after-free\", N);\n\n    // Note with explicit\
+  \ location is omitted to avoid unavailable PathDiagnostic headers.\n    C.emitReport(std::move(R));\n\
+  \  }\n}\n\n// Post-call: after calling btrfs_close_bdev(device), require both device->bdev\
+  \ and device->bdev_file to be set to NULL.\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isBtrfsCloseBdev(Call, C))\n\
+  \    return;\n\n  if (Call.getNumArgs() < 1)\n    return;\n\n  const Expr *Arg0\
+  \ = Call.getArgExpr(0);\n  const VarDecl *VD = getBaseVarDeclOfExpr(Arg0);\n  if\
+  \ (!VD)\n    return;\n\n  ProgramStateRef State = C.getState();\n  State = State->set<CloseNeedsNullMap>(VD,\
+  \ BIT_BDEV | BIT_BDEV_FILE);\n  const Stmt *Origin = Call.getOriginExpr();\n  if\
+  \ (Origin)\n    State = State->set<CloseOriginMap>(VD, Origin);\n\n  C.addTransition(State);\n\
+  }\n\n// Bind: track assignments to device->bdev and device->bdev_file and clear\
+  \ bits if assigned NULL.\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *S, CheckerContext &C) const {\n  const FieldRegion *FR = dyn_cast_or_null<FieldRegion>(Loc.getAsRegion());\n\
+  \  if (!FR)\n    return;\n\n  const FieldDecl *FD = FR->getDecl();\n  if (!FD)\n\
+  \    return;\n\n  StringRef FieldName = getFieldNameFromFD(FD);\n  if (!(FieldName\
+  \ == \"bdev\" || FieldName == \"bdev_file\"))\n    return;\n\n  const BinaryOperator\
+  \ *BO = dyn_cast_or_null<BinaryOperator>(S);\n  const Expr *RHS = BO ? BO->getRHS()\
+  \ : nullptr;\n\n  if (!isNullAssigned(Val, RHS, C))\n    return;\n\n  // Find the\
+  \ MemberExpr on the LHS to get the base VarDecl\n  const MemberExpr *ME = nullptr;\n\
+  \  if (BO) {\n    const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n    ME =\
+  \ dyn_cast<MemberExpr>(LHS);\n    if (!ME)\n      ME = findSpecificTypeInChildren<MemberExpr>(LHS);\n\
+  \  }\n  if (!ME)\n    ME = findSpecificTypeInChildren<MemberExpr>(S);\n\n  const\
+  \ VarDecl *BaseVD = nullptr;\n  if (ME)\n    BaseVD = getBaseVarDeclOfExpr(ME->getBase());\n\
+  \n  if (!BaseVD)\n    return;\n\n  ProgramStateRef State = C.getState();\n  const\
+  \ unsigned *MaskPtr = State->get<CloseNeedsNullMap>(BaseVD);\n  if (!MaskPtr)\n\
+  \    return;\n\n  unsigned Mask = *MaskPtr;\n  bool Changed = false;\n\n  if (FieldName\
+  \ == \"bdev\" && (Mask & BIT_BDEV)) {\n    Mask &= ~BIT_BDEV;\n    Changed = true;\n\
+  \  } else if (FieldName == \"bdev_file\" && (Mask & BIT_BDEV_FILE)) {\n    Mask\
+  \ &= ~BIT_BDEV_FILE;\n    Changed = true;\n  }\n\n  if (!Changed)\n    return;\n\
+  \n  if (Mask == 0) {\n    State = State->remove<CloseNeedsNullMap>(BaseVD);\n  \
+  \  State = State->remove<CloseOriginMap>(BaseVD);\n  } else {\n    State = State->set<CloseNeedsNullMap>(BaseVD,\
+  \ Mask);\n  }\n\n  C.addTransition(State);\n}\n\n// Pre-call: flag immediate uses\
+  \ of device->bdev_file (e.g., fput(device->bdev_file)) after close without NULL\
+  \ reset.\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  // Only handle fput(ptr) here as a definite dereference use.\n\
+  \  if (!hasCalleeName(Call, \"fput\", C))\n    return;\n\n  if (Call.getNumArgs()\
+  \ < 1)\n    return;\n\n  const Expr *Arg0 = Call.getArgExpr(0);\n  const MemberExpr\
+  \ *ME = getMemberExprFrom(Arg0);\n  if (!ME)\n    return;\n\n  const FieldDecl *FD\
+  \ = dyn_cast<FieldDecl>(ME->getMemberDecl());\n  if (!FD)\n    return;\n\n  StringRef\
+  \ FieldName = getFieldNameFromFD(FD);\n  if (FieldName != \"bdev_file\")\n    return;\n\
+  \n  const VarDecl *BaseVD = getBaseVarDeclOfExpr(ME->getBase());\n  if (!BaseVD)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  const unsigned *MaskPtr\
+  \ = State->get<CloseNeedsNullMap>(BaseVD);\n  if (!MaskPtr)\n    return;\n\n  unsigned\
+  \ Mask = *MaskPtr;\n  if (Mask & BIT_BDEV_FILE) {\n    const Stmt *const *CloseSitePtr\
+  \ = State->get<CloseOriginMap>(BaseVD);\n    const Stmt *CloseSite = CloseSitePtr\
+  \ ? *CloseSitePtr : nullptr;\n    (void)CloseSite; // CloseSite kept for potential\
+  \ future diagnostics.\n    reportImmediateUseAfterClose(Call.getOriginExpr(), BaseVD,\
+  \ FieldName, CloseSite, C);\n  }\n}\n\n// When 'if (device->bdev_file) ...' appears\
+  \ after close without NULL reset, warn about using freed pointer as flag.\nvoid\
+  \ SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C)\
+  \ const {\n  const Expr *CondE = dyn_cast<Expr>(Condition);\n  if (!CondE)\n   \
+  \ return;\n\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(CondE);\n\
+  \  if (!ME)\n    return;\n\n  const FieldDecl *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FD)\n    return;\n\n  StringRef FieldName = getFieldNameFromFD(FD);\n  if\
+  \ (FieldName != \"bdev_file\")\n    return;\n\n  const VarDecl *BaseVD = getBaseVarDeclOfExpr(ME->getBase());\n\
+  \  if (!BaseVD)\n    return;\n\n  ProgramStateRef State = C.getState();\n  const\
+  \ unsigned *MaskPtr = State->get<CloseNeedsNullMap>(BaseVD);\n  if (!MaskPtr)\n\
+  \    return;\n\n  unsigned Mask = *MaskPtr;\n  if (Mask & BIT_BDEV_FILE) {\n   \
+  \ const Stmt *const *CloseSitePtr = State->get<CloseOriginMap>(BaseVD);\n    const\
+  \ Stmt *CloseSite = CloseSitePtr ? *CloseSitePtr : nullptr;\n    (void)CloseSite;\
+  \ // CloseSite kept for potential future diagnostics.\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    if (!N)\n      return;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \        *BT, \"Freed 'bdev_file' used as open-flag after close; reset it to NULL\"\
+  , N);\n    R->addRange(Condition->getSourceRange());\n    C.emitReport(std::move(R));\n\
+  \  }\n}\n\n// At function end, if btrfs_close_bdev(device) was called but device->bdev_file\
+  \ wasn't set to NULL, report.\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt\
+  \ *RS, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\n \
+  \ // Iterate over entries\n  auto Map = State->get<CloseNeedsNullMap>();\n  for\
+  \ (auto It = Map.begin(); It != Map.end(); ++It) {\n    const VarDecl *VD = It->first;\n\
+  \    unsigned Mask = It->second;\n\n    if (Mask & BIT_BDEV_FILE) {\n      const\
+  \ Stmt *const *CloseSitePtr = State->get<CloseOriginMap>(VD);\n      const Stmt\
+  \ *CloseSite = CloseSitePtr ? *CloseSitePtr : nullptr;\n      reportMissingNullAtEnd(VD,\
+  \ Mask, CloseSite, C);\n    }\n  }\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects stale member pointer (e.g.,\
+  \ bdev_file) not set to NULL after close, leading to UAF\",\n      \"\");\n}\n\n\
+  extern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

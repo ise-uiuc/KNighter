@@ -1,0 +1,437 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 51df947678360faf1967fe0bd1a40c681f634104
+commit_type: Memory-Leak
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"\
+  clang/AST/Expr.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program state maps\n// Tracks the pointer region that owns an allocated\
+  \ net_device in current loop iteration.\nREGISTER_MAP_WITH_PROGRAMSTATE(PendingNetdevMap,\
+  \ const MemRegion*, const Stmt*)\n// Tracks the loop statement where the allocation\
+  \ happened (For/While/Do).\nREGISTER_MAP_WITH_PROGRAMSTATE(NetdevLoopMap, const\
+  \ MemRegion*, const Stmt*)\n// Pointer aliasing: dest region -> source region.\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)\n\
+  \nnamespace {\n\n// Simple visitor to collect all CallExpr inside a statement subtree.\n\
+  struct CallCollectorVisitor : public RecursiveASTVisitor<CallCollectorVisitor> {\n\
+  \  SmallVector<const CallExpr*, 16> Calls;\n  bool VisitCallExpr(const CallExpr\
+  \ *CE) {\n    Calls.push_back(CE);\n    return true;\n  }\n};\n\n// Simple visitor\
+  \ to collect all GotoStmt inside a statement subtree.\nstruct GotoCollectorVisitor\
+  \ : public RecursiveASTVisitor<GotoCollectorVisitor> {\n  SmallVector<const GotoStmt*,\
+  \ 8> Gotos;\n  bool VisitGotoStmt(const GotoStmt *GS) {\n    Gotos.push_back(GS);\n\
+  \    return true;\n  }\n};\n\nclass SAGenTestChecker\n  : public Checker<\n    \
+  \    check::BeginFunction,\n        check::Bind,\n        check::PostCall,\n   \
+  \     check::BranchCondition> {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n\
+  \  SAGenTestChecker()\n      : BT(new BugType(this, \"Resource leak in loop iteration\
+  \ (net_device)\",\n                       \"Memory Management\")) {}\n\n  void checkBeginFunction(CheckerContext\
+  \ &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext\
+  \ &C) const;\n  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\n\
+  private:\n  // Helpers\n  static bool isAllocNetdevCall(const Expr *E, CheckerContext\
+  \ &C);\n  static bool isExitLikeLabel(const LabelDecl *LD);\n  static const Stmt*\
+  \ findEnclosingLoop(const Stmt *S, CheckerContext &C);\n\n  static const MemRegion*\
+  \ canonicalizeRegion(ProgramStateRef State,\n                                  \
+  \           const MemRegion *R) {\n    if (!R) return nullptr;\n    R = R->getBaseRegion();\n\
+  \    // Follow aliases a few steps to reach the original source.\n    for (int i\
+  \ = 0; i < 8 && R; ++i) {\n      if (const MemRegion *R2 = State->get<PtrAliasMap>(R))\n\
+  \        R = R2->getBaseRegion();\n      else\n        break;\n    }\n    return\
+  \ R;\n  }\n\n  static bool thenContainsFreeOfRegion(const Stmt *Then, ProgramStateRef\
+  \ State,\n                                       const MemRegion *TargetR,\n   \
+  \                                    CheckerContext &C) {\n    if (!Then || !TargetR)\n\
+  \      return false;\n\n    const MemRegion *CanonTarget = canonicalizeRegion(State,\
+  \ TargetR);\n    if (!CanonTarget)\n      return false;\n\n    CallCollectorVisitor\
+  \ V;\n    // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall)\n    const_cast<Stmt*>(Then)->walk(V);\n\
+  \    for (const CallExpr *CE : V.Calls) {\n      if (!CE) continue;\n      if (!ExprHasName(CE,\
+  \ \"free_netdev\", C))\n        continue;\n      if (CE->getNumArgs() < 1)\n   \
+  \     continue;\n      const Expr *Arg0 = CE->getArg(0);\n      if (!Arg0) continue;\n\
+  \      const MemRegion *ArgR = getMemRegionFromExpr(Arg0, C);\n      if (!ArgR)\
+  \ continue;\n      ArgR = ArgR->getBaseRegion();\n      ArgR = canonicalizeRegion(State,\
+  \ ArgR);\n      if (ArgR && ArgR == CanonTarget)\n        return true;\n    }\n\
+  \    return false;\n  }\n\n  void erasePendingFor(ProgramStateRef &State, const\
+  \ MemRegion *R) const {\n    if (!R) return;\n    R = R->getBaseRegion();\n    State\
+  \ = State->remove<PendingNetdevMap>(R);\n    State = State->remove<NetdevLoopMap>(R);\n\
+  \    // Optional: could clear aliases for R as a key\n    if (const auto *AM = State->get<PtrAliasMap>())\
+  \ {\n      for (auto It = AM->begin(), E = AM->end(); It != E; ++It) {\n       \
+  \ if (It->first == R) {\n          State = State->remove<PtrAliasMap>(It->first);\n\
+  \        }\n      }\n    }\n  }\n};\n\nvoid SAGenTestChecker::checkBeginFunction(CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Clear all maps to\
+  \ avoid cross-function bleed.\n  if (const auto *PM = State->get<PendingNetdevMap>())\
+  \ {\n    for (auto I = PM->begin(), E = PM->end(); I != E; ++I) {\n      State =\
+  \ State->remove<PendingNetdevMap>(I->first);\n    }\n  }\n  if (const auto *LM =\
+  \ State->get<NetdevLoopMap>()) {\n    for (auto I = LM->begin(), E = LM->end();\
+  \ I != E; ++I) {\n      State = State->remove<NetdevLoopMap>(I->first);\n    }\n\
+  \  }\n  if (const auto *AM = State->get<PtrAliasMap>()) {\n    for (auto I = AM->begin(),\
+  \ E = AM->end(); I != E; ++I) {\n      State = State->remove<PtrAliasMap>(I->first);\n\
+  \    }\n  }\n\n  C.addTransition(State);\n}\n\nstatic bool isPointerLikeRegion(const\
+  \ MemRegion *R) {\n  if (!R) return false;\n  // We don't strictly need to check\
+  \ type; alias map can accept any region keys.\n  // Keep it permissive.\n  return\
+  \ true;\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,\n\
+  \                                 CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  bool Changed = false;\n\n  const MemRegion *DstR = Loc.getAsRegion();\n\
+  \  if (DstR) DstR = DstR->getBaseRegion();\n\n  // Track aliasing: DstR = ValRegion;\n\
+  \  if (DstR && isPointerLikeRegion(DstR)) {\n    if (const MemRegion *SrcR = Val.getAsRegion())\
+  \ {\n      SrcR = SrcR->getBaseRegion();\n      if (SrcR) {\n        State = State->set<PtrAliasMap>(DstR,\
+  \ SrcR);\n        Changed = true;\n      }\n    }\n  }\n\n  // Detect allocation\
+  \ assignment inside a loop: ptr = alloc_etherdev/alloc_netdev...\n  if (StoreE &&\
+  \ DstR) {\n    const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(StoreE);\n\
+  \    if (CE && isAllocNetdevCall(CE, C)) {\n      // Find nearest enclosing loop\n\
+  \      const Stmt *LoopS = nullptr;\n      if (!LoopS) LoopS = findEnclosingLoop(StoreE,\
+  \ C);\n      if (LoopS) {\n        State = State->set<PendingNetdevMap>(DstR, StoreE);\n\
+  \        State = State->set<NetdevLoopMap>(DstR, LoopS);\n        Changed = true;\n\
+  \      }\n    }\n  }\n\n  if (Changed)\n    C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return;\n\n \
+  \ // If register_netdev(arg0) is called, the ownership is now transferred; stop\
+  \ tracking.\n  if (ExprHasName(Origin, \"register_netdev\", C)) {\n    if (Call.getNumArgs()\
+  \ >= 1) {\n      const Expr *Arg0 = Call.getArgExpr(0);\n      if (Arg0) {\n   \
+  \     const MemRegion *ArgR = getMemRegionFromExpr(Arg0, C);\n        if (ArgR)\
+  \ {\n          ArgR = canonicalizeRegion(State, ArgR->getBaseRegion());\n      \
+  \    if (ArgR) {\n            const Stmt **LoopPtr = State->get<NetdevLoopMap>(ArgR);\n\
+  \            const Stmt **AllocPtr = State->get<PendingNetdevMap>(ArgR);\n     \
+  \       if (LoopPtr || AllocPtr) {\n              erasePendingFor(State, ArgR);\n\
+  \              C.addTransition(State);\n            }\n          }\n        }\n\
+  \      }\n    }\n    return;\n  }\n\n  // If free_netdev(arg0) is called, remove\
+  \ from pending if tracked.\n  if (ExprHasName(Origin, \"free_netdev\", C)) {\n \
+  \   if (Call.getNumArgs() >= 1) {\n      const Expr *Arg0 = Call.getArgExpr(0);\n\
+  \      if (Arg0) {\n        const MemRegion *ArgR = getMemRegionFromExpr(Arg0, C);\n\
+  \        if (ArgR) {\n          ArgR = canonicalizeRegion(State, ArgR->getBaseRegion());\n\
+  \          if (ArgR) {\n            const Stmt **LoopPtr = State->get<NetdevLoopMap>(ArgR);\n\
+  \            const Stmt **AllocPtr = State->get<PendingNetdevMap>(ArgR);\n     \
+  \       if (LoopPtr || AllocPtr) {\n              erasePendingFor(State, ArgR);\n\
+  \              C.addTransition(State);\n            }\n          }\n        }\n\
+  \      }\n    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition)\n    return;\n\n\
+  \  // Find the IfStmt that owns this condition.\n  const IfStmt *IS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IS)\n    return;\n\n  const Stmt *Then = IS->getThen();\n  if (!Then)\n\
+  \    return;\n\n  // Does the then-branch contain a goto to an \"exit-like\" label?\n\
+  \  GotoCollectorVisitor GV;\n  // NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall)\n\
+  \  const_cast<Stmt*>(Then)->walk(GV);\n\n  bool HasExitLikeGoto = false;\n  for\
+  \ (const GotoStmt *GS : GV.Gotos) {\n    if (!GS) continue;\n    const LabelDecl\
+  \ *LD = GS->getLabel();\n    if (isExitLikeLabel(LD)) {\n      HasExitLikeGoto =\
+  \ true;\n      break;\n    }\n  }\n  if (!HasExitLikeGoto)\n    return;\n\n  //\
+  \ Find enclosing loop of this if-statement.\n  const Stmt *LoopS = findEnclosingLoop(IS,\
+  \ C);\n  if (!LoopS)\n    return;\n\n  ProgramStateRef State = C.getState();\n \
+  \ const auto *Pend = State->get<PendingNetdevMap>();\n  if (!Pend || Pend->isEmpty())\n\
+  \    return;\n\n  // For each pending netdev tied to this loop, ensure Then frees\
+  \ it before goto.\n  for (auto I = Pend->begin(), E = Pend->end(); I != E; ++I)\
+  \ {\n    const MemRegion *R = I->first;\n    if (!R) continue;\n    R = R->getBaseRegion();\n\
+  \n    const Stmt **RLoop = State->get<NetdevLoopMap>(R);\n    if (!RLoop || *RLoop\
+  \ != LoopS)\n      continue;\n\n    // Check whether Then frees the current iteration's\
+  \ net_device.\n    if (!thenContainsFreeOfRegion(Then, State, R, C)) {\n      ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n      if (!N)\n        return;\n\n      auto\
+  \ Rpt = std::make_unique<PathSensitiveBugReport>(\n          *BT, \"Missing free_netdev\
+  \ before goto exit; leaks current net_device\",\n          N);\n      // Try to\
+  \ highlight the 'then' branch range.\n      Rpt->addRange(Then->getSourceRange());\n\
+  \      C.emitReport(std::move(Rpt));\n      // Do not break; potentially multiple\
+  \ regions (though uncommon).\n    }\n  }\n}\n\n// Helper implementations\n\nbool\
+  \ SAGenTestChecker::isAllocNetdevCall(const Expr *E, CheckerContext &C) {\n  if\
+  \ (!E) return false;\n  // Recognize common Linux netdev allocation helpers.\n \
+  \ return ExprHasName(E, \"alloc_etherdev\", C) ||\n         ExprHasName(E, \"alloc_etherdev_mqs\"\
+  , C) ||\n         ExprHasName(E, \"alloc_netdev\", C) ||\n         ExprHasName(E,\
+  \ \"alloc_netdev_mqs\", C);\n}\n\nbool SAGenTestChecker::isExitLikeLabel(const LabelDecl\
+  \ *LD) {\n  if (!LD) return false;\n  StringRef Name = LD->getName();\n  if (Name.empty())\
+  \ return false;\n\n  if (Name.equals_lower(\"exit\") ||\n      Name.equals_lower(\"\
+  out\") ||\n      Name.equals_lower(\"error\"))\n    return true;\n\n  // Common\
+  \ kernel styles: err, err_X, error_X, out_X\n  if (Name.startswith_lower(\"err\"\
+  ) || Name.startswith_lower(\"error\") ||\n      Name.startswith_lower(\"out\"))\n\
+  \    return true;\n\n  return false;\n}\n\nconst Stmt* SAGenTestChecker::findEnclosingLoop(const\
+  \ Stmt *S, CheckerContext &C) {\n  if (!S) return nullptr;\n  if (const auto *FS\
+  \ = findSpecificTypeInParents<ForStmt>(S, C))\n    return FS;\n  if (const auto\
+  \ *WS = findSpecificTypeInParents<WhileStmt>(S, C))\n    return WS;\n  if (const\
+  \ auto *DS = findSpecificTypeInParents<DoStmt>(S, C))\n    return DS;\n  return\
+  \ nullptr;\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects missing free_netdev before goto exit in loops (leaks current\
+  \ iteration net_device)\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nocteontx2-pf: fix netdev memory leak in rvu_rep_create()\n\
+  \nWhen rvu_rep_devlink_port_register() fails, free_netdev(ndev) for this\nincomplete\
+  \ iteration before going to \"exit:\" label.\n\nFixes: 9ed0343f561e (\"octeontx2-pf:\
+  \ Add devlink port support\")\nReviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>\n\
+  Signed-off-by: Harshit Mogalapalli <harshit.m.mogalapalli@oracle.com>\nLink: https://patch.msgid.link/20241217052326.1086191-1-harshit.m.mogalapalli@oracle.com\n\
+  Signed-off-by: Jakub Kicinski <kuba@kernel.org>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ rvu_rep_create in drivers/net/ethernet/marvell/octeontx2/nic/rep.c\nint rvu_rep_create(struct\
+  \ otx2_nic *priv, struct netlink_ext_ack *extack)\n{\n\tint rep_cnt = priv->rep_cnt;\n\
+  \tstruct net_device *ndev;\n\tstruct rep_dev *rep;\n\tint rep_id, err;\n\tu16 pcifunc;\n\
+  \n\terr = rvu_rep_rsrc_init(priv);\n\tif (err)\n\t\treturn -ENOMEM;\n\n\tpriv->reps\
+  \ = kcalloc(rep_cnt, sizeof(struct rep_dev *), GFP_KERNEL);\n\tif (!priv->reps)\n\
+  \t\treturn -ENOMEM;\n\n\tfor (rep_id = 0; rep_id < rep_cnt; rep_id++) {\n\t\tndev\
+  \ = alloc_etherdev(sizeof(*rep));\n\t\tif (!ndev) {\n\t\t\tNL_SET_ERR_MSG_FMT_MOD(extack,\n\
+  \t\t\t\t\t       \"PFVF representor:%d creation failed\",\n\t\t\t\t\t       rep_id);\n\
+  \t\t\terr = -ENOMEM;\n\t\t\tgoto exit;\n\t\t}\n\n\t\trep = netdev_priv(ndev);\n\t\
+  \tpriv->reps[rep_id] = rep;\n\t\trep->mdev = priv;\n\t\trep->netdev = ndev;\n\t\t\
+  rep->rep_id = rep_id;\n\n\t\tndev->min_mtu = OTX2_MIN_MTU;\n\t\tndev->max_mtu =\
+  \ priv->hw.max_mtu;\n\t\tndev->netdev_ops = &rvu_rep_netdev_ops;\n\t\tpcifunc =\
+  \ priv->rep_pf_map[rep_id];\n\t\trep->pcifunc = pcifunc;\n\n\t\tsnprintf(ndev->name,\
+  \ sizeof(ndev->name), \"Rpf%dvf%d\",\n\t\t\t rvu_get_pf(pcifunc), (pcifunc & RVU_PFVF_FUNC_MASK));\n\
+  \n\t\tndev->hw_features = (NETIF_F_RXCSUM | NETIF_F_IP_CSUM |\n\t\t\t       NETIF_F_IPV6_CSUM\
+  \ | NETIF_F_RXHASH |\n\t\t\t       NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6);\n\n\
+  \t\tndev->hw_features |= NETIF_F_HW_TC;\n\t\tndev->features |= ndev->hw_features;\n\
+  \t\teth_hw_addr_random(ndev);\n\t\terr = rvu_rep_devlink_port_register(rep);\n\t\
+  \tif (err)\n\t\t\tgoto exit;\n\n\t\tSET_NETDEV_DEVLINK_PORT(ndev, &rep->dl_port);\n\
+  \t\terr = register_netdev(ndev);\n\t\tif (err) {\n\t\t\tNL_SET_ERR_MSG_MOD(extack,\n\
+  \t\t\t\t\t   \"PFVF representor registration failed\");\n\t\t\tfree_netdev(ndev);\n\
+  \t\t\tgoto exit;\n\t\t}\n\n\t\tINIT_DELAYED_WORK(&rep->stats_wrk, rvu_rep_get_stats);\n\
+  \t}\n\terr = rvu_rep_napi_init(priv, extack);\n\tif (err)\n\t\tgoto exit;\n\n\t\
+  rvu_eswitch_config(priv, true);\n\treturn 0;\nexit:\n\twhile (--rep_id >= 0) {\n\
+  \t\trep = priv->reps[rep_id];\n\t\tunregister_netdev(rep->netdev);\n\t\trvu_rep_devlink_port_unregister(rep);\n\
+  \t\tfree_netdev(rep->netdev);\n\t}\n\tkfree(priv->reps);\n\trvu_rep_rsrc_free(priv);\n\
+  \treturn err;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/net/ethernet/marvell/octeontx2/nic/rep.c\
+  \ b/drivers/net/ethernet/marvell/octeontx2/nic/rep.c\nindex 232b10740c13..9e3fcbae5dee\
+  \ 100644\n--- a/drivers/net/ethernet/marvell/octeontx2/nic/rep.c\n+++ b/drivers/net/ethernet/marvell/octeontx2/nic/rep.c\n\
+  @@ -680,8 +680,10 @@ int rvu_rep_create(struct otx2_nic *priv, struct netlink_ext_ack\
+  \ *extack)\n \t\tndev->features |= ndev->hw_features;\n \t\teth_hw_addr_random(ndev);\n\
+  \ \t\terr = rvu_rep_devlink_port_register(rep);\n-\t\tif (err)\n+\t\tif (err) {\n\
+  +\t\t\tfree_netdev(ndev);\n \t\t\tgoto exit;\n+\t\t}\n \n \t\tSET_NETDEV_DEVLINK_PORT(ndev,\
+  \ &rep->dl_port);\n \t\terr = register_netdev(ndev);\n```\n"
+pattern: '## Bug Pattern
+
+
+  In a loop that creates multiple net_devices, an error occurs after alloc_etherdev()
+  but before the device is fully registered/owned (e.g., devlink port registration
+  fails). The code jumps to a common exit handler whose cleanup loop frees only previously
+  created items using a pre-decrement index (while (--idx >= 0) ...), which skips
+  the current iteration. Because the current net_device is not explicitly freed before
+  goto exit, it leaks.'
+plan: "Plan to detect \u201Cleak of current loop iteration\u2019s net_device when\
+  \ goto exit is taken before register_netdev\u201D\n\n\n1) Program state\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(PendingNetdevMap,\
+  \ const MemRegion*, const Stmt*)\n  - Key: the MemRegion of a net_device pointer\
+  \ variable that currently owns an allocated net_device in this loop iteration.\n\
+  \  - Value: the allocation site statement (for diagnostics). Presence in this map\
+  \ means \u201Callocated and not yet registered/freed.\u201D\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(NetdevLoopMap,\
+  \ const MemRegion*, const Stmt*)\n  - Key: same MemRegion as above.\n  - Value:\
+  \ the nearest enclosing loop statement (ForStmt/WhileStmt/DoStmt) where the allocation\
+  \ happened. Used to tie the \u201Cpending\u201D object to its loop iteration.\n\n\
+  - REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)\n\
+  \  - Tracks pointer aliases so a free_netdev done through an alias (e.g. rep->netdev)\
+  \ is recognized. Key is destination pointer region, value is its current source\
+  \ pointer region.\n  - Keep this simple: only record on direct pointer-to-pointer\
+  \ assignments; no need to propagate through non-pointer types.\n\n- No other traits\
+  \ are necessary.\n\n\n2) Callback functions and how to implement\n\nA) checkBeginFunction\
+  \ / checkEndFunction\n- On function entry (checkBeginFunction): clear all three\
+  \ maps to avoid state bleed across functions.\n- On function exit (checkEndFunction):\
+  \ no special action needed (state is discarded), but safe to clear maps if desired.\n\
+  \nB) checkBind (track allocations bound to a pointer and record aliases)\n- Goal\
+  \ 1: Detect \u201Cptr = alloc_etherdev(...);\u201D done inside a loop and mark ptr\
+  \ as \u201Cpending net_device\u201D of this iteration.\n  - For each bind:\n   \
+  \ - Use findSpecificTypeInChildren<CallExpr>(S) to see if the RHS contains a CallExpr\
+  \ to one of:\n      - alloc_etherdev, alloc_etherdev_mqs, alloc_netdev, alloc_netdev_mqs\n\
+  \    - Ensure the LHS is a pointer-typed region: auto Rdst = Loc.getAsRegion();\
+  \ if (!Rdst) return.\n    - Find the nearest loop using findSpecificTypeInParents<ForStmt/WhileStmt/DoStmt>(S,\
+  \ C). If none, skip to reduce noise.\n    - Insert into PendingNetdevMap[Rdst] =\
+  \ S.\n    - Insert into NetdevLoopMap[Rdst] = that loop Stmt*.\n- Goal 2: Record\
+  \ pointer aliases to be able to match free_netdev performed via an alias.\n  - If\
+  \ RHS is a load of another pointer (e.g., p2 = p1; or rep->netdev = ndev;), obtain\
+  \ both regions:\n    - Rdst = Loc.getAsRegion()\n    - Rsrc = getMemRegionFromExpr(RHS-Expr,\
+  \ C) (derive RHS Expr via AST from S or SVal if accessible)\n  - If both regions\
+  \ exist and are pointer-typed, set PtrAliasMap[Rdst] = Rsrc (overwriting previous\
+  \ mapping).\n  - Do not mutate PendingNetdevMap here.\n\nC) checkPostCall (observe\
+  \ register/free and remove from pending)\n- If callee is register_netdev:\n  - Extract\
+  \ argument 0 expression, get its region ArgR via getMemRegionFromExpr.\n  - Canonicalize\
+  \ aliases: follow PtrAliasMap repeatedly (bounded by a few steps) to resolve to\
+  \ a base region BaseR.\n  - If PendingNetdevMap contains BaseR, remove BaseR from\
+  \ PendingNetdevMap and NetdevLoopMap (it is now \u201Cregistered/owned,\u201D so\
+  \ this checker no longer cares).\n- If callee is free_netdev:\n  - Extract argument\
+  \ 0 region ArgR and canonicalize via PtrAliasMap to BaseR.\n  - If PendingNetdevMap\
+  \ contains BaseR, remove BaseR from PendingNetdevMap and NetdevLoopMap (freed).\n\
+  \nD) check::BranchCondition (detect error path with goto exit/out/err and missing\
+  \ immediate free)\n- For the incoming Condition expression:\n  - Get the parent\
+  \ IfStmt via findSpecificTypeInParents<IfStmt>(Condition, C).\n  - Let Then = IfStmt->getThen().\n\
+  \  - Search Then for a GotoStmt via findSpecificTypeInChildren<GotoStmt>(Then).\
+  \ If none, return.\n  - If found, try to reduce false positives by checking the\
+  \ target label name:\n    - LabelDecl *LD = GotoStmt->getLabel(); Name = LD->getName().\
+  \ Warn only if Name equals \u201Cexit\u201D or \u201Cout\u201D or starts with \u201C\
+  err\u201D or \u201Cerror\u201D.\n  - Find the nearest enclosing loop: LoopS = findSpecificTypeInParents<ForStmt/WhileStmt/DoStmt>(IfStmt,\
+  \ C). If none, return.\n  - For each entry R in PendingNetdevMap:\n    - If NetdevLoopMap[R]\
+  \ != LoopS, continue (not the current loop iteration).\n    - Check whether Then\
+  \ contains a free_netdev() call for R or any alias of R:\n      - Walk Then for\
+  \ CallExpr to \u201Cfree_netdev\u201D.\n      - For each such call, get arg region\
+  \ ArgR (getMemRegionFromExpr) and canonicalize using PtrAliasMap to BaseR. If BaseR\
+  \ == R, then this path frees the current iteration\u2019s net_device: do not warn\
+  \ for R.\n    - If no free_netdev(R) exists in Then, emit a bug report at the GotoStmt\
+  \ location (or at the IfStmt) for this R.\n\nNotes:\n- We do not need to verify\
+  \ the specific \u201Cerr\u201D variable or result value; the presence of the goto\
+  \ to an exit-like label inside the loop, combined with a currently pending unregistered/unfreed\
+  \ net_device, is sufficient to model the bug.\n- We intentionally consider only\
+  \ the \u201Cimmediate free before goto\u201D requirement. The well-known cleanup\
+  \ pattern \u201Cwhile (--idx >= 0) free previously created \u2026\u201D would miss\
+  \ the current iteration, which is precisely what we want to catch.\n\nE) Optional:\
+  \ checkPostCall for error-producing functions (not required)\n- Not necessary for\
+  \ this pattern; the BranchCondition + Goto detection is enough.\n\nF) Reporting\n\
+  - Create a BugType like \u201CResource leak in loop iteration (net_device)\u201D\
+  .\n- Message: \u201Cmissing free_netdev for current iteration before goto exit\u201D\
+  \n- Use generateNonFatalErrorNode and emit a PathSensitiveBugReport, optionally\
+  \ adding a note with the alloc site stored in PendingNetdevMap[R] for better guidance.\n\
+  \n\n3) Helper details\n\n- Canonicalize aliases:\n  - Implement a small loop: while\
+  \ (auto R2 = State->get<PtrAliasMap>(R)) R = R2; limit to e.g. 4 steps to avoid\
+  \ cycles.\n  - When comparing argument regions vs pending region, compare canonical\
+  \ regions.\n\n- Allocation function names:\n  - alloc_etherdev, alloc_etherdev_mqs,\
+  \ alloc_netdev, alloc_netdev_mqs (extendable via a small array).\n\n- Label name\
+  \ heuristic:\n  - Accept names: \u201Cexit\u201D, \u201Cout\u201D, \u201Cerror\u201D\
+  , starting with \u201Cerr\u201D or \u201Cout\u201D. This keeps FPs low and matches\
+  \ common kernel patterns.\n\n- Clean up state:\n  - When a pending region is removed\
+  \ due to free/register, also remove its PtrAliasMap entries where it is a key (optional\
+  \ but helps keep state small).\n\n\n4) Why this catches the target patch\n- In the\
+  \ buggy function, within the for loop, ndev is allocated, but on the failure branch\
+  \ after rvu_rep_devlink_port_register(rep), the then-branch only \u201Cgoto exit;\u201D\
+  \ without calling free_netdev(ndev).\n- Our checker marks ndev as pending for the\
+  \ loop, sees an If with goto exit in the same loop and no free_netdev in the then-branch,\
+  \ and reports.\n- After the patch, the then-branch contains free_netdev(ndev) before\
+  \ goto exit, so the checker sees the free and remains silent."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"\
+  clang/AST/Expr.h\"\n#include \"llvm/ADT/StringExtras.h\"\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\n// Program state maps\n// Tracks\
+  \ the pointer region that owns an allocated net_device in current loop iteration.\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PendingNetdevMap, const MemRegion*, const Stmt*)\n\
+  // Tracks the loop statement where the allocation happened (For/While/Do).\nREGISTER_MAP_WITH_PROGRAMSTATE(NetdevLoopMap,\
+  \ const MemRegion*, const Stmt*)\n// Pointer aliasing: dest region -> source region.\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)\n\
+  \nnamespace {\n\n// Simple visitor to collect all CallExpr inside a statement subtree.\n\
+  struct CallCollectorVisitor : public RecursiveASTVisitor<CallCollectorVisitor> {\n\
+  \  SmallVector<const CallExpr*, 16> Calls;\n  bool VisitCallExpr(CallExpr *CE) {\n\
+  \    Calls.push_back(CE);\n    return true;\n  }\n};\n\n// Simple visitor to collect\
+  \ all GotoStmt inside a statement subtree.\nstruct GotoCollectorVisitor : public\
+  \ RecursiveASTVisitor<GotoCollectorVisitor> {\n  SmallVector<const GotoStmt*, 8>\
+  \ Gotos;\n  bool VisitGotoStmt(GotoStmt *GS) {\n    Gotos.push_back(GS);\n    return\
+  \ true;\n  }\n};\n\nclass SAGenTestChecker\n  : public Checker<\n        check::BeginFunction,\n\
+  \        check::Bind,\n        check::PostCall,\n        check::BranchCondition>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \      : BT(new BugType(this, \"Resource leak in loop iteration (net_device)\",\n\
+  \                       \"Memory Management\")) {}\n\n  void checkBeginFunction(CheckerContext\
+  \ &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext\
+  \ &C) const;\n  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\n\
+  private:\n  // Helpers\n  static bool isAllocNetdevCall(const Expr *E, CheckerContext\
+  \ &C);\n  static bool isExitLikeLabel(const LabelDecl *LD);\n  static const Stmt*\
+  \ findEnclosingLoop(const Stmt *S, CheckerContext &C);\n\n  static const MemRegion*\
+  \ canonicalizeRegion(ProgramStateRef State,\n                                  \
+  \           const MemRegion *R) {\n    if (!R) return nullptr;\n    R = R->getBaseRegion();\n\
+  \    // Follow aliases a few steps to reach the original source.\n    for (int i\
+  \ = 0; i < 8 && R; ++i) {\n      if (const MemRegion *const *R2 = State->get<PtrAliasMap>(R))\n\
+  \        R = (*R2)->getBaseRegion();\n      else\n        break;\n    }\n    return\
+  \ R;\n  }\n\n  static bool thenContainsFreeOfRegion(const Stmt *Then, ProgramStateRef\
+  \ State,\n                                       const MemRegion *TargetR,\n   \
+  \                                    CheckerContext &C) {\n    if (!Then || !TargetR)\n\
+  \      return false;\n\n    const MemRegion *CanonTarget = canonicalizeRegion(State,\
+  \ TargetR);\n    if (!CanonTarget)\n      return false;\n\n    CallCollectorVisitor\
+  \ V;\n    V.TraverseStmt(const_cast<Stmt *>(Then));\n    for (const CallExpr *CE\
+  \ : V.Calls) {\n      if (!CE) continue;\n      if (!ExprHasName(CE, \"free_netdev\"\
+  , C))\n        continue;\n      if (CE->getNumArgs() < 1)\n        continue;\n \
+  \     const Expr *Arg0 = CE->getArg(0);\n      if (!Arg0) continue;\n      const\
+  \ MemRegion *ArgR = getMemRegionFromExpr(Arg0, C);\n      if (!ArgR) continue;\n\
+  \      ArgR = ArgR->getBaseRegion();\n      ArgR = canonicalizeRegion(State, ArgR);\n\
+  \      if (ArgR && ArgR == CanonTarget)\n        return true;\n    }\n    return\
+  \ false;\n  }\n\n  void erasePendingFor(ProgramStateRef &State, const MemRegion\
+  \ *R) const {\n    if (!R) return;\n    R = R->getBaseRegion();\n    State = State->remove<PendingNetdevMap>(R);\n\
+  \    State = State->remove<NetdevLoopMap>(R);\n    // Optional: could clear aliases\
+  \ for R as a key\n    auto AM = State->get<PtrAliasMap>();\n    if (!AM.isEmpty())\
+  \ {\n      for (auto It = AM.begin(), E = AM.end(); It != E; ++It) {\n        if\
+  \ (It->first == R) {\n          State = State->remove<PtrAliasMap>(It->first);\n\
+  \        }\n      }\n    }\n  }\n};\n\nvoid SAGenTestChecker::checkBeginFunction(CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Clear all maps to\
+  \ avoid cross-function bleed.\n  auto PM = State->get<PendingNetdevMap>();\n  if\
+  \ (!PM.isEmpty()) {\n    for (auto I = PM.begin(), E = PM.end(); I != E; ++I) {\n\
+  \      State = State->remove<PendingNetdevMap>(I->first);\n    }\n  }\n  auto LM\
+  \ = State->get<NetdevLoopMap>();\n  if (!LM.isEmpty()) {\n    for (auto I = LM.begin(),\
+  \ E = LM.end(); I != E; ++I) {\n      State = State->remove<NetdevLoopMap>(I->first);\n\
+  \    }\n  }\n  auto AM = State->get<PtrAliasMap>();\n  if (!AM.isEmpty()) {\n  \
+  \  for (auto I = AM.begin(), E = AM.end(); I != E; ++I) {\n      State = State->remove<PtrAliasMap>(I->first);\n\
+  \    }\n  }\n\n  C.addTransition(State);\n}\n\nstatic bool isPointerLikeRegion(const\
+  \ MemRegion *R) {\n  if (!R) return false;\n  // We don't strictly need to check\
+  \ type; alias map can accept any region keys.\n  // Keep it permissive.\n  return\
+  \ true;\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,\n\
+  \                                 CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  bool Changed = false;\n\n  const MemRegion *DstR = Loc.getAsRegion();\n\
+  \  if (DstR) DstR = DstR->getBaseRegion();\n\n  // Track aliasing: DstR = ValRegion;\n\
+  \  if (DstR && isPointerLikeRegion(DstR)) {\n    if (const MemRegion *SrcR = Val.getAsRegion())\
+  \ {\n      SrcR = SrcR->getBaseRegion();\n      if (SrcR) {\n        State = State->set<PtrAliasMap>(DstR,\
+  \ SrcR);\n        Changed = true;\n      }\n    }\n  }\n\n  // Detect allocation\
+  \ assignment inside a loop: ptr = alloc_etherdev/alloc_netdev...\n  if (StoreE &&\
+  \ DstR) {\n    const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(StoreE);\n\
+  \    if (CE && isAllocNetdevCall(CE, C)) {\n      // Find nearest enclosing loop\n\
+  \      const Stmt *LoopS = nullptr;\n      if (!LoopS) LoopS = findEnclosingLoop(StoreE,\
+  \ C);\n      if (LoopS) {\n        State = State->set<PendingNetdevMap>(DstR, StoreE);\n\
+  \        State = State->set<NetdevLoopMap>(DstR, LoopS);\n        Changed = true;\n\
+  \      }\n    }\n  }\n\n  if (Changed)\n    C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return;\n\n \
+  \ // If register_netdev(arg0) is called, the ownership is now transferred; stop\
+  \ tracking.\n  if (ExprHasName(Origin, \"register_netdev\", C)) {\n    if (Call.getNumArgs()\
+  \ >= 1) {\n      const Expr *Arg0 = Call.getArgExpr(0);\n      if (Arg0) {\n   \
+  \     const MemRegion *ArgR = getMemRegionFromExpr(Arg0, C);\n        if (ArgR)\
+  \ {\n          ArgR = canonicalizeRegion(State, ArgR->getBaseRegion());\n      \
+  \    if (ArgR) {\n            auto LoopPtr = State->get<NetdevLoopMap>(ArgR);\n\
+  \            auto AllocPtr = State->get<PendingNetdevMap>(ArgR);\n            if\
+  \ (LoopPtr || AllocPtr) {\n              erasePendingFor(State, ArgR);\n       \
+  \       C.addTransition(State);\n            }\n          }\n        }\n      }\n\
+  \    }\n    return;\n  }\n\n  // If free_netdev(arg0) is called, remove from pending\
+  \ if tracked.\n  if (ExprHasName(Origin, \"free_netdev\", C)) {\n    if (Call.getNumArgs()\
+  \ >= 1) {\n      const Expr *Arg0 = Call.getArgExpr(0);\n      if (Arg0) {\n   \
+  \     const MemRegion *ArgR = getMemRegionFromExpr(Arg0, C);\n        if (ArgR)\
+  \ {\n          ArgR = canonicalizeRegion(State, ArgR->getBaseRegion());\n      \
+  \    if (ArgR) {\n            auto LoopPtr = State->get<NetdevLoopMap>(ArgR);\n\
+  \            auto AllocPtr = State->get<PendingNetdevMap>(ArgR);\n            if\
+  \ (LoopPtr || AllocPtr) {\n              erasePendingFor(State, ArgR);\n       \
+  \       C.addTransition(State);\n            }\n          }\n        }\n      }\n\
+  \    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition)\n    return;\n\n\
+  \  // Find the IfStmt that owns this condition.\n  const IfStmt *IS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IS)\n    return;\n\n  const Stmt *Then = IS->getThen();\n  if (!Then)\n\
+  \    return;\n\n  // Does the then-branch contain a goto to an \"exit-like\" label?\n\
+  \  GotoCollectorVisitor GV;\n  GV.TraverseStmt(const_cast<Stmt *>(Then));\n\n  bool\
+  \ HasExitLikeGoto = false;\n  for (const GotoStmt *GS : GV.Gotos) {\n    if (!GS)\
+  \ continue;\n    const LabelDecl *LD = GS->getLabel();\n    if (isExitLikeLabel(LD))\
+  \ {\n      HasExitLikeGoto = true;\n      break;\n    }\n  }\n  if (!HasExitLikeGoto)\n\
+  \    return;\n\n  // Find enclosing loop of this if-statement.\n  const Stmt *LoopS\
+  \ = findEnclosingLoop(IS, C);\n  if (!LoopS)\n    return;\n\n  ProgramStateRef State\
+  \ = C.getState();\n  auto Pend = State->get<PendingNetdevMap>();\n  if (Pend.isEmpty())\n\
+  \    return;\n\n  // For each pending netdev tied to this loop, ensure Then frees\
+  \ it before goto.\n  for (auto I = Pend.begin(), E = Pend.end(); I != E; ++I) {\n\
+  \    const MemRegion *R = I->first;\n    if (!R) continue;\n    R = R->getBaseRegion();\n\
+  \n    auto RLoop = State->get<NetdevLoopMap>(R);\n    if (!RLoop || *RLoop != LoopS)\n\
+  \      continue;\n\n    // Check whether Then frees the current iteration's net_device.\n\
+  \    if (!thenContainsFreeOfRegion(Then, State, R, C)) {\n      ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n      if (!N)\n        return;\n\n      auto\
+  \ Rpt = std::make_unique<PathSensitiveBugReport>(\n          *BT, \"Missing free_netdev\
+  \ before goto exit; leaks current net_device\",\n          N);\n      // Try to\
+  \ highlight the 'then' branch range.\n      Rpt->addRange(Then->getSourceRange());\n\
+  \      C.emitReport(std::move(Rpt));\n      // Do not break; potentially multiple\
+  \ regions (though uncommon).\n    }\n  }\n}\n\n// Helper implementations\n\nbool\
+  \ SAGenTestChecker::isAllocNetdevCall(const Expr *E, CheckerContext &C) {\n  if\
+  \ (!E) return false;\n  // Recognize common Linux netdev allocation helpers.\n \
+  \ return ExprHasName(E, \"alloc_etherdev\", C) ||\n         ExprHasName(E, \"alloc_etherdev_mqs\"\
+  , C) ||\n         ExprHasName(E, \"alloc_netdev\", C) ||\n         ExprHasName(E,\
+  \ \"alloc_netdev_mqs\", C);\n}\n\nbool SAGenTestChecker::isExitLikeLabel(const LabelDecl\
+  \ *LD) {\n  if (!LD) return false;\n  StringRef Name = LD->getName();\n  if (Name.empty())\
+  \ return false;\n\n  std::string Lower = Name.lower();\n  StringRef LRef(Lower);\n\
+  \n  if (LRef == \"exit\" || LRef == \"out\" || LRef == \"error\")\n    return true;\n\
+  \n  // Common kernel styles: err, err_X, error_X, out_X\n  if (LRef.startswith(\"\
+  err\") || LRef.startswith(\"error\") || LRef.startswith(\"out\"))\n    return true;\n\
+  \n  return false;\n}\n\nconst Stmt* SAGenTestChecker::findEnclosingLoop(const Stmt\
+  \ *S, CheckerContext &C) {\n  if (!S) return nullptr;\n  if (const auto *FS = findSpecificTypeInParents<ForStmt>(S,\
+  \ C))\n    return FS;\n  if (const auto *WS = findSpecificTypeInParents<WhileStmt>(S,\
+  \ C))\n    return WS;\n  if (const auto *DS = findSpecificTypeInParents<DoStmt>(S,\
+  \ C))\n    return DS;\n  return nullptr;\n}\n\n} // end anonymous namespace\n\n\
+  extern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects missing free_netdev before\
+  \ goto exit in loops (leaks current iteration net_device)\",\n      \"\");\n}\n\n\
+  extern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

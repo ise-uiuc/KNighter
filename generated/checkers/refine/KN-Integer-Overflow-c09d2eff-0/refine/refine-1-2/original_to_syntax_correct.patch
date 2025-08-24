@@ -1,0 +1,224 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -20,6 +20,7 @@ #include "clang/AST/Stmt.h"
+ #include "clang/Basic/SourceManager.h"
+ #include "clang/Lex/Lexer.h"
++#include <optional>
+
+ using namespace clang;
+ using namespace ento;
+@@ -39,11 +40,17 @@                           llvm::SmallVectorImpl<unsigned> &DerefParams);
+ bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
+
+-// No custom program state needed.
++// Program state: Map constant-valued integer locals to their known values.
++REGISTER_MAP_WITH_PROGRAMSTATE(ConstIntVarMap, const VarDecl *, llvm::APSInt)
+
+ namespace {
+
+-class SAGenTestChecker : public Checker<check::PostStmt<BinaryOperator>> {
++class SAGenTestChecker
++    : public Checker<
++          check::PostStmt<BinaryOperator>,
++          check::PostStmt<DeclStmt>,
++          check::Bind,
++          check::RegionChanges> {
+    mutable std::unique_ptr<BugType> BT;
+
+ public:
+@@ -52,6 +59,14 @@                        "Integer Overflow")) {}
+
+   void checkPostStmt(const BinaryOperator *B, CheckerContext &C) const;
++  void checkPostStmt(const DeclStmt *DS, CheckerContext &C) const;
++  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
++  ProgramStateRef checkRegionChanges(ProgramStateRef State,
++                                     const InvalidatedSymbols *Invalidated,
++                                     ArrayRef<const MemRegion *> ExplicitRegions,
++                                     ArrayRef<const MemRegion *> Regions,
++                                     const LocationContext *LCtx,
++                                     const CallEvent *Call) const;
+
+ private:
+   static unsigned getIntWidth(QualType T, CheckerContext &C) {
+@@ -67,8 +82,31 @@     return E->getType()->isIntegerType();
+   }
+
++  static const Expr *ignoreNoOps(const Expr *E) {
++    return E ? E->IgnoreParenImpCasts() : nullptr;
++  }
++
+   static bool isNoOpWrapper(const Stmt *S) {
+     return isa<ParenExpr>(S) || isa<ImplicitCastExpr>(S);
++  }
++
++  // Helpers to work with state-tracked constant ints.
++  static bool getConstValueFromState(const Expr *E, CheckerContext &C,
++                                     llvm::APSInt &Out) {
++    const Expr *Core = ignoreNoOps(E);
++    if (!Core)
++      return false;
++
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(Core)) {
++      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++        ProgramStateRef St = C.getState();
++        if (const llvm::APSInt *V = St->get<ConstIntVarMap>(VD)) {
++          Out = *V;
++          return true;
++        }
++      }
++    }
++    return false;
+   }
+
+   bool getImmediateNonTrivialParent(const Stmt *Child,
+@@ -140,7 +178,8 @@     }
+
+     if (const auto *Ret = dyn_cast_or_null<ReturnStmt>(PStmt)) {
+-      const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());
++      const auto *FD =
++          dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());
+       if (FD && isInt64OrWider(FD->getReturnType(), C)) {
+         UseSiteStmt = PStmt;
+         return true;
+@@ -179,17 +218,45 @@   }
+
+   // Try to determine an upper bound for an expression:
++  // - Exact tracked constant from state
+   // - Constant-evaluable? use it
++  // - Simple folding of (+/-) with known maxima
+   // - Symbolic? ask the constraint manager for max
+   // - Otherwise: fall back to type-based maximum
+   bool getMaxForExpr(const Expr *E, CheckerContext &C, llvm::APSInt &Out) const {
+     if (!E) return false;
+
+-    // Try constant evaluation
++    E = E->IgnoreParenImpCasts();
++
++    // Exact tracked constant?
++    if (getConstValueFromState(E, C, Out))
++      return true;
++
++    // Constant evaluation?
+     if (EvaluateExprToInt(Out, E, C))
+       return true;
+
+-    // Try symbolic max value
++    // Simple folding for sum/difference to tighten bounds.
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      if (BO->isAdditiveOp()) {
++        llvm::APSInt LMax, RMax;
++        bool HasL = getMaxForExpr(BO->getLHS(), C, LMax);
++        bool HasR = getMaxForExpr(BO->getRHS(), C, RMax);
++        if (HasL && HasR) {
++          // Compute an upper bound conservatively in 128 bits, return as unsigned.
++          __int128 L = LMax.isSigned() ? (__int128)LMax.getExtValue()
++                                       : (__int128)LMax.getZExtValue();
++          __int128 R = RMax.isSigned() ? (__int128)RMax.getExtValue()
++                                       : (__int128)RMax.getZExtValue();
++          __int128 S = BO->getOpcode() == BO_Add ? (L + R) : (L - R);
++          uint64_t UB = S < 0 ? 0 : (S > (__int128)UINT64_MAX ? UINT64_MAX : (uint64_t)S);
++          Out = llvm::APSInt(llvm::APInt(64, UB), /*isUnsigned=*/true);
++          return true;
++        }
++      }
++    }
++
++    // Symbolic maximum?
+     ProgramStateRef State = C.getState();
+     SVal V = State->getSVal(E, C.getLocationContext());
+     SymbolRef Sym = V.getAsSymbol();
+@@ -211,10 +278,8 @@       return false;
+
+     if (IsUnsigned) {
+-      // For unsigned, max is 2^W - 1
+       Out = llvm::APSInt::getMaxValue(W, /*isUnsigned=*/true);
+     } else {
+-      // For signed, max is 2^(W-1) - 1
+       Out = llvm::APSInt::getMaxValue(W, /*isUnsigned=*/false);
+     }
+     return true;
+@@ -329,7 +394,6 @@   bool looksLikeNonSizeEncodingContext(const Stmt *UseSiteStmt,
+                                        const Decl *UseSiteDecl,
+                                        CheckerContext &C) const {
+-    // Suppress in contexts that look like inode/permission/class encodings etc.
+     static const std::initializer_list<StringRef> Negatives = {
+         "irq", "hwirq", "interrupt", "index", "idx", "id",
+         "ino", "inode", "perm", "class", "sid"
+@@ -428,6 +492,80 @@   C.emitReport(std::move(R));
+ }
+
++void SAGenTestChecker::checkPostStmt(const DeclStmt *DS, CheckerContext &C) const {
++  if (!DS)
++    return;
++  ProgramStateRef State = C.getState();
++  for (const Decl *D : DS->decls()) {
++    const auto *VD = dyn_cast<VarDecl>(D);
++    if (!VD)
++      continue;
++    if (!VD->getType()->isIntegerType())
++      continue;
++    if (!VD->hasInit())
++      continue;
++
++    const Expr *Init = VD->getInit();
++    llvm::APSInt V;
++    if (EvaluateExprToInt(V, Init, C)) {
++      State = State->set<ConstIntVarMap>(VD, V);
++    } else {
++      // If not a constant init, drop any previous knowledge.
++      State = State->remove<ConstIntVarMap>(VD);
++    }
++  }
++  if (State != C.getState())
++    C.addTransition(State);
++}
++
++void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,
++                                 CheckerContext &C) const {
++  ProgramStateRef State = C.getState();
++  const MemRegion *MR = Loc.getAsRegion();
++  if (!MR) {
++    return;
++  }
++
++  const auto *VR = dyn_cast<VarRegion>(MR->getBaseRegion());
++  if (!VR) {
++    return;
++  }
++
++  const VarDecl *VD = VR->getDecl();
++  if (!VD || !VD->getType()->isIntegerType())
++    return;
++
++  if (auto CI = Val.getAs<nonloc::ConcreteInt>()) {
++    // Track constant value.
++    State = State->set<ConstIntVarMap>(VD, CI->getValue());
++  } else {
++    // Unknown/non-constant write: drop info.
++    State = State->remove<ConstIntVarMap>(VD);
++  }
++
++  if (State != C.getState())
++    C.addTransition(State);
++}
++
++ProgramStateRef SAGenTestChecker::checkRegionChanges(
++    ProgramStateRef State, const InvalidatedSymbols *Invalidated,
++    ArrayRef<const MemRegion *> ExplicitRegions,
++    ArrayRef<const MemRegion *> Regions, const LocationContext *LCtx,
++    const CallEvent *Call) const {
++
++  for (const MemRegion *R : Regions) {
++    const MemRegion *Base = R ? R->getBaseRegion() : nullptr;
++    const auto *VR = dyn_cast_or_null<VarRegion>(Base);
++    if (!VR)
++      continue;
++    const VarDecl *VD = VR->getDecl();
++    if (!VD)
++      continue;
++    State = State->remove<ConstIntVarMap>(VD);
++  }
++  return State;
++}
++
+ } // end anonymous namespace
+
+ extern "C" void clang_registerCheckers(CheckerRegistry &registry) {

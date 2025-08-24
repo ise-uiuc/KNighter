@@ -1,0 +1,257 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -183,11 +183,14 @@        return false;
+   }
+
++  // Heuristic suppression contexts.
+   static bool isFalsePositiveContext(const Expr *WholeExpr,
+                                      const BinaryOperator *Shl,
+                                      QualType DestTy,
+                                      CheckerContext &C,
+                                      StringRef Ctx) {
++    // If the shift isn't the top-level expression of the assigned/returned/arg
++    // expression, skip to avoid spurious nesting matches.
+     if (!isTopLevelShiftExpr(WholeExpr, Shl))
+       return true;
+
+@@ -200,9 +203,11 @@         if (FD && ArgIdx < FD->getNumParams())
+           PVD = FD->getParamDecl(ArgIdx);
+
++        // Many APIs expect pointer-sized arithmetic; long parameters are safe.
+         if (isAnyLongType(DestTy))
+           return true;
+
++        // Heuristics for MMIO/IO helpers that combine address+offset.
+         if (PVD && paramNameLooksLikeAddrOffset(PVD))
+           return true;
+
+@@ -213,6 +218,7 @@           }
+         }
+
++        // Tiny shifts are almost always address bitfields; avoid noise.
+         uint64_t K = 0;
+         if (tryGetConstShiftAmount(Shl->getRHS(), C, K) && K <= 3)
+           return true;
+@@ -250,8 +256,6 @@           MaxVal = llvm::APSInt(V, /*isUnsigned=*/true);
+         Found = true;
+       } else if (const auto *UO = dyn_cast<UnaryOperator>(Cur)) {
+-        // Try to handle sizeof-like folds that may appear as integral casts.
+-        // We still just traverse.
+         if (const Expr *SubE = UO->getSubExpr())
+           Worklist.push_back(SubE);
+       } else {
+@@ -286,10 +290,130 @@     return true;
+   }
+
++  // AST-based inference: try to extract an upper bound for a variable from
++  // dominating loop conditions such as:
++  //   for (..; var < K; ..)  or  while (var < K)  or  (K > var)
++  // Handles <= and &&-combined conditions, evaluates K as integer constant.
++  static bool extractUpperBoundFromConditionExpr(const Expr *CondE,
++                                                 const VarDecl *VD,
++                                                 CheckerContext &C,
++                                                 uint64_t &OutUB) {
++    if (!CondE || !VD)
++      return false;
++
++    const Expr *E = peel(CondE);
++
++    // Handle (A && B): pick min UB if found on either side.
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      if (BO->getOpcode() == BO_LAnd) {
++        uint64_t UB1 = UINT64_MAX, UB2 = UINT64_MAX;
++        bool F1 = extractUpperBoundFromConditionExpr(BO->getLHS(), VD, C, UB1);
++        bool F2 = extractUpperBoundFromConditionExpr(BO->getRHS(), VD, C, UB2);
++        if (F1 && F2) {
++          OutUB = std::min(UB1, UB2);
++          return true;
++        }
++        if (F1) { OutUB = UB1; return true; }
++        if (F2) { OutUB = UB2; return true; }
++        return false;
++      }
++
++      auto EvalConstToU64 = [&](const Expr *X, uint64_t &Val) -> bool {
++        llvm::APSInt Res;
++        if (!EvaluateExprToInt(Res, X, C))
++          return false;
++        if (Res.isSigned() && Res.isNegative())
++          return false;
++        Val = Res.getZExtValue();
++        return true;
++      };
++
++      const Expr *L = peel(BO->getLHS());
++      const Expr *R = peel(BO->getRHS());
++      const auto *LDRE = dyn_cast<DeclRefExpr>(L);
++      const auto *RDRE = dyn_cast<DeclRefExpr>(R);
++
++      // var < K  => UB = K-1
++      if (BO->getOpcode() == BO_LT && LDRE && LDRE->getDecl() == VD) {
++        uint64_t K;
++        if (EvalConstToU64(R, K)) {
++          if (K == 0)
++            return false;
++          OutUB = K - 1;
++          return true;
++        }
++      }
++      // var <= K => UB = K
++      if (BO->getOpcode() == BO_LE && LDRE && LDRE->getDecl() == VD) {
++        uint64_t K;
++        if (EvalConstToU64(R, K)) {
++          OutUB = K;
++          return true;
++        }
++      }
++      // K > var => UB = K-1
++      if (BO->getOpcode() == BO_GT && RDRE && RDRE->getDecl() == VD) {
++        uint64_t K;
++        if (EvalConstToU64(L, K)) {
++          if (K == 0)
++            return false;
++          OutUB = K - 1;
++          return true;
++        }
++      }
++      // K >= var => UB = K
++      if (BO->getOpcode() == BO_GE && RDRE && RDRE->getDecl() == VD) {
++        uint64_t K;
++        if (EvalConstToU64(L, K)) {
++          OutUB = K;
++          return true;
++        }
++      }
++    }
++
++    return false;
++  }
++
++  static bool inferUpperBoundFromDominatingLoops(const Expr *VarExpr,
++                                                 CheckerContext &C,
++                                                 uint64_t &OutUB) {
++    const auto *DRE = dyn_cast_or_null<DeclRefExpr>(peel(VarExpr));
++    if (!DRE)
++      return false;
++    const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
++    if (!VD)
++      return false;
++
++    // ForStmt
++    if (const ForStmt *FS = findSpecificTypeInParents<ForStmt>(VarExpr, C)) {
++      if (const Expr *Cond = FS->getCond()) {
++        if (extractUpperBoundFromConditionExpr(Cond, VD, C, OutUB))
++          return true;
++      }
++    }
++    // WhileStmt
++    if (const WhileStmt *WS = findSpecificTypeInParents<WhileStmt>(VarExpr, C)) {
++      if (const Expr *Cond = WS->getCond()) {
++        if (extractUpperBoundFromConditionExpr(Cond, VD, C, OutUB))
++          return true;
++      }
++    }
++    // DoStmt (do { ... } while (cond));
++    if (const DoStmt *DS = findSpecificTypeInParents<DoStmt>(VarExpr, C)) {
++      if (const Expr *Cond = DS->getCond()) {
++        if (extractUpperBoundFromConditionExpr(Cond, VD, C, OutUB))
++          return true;
++      }
++    }
++
++    return false;
++  }
++
+   // Compute an upper bound for an expression based on:
+   // - Exact constant evaluation
+   // - Recorded per-variable upper bounds
+-  // - Simple addition of sub-bounds
++  // - Symbolic max via constraint manager
++  // - AST-deduced bounds from dominating loops (for DeclRefExpr only)
+   static bool computeExprUpperBound(const Expr *E, CheckerContext &C,
+                                     llvm::APSInt &Out) {
+     if (!E)
+@@ -310,7 +434,7 @@     if (getRecordedVarUpperBound(E, C, Out))
+       return true;
+
+-    // Symbolic? Try constraint manager max.
++    // Symbolic? Try constraint manager max or loop-based bound.
+     ProgramStateRef State = C.getState();
+     SVal SV = State->getSVal(E, C.getLocationContext());
+     if (std::optional<nonloc::ConcreteInt> CI = SV.getAs<nonloc::ConcreteInt>()) {
+@@ -332,7 +456,16 @@       }
+     }
+
+-    // Composite expressions: try L + R for additions
++    // AST-based loop bound inference for DeclRefExpr.
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++      uint64_t UB = 0;
++      if (inferUpperBoundFromDominatingLoops(DRE, C, UB)) {
++        Out = llvm::APSInt(llvm::APInt(64, UB), /*isUnsigned=*/true);
++        return true;
++      }
++    }
++
++    // Composite expressions: try L + R for additions (best-effort).
+     if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+       if (BO->getOpcode() == BO_Add) {
+         llvm::APSInt LUB, RUB;
+@@ -355,7 +488,7 @@   }
+
+   // Compute maximum number of active bits an expression's value can have,
+-  // using constants or recorded/symbolic upper bounds.
++  // using constants or recorded/symbolic/loop-derived upper bounds.
+   static bool computeExprMaxActiveBits(const Expr *E, CheckerContext &C,
+                                        unsigned &OutBits) {
+     if (!E)
+@@ -372,7 +505,6 @@
+     llvm::APSInt UB;
+     if (computeExprUpperBound(E, C, UB)) {
+-      // Active bits of the upper bound is an upper bound on the active bits.
+       OutBits = UB.getActiveBits();
+       return true;
+     }
+@@ -389,8 +521,20 @@       return false;
+
+     llvm::APSInt RMax;
+-    if (!computeExprUpperBound(R, C, RMax))
+-      return false;
++    if (!computeExprUpperBound(R, C, RMax)) {
++      // As a last resort, try loop-based bound directly if computeExprUpperBound
++      // failed to get any bound (e.g. no symbol available from SVal).
++      const Expr *Rpeel = peel(R);
++      if (const auto *DRE = dyn_cast<DeclRefExpr>(Rpeel)) {
++        uint64_t UB = 0;
++        if (inferUpperBoundFromDominatingLoops(DRE, C, UB)) {
++          if (MaxLBits == 0)
++            return true;
++          return (uint64_t)MaxLBits + UB <= (uint64_t)LHSW;
++        }
++      }
++      return false;
++    }
+
+     uint64_t ShiftMax = RMax.getZExtValue();
+
+@@ -477,16 +621,16 @@   if (hasExplicitCastToWide64(L, ACtx))
+     return;
+
++  // Heuristic context-based suppression (e.g. known IO helpers, small shifts)
+   if (isFalsePositiveContext(E, Shl, DestTy, C, Ctx))
+     return;
+
+-  // Constant proof: safely fits.
++  // Constant proof: safely fits within LHS width.
+   if (constantShiftFitsInLHSWidth(L, R, LHSW, C))
+     return;
+
+-  // New: Symbolic upper-bound proof: if we can prove the result fits in 32-bit,
+-  // suppress. This addresses cases like: pool_size = 1 << (PAGE_SHIFT + order),
+-  // where 'order' was clamped by min(..., MAX_PAGE_ORDER).
++  // Symbolic/loop-bound proof: if we can prove the result fits in 32-bit (or LHSW),
++  // suppress. This addresses the Linux compaction false positive (start_order < NR_PAGE_ORDERS).
+   if (shiftSafeUnderUpperBounds(L, R, LHSW, C))
+     return;
+
+@@ -610,3 +754,4 @@
+ extern "C" const char clang_analyzerAPIVersionString[] =
+     CLANG_ANALYZER_API_VERSION_STRING;
++

@@ -1,0 +1,188 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Off-by-one index validation: using `if (idx > MAX)` instead of `if (idx >= MAX)` when checking user-provided indices against an array bound constant, where the array is sized `MAX` and valid indices are `[0..MAX-1]`. This allows `idx == MAX` to pass, and subsequent use (e.g., accessing `array[idx]` or `array[idx + 1]`) can cause out-of-bounds access.
+
+## Bug Pattern
+
+Off-by-one index validation: using `if (idx > MAX)` instead of `if (idx >= MAX)` when checking user-provided indices against an array bound constant, where the array is sized `MAX` and valid indices are `[0..MAX-1]`. This allows `idx == MAX` to pass, and subsequent use (e.g., accessing `array[idx]` or `array[idx + 1]`) can cause out-of-bounds access.
+
+# Report
+
+### Report Summary
+
+File:| /scratch/chenyuan-data/linux-debug/net/sctp/socket.c
+---|---
+Warning:| line 3289, column 28
+Off-by-one bound check: use '>= MAX' instead of '> MAX' for index validation
+
+### Annotated Source Code
+
+
+3202  |  *
+3203  |  * This socket option is a boolean flag which turns on or off mapped V4
+3204  |  * addresses.  If this option is turned on and the socket is type
+3205  |  * PF_INET6, then IPv4 addresses will be mapped to V6 representation.
+3206  |  * If this option is turned off, then no mapping will be done of V4
+3207  |  * addresses and a user will receive both PF_INET6 and PF_INET type
+3208  |  * addresses on the socket.
+3209  |  */
+3210  | static int sctp_setsockopt_mappedv4(struct sock *sk, int *val,
+3211  |  unsigned int optlen)
+3212  | {
+3213  |  struct sctp_sock *sp = sctp_sk(sk);
+3214  |
+3215  |  if (optlen < sizeof(int))
+3216  |  return -EINVAL;
+3217  |  if (*val)
+3218  | 		sp->v4mapped = 1;
+3219  |  else
+3220  | 		sp->v4mapped = 0;
+3221  |
+3222  |  return 0;
+3223  | }
+3224  |
+3225  | /*
+3226  |  * 8.1.16.  Get or Set the Maximum Fragmentation Size (SCTP_MAXSEG)
+3227  |  * This option will get or set the maximum size to put in any outgoing
+3228  |  * SCTP DATA chunk.  If a message is larger than this size it will be
+3229  |  * fragmented by SCTP into the specified size.  Note that the underlying
+3230  |  * SCTP implementation may fragment into smaller sized chunks when the
+3231  |  * PMTU of the underlying association is smaller than the value set by
+3232  |  * the user.  The default value for this option is '0' which indicates
+3233  |  * the user is NOT limiting fragmentation and only the PMTU will effect
+3234  |  * SCTP's choice of DATA chunk size.  Note also that values set larger
+3235  |  * than the maximum size of an IP datagram will effectively let SCTP
+3236  |  * control fragmentation (i.e. the same as setting this option to 0).
+3237  |  *
+3238  |  * The following structure is used to access and modify this parameter:
+3239  |  *
+3240  |  * struct sctp_assoc_value {
+3241  |  *   sctp_assoc_t assoc_id;
+3242  |  *   uint32_t assoc_value;
+3243  |  * };
+3244  |  *
+3245  |  * assoc_id:  This parameter is ignored for one-to-one style sockets.
+3246  |  *    For one-to-many style sockets this parameter indicates which
+3247  |  *    association the user is performing an action upon.  Note that if
+3248  |  *    this field's value is zero then the endpoints default value is
+3249  |  *    changed (effecting future associations only).
+3250  |  * assoc_value:  This parameter specifies the maximum size in bytes.
+3251  |  */
+3252  | static int sctp_setsockopt_maxseg(struct sock *sk,
+3253  |  struct sctp_assoc_value *params,
+3254  |  unsigned int optlen)
+3255  | {
+3256  |  struct sctp_sock *sp = sctp_sk(sk);
+3257  |  struct sctp_association *asoc;
+3258  | 	sctp_assoc_t assoc_id;
+3259  |  int val;
+3260  |
+3261  |  if (optlen == sizeof(int)) {
+    1Assuming the condition is false→
+    2←Taking false branch→
+3262  |  pr_warn_ratelimited(DEPRECATED
+3263  |  "%s (pid %d) "
+3264  |  "Use of int in maxseg socket option.\n"
+3265  |  "Use struct sctp_assoc_value instead\n",
+3266  |  current->comm, task_pid_nr(current));
+3267  | 		assoc_id = SCTP_FUTURE_ASSOC;
+3268  | 		val = *(int *)params;
+3269  | 	} else if (optlen == sizeof(struct sctp_assoc_value)) {
+    3←Assuming the condition is true→
+    4←Taking true branch→
+3270  |  assoc_id = params->assoc_id;
+3271  |  val = params->assoc_value;
+3272  | 	} else {
+3273  |  return -EINVAL;
+3274  | 	}
+3275  |
+3276  |  asoc = sctp_id2assoc(sk, assoc_id);
+3277  |  if (!asoc && assoc_id != SCTP_FUTURE_ASSOC &&
+    5←Assuming 'asoc' is null→
+    6←Assuming 'assoc_id' is equal to SCTP_FUTURE_ASSOC→
+3278  |  sctp_style(sk, UDP))
+3279  |  return -EINVAL;
+3280  |
+3281  |  if (val) {
+    7←Assuming 'val' is not equal to 0→
+    8←Taking true branch→
+3282  |  int min_len, max_len;
+3283  |  __u16 datasize = asoc8.1'asoc' is null ? sctp_datachk_len(&asoc->stream) :
+    9←'?' condition is false→
+3284  |  sizeof(struct sctp_data_chunk);
+3285  |
+3286  | 		min_len = sctp_min_frag_point(sp, datasize);
+3287  | 		max_len = SCTP_MAX_CHUNK_LEN - datasize;
+3288  |
+3289  |  if (val < min_len || val > max_len)
+    10←Assuming 'val' is >= 'min_len'→
+    11←Assuming 'val' is <= 'max_len'→
+    12←Off-by-one bound check: use '>= MAX' instead of '> MAX' for index validation
+3290  |  return -EINVAL;
+3291  | 	}
+3292  |
+3293  |  if (asoc) {
+3294  | 		asoc->user_frag = val;
+3295  | 		sctp_assoc_update_frag_point(asoc);
+3296  | 	} else {
+3297  | 		sp->user_frag = val;
+3298  | 	}
+3299  |
+3300  |  return 0;
+3301  | }
+3302  |
+3303  |
+3304  | /*
+3305  |  *  7.1.9 Set Peer Primary Address (SCTP_SET_PEER_PRIMARY_ADDR)
+3306  |  *
+3307  |  *   Requests that the peer mark the enclosed address as the association
+3308  |  *   primary. The enclosed address must be one of the association's
+3309  |  *   locally bound addresses. The following structure is used to make a
+3310  |  *   set primary request:
+3311  |  */
+3312  | static int sctp_setsockopt_peer_primary_addr(struct sock *sk,
+3313  |  struct sctp_setpeerprim *prim,
+3314  |  unsigned int optlen)
+3315  | {
+3316  |  struct sctp_sock	*sp;
+3317  |  struct sctp_association	*asoc = NULL;
+3318  |  struct sctp_chunk	*chunk;
+3319  |  struct sctp_af		*af;
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

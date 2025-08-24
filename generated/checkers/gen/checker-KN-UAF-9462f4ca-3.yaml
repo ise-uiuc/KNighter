@@ -1,0 +1,345 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 9462f4ca56e7d2430fdb6dcc8498244acbfc4489
+commit_type: UAF
+index: 3
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing\
+  \ namespace ento;\nusing namespace taint;\n\n// No custom program states needed.\n\
+  \nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PreCall> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker() : BT(new BugType(this,\
+  \ \"Missing protecting spinlock when freeing list\", \"Concurrency\")) {}\n\n  void\
+  \ checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\nprivate:\n  //\
+  \ Helpers\n  static bool isFreeLike(const CallEvent &Call, CheckerContext &C);\n\
+  \  static bool isSpinLockAcquireCE(const CallExpr *CE, CheckerContext &C);\n  static\
+  \ void collectCallExprs(const Stmt *S, llvm::SmallVectorImpl<const CallExpr*> &Out);\n\
+  \  static const MemberExpr* findMemberExprWithSuffix(const Stmt *Root, StringRef\
+  \ Suffix);\n  static std::string extractRootDeclName(const Expr *E);\n  static const\
+  \ MemRegion* getBaseRegionFromExpr(const Expr *E, CheckerContext &C);\n  static\
+  \ bool sameBaseObject(const Expr *A, const Expr *B, CheckerContext &C);\n  static\
+  \ bool matchLockForList(const Expr *LockArg, const MemberExpr *ListME, StringRef\
+  \ BaseName, CheckerContext &C);\n};\n\nbool SAGenTestChecker::isFreeLike(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  const Expr *Orig = Call.getOriginExpr();\n\
+  \  if (!Orig)\n    return false;\n  // Use ExprHasName for robust matching.\n  if\
+  \ (ExprHasName(Orig, \"kfree\", C))\n    return true;\n  if (ExprHasName(Orig, \"\
+  kvfree\", C))\n    return true;\n  return false;\n}\n\nbool SAGenTestChecker::isSpinLockAcquireCE(const\
+  \ CallExpr *CE, CheckerContext &C) {\n  if (!CE)\n    return false;\n  // Check\
+  \ for multiple known spinlock acquire APIs\n  static const char *Names[] = {\n \
+  \   \"spin_lock\", \"spin_lock_irqsave\", \"spin_lock_bh\",\n    \"_raw_spin_lock\"\
+  , \"_raw_spin_lock_irqsave\",\n    \"raw_spin_lock\", \"raw_spin_lock_irqsave\"\n\
+  \  };\n\n  for (const char *N : Names) {\n    if (ExprHasName(CE, N, C))\n     \
+  \ return true;\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::collectCallExprs(const\
+  \ Stmt *S, llvm::SmallVectorImpl<const CallExpr*> &Out) {\n  if (!S)\n    return;\n\
+  \  if (const auto *CE = dyn_cast<CallExpr>(S)) {\n    Out.push_back(CE);\n  }\n\
+  \  for (const Stmt *Child : S->children()) {\n    if (Child)\n      collectCallExprs(Child,\
+  \ Out);\n  }\n}\n\nstatic const FieldDecl* getFieldFromMemberExpr(const MemberExpr\
+  \ *ME) {\n  if (!ME)\n    return nullptr;\n  if (const auto *FD = dyn_cast_or_null<FieldDecl>(ME->getMemberDecl()))\n\
+  \    return FD;\n  return nullptr;\n}\n\nconst MemberExpr* SAGenTestChecker::findMemberExprWithSuffix(const\
+  \ Stmt *Root, StringRef Suffix) {\n  if (!Root)\n    return nullptr;\n\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(Root)) {\n    if (const FieldDecl *FD = getFieldFromMemberExpr(ME))\
+  \ {\n      StringRef Name = FD->getName();\n      if (Name.endswith(Suffix))\n \
+  \       return ME;\n    }\n  }\n\n  for (const Stmt *Child : Root->children()) {\n\
+  \    if (const MemberExpr *Found = findMemberExprWithSuffix(Child, Suffix))\n  \
+  \    return Found;\n  }\n  return nullptr;\n}\n\nstd::string SAGenTestChecker::extractRootDeclName(const\
+  \ Expr *E) {\n  if (!E)\n    return {};\n  E = E->IgnoreParenImpCasts();\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    const ValueDecl *VD = DRE->getDecl();\n\
+  \    if (VD)\n      return VD->getNameAsString();\n    return {};\n  }\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(E)) {\n    return extractRootDeclName(ME->getBase());\n\
+  \  }\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    return extractRootDeclName(UO->getSubExpr());\n\
+  \  }\n  if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {\n    return extractRootDeclName(ASE->getBase());\n\
+  \  }\n  return {};\n}\n\nconst MemRegion* SAGenTestChecker::getBaseRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  // Always\
+  \ normalize to base region as suggested.\n  MR = MR->getBaseRegion();\n  return\
+  \ MR;\n}\n\nbool SAGenTestChecker::sameBaseObject(const Expr *A, const Expr *B,\
+  \ CheckerContext &C) {\n  const MemRegion *RA = getBaseRegionFromExpr(A, C);\n \
+  \ const MemRegion *RB = getBaseRegionFromExpr(B, C);\n  if (!RA || !RB)\n    return\
+  \ false;\n  return RA == RB;\n}\n\nbool SAGenTestChecker::matchLockForList(const\
+  \ Expr *LockArg, const MemberExpr *ListME, StringRef BaseName, CheckerContext &C)\
+  \ {\n  if (!LockArg || !ListME)\n    return false;\n\n  // Precise match via region\
+  \ base equality\n  if (sameBaseObject(LockArg, ListME->getBase(), C))\n    return\
+  \ true;\n\n  // Fallback textual check if regions not available or didn't match\n\
+  \  if (!BaseName.empty()) {\n    if (ExprHasName(LockArg, BaseName, C) && ExprHasName(LockArg,\
+  \ \"_lock\", C))\n      return true;\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isFreeLike(Call, C))\n   \
+  \ return;\n\n  const Expr *CallExprE = Call.getOriginExpr();\n  if (!CallExprE)\n\
+  \    return;\n\n  // Ensure we are inside a for-loop (likely a list_for_each* expansion).\n\
+  \  const ForStmt *FS = findSpecificTypeInParents<ForStmt>(CallExprE, C);\n  if (!FS)\n\
+  \    return;\n\n  // Find a MemberExpr under this ForStmt that references a list\
+  \ head with suffix \"_list\".\n  const MemberExpr *ListME = findMemberExprWithSuffix(FS,\
+  \ \"_list\");\n  if (!ListME)\n    return;\n\n  // Extract a textual base name for\
+  \ fallback (e.g., \"gsm\" in gsm->tx_ctrl_list).\n  std::string BaseName = extractRootDeclName(ListME->getBase());\n\
+  \n  // Find the surrounding compound statement to scan preceding statements for\
+  \ spin_lock acquisition.\n  const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(FS,\
+  \ C);\n  if (!CS)\n    return;\n\n  // Iterate statements in CS and scan those before\
+  \ FS.\n  bool FoundFS = false;\n  bool FoundProtectingLock = false;\n\n  for (const\
+  \ Stmt *S : CS->body()) {\n    if (S == FS) {\n      FoundFS = true;\n      break;\n\
+  \    }\n\n    // Scan calls within this preceding statement.\n    llvm::SmallVector<const\
+  \ CallExpr*, 8> Calls;\n    collectCallExprs(S, Calls);\n    for (const CallExpr\
+  \ *CE : Calls) {\n      if (!isSpinLockAcquireCE(CE, C))\n        continue;\n\n\
+  \      // First argument should be the lock pointer (e.g., &gsm->tx_lock).\n   \
+  \   if (CE->getNumArgs() < 1)\n        continue;\n\n      const Expr *Arg0 = CE->getArg(0);\n\
+  \      if (matchLockForList(Arg0, ListME, BaseName, C)) {\n        FoundProtectingLock\
+  \ = true;\n        break;\n      }\n    }\n    if (FoundProtectingLock)\n      break;\n\
+  \  }\n\n  if (!FoundFS) {\n    // FS wasn't within the body list; conservative bail.\n\
+  \    return;\n  }\n\n  if (!FoundProtectingLock) {\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    if (!N)\n      return;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \        *BT, \"Freeing list elements without holding the protecting spinlock\"\
+  , N);\n    R->addRange(Call.getSourceRange());\n    C.emitReport(std::move(R));\n\
+  \  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing/iterating kernel list entries without holding the protecting\
+  \ spinlock\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ntty: n_gsm: Fix use-after-free in gsm_cleanup_mux\n\
+  \nBUG: KASAN: slab-use-after-free in gsm_cleanup_mux+0x77b/0x7b0\ndrivers/tty/n_gsm.c:3160\
+  \ [n_gsm]\nRead of size 8 at addr ffff88815fe99c00 by task poc/3379\nCPU: 0 UID:\
+  \ 0 PID: 3379 Comm: poc Not tainted 6.11.0+ #56\nHardware name: VMware, Inc. VMware\
+  \ Virtual Platform/440BX\nDesktop Reference Platform, BIOS 6.00 11/12/2020\nCall\
+  \ Trace:\n <TASK>\n gsm_cleanup_mux+0x77b/0x7b0 drivers/tty/n_gsm.c:3160 [n_gsm]\n\
+  \ __pfx_gsm_cleanup_mux+0x10/0x10 drivers/tty/n_gsm.c:3124 [n_gsm]\n __pfx_sched_clock_cpu+0x10/0x10\
+  \ kernel/sched/clock.c:389\n update_load_avg+0x1c1/0x27b0 kernel/sched/fair.c:4500\n\
+  \ __pfx_min_vruntime_cb_rotate+0x10/0x10 kernel/sched/fair.c:846\n __rb_insert_augmented+0x492/0xbf0\
+  \ lib/rbtree.c:161\n gsmld_ioctl+0x395/0x1450 drivers/tty/n_gsm.c:3408 [n_gsm]\n\
+  \ _raw_spin_lock_irqsave+0x92/0xf0 arch/x86/include/asm/atomic.h:107\n __pfx_gsmld_ioctl+0x10/0x10\
+  \ drivers/tty/n_gsm.c:3822 [n_gsm]\n ktime_get+0x5e/0x140 kernel/time/timekeeping.c:195\n\
+  \ ldsem_down_read+0x94/0x4e0 arch/x86/include/asm/atomic64_64.h:79\n __pfx_ldsem_down_read+0x10/0x10\
+  \ drivers/tty/tty_ldsem.c:338\n __pfx_do_vfs_ioctl+0x10/0x10 fs/ioctl.c:805\n tty_ioctl+0x643/0x1100\
+  \ drivers/tty/tty_io.c:2818\n\nAllocated by task 65:\n gsm_data_alloc.constprop.0+0x27/0x190\
+  \ drivers/tty/n_gsm.c:926 [n_gsm]\n gsm_send+0x2c/0x580 drivers/tty/n_gsm.c:819\
+  \ [n_gsm]\n gsm1_receive+0x547/0xad0 drivers/tty/n_gsm.c:3038 [n_gsm]\n gsmld_receive_buf+0x176/0x280\
+  \ drivers/tty/n_gsm.c:3609 [n_gsm]\n tty_ldisc_receive_buf+0x101/0x1e0 drivers/tty/tty_buffer.c:391\n\
+  \ tty_port_default_receive_buf+0x61/0xa0 drivers/tty/tty_port.c:39\n flush_to_ldisc+0x1b0/0x750\
+  \ drivers/tty/tty_buffer.c:445\n process_scheduled_works+0x2b0/0x10d0 kernel/workqueue.c:3229\n\
+  \ worker_thread+0x3dc/0x950 kernel/workqueue.c:3391\n kthread+0x2a3/0x370 kernel/kthread.c:389\n\
+  \ ret_from_fork+0x2d/0x70 arch/x86/kernel/process.c:147\n ret_from_fork_asm+0x1a/0x30\
+  \ arch/x86/entry/entry_64.S:257\n\nFreed by task 3367:\n kfree+0x126/0x420 mm/slub.c:4580\n\
+  \ gsm_cleanup_mux+0x36c/0x7b0 drivers/tty/n_gsm.c:3160 [n_gsm]\n gsmld_ioctl+0x395/0x1450\
+  \ drivers/tty/n_gsm.c:3408 [n_gsm]\n tty_ioctl+0x643/0x1100 drivers/tty/tty_io.c:2818\n\
+  \n[Analysis]\ngsm_msg on the tx_ctrl_list or tx_data_list of gsm_mux\ncan be freed\
+  \ by multi threads through ioctl,which leads\nto the occurrence of uaf. Protect\
+  \ it by gsm tx lock.\n\nSigned-off-by: Longlong Xia <xialonglong@kylinos.cn>\nCc:\
+  \ stable <stable@kernel.org>\nSuggested-by: Jiri Slaby <jirislaby@kernel.org>\n\
+  Link: https://lore.kernel.org/r/20240926130213.531959-1-xialonglong@kylinos.cn\n\
+  Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>\n\n## Buggy Code\n\
+  \n```c\n// Function: gsm_cleanup_mux in drivers/tty/n_gsm.c\nstatic void gsm_cleanup_mux(struct\
+  \ gsm_mux *gsm, bool disc)\n{\n\tint i;\n\tstruct gsm_dlci *dlci;\n\tstruct gsm_msg\
+  \ *txq, *ntxq;\n\n\tgsm->dead = true;\n\tmutex_lock(&gsm->mutex);\n\n\tdlci = gsm->dlci[0];\n\
+  \tif (dlci) {\n\t\tif (disc && dlci->state != DLCI_CLOSED) {\n\t\t\tgsm_dlci_begin_close(dlci);\n\
+  \t\t\twait_event(gsm->event, dlci->state == DLCI_CLOSED);\n\t\t}\n\t\tdlci->dead\
+  \ = true;\n\t}\n\n\t/* Finish outstanding timers, making sure they are done */\n\
+  \tdel_timer_sync(&gsm->kick_timer);\n\tdel_timer_sync(&gsm->t2_timer);\n\tdel_timer_sync(&gsm->ka_timer);\n\
+  \n\t/* Finish writing to ldisc */\n\tflush_work(&gsm->tx_work);\n\n\t/* Free up\
+  \ any link layer users and finally the control channel */\n\tif (gsm->has_devices)\
+  \ {\n\t\tgsm_unregister_devices(gsm_tty_driver, gsm->num);\n\t\tgsm->has_devices\
+  \ = false;\n\t}\n\tfor (i = NUM_DLCI - 1; i >= 0; i--)\n\t\tif (gsm->dlci[i])\n\t\
+  \t\tgsm_dlci_release(gsm->dlci[i]);\n\tmutex_unlock(&gsm->mutex);\n\t/* Now wipe\
+  \ the queues */\n\ttty_ldisc_flush(gsm->tty);\n\tlist_for_each_entry_safe(txq, ntxq,\
+  \ &gsm->tx_ctrl_list, list)\n\t\tkfree(txq);\n\tINIT_LIST_HEAD(&gsm->tx_ctrl_list);\n\
+  \tlist_for_each_entry_safe(txq, ntxq, &gsm->tx_data_list, list)\n\t\tkfree(txq);\n\
+  \tINIT_LIST_HEAD(&gsm->tx_data_list);\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff\
+  \ --git a/drivers/tty/n_gsm.c b/drivers/tty/n_gsm.c\nindex 5d37a0984916..252849910588\
+  \ 100644\n--- a/drivers/tty/n_gsm.c\n+++ b/drivers/tty/n_gsm.c\n@@ -3157,6 +3157,8\
+  \ @@ static void gsm_cleanup_mux(struct gsm_mux *gsm, bool disc)\n \tmutex_unlock(&gsm->mutex);\n\
+  \ \t/* Now wipe the queues */\n \ttty_ldisc_flush(gsm->tty);\n+\n+\tguard(spinlock_irqsave)(&gsm->tx_lock);\n\
+  \ \tlist_for_each_entry_safe(txq, ntxq, &gsm->tx_ctrl_list, list)\n \t\tkfree(txq);\n\
+  \ \tINIT_LIST_HEAD(&gsm->tx_ctrl_list);\n```\n"
+pattern: "## Bug Pattern\n\nFreeing or iterating over a shared list without holding\
+  \ the list\u2019s protecting lock.\n\nSpecifically, the cleanup path walks and kfree\u2019\
+  s entries from tx_ctrl_list/tx_data_list after dropping the outer mutex but without\
+  \ taking the required spinlock (gsm->tx_lock), while other threads (e.g., ioctl\
+  \ paths) can concurrently manipulate/free the same lists under that spinlock. This\
+  \ lockless traversal/free leads to races and use-after-free.\n\nPattern example:\n\
+  - WRONG:\n  mutex_unlock(&gsm->mutex);\n  list_for_each_entry_safe(msg, n, &gsm->tx_ctrl_list,\
+  \ list)\n      kfree(msg);\n\n- RIGHT:\n  mutex_unlock(&gsm->mutex);\n  spin_lock_irqsave(&gsm->tx_lock,\
+  \ flags);\n  list_for_each_entry_safe(msg, n, &gsm->tx_ctrl_list, list) {\n    \
+  \  /* optionally list_del(&msg->list); */\n      kfree(msg);\n  }\n  INIT_LIST_HEAD(&gsm->tx_ctrl_list);\n\
+  \  spin_unlock_irqrestore(&gsm->tx_lock, flags);"
+plan: "Plan\n\n1. Program state\n- No custom program state is needed. The pattern\
+  \ can be detected with AST/context inspection around kfree-like calls and loop headers,\
+  \ plus a lightweight lock-acquire scan in the surrounding block.\n\n2. Callbacks\n\
+  - Use only:\n  - checkPreCall: to anchor on kfree-like frees, then analyze the surrounding\
+  \ loop and locking.\n  - checkASTCodeBody: optional pre-scan to cache nothing; we\
+  \ can skip it to keep the checker simple.\n\n3. Detection strategy in checkPreCall\n\
+  - Goal: If a kfree (or kvfree) is executed inside a list traversal loop that references\
+  \ a list_head (field with name ending in \u201C_list\u201D), ensure a protecting\
+  \ spinlock on the same base object (field ending in \u201C_lock\u201D) is acquired\
+  \ in the statements preceding the loop. If not, report.\n\n- Step-by-step implementation\
+  \ in checkPreCall:\n  1) Match frees:\n     - Intercept calls whose callee name\
+  \ is in {\"kfree\", \"kvfree\"}.\n     - Let S be the Statement of this call.\n\n\
+  \  2) Ensure we are inside a loop created by Linux list_for_each* macro:\n     -\
+  \ Go up the AST from S with findSpecificTypeInParents<ForStmt>(S, C). If no ForStmt,\
+  \ return (not our case).\n     - Let FS be that ForStmt.\n\n  3) Extract evidence\
+  \ that FS iterates a kernel list_head:\n     - Search for an UnaryOperator with\
+  \ UO_AddrOf under FS (init/cond/inc preferred, but searching FS subtree is fine):\n\
+  \       - Use findSpecificTypeInChildren<UnaryOperator>(FS).\n       - Check it\
+  \ is an address-of (&).\n       - From that UnaryOperator, find a MemberExpr child:\
+  \ findSpecificTypeInChildren<MemberExpr>(UnaryOpExpr).\n       - If no MemberExpr\
+  \ found, bail (cannot prove a list head).\n       - Let ME_list be the MemberExpr.\
+  \ If FieldDecl name does not end with \"_list\", bail (not a list_head).\n     -\
+  \ Obtain the base of the list head:\n       - BaseExpr = ME_list->getBase()->IgnoreParenImpCasts().\n\
+  \       - If BaseExpr is a DeclRefExpr, get its name string: BaseName = DRE->getDecl()->getNameAsString().\
+  \ Keep this as a textual fallback.\n     - Also compute the precise memory region\
+  \ for the list head field to identify the owning object:\n       - ListHeadRegion\
+  \ = getMemRegionFromExpr(UnaryOpExpr, C). This should be a FieldRegion or a locatable\
+  \ region.\n       - If ListHeadRegion is a FieldRegion, extract its super region\
+  \ (the base/object region). Call it ListBaseSuperRegion. We will use this to match\
+  \ the lock\u2019s base.\n\n  4) Find the surrounding block and scan for a spin_lock\
+  \ acquisition before the loop:\n     - Let CS be the nearest parent CompoundStmt\
+  \ of FS: findSpecificTypeInParents<CompoundStmt>(FS, C).\n     - Iterate statements\
+  \ of CS to find the position of FS.\n     - Scan all statements preceding FS (from\
+  \ the start of CS up to but not including FS).\n     - For each statement P:\n \
+  \      - Recursively inspect all descendant CallExpr nodes in P (iterate children;\
+  \ you can do a small DFS/BFS for CallExprs).\n       - For each CallExpr CE:\n \
+  \        - If its callee is one of:\n           {\"spin_lock\", \"spin_lock_irqsave\"\
+  , \"spin_lock_bh\", \"_raw_spin_lock\", \"_raw_spin_lock_irqsave\", \"raw_spin_lock\"\
+  , \"raw_spin_lock_irqsave\"}\n           then treat it as a potential lock acquisition.\n\
+  \         - Extract its first argument Arg0 (the lock pointer).\n         - Try\
+  \ to bind Arg0 to a region: LockRegion = getMemRegionFromExpr(Arg0, C).\n      \
+  \      - If LockRegion is a FieldRegion, and its FieldDecl name ends with \"_lock\"\
+  :\n              - Compute LockBaseSuperRegion = super region of LockRegion.\n \
+  \             - If both ListBaseSuperRegion and LockBaseSuperRegion are non-null\
+  \ and equal, then we consider the protecting spinlock as held for this loop. Set\
+  \ FoundProtectingLock = true and stop scanning.\n            - If precise regions\
+  \ cannot be obtained (e.g., due to macro complexity), use a textual fallback:\n\
+  \              - If BaseName is known, and ExprHasName(Arg0, BaseName) && ExprHasName(Arg0,\
+  \ \"_lock\"), consider the lock matched. Set FoundProtectingLock = true.\n\n   \
+  \  - Note on RAII guard(spinlock_irqsave): This macro typically expands to a DeclStmt\
+  \ with an initializer that calls raw_spin_lock_irqsave internally. The above recursive\
+  \ CallExpr scan of preceding statements will still see that call; no special handling\
+  \ is required.\n\n  5) Emit a report if no protecting lock is found:\n     - If\
+  \ FoundProtectingLock is false:\n       - Generate a non-fatal error node with C.generateNonFatalErrorNode().\n\
+  \       - Create a PathSensitiveBugReport with a short message like:\n         \"\
+  Freeing list elements without holding the protecting spinlock\"\n       - Anchor\
+  \ the report at the kfree call expression.\n       - Emit with C.emitReport(...).\n\
+  \n4. Additional heuristics and constraints to reduce false positives\n- Only warn\
+  \ if all of the following hold:\n  - The free happens inside a ForStmt.\n  - The\
+  \ same ForStmt subtree contains an address-of a field whose name ends with \u201C\
+  _list\u201D.\n  - The list head base can be identified either via region or simple\
+  \ base variable name, and no spin_lock-like acquisition on a \u201C_lock\u201D field\
+  \ of the same base object is found in the same block before the loop.\n- This avoids\
+  \ warning on arbitrary frees in loops and focuses precisely on Linux list traversal\
+  \ plus free.\n\n5. Utility functions usage summary\n- findSpecificTypeInParents<ForStmt>(S,\
+  \ C): to locate the enclosing loop.\n- findSpecificTypeInParents<CompoundStmt>(FS,\
+  \ C): to get the surrounding block and enable scanning of preceding statements.\n\
+  - findSpecificTypeInChildren<UnaryOperator>(FS): to find address-of operators; then\
+  \ findSpecificTypeInChildren<MemberExpr>(UnaryOp) to get the list head field.\n\
+  - getMemRegionFromExpr(E, C): to map \"&base->field\" and \"&base->lock\" expressions\
+  \ to regions and compare their super regions (owners).\n- ExprHasName(E, \"token\"\
+  ): as a fallback textual check for base name and \u201C_lock\u201D when precise\
+  \ regions are unavailable.\n\n6. Notes\n- This checker purposely focuses on kernel\
+  \ list traversal/free patterns and spinlock acquisition, matching the bug in gsm_cleanup_mux:\n\
+  \  - mutex_unlock precedes the loop (not required for detection).\n  - Two loops\
+  \ traverse &gsm->tx_ctrl_list and &gsm->tx_data_list and kfree entries.\n  - No\
+  \ spin_lock on &gsm->tx_lock before the loops.\n- The added guard(spinlock_irqsave)\
+  \ in the fix expands to a raw_spin_lock_irqsave call; scanning preceding statements\
+  \ and their CallExpr descendants will correctly recognize it as a lock acquisition\
+  \ and suppress the warning."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing\
+  \ namespace ento;\nusing namespace taint;\n\n// No custom program states needed.\n\
+  \nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PreCall> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker() : BT(new BugType(this,\
+  \ \"Missing protecting spinlock when freeing list\", \"Concurrency\")) {}\n\n  void\
+  \ checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\nprivate:\n  //\
+  \ Helpers\n  static bool isFreeLike(const CallEvent &Call, CheckerContext &C);\n\
+  \  static bool isSpinLockAcquireCE(const CallExpr *CE, CheckerContext &C);\n  static\
+  \ void collectCallExprs(const Stmt *S, llvm::SmallVectorImpl<const CallExpr*> &Out);\n\
+  \  static const MemberExpr* findMemberExprWithSuffix(const Stmt *Root, StringRef\
+  \ Suffix);\n  static std::string extractRootDeclName(const Expr *E);\n  static const\
+  \ MemRegion* getBaseRegionFromExpr(const Expr *E, CheckerContext &C);\n  static\
+  \ bool sameBaseObject(const Expr *A, const Expr *B, CheckerContext &C);\n  static\
+  \ bool matchLockForList(const Expr *LockArg, const MemberExpr *ListME, StringRef\
+  \ BaseName, CheckerContext &C);\n};\n\nbool SAGenTestChecker::isFreeLike(const CallEvent\
+  \ &Call, CheckerContext &C) {\n  const Expr *Orig = Call.getOriginExpr();\n  if\
+  \ (!Orig)\n    return false;\n  // Use ExprHasName for robust matching.\n  if (ExprHasName(Orig,\
+  \ \"kfree\", C))\n    return true;\n  if (ExprHasName(Orig, \"kvfree\", C))\n  \
+  \  return true;\n  return false;\n}\n\nbool SAGenTestChecker::isSpinLockAcquireCE(const\
+  \ CallExpr *CE, CheckerContext &C) {\n  if (!CE)\n    return false;\n  // Check\
+  \ for multiple known spinlock acquire APIs\n  static const char *Names[] = {\n \
+  \   \"spin_lock\", \"spin_lock_irqsave\", \"spin_lock_bh\",\n    \"_raw_spin_lock\"\
+  , \"_raw_spin_lock_irqsave\",\n    \"raw_spin_lock\", \"raw_spin_lock_irqsave\"\n\
+  \  };\n\n  for (const char *N : Names) {\n    if (ExprHasName(CE, N, C))\n     \
+  \ return true;\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::collectCallExprs(const\
+  \ Stmt *S, llvm::SmallVectorImpl<const CallExpr*> &Out) {\n  if (!S)\n    return;\n\
+  \  if (const auto *CE = dyn_cast<CallExpr>(S)) {\n    Out.push_back(CE);\n  }\n\
+  \  for (const Stmt *Child : S->children()) {\n    if (Child)\n      collectCallExprs(Child,\
+  \ Out);\n  }\n}\n\nstatic const FieldDecl* getFieldFromMemberExpr(const MemberExpr\
+  \ *ME) {\n  if (!ME)\n    return nullptr;\n  if (const auto *FD = dyn_cast_or_null<FieldDecl>(ME->getMemberDecl()))\n\
+  \    return FD;\n  return nullptr;\n}\n\nconst MemberExpr* SAGenTestChecker::findMemberExprWithSuffix(const\
+  \ Stmt *Root, StringRef Suffix) {\n  if (!Root)\n    return nullptr;\n\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(Root)) {\n    if (const FieldDecl *FD = getFieldFromMemberExpr(ME))\
+  \ {\n      StringRef Name = FD->getName();\n      if (Name.endswith(Suffix))\n \
+  \       return ME;\n    }\n  }\n\n  for (const Stmt *Child : Root->children()) {\n\
+  \    if (const MemberExpr *Found = findMemberExprWithSuffix(Child, Suffix))\n  \
+  \    return Found;\n  }\n  return nullptr;\n}\n\nstd::string SAGenTestChecker::extractRootDeclName(const\
+  \ Expr *E) {\n  if (!E)\n    return {};\n  E = E->IgnoreParenImpCasts();\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    const ValueDecl *VD = DRE->getDecl();\n\
+  \    if (VD)\n      return VD->getNameAsString();\n    return {};\n  }\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(E)) {\n    return extractRootDeclName(ME->getBase());\n\
+  \  }\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    return extractRootDeclName(UO->getSubExpr());\n\
+  \  }\n  if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {\n    return extractRootDeclName(ASE->getBase());\n\
+  \  }\n  return {};\n}\n\nconst MemRegion* SAGenTestChecker::getBaseRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  // Always\
+  \ normalize to base region as suggested.\n  MR = MR->getBaseRegion();\n  return\
+  \ MR;\n}\n\nbool SAGenTestChecker::sameBaseObject(const Expr *A, const Expr *B,\
+  \ CheckerContext &C) {\n  const MemRegion *RA = getBaseRegionFromExpr(A, C);\n \
+  \ const MemRegion *RB = getBaseRegionFromExpr(B, C);\n  if (!RA || !RB)\n    return\
+  \ false;\n  return RA == RB;\n}\n\nbool SAGenTestChecker::matchLockForList(const\
+  \ Expr *LockArg, const MemberExpr *ListME, StringRef BaseName, CheckerContext &C)\
+  \ {\n  if (!LockArg || !ListME)\n    return false;\n\n  // Precise match via region\
+  \ base equality\n  if (sameBaseObject(LockArg, ListME->getBase(), C))\n    return\
+  \ true;\n\n  // Fallback textual check if regions not available or didn't match\n\
+  \  if (!BaseName.empty()) {\n    if (ExprHasName(LockArg, BaseName, C) && ExprHasName(LockArg,\
+  \ \"_lock\", C))\n      return true;\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isFreeLike(Call, C))\n   \
+  \ return;\n\n  const Expr *CallExprE = Call.getOriginExpr();\n  if (!CallExprE)\n\
+  \    return;\n\n  // Ensure we are inside a for-loop (likely a list_for_each* expansion).\n\
+  \  const ForStmt *FS = findSpecificTypeInParents<ForStmt>(CallExprE, C);\n  if (!FS)\n\
+  \    return;\n\n  // Find a MemberExpr under this ForStmt that references a list\
+  \ head with suffix \"_list\".\n  const MemberExpr *ListME = findMemberExprWithSuffix(FS,\
+  \ \"_list\");\n  if (!ListME)\n    return;\n\n  // Extract a textual base name for\
+  \ fallback (e.g., \"gsm\" in gsm->tx_ctrl_list).\n  std::string BaseName = extractRootDeclName(ListME->getBase());\n\
+  \n  // Find the surrounding compound statement to scan preceding statements for\
+  \ spin_lock acquisition.\n  const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(FS,\
+  \ C);\n  if (!CS)\n    return;\n\n  // Iterate statements in CS and scan those before\
+  \ FS.\n  bool FoundFS = false;\n  bool FoundProtectingLock = false;\n\n  for (const\
+  \ Stmt *S : CS->body()) {\n    if (S == FS) {\n      FoundFS = true;\n      break;\n\
+  \    }\n\n    // Scan calls within this preceding statement.\n    llvm::SmallVector<const\
+  \ CallExpr*, 8> Calls;\n    collectCallExprs(S, Calls);\n    for (const CallExpr\
+  \ *CE : Calls) {\n      if (!isSpinLockAcquireCE(CE, C))\n        continue;\n\n\
+  \      // First argument should be the lock pointer (e.g., &gsm->tx_lock).\n   \
+  \   if (CE->getNumArgs() < 1)\n        continue;\n\n      const Expr *Arg0 = CE->getArg(0);\n\
+  \      if (matchLockForList(Arg0, ListME, BaseName, C)) {\n        FoundProtectingLock\
+  \ = true;\n        break;\n      }\n    }\n    if (FoundProtectingLock)\n      break;\n\
+  \  }\n\n  if (!FoundFS) {\n    // FS wasn't within the body list; conservative bail.\n\
+  \    return;\n  }\n\n  if (!FoundProtectingLock) {\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    if (!N)\n      return;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \        *BT, \"Freeing list elements without holding the protecting spinlock\"\
+  , N);\n    R->addRange(Call.getSourceRange());\n    C.emitReport(std::move(R));\n\
+  \  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing/iterating kernel list entries without holding the protecting\
+  \ spinlock\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

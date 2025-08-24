@@ -1,0 +1,133 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -41,7 +41,7 @@
+ private:
+   // Helper functions
+-  bool isCopyFromUser(const CallEvent &Call, CheckerContext &C) const;
++  bool isCopyFromUser(const CallEvent &Call) const;
+
+   // Try to identify destination as a fixed-size array. Returns true on success and fills ArraySize, ArrReg, ArrName.
+   bool getDestArrayInfo(const Expr *DstArg, CheckerContext &C,
+@@ -58,19 +58,20 @@
+   void reportUnbounded(const CallEvent &Call, const Expr *Dst,
+                        const Expr *Len, CheckerContext &C) const;
++
++  // Filter out benign cases to reduce false positives.
++  bool isFalsePositive(const CallEvent &Call, const Expr *LenArg,
++                       uint64_t ArraySize, CheckerContext &C) const;
+ };
+
+-bool SAGenTestChecker::isCopyFromUser(const CallEvent &Call, CheckerContext &C) const {
+-  const Expr *OE = Call.getOriginExpr();
+-  if (!OE)
+-    return false;
+-  // Use textual match as recommended to be robust with macros and wrappers.
+-  if (ExprHasName(OE, "copy_from_user", C))
+-    return true;
+-  if (ExprHasName(OE, "__copy_from_user", C))
+-    return true;
+-  if (ExprHasName(OE, "raw_copy_from_user", C))
+-    return true;
++bool SAGenTestChecker::isCopyFromUser(const CallEvent &Call) const {
++  // Only consider exact function names, avoid substring matches (e.g., copy_from_user_nmi).
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    StringRef Name = ID->getName();
++    return Name == "copy_from_user" ||
++           Name == "__copy_from_user" ||
++           Name == "raw_copy_from_user";
++  }
+   return false;
+ }
+
+@@ -164,6 +165,21 @@   if (Len)
+     R->addRange(Len->getSourceRange());
+   C.emitReport(std::move(R));
++}
++
++// False-positive filter:
++// - If the length argument folds to a compile-time constant that is <= sizeof(array),
++//   treat it as safe (raw byte copies).
++bool SAGenTestChecker::isFalsePositive(const CallEvent &Call, const Expr *LenArg,
++                                       uint64_t ArraySize, CheckerContext &C) const {
++  llvm::APSInt ConstLen;
++  if (EvaluateExprToInt(ConstLen, LenArg, C)) {
++    uint64_t L = ConstLen.isSigned() ? static_cast<uint64_t>(ConstLen.getSExtValue())
++                                     : ConstLen.getZExtValue();
++    if (L <= ArraySize)
++      return true;
++  }
++  return false;
+ }
+
+ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+@@ -216,7 +232,7 @@ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+-  if (!isCopyFromUser(Call, C))
++  if (!isCopyFromUser(Call))
+     return;
+
+   if (Call.getNumArgs() < 3)
+@@ -235,9 +251,15 @@     return; // Only warn when destination is a provable fixed-size array
+
+   uint64_t ArraySize = ArraySizeAP.getZExtValue();
+-  uint64_t SafeCopyLimit = (ArraySize > 0) ? (ArraySize - 1) : 0;
+-
+-  // 1) Len directly contains sizeof(array)
++  // Historically, some callers clamp to sizeof(buf)-1 for C-string usage.
++  // For raw byte copies, copying up to sizeof(buf) is safe.
++  uint64_t SafeCopyLimitMinusOne = (ArraySize > 0) ? (ArraySize - 1) : 0;
++
++  // 0) Ignore benign constant cases: const length <= sizeof(array)
++  if (isFalsePositive(Call, LenArg, ArraySize, C))
++    return;
++
++  // 1) Len directly contains sizeof(array) (or variations detected via AST/text)
+   if (exprContainsSizeofOfArray(LenArg, ArrReg, ArrName, C))
+     return;
+
+@@ -252,36 +274,33 @@   if (BoundRegForArray && LenReg && (BoundRegForArray == LenReg))
+     return;
+
+-  // 3) Try to infer if Len is constant and exceeds the array size
++  // 3) Try to infer if Len is constant and exceeds the array size (already handled <= ArraySize above)
+   llvm::APSInt ConstLen;
+   if (EvaluateExprToInt(ConstLen, LenArg, C)) {
+-    // If definitely larger than the array, report.
+-    if (ConstLen.isSigned() ? ConstLen.getSExtValue() > (int64_t)ArraySize
+-                            : ConstLen.getZExtValue() > ArraySize) {
++    uint64_t L = ConstLen.isSigned() ? static_cast<uint64_t>(ConstLen.getSExtValue())
++                                     : ConstLen.getZExtValue();
++    if (L > ArraySize) {
+       reportUnbounded(Call, DstArg, LenArg, C);
+       return;
+     }
+-    // If definitely <= SafeCopyLimit, consider safe.
+-    if (ConstLen.isSigned() ? ConstLen.getSExtValue() <= (int64_t)SafeCopyLimit
+-                            : ConstLen.getZExtValue() <= SafeCopyLimit) {
+-      return;
+-    }
+-    // Otherwise, do not early report here; continue checks.
++    // If not exceeding, we've already returned in isFalsePositive; so continue only if unknown.
+   }
+
+   // 4) Infer maximal value for symbolic Len
+   if (LenSym) {
+     if (const llvm::APSInt *MaxV = inferSymbolMaxVal(LenSym, C)) {
+-      uint64_t MaxVal = MaxV->isSigned() ? (uint64_t)MaxV->getSExtValue() : MaxV->getZExtValue();
+-      if (MaxVal <= SafeCopyLimit)
+-        return; // safely bounded
++      uint64_t MaxVal = MaxV->isSigned() ? static_cast<uint64_t>(MaxV->getSExtValue())
++                                         : MaxV->getZExtValue();
++      if (MaxVal <= ArraySize)
++        return; // safely bounded by buffer size
+       if (MaxVal > ArraySize) {
+         // Definitely can exceed buffer size.
+         reportUnbounded(Call, DstArg, LenArg, C);
+         return;
+       }
+     }
+-    // Weak heuristic: if we heuristically said the symbol is bounded, accept it.
++    // Weak heuristic: if we heuristically said the symbol is bounded (min with sizeof),
++    // accept it.
+     if (State->contains<BoundedLenSyms>(LenSym))
+       return;
+   }

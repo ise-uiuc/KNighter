@@ -1,0 +1,100 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -107,6 +107,10 @@       // Additional helpers for symbol-based suppression
+       void recordSymbolicWrite(const MemRegion *DstR, SymbolRef LenSym, uint64_t Offset, CheckerContext &C) const;
+       bool suppressDueToLastWriteSymbol(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
++
++      // Heuristic detection of "writer-like" functions (device reads, recv, etc.)
++      bool isWriterLikeFunction(const CallEvent &Call, CheckerContext &C,
++                                unsigned &BufParamIdx, unsigned &LenParamIdx) const;
+ };
+
+ const MemRegion *SAGenTestChecker::canonical(ProgramStateRef State, const MemRegion *R) const {
+@@ -578,6 +582,16 @@     }
+     return;
+   }
++
++  // Heuristic: treat "writer-like" device-read/recv functions as initializers:
++  // - name starts with "read" or contains "_read", or contains common read patterns (raw_read, bulk_read)
++  // - or name starts with "recv" or contains "_recv" variations
++  // - buffer argument is a non-const pointer and is immediately followed by a length argument.
++  unsigned WBufIdx = 0, WLenIdx = 0;
++  if (isWriterLikeFunction(Call, C, WBufIdx, WLenIdx)) {
++    noteWriteCallWithLen(Call, C, WBufIdx, WLenIdx);
++    return;
++  }
+ }
+
+ // Suppress false positives when the last write into the buffer used the same length symbol as copy_to_user and started at offset 0.
+@@ -715,6 +729,74 @@   C.addTransition(State);
+ }
+
++// Heuristic detection of "writer-like" functions that fill a buffer with 'len' bytes.
++// This aims to catch device read APIs such as wlcore_raw_read(), kernel_read(), i2c_master_recv(), etc.
++bool SAGenTestChecker::isWriterLikeFunction(const CallEvent &Call, CheckerContext &C,
++                                            unsigned &BufParamIdx, unsigned &LenParamIdx) const {
++  const IdentifierInfo *ID = Call.getCalleeIdentifier();
++  StringRef Name = ID ? ID->getName() : StringRef();
++
++  // Fall back to Origin-based name extraction if needed.
++  if (Name.empty()) {
++    if (const Expr *Origin = Call.getOriginExpr()) {
++      // Using ExprHasName is costly; only use it as a last resort for canonical patterns.
++      if (ExprHasName(Origin, "raw_read", C) || ExprHasName(Origin, "bulk_read", C))
++        Name = "raw_read";
++    }
++  }
++
++  if (Name.empty())
++    return false;
++
++  // Normalize to lowercase for matching.
++  std::string LowerName = Name.lower();
++
++  // Conservative name-based filter to avoid matching "thread", etc.
++  bool NameLooksRead =
++      llvm::StringRef(LowerName).startswith("read") ||
++      llvm::StringRef(LowerName).contains("_read") ||
++      llvm::StringRef(LowerName).contains("raw_read") ||
++      llvm::StringRef(LowerName).contains("bulk_read");
++  bool NameLooksRecv =
++      llvm::StringRef(LowerName).startswith("recv") ||
++      llvm::StringRef(LowerName).contains("_recv") ||
++      llvm::StringRef(LowerName).contains("recv_");
++
++  if (!NameLooksRead && !NameLooksRecv)
++    return false;
++
++  // Heuristic: find a non-const pointer arg followed immediately by an integer 'len' argument.
++  unsigned N = Call.getNumArgs();
++  for (unsigned i = 0; i + 1 < N; ++i) {
++    const Expr *BufE = Call.getArgExpr(i);
++    if (!BufE)
++      continue;
++    QualType AT = BufE->getType();
++    if (AT.isNull() || !AT->isPointerType())
++      continue;
++
++    QualType Pointee = AT->getPointeeType();
++    if (Pointee.isNull())
++      continue;
++    if (Pointee.isConstQualified())
++      continue; // Likely a source buffer, not a destination.
++
++    const Expr *LenE = Call.getArgExpr(i + 1);
++    if (!LenE)
++      continue;
++    QualType LT = LenE->getType();
++    if (LT.isNull() || !(LT->isIntegerType() || LT->isEnumeralType()))
++      continue;
++
++    // Candidate found.
++    BufParamIdx = i;
++    LenParamIdx = i + 1;
++    return true;
++  }
++
++  return false;
++}
++
+ } // end anonymous namespace
+
+ extern "C" void clang_registerCheckers(CheckerRegistry &registry) {

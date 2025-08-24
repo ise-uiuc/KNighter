@@ -1,0 +1,514 @@
+### Report Summary
+
+File:| kernel/user_namespace.c
+---|---
+Warning:| line 1100, column 3
+Freeing unowned field in shared error label; possible double free
+
+### Annotated Source Code
+
+
+228   | void __put_user_ns(struct user_namespace *ns)
+229   | {
+230   | 	schedule_work(&ns->work);
+231   | }
+232   | EXPORT_SYMBOL(__put_user_ns);
+233   |
+234   | /*
+235   |  * struct idmap_key - holds the information necessary to find an idmapping in a
+236   |  * sorted idmap array. It is passed to cmp_map_id() as first argument.
+237   |  */
+238   | struct idmap_key {
+239   | 	bool map_up; /* true  -> id from kid; false -> kid from id */
+240   | 	u32 id; /* id to find */
+241   | 	u32 count; /* == 0 unless used with map_id_range_down() */
+242   | };
+243   |
+244   | /*
+245   |  * cmp_map_id - Function to be passed to bsearch() to find the requested
+246   |  * idmapping. Expects struct idmap_key to be passed via @k.
+247   |  */
+248   | static int cmp_map_id(const void *k, const void *e)
+249   | {
+250   | 	u32 first, last, id2;
+251   |  const struct idmap_key *key = k;
+252   |  const struct uid_gid_extent *el = e;
+253   |
+254   | 	id2 = key->id + key->count - 1;
+255   |
+256   |  /* handle map_id_{down,up}() */
+257   |  if (key->map_up)
+258   | 		first = el->lower_first;
+259   |  else
+260   | 		first = el->first;
+261   |
+262   | 	last = first + el->count - 1;
+263   |
+264   |  if (key->id >= first && key->id <= last &&
+265   | 	    (id2 >= first && id2 <= last))
+266   |  return 0;
+267   |
+268   |  if (key->id < first || id2 < first)
+269   |  return -1;
+270   |
+271   |  return 1;
+272   | }
+273   |
+274   | /*
+275   |  * map_id_range_down_max - Find idmap via binary search in ordered idmap array.
+276   |  * Can only be called if number of mappings exceeds UID_GID_MAP_MAX_BASE_EXTENTS.
+277   |  */
+278   | static struct uid_gid_extent *
+279   | map_id_range_down_max(unsigned extents, struct uid_gid_map *map, u32 id, u32 count)
+280   | {
+281   |  struct idmap_key key;
+282   |
+283   | 	key.map_up = false;
+284   | 	key.count = count;
+285   | 	key.id = id;
+286   |
+287   |  return bsearch(&key, map->forward, extents,
+288   |  sizeof(struct uid_gid_extent), cmp_map_id);
+289   | }
+290   |
+291   | /*
+292   |  * map_id_range_down_base - Find idmap via binary search in static extent array.
+293   |  * Can only be called if number of mappings is equal or less than
+294   |  * UID_GID_MAP_MAX_BASE_EXTENTS.
+295   |  */
+296   | static struct uid_gid_extent *
+297   | map_id_range_down_base(unsigned extents, struct uid_gid_map *map, u32 id, u32 count)
+298   | {
+299   |  unsigned idx;
+300   | 	u32 first, last, id2;
+301   |
+302   | 	id2 = id + count - 1;
+303   |
+304   |  /* Find the matching extent */
+305   |  for (idx = 0; idx < extents; idx++) {
+306   | 		first = map->extent[idx].first;
+307   | 		last = first + map->extent[idx].count - 1;
+308   |  if (id >= first && id <= last &&
+309   | 		    (id2 >= first && id2 <= last))
+310   |  return &map->extent[idx];
+311   | 	}
+312   |  return NULL;
+313   | }
+314   |
+315   | static u32 map_id_range_down(struct uid_gid_map *map, u32 id, u32 count)
+316   | {
+317   |  struct uid_gid_extent *extent;
+318   |  unsigned extents = map->nr_extents;
+319   |  smp_rmb();
+320   |
+321   |  if (extents <= UID_GID_MAP_MAX_BASE_EXTENTS)
+322   | 		extent = map_id_range_down_base(extents, map, id, count);
+323   |  else
+324   | 		extent = map_id_range_down_max(extents, map, id, count);
+325   |
+326   |  /* Map the id or note failure */
+327   |  if (extent)
+328   | 		id = (id - extent->first) + extent->lower_first;
+329   |  else
+330   | 		id = (u32) -1;
+331   |
+332   |  return id;
+333   | }
+334   |
+335   | u32 map_id_down(struct uid_gid_map *map, u32 id)
+336   | {
+337   |  return map_id_range_down(map, id, 1);
+338   | }
+339   |
+340   | /*
+341   |  * map_id_up_base - Find idmap via binary search in static extent array.
+342   |  * Can only be called if number of mappings is equal or less than
+343   |  * UID_GID_MAP_MAX_BASE_EXTENTS.
+344   |  */
+345   | static struct uid_gid_extent *
+346   | map_id_up_base(unsigned extents, struct uid_gid_map *map, u32 id)
+347   | {
+348   |  unsigned idx;
+349   | 	u32 first, last;
+350   |
+351   |  /* Find the matching extent */
+352   |  for (idx = 0; idx < extents; idx++) {
+353   | 		first = map->extent[idx].lower_first;
+354   | 		last = first + map->extent[idx].count - 1;
+355   |  if (id >= first && id <= last)
+356   |  return &map->extent[idx];
+357   | 	}
+358   |  return NULL;
+359   | }
+360   |
+361   | /*
+362   |  * map_id_up_max - Find idmap via binary search in ordered idmap array.
+873   |  * @new_map: requested idmap
+874   |  *
+875   |  * If a process requests mapping parent uid 0 into the new ns, verify that the
+876   |  * process writing the map had the CAP_SETFCAP capability as the target process
+877   |  * will be able to write fscaps that are valid in ancestor user namespaces.
+878   |  *
+879   |  * Return: true if the mapping is allowed, false if not.
+880   |  */
+881   | static bool verify_root_map(const struct file *file,
+882   |  struct user_namespace *map_ns,
+883   |  struct uid_gid_map *new_map)
+884   | {
+885   |  int idx;
+886   |  const struct user_namespace *file_ns = file->f_cred->user_ns;
+887   |  struct uid_gid_extent *extent0 = NULL;
+888   |
+889   |  for (idx = 0; idx < new_map->nr_extents; idx++) {
+890   |  if (new_map->nr_extents <= UID_GID_MAP_MAX_BASE_EXTENTS)
+891   | 			extent0 = &new_map->extent[idx];
+892   |  else
+893   | 			extent0 = &new_map->forward[idx];
+894   |  if (extent0->lower_first == 0)
+895   |  break;
+896   |
+897   | 		extent0 = NULL;
+898   | 	}
+899   |
+900   |  if (!extent0)
+901   |  return true;
+902   |
+903   |  if (map_ns == file_ns) {
+904   |  /* The process unshared its ns and is writing to its own
+905   |  * /proc/self/uid_map.  User already has full capabilites in
+906   |  * the new namespace.  Verify that the parent had CAP_SETFCAP
+907   |  * when it unshared.
+908   |  * */
+909   |  if (!file_ns->parent_could_setfcap)
+910   |  return false;
+911   | 	} else {
+912   |  /* Process p1 is writing to uid_map of p2, who is in a child
+913   |  * user namespace to p1's.  Verify that the opener of the map
+914   |  * file has CAP_SETFCAP against the parent of the new map
+915   |  * namespace */
+916   |  if (!file_ns_capable(file, map_ns->parent, CAP_SETFCAP))
+917   |  return false;
+918   | 	}
+919   |
+920   |  return true;
+921   | }
+922   |
+923   | static ssize_t map_write(struct file *file, const char __user *buf,
+924   | 			 size_t count, loff_t *ppos,
+925   |  int cap_setid,
+926   |  struct uid_gid_map *map,
+927   |  struct uid_gid_map *parent_map)
+928   | {
+929   |  struct seq_file *seq = file->private_data;
+930   |  struct user_namespace *map_ns = seq->private;
+931   |  struct uid_gid_map new_map;
+932   |  unsigned idx;
+933   |  struct uid_gid_extent extent;
+934   |  char *kbuf, *pos, *next_line;
+935   | 	ssize_t ret;
+936   |
+937   |  /* Only allow < page size writes at the beginning of the file */
+938   |  if ((*ppos != 0) || (count >= PAGE_SIZE))
+    4←Assuming the condition is false→
+    5←Assuming the condition is false→
+    6←Taking false branch→
+939   |  return -EINVAL;
+940   |
+941   |  /* Slurp in the user data */
+942   |  kbuf = memdup_user_nul(buf, count);
+943   |  if (IS_ERR(kbuf))
+    7←Taking false branch→
+944   |  return PTR_ERR(kbuf);
+945   |
+946   |  /*
+947   |  * The userns_state_mutex serializes all writes to any given map.
+948   |  *
+949   |  * Any map is only ever written once.
+950   |  *
+951   |  * An id map fits within 1 cache line on most architectures.
+952   |  *
+953   |  * On read nothing needs to be done unless you are on an
+954   |  * architecture with a crazy cache coherency model like alpha.
+955   |  *
+956   |  * There is a one time data dependency between reading the
+957   |  * count of the extents and the values of the extents.  The
+958   |  * desired behavior is to see the values of the extents that
+959   |  * were written before the count of the extents.
+960   |  *
+961   |  * To achieve this smp_wmb() is used on guarantee the write
+962   |  * order and smp_rmb() is guaranteed that we don't have crazy
+963   |  * architectures returning stale data.
+964   |  */
+965   |  mutex_lock(&userns_state_mutex);
+966   |
+967   |  memset(&new_map, 0, sizeof(struct uid_gid_map));
+968   |
+969   | 	ret = -EPERM;
+970   |  /* Only allow one successful write to the map */
+971   |  if (map->nr_extents != 0)
+    8←Assuming field 'nr_extents' is equal to 0→
+972   |  goto out;
+973   |
+974   |  /*
+975   |  * Adjusting namespace settings requires capabilities on the target.
+976   |  */
+977   |  if (cap_valid(cap_setid) && !file_ns_capable(file, map_ns, CAP_SYS_ADMIN))
+    9←Taking false branch→
+978   |  goto out;
+979   |
+980   |  /* Parse the user data */
+981   |  ret = -EINVAL;
+982   | 	pos = kbuf;
+983   |  for (; pos; pos = next_line) {
+    10←Loop condition is false. Execution continues on line 1042→
+984   |
+985   |  /* Find the end of line and ensure I don't look past it */
+986   | 		next_line = strchr(pos, '\n');
+987   |  if (next_line) {
+988   | 			*next_line = '\0';
+989   | 			next_line++;
+990   |  if (*next_line == '\0')
+991   | 				next_line = NULL;
+992   | 		}
+993   |
+994   | 		pos = skip_spaces(pos);
+995   | 		extent.first = simple_strtoul(pos, &pos, 10);
+996   |  if (!isspace(*pos))
+997   |  goto out;
+998   |
+999   | 		pos = skip_spaces(pos);
+1000  | 		extent.lower_first = simple_strtoul(pos, &pos, 10);
+1001  |  if (!isspace(*pos))
+1002  |  goto out;
+1003  |
+1004  | 		pos = skip_spaces(pos);
+1005  | 		extent.count = simple_strtoul(pos, &pos, 10);
+1006  |  if (*pos && !isspace(*pos))
+1007  |  goto out;
+1008  |
+1009  |  /* Verify there is not trailing junk on the line */
+1010  | 		pos = skip_spaces(pos);
+1011  |  if (*pos != '\0')
+1012  |  goto out;
+1013  |
+1014  |  /* Verify we have been given valid starting values */
+1015  |  if ((extent.first == (u32) -1) ||
+1016  | 		    (extent.lower_first == (u32) -1))
+1017  |  goto out;
+1018  |
+1019  |  /* Verify count is not zero and does not cause the
+1020  |  * extent to wrap
+1021  |  */
+1022  |  if ((extent.first + extent.count) <= extent.first)
+1023  |  goto out;
+1024  |  if ((extent.lower_first + extent.count) <=
+1025  | 		     extent.lower_first)
+1026  |  goto out;
+1027  |
+1028  |  /* Do the ranges in extent overlap any previous extents? */
+1029  |  if (mappings_overlap(&new_map, &extent))
+1030  |  goto out;
+1031  |
+1032  |  if ((new_map.nr_extents + 1) == UID_GID_MAP_MAX_EXTENTS &&
+1033  | 		    (next_line != NULL))
+1034  |  goto out;
+1035  |
+1036  | 		ret = insert_extent(&new_map, &extent);
+1037  |  if (ret < 0)
+1038  |  goto out;
+1039  | 		ret = -EINVAL;
+1040  | 	}
+1041  |  /* Be very certain the new map actually exists */
+1042  |  if (new_map.nr_extents == 0)
+    11←Assuming field 'nr_extents' is not equal to 0→
+    12←Taking false branch→
+1043  |  goto out;
+1044  |
+1045  |  ret = -EPERM;
+1046  |  /* Validate the user is allowed to use user id's mapped to. */
+1047  |  if (!new_idmap_permitted(file, map_ns, cap_setid, &new_map))
+    13←Taking false branch→
+1048  |  goto out;
+1049  |
+1050  |  ret = -EPERM;
+1051  |  /* Map the lower ids from the parent user namespace to the
+1052  |  * kernel global id space.
+1053  |  */
+1054  |  for (idx = 0; idx13.1'idx' is < field 'nr_extents' < new_map.nr_extents; idx++) {
+    14←Loop condition is true.  Entering loop body→
+1055  |  struct uid_gid_extent *e;
+1056  | 		u32 lower_first;
+1057  |
+1058  |  if (new_map.nr_extents <= UID_GID_MAP_MAX_BASE_EXTENTS)
+    15←Assuming field 'nr_extents' is > UID_GID_MAP_MAX_BASE_EXTENTS→
+    16←Taking false branch→
+1059  | 			e = &new_map.extent[idx];
+1060  |  else
+1061  |  e = &new_map.forward[idx];
+1062  |
+1063  |  lower_first = map_id_range_down(parent_map,
+1064  | 						e->lower_first,
+1065  | 						e->count);
+1066  |
+1067  |  /* Fail if we can not map the specified extent to
+1068  |  * the kernel global id space.
+1069  |  */
+1070  |  if (lower_first == (u32) -1)
+    17←Taking true branch→
+1071  |  goto out;
+1072  |
+1073  | 		e->lower_first = lower_first;
+1074  | 	}
+1075  |
+1076  |  /*
+1077  |  * If we want to use binary search for lookup, this clones the extent
+1078  |  * array and sorts both copies.
+1079  |  */
+1080  | 	ret = sort_idmaps(&new_map);
+1081  |  if (ret < 0)
+1082  |  goto out;
+1083  |
+1084  |  /* Install the map */
+1085  |  if (new_map.nr_extents <= UID_GID_MAP_MAX_BASE_EXTENTS) {
+1086  |  memcpy(map->extent, new_map.extent,
+1087  |  new_map.nr_extents * sizeof(new_map.extent[0]));
+1088  | 	} else {
+1089  | 		map->forward = new_map.forward;
+1090  | 		map->reverse = new_map.reverse;
+1091  | 	}
+1092  |  smp_wmb();
+1093  | 	map->nr_extents = new_map.nr_extents;
+1094  |
+1095  | 	*ppos = count;
+1096  | 	ret = count;
+1097  | out:
+1098  |  if (ret17.1'ret' is < 0 < 0 && new_map.nr_extents17.2Field 'nr_extents' is > UID_GID_MAP_MAX_BASE_EXTENTS > UID_GID_MAP_MAX_BASE_EXTENTS) {
+    18←Taking true branch→
+1099  |  kfree(new_map.forward);
+1100  |  kfree(new_map.reverse);
+    19←Freeing unowned field in shared error label; possible double free
+1101  | 		map->forward = NULL;
+1102  | 		map->reverse = NULL;
+1103  | 		map->nr_extents = 0;
+1104  | 	}
+1105  |
+1106  | 	mutex_unlock(&userns_state_mutex);
+1107  | 	kfree(kbuf);
+1108  |  return ret;
+1109  | }
+1110  |
+1111  | ssize_t proc_uid_map_write(struct file *file, const char __user *buf,
+1112  | 			   size_t size, loff_t *ppos)
+1113  | {
+1114  |  struct seq_file *seq = file->private_data;
+1115  |  struct user_namespace *ns = seq->private;
+1116  |  struct user_namespace *seq_ns = seq_user_ns(seq);
+1117  |
+1118  |  if (!ns->parent)
+1119  |  return -EPERM;
+1120  |
+1121  |  if ((seq_ns != ns) && (seq_ns != ns->parent))
+1122  |  return -EPERM;
+1123  |
+1124  |  return map_write(file, buf, size, ppos, CAP_SETUID,
+1125  | 			 &ns->uid_map, &ns->parent->uid_map);
+1126  | }
+1127  |
+1128  | ssize_t proc_gid_map_write(struct file *file, const char __user *buf,
+1129  | 			   size_t size, loff_t *ppos)
+1130  | {
+1131  |  struct seq_file *seq = file->private_data;
+1132  |  struct user_namespace *ns = seq->private;
+1133  |  struct user_namespace *seq_ns = seq_user_ns(seq);
+1134  |
+1135  |  if (!ns->parent)
+1136  |  return -EPERM;
+1137  |
+1138  |  if ((seq_ns != ns) && (seq_ns != ns->parent))
+1139  |  return -EPERM;
+1140  |
+1141  |  return map_write(file, buf, size, ppos, CAP_SETGID,
+1142  | 			 &ns->gid_map, &ns->parent->gid_map);
+1143  | }
+1144  |
+1145  | ssize_t proc_projid_map_write(struct file *file, const char __user *buf,
+1146  | 			      size_t size, loff_t *ppos)
+1147  | {
+1148  |  struct seq_file *seq = file->private_data;
+1149  |  struct user_namespace *ns = seq->private;
+1150  |  struct user_namespace *seq_ns = seq_user_ns(seq);
+1151  |
+1152  |  if (!ns->parent)
+    1Assuming field 'parent' is non-null→
+1153  |  return -EPERM;
+1154  |
+1155  |  if ((seq_ns != ns) && (seq_ns != ns->parent))
+    2←Assuming 'seq_ns' is equal to 'ns'→
+1156  |  return -EPERM;
+1157  |
+1158  |  /* Anyone can set any valid project id no capability needed */
+1159  |  return map_write(file, buf, size, ppos, -1,
+    3←Calling 'map_write'→
+1160  |  &ns->projid_map, &ns->parent->projid_map);
+1161  | }
+1162  |
+1163  | static bool new_idmap_permitted(const struct file *file,
+1164  |  struct user_namespace *ns, int cap_setid,
+1165  |  struct uid_gid_map *new_map)
+1166  | {
+1167  |  const struct cred *cred = file->f_cred;
+1168  |
+1169  |  if (cap_setid == CAP_SETUID && !verify_root_map(file, ns, new_map))
+1170  |  return false;
+1171  |
+1172  |  /* Don't allow mappings that would allow anything that wouldn't
+1173  |  * be allowed without the establishment of unprivileged mappings.
+1174  |  */
+1175  |  if ((new_map->nr_extents == 1) && (new_map->extent[0].count == 1) &&
+1176  | 	    uid_eq(ns->owner, cred->euid)) {
+1177  | 		u32 id = new_map->extent[0].lower_first;
+1178  |  if (cap_setid == CAP_SETUID) {
+1179  | 			kuid_t uid = make_kuid(ns->parent, id);
+1180  |  if (uid_eq(uid, cred->euid))
+1181  |  return true;
+1182  | 		} else if (cap_setid == CAP_SETGID) {
+1183  | 			kgid_t gid = make_kgid(ns->parent, id);
+1184  |  if (!(ns->flags & USERNS_SETGROUPS_ALLOWED) &&
+1185  | 			    gid_eq(gid, cred->egid))
+1186  |  return true;
+1187  | 		}
+1188  | 	}
+1189  |
+1190  |  /* Allow anyone to set a mapping that doesn't require privilege */
+1191  |  if (!cap_valid(cap_setid))
+1192  |  return true;
+1193  |
+1194  |  /* Allow the specified ids if we have the appropriate capability
+1195  |  * (CAP_SETUID or CAP_SETGID) over the parent user namespace.
+1196  |  * And the opener of the id file also has the appropriate capability.
+1197  |  */
+1198  |  if (ns_capable(ns->parent, cap_setid) &&
+1199  | 	    file_ns_capable(file, ns->parent, cap_setid))
+1200  |  return true;
+1201  |
+1202  |  return false;
+1203  | }
+1204  |
+1205  | int proc_setgroups_show(struct seq_file *seq, void *v)
+1206  | {
+1207  |  struct user_namespace *ns = seq->private;
+1208  |  unsigned long userns_flags = READ_ONCE(ns->flags);
+1209  |
+1210  | 	seq_printf(seq, "%s\n",
+1211  | 		   (userns_flags & USERNS_SETGROUPS_ALLOWED) ?
+1212  |  "allow" : "deny");
+1213  |  return 0;
+1214  | }
+1215  |
+1216  | ssize_t proc_setgroups_write(struct file *file, const char __user *buf,
+1217  | 			     size_t count, loff_t *ppos)
+1218  | {
+1219  |  struct seq_file *seq = file->private_data;
+1220  |  struct user_namespace *ns = seq->private;
+1221  |  char kbuf[8], *pos;
+1222  | 	bool setgroups_allowed;

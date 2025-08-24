@@ -1,0 +1,199 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -74,6 +74,10 @@   static bool getExprRange128(const Expr *E, CheckerContext &C,
+                               llvm::APInt &Min, llvm::APInt &Max,
+                               unsigned Depth = 0);
++
++  static bool tryGetUpperBoundFromState(const Expr *E, CheckerContext &C,
++                                        llvm::APInt &MaxOut, bool &Known);
++
+   static bool productDefinitelyFitsInType(const Expr *L, const Expr *R,
+                                           QualType MulType, CheckerContext &C);
+
+@@ -131,6 +135,11 @@   static bool isBenignCFIMaskedShiftInterleaveCase(const BinaryOperator *MulBO,
+                                                    CheckerContext &C);
+
++  // Radeon-specific benign DMA packet math suppression:
++  static bool isBenignNdwDiv2TimesIncrAddrPattern(const BinaryOperator *MulBO,
++                                                  const Expr *LHSExpr,
++                                                  CheckerContext &C);
++
+   // Aggregated FP gate.
+   static bool isFalsePositive(const Expr *Root,
+                               const BinaryOperator *MulBO,
+@@ -156,7 +165,6 @@ }
+
+ // Wide target: unsigned integer-like and width >= 64 bits (covers u64, dma_addr_t on 64-bit).
+-// Narrowing to unsigned eliminates benign signed long "size" temporaries like ALSA's private_size.
+ bool SAGenTestChecker::isWideTargetType(QualType QT, CheckerContext &C) {
+   if (!isIntegerLike(QT))
+     return false;
+@@ -194,6 +202,36 @@   }
+ }
+
++// Attempt to obtain an upper bound from the current program state for E.
++// Returns true if a bound was found. MaxOut is 128-bit extended.
++bool SAGenTestChecker::tryGetUpperBoundFromState(const Expr *E, CheckerContext &C,
++                                                 llvm::APInt &MaxOut, bool &Known) {
++  Known = false;
++  if (!E) return false;
++
++  // If E folds to a constant, its "max" is itself.
++  llvm::APSInt Folded;
++  if (EvaluateExprToInt(Folded, E->IgnoreParenImpCasts(), C)) {
++    MaxOut = Folded.extOrTrunc(128);
++    Known = true;
++    return true;
++  }
++
++  // Try symbol-based bound via constraint manager.
++  SVal V = C.getSVal(E);
++  SymbolRef Sym = V.getAsSymbol();
++  if (!Sym)
++    return false;
++
++  if (const llvm::APSInt *Max = inferSymbolMaxVal(Sym, C)) {
++    MaxOut = Max->extOrTrunc(128);
++    Known = true;
++    return true;
++  }
++
++  return false;
++}
++
+ // Clamp ranges based on identifier hints (heuristics for kernel).
+ void SAGenTestChecker::clampByNameHints(const Expr *E, llvm::APInt &Min, llvm::APInt &Max,
+                                         CheckerContext &C) {
+@@ -208,7 +246,6 @@
+ // Lightweight interval analysis for expressions. Always returns true,
+ // providing a conservative range, falling back to type-based ranges.
+-// Depth-limited to avoid pathological recursion.
+ bool SAGenTestChecker::getExprRange128(const Expr *E, CheckerContext &C,
+                                        llvm::APInt &Min, llvm::APInt &Max,
+                                        unsigned Depth) {
+@@ -329,12 +366,29 @@       }
+       return true;
+     }
++    case BO_Div: {
++      // If RHS is a positive constant, derive tighter bounds for non-negative LHS.
++      llvm::APSInt AmtAPS;
++      if (EvaluateExprToInt(AmtAPS, BO->getRHS()->IgnoreParenImpCasts(), C)) {
++        if (AmtAPS.isSigned() ? AmtAPS.isStrictlyPositive() : AmtAPS.isStrictlyPositive()) {
++          uint64_t D = (uint64_t)AmtAPS.getExtValue();
++          // Handle common unsigned or nonnegative LHS case.
++          if (!LMin.isNegative() && !LMax.isNegative() && D != 0) {
++            Min = LMin.udiv(D);
++            Max = LMax.udiv(D);
++            return true;
++          }
++        }
++      }
++      // Fallback
++      getTypeRange128(BO->getType(), C, Min, Max);
++      return true;
++    }
+     case BO_Shr: {
+       // If RHS is a constant, tighten by shifting bounds; valid for nonnegative ranges.
+       llvm::APSInt AmtAPS;
+       if (EvaluateExprToInt(AmtAPS, BO->getRHS()->IgnoreParenImpCasts(), C)) {
+         unsigned Amt = (unsigned)AmtAPS.getExtValue();
+-        // If LHS min is nonnegative (common for unsigned types), shift both.
+         if (!LMin.isNegative() && !LMax.isNegative()) {
+           Min = LMin.lshr(Amt);
+           Max = LMax.lshr(Amt);
+@@ -406,9 +460,16 @@     return true;
+   }
+
+-  // Member access / decl ref: use their type ranges, then clamp by name hints.
++  // Member access / decl ref: use their type ranges, then clamp by state-based upper bound and hints.
+   if (isa<MemberExpr>(E) || isa<DeclRefExpr>(E)) {
+     getTypeRange128(E->getType(), C, Min, Max);
++    // Try to refine upper bound from the state (e.g., ndw <= 0xFFFFE).
++    llvm::APInt UB(128, 0, false);
++    bool Known = false;
++    if (tryGetUpperBoundFromState(E, C, UB, Known) && Known) {
++      if (Max.sgt(UB))
++        Max = UB;
++    }
+     clampByNameHints(E, Min, Max, C);
+     return true;
+   }
+@@ -793,7 +854,7 @@   return true;
+ }
+
+-// Detect ((X >> ShiftAmt) & MaskClearingLowClearedBits)
++// Detect ((X >> ShiftAmt) & mask-clearing low bits)
+ bool SAGenTestChecker::matchMaskedShiftExpr(const Expr *E, unsigned &ShiftAmt,
+                                             unsigned &ClearedBits, CheckerContext &C) {
+   E = E ? E->IgnoreParenImpCasts() : nullptr;
+@@ -855,6 +916,63 @@   return true;
+ }
+
++// Detect benign Radeon DMA PTE math: addr += (ndw / 2) * incr;
++// Returns true if matched.
++bool SAGenTestChecker::isBenignNdwDiv2TimesIncrAddrPattern(const BinaryOperator *MulBO,
++                                                           const Expr *LHSExpr,
++                                                           CheckerContext &C) {
++  if (!MulBO || MulBO->getOpcode() != BO_Mul || !LHSExpr)
++    return false;
++
++  // Require LHS name to be 'addr'-like to narrow to address accumulators.
++  std::string LHSName = extractIdentifierLikeName(LHSExpr);
++  std::string LLower = LHSName;
++  std::transform(LLower.begin(), LLower.end(), LLower.begin(), ::tolower);
++  if (LLower.empty() || !nameContains(LLower, {"addr"}))
++    return false;
++
++  auto IsNdwDiv2 = [&](const Expr *E) -> bool {
++    E = E ? E->IgnoreParenImpCasts() : nullptr;
++    if (!E) return false;
++    // Either 'ndw / 2' or 'ndw >> 1'
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      if (BO->getOpcode() == BO_Div || BO->getOpcode() == BO_Shr) {
++        // RHS must be 2 (for Div) or 1 (for Shr)
++        llvm::APSInt APS;
++        if (!EvaluateExprToInt(APS, BO->getRHS()->IgnoreParenImpCasts(), C))
++          return false;
++        uint64_t V = APS.getExtValue();
++        if ((BO->getOpcode() == BO_Div && V != 2) ||
++            (BO->getOpcode() == BO_Shr && V != 1))
++          return false;
++        // LHS must be a variable named 'ndw'
++        std::string Name = extractIdentifierLikeName(BO->getLHS());
++        std::string Lower = Name;
++        std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++        if (Lower == "ndw")
++          return true;
++      }
++    }
++    return false;
++  };
++
++  auto IsIncr = [&](const Expr *E) -> bool {
++    std::string Name = extractIdentifierLikeName(E);
++    std::string Lower = Name;
++    std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++    return Lower == "incr";
++  };
++
++  const Expr *ML = MulBO->getLHS()->IgnoreParenImpCasts();
++  const Expr *MR = MulBO->getRHS()->IgnoreParenImpCasts();
++
++  // Match (ndw/2) * incr or incr * (ndw/2).
++  if ((IsNdwDiv2(ML) && IsIncr(MR)) || (IsNdwDiv2(MR) && IsIncr(ML)))
++    return true;
++
++  return false;
++}
++
+ // Aggregated FP logic.
+ bool SAGenTestChecker::isFalsePositive(const Expr *Root,
+                                        const BinaryOperator *MulBO,
+@@ -879,6 +997,10 @@
+   // Targeted suppression: CFI erase-region product pattern.
+   if (isBenignCFIMaskedShiftInterleaveCase(MulBO, C))
++    return true;
++
++  // Targeted suppression: Radeon DMA PTE benign pattern addr += (ndw/2) * incr;
++  if (isBenignNdwDiv2TimesIncrAddrPattern(MulBO, LHSExpr, C))
+     return true;
+
+   return false;

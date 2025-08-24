@@ -1,0 +1,241 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -22,8 +22,12 @@
+ // Map: return-symbol of hwrm_req_init() -> req MemRegion*
+ REGISTER_MAP_WITH_PROGRAMSTATE(PendingInitMap, SymbolRef, const MemRegion *)
+-// Set: Acquired req MemRegion*s that require hwrm_req_drop() before exit
+-REGISTER_SET_WITH_PROGRAMSTATE(AcquiredReqs, const MemRegion *)
++
++// Set: req MemRegions that had a successful hwrm_req_init()
++REGISTER_SET_WITH_PROGRAMSTATE(OpenInitReqs, const MemRegion *)
++
++// Set: req MemRegions that require hwrm_req_drop() because of hold/replace
++REGISTER_SET_WITH_PROGRAMSTATE(NeedsDropReqs, const MemRegion *)
+
+ namespace {
+
+@@ -32,6 +36,20 @@   if (!Origin)
+     return false;
+   return ExprHasName(Origin, Name, C);
++}
++
++static const MemRegion *getReqRegionFromArg(const CallEvent &Call,
++                                            unsigned ArgIdx,
++                                            CheckerContext &C) {
++  if (Call.getNumArgs() <= ArgIdx)
++    return nullptr;
++  const Expr *ReqExpr = Call.getArgExpr(ArgIdx);
++  if (!ReqExpr)
++    return nullptr;
++  const MemRegion *ReqMR = getMemRegionFromExpr(ReqExpr, C);
++  if (!ReqMR)
++    return nullptr;
++  return ReqMR->getBaseRegion();
+ }
+
+ /* The checker callbacks are to be decided. */
+@@ -56,106 +74,121 @@       ProgramStateRef evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const;
+
+    private:
+-
+       void reportLeak(CheckerContext &C, const Stmt *S) const;
+ };
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
++  bool Changed = false;
+
+   // Track hwrm_req_init(bp, req, ...)
+   if (isCallTo(Call, "hwrm_req_init", C)) {
+     // Ensure we have at least 2 args: 0: bp, 1: req
+-    if (Call.getNumArgs() < 2)
+-      return;
+-
+-    const Expr *ReqExpr = Call.getArgExpr(1);
+-    if (!ReqExpr)
+-      return;
+-
+-    const MemRegion *ReqMR = getMemRegionFromExpr(ReqExpr, C);
++    const MemRegion *ReqMR = getReqRegionFromArg(Call, 1, C);
+     if (!ReqMR)
+       return;
+-    ReqMR = ReqMR->getBaseRegion();
+-    if (!ReqMR)
+-      return;
+-
+-    SymbolRef RetSym = Call.getReturnValue().getAsSymbol();
+-    if (!RetSym)
+-      return;
+
+     // Record pending init: we'll determine success in evalAssume
+-    State = State->set<PendingInitMap>(RetSym, ReqMR);
+-    C.addTransition(State);
+-    return;
++    if (SymbolRef RetSym = Call.getReturnValue().getAsSymbol()) {
++      State = State->set<PendingInitMap>(RetSym, ReqMR);
++      Changed = true;
++    }
++  }
++
++  // Track hwrm_req_hold(bp, req) => requires drop if there was a successful init
++  if (isCallTo(Call, "hwrm_req_hold", C)) {
++    const MemRegion *ReqMR = getReqRegionFromArg(Call, 1, C);
++    if (ReqMR && State->get<OpenInitReqs>().contains(ReqMR)) {
++      State = State->add<NeedsDropReqs>(ReqMR);
++      Changed = true;
++    }
++  }
++
++  // Track hwrm_req_replace(bp, req, ...) => requires drop if there was a successful init,
++  // regardless of replace rc (matches the bug pattern/fix)
++  if (isCallTo(Call, "hwrm_req_replace", C)) {
++    const MemRegion *ReqMR = getReqRegionFromArg(Call, 1, C);
++    if (ReqMR && State->get<OpenInitReqs>().contains(ReqMR)) {
++      State = State->add<NeedsDropReqs>(ReqMR);
++      Changed = true;
++    }
++  }
++
++  // Track hwrm_req_send(bp, req)
++  // If this is a simple init+send path (no hold/replace), no drop is required.
++  // So we can clear OpenInit state (but keep NeedsDrop if present).
++  if (isCallTo(Call, "hwrm_req_send", C)) {
++    const MemRegion *ReqMR = getReqRegionFromArg(Call, 1, C);
++    if (ReqMR) {
++      auto OpenSet = State->get<OpenInitReqs>();
++      auto NeedSet = State->get<NeedsDropReqs>();
++      if (OpenSet.contains(ReqMR) && !NeedSet.contains(ReqMR)) {
++        State = State->remove<OpenInitReqs>(ReqMR);
++        Changed = true;
++      }
++    }
+   }
+
+   // Track hwrm_req_drop(bp, req)
+   if (isCallTo(Call, "hwrm_req_drop", C)) {
+-    if (Call.getNumArgs() < 2)
+-      return;
+-
+-    const Expr *ReqExpr = Call.getArgExpr(1);
+-    if (!ReqExpr)
+-      return;
+-
+-    const MemRegion *ReqMR = getMemRegionFromExpr(ReqExpr, C);
+-    if (!ReqMR)
+-      return;
+-    ReqMR = ReqMR->getBaseRegion();
+-    if (!ReqMR)
+-      return;
+-
+-    // On drop, remove from acquired set (if present)
+-    auto Set = State->get<AcquiredReqs>();
+-    if (Set.contains(ReqMR)) {
+-      State = State->remove<AcquiredReqs>(ReqMR);
+-      C.addTransition(State);
+-    }
+-    return;
+-  }
++    const MemRegion *ReqMR = getReqRegionFromArg(Call, 1, C);
++    if (ReqMR) {
++      if (State->get<OpenInitReqs>().contains(ReqMR)) {
++        State = State->remove<OpenInitReqs>(ReqMR);
++        Changed = true;
++      }
++      if (State->get<NeedsDropReqs>().contains(ReqMR)) {
++        State = State->remove<NeedsDropReqs>(ReqMR);
++        Changed = true;
++      }
++    }
++  }
++
++  if (Changed)
++    C.addTransition(State);
+ }
+
+ ProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const {
+   if (!State)
+     return State;
+
+-  // Handle pattern: if (rc) or if (!rc) or if (rc == 0) / if (rc != 0)
++  auto consumePendingInit = [&](SymbolRef Sym, bool Success) -> ProgramStateRef {
++    if (!Sym)
++      return State;
++    const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
++    if (!PendingReq)
++      return State;
++
++    ProgramStateRef NewState = State->remove<PendingInitMap>(Sym);
++    if (Success) {
++      NewState = NewState->add<OpenInitReqs>(*PendingReq);
++    }
++    return NewState;
++  };
++
++  // Handle symbolic condition patterns for rc checks
+   if (std::optional<NonLoc> NL = Cond.getAs<NonLoc>()) {
+     // Case 1: plain symbolic value 'rc'
+     if (SymbolRef Sym = NL->getAsSymbol()) {
+-      const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
+-      if (PendingReq) {
+-        // if (rc) with Assumption == false means rc == 0 (success)
+-        if (!Assumption) {
+-          State = State->add<AcquiredReqs>(*PendingReq);
+-        }
+-        // Consume the pending mapping either way
+-        State = State->remove<PendingInitMap>(Sym);
+-      }
+-      return State;
+-    }
+-
+-    // Case 2: symbolic comparison with integer, usually rc == 0 or rc != 0
++      // if (rc) and Assumption == false => rc == 0 (success)
++      bool Success = !Assumption;
++      return consumePendingInit(Sym, Success);
++    }
++
++    // Case 2: symbolic int comparison, e.g., (rc == 0) or (rc != 0)
+     if (SymbolRef SE = Cond.getAsSymbol()) {
+       if (const auto *SIE = dyn_cast<SymIntExpr>(SE)) {
+         BinaryOperator::Opcode Op = SIE->getOpcode();
+         SymbolRef Sym = SIE->getLHS();
+         const llvm::APSInt &RHS = SIE->getRHS();
+-        if (Sym) {
+-          const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
+-          if (PendingReq && RHS == 0) {
+-            bool SuccessBranch = false;
+-            if (Op == BO_EQ && Assumption)
+-              SuccessBranch = true;        // (rc == 0) assumed true
+-            else if (Op == BO_NE && !Assumption)
+-              SuccessBranch = true;        // (rc != 0) assumed false
+-
+-            if (SuccessBranch) {
+-              State = State->add<AcquiredReqs>(*PendingReq);
+-            }
+-            State = State->remove<PendingInitMap>(Sym);
+-          }
++        if (RHS == 0 && Sym) {
++          bool SuccessBranch = false;
++          if (Op == BO_EQ && Assumption)
++            SuccessBranch = true;        // (rc == 0) assumed true
++          else if (Op == BO_NE && !Assumption)
++            SuccessBranch = true;        // (rc != 0) assumed false
++
++          return consumePendingInit(Sym, SuccessBranch);
+         }
+       }
+     }
+@@ -169,15 +202,14 @@     return;
+
+   ProgramStateRef State = C.getState();
+-  // If any acquired req is still live, report a leak.
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
++  if (!State->get<NeedsDropReqs>().isEmpty()) {
+     reportLeak(C, RS);
+   }
+ }
+
+ void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
++  if (!State->get<NeedsDropReqs>().isEmpty()) {
+     reportLeak(C, nullptr);
+   }
+ }

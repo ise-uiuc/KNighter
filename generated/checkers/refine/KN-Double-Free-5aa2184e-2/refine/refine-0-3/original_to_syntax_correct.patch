@@ -1,0 +1,152 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -116,7 +116,7 @@       return true;
+     }
+
+-    // Heuristic allocator detection for CallExpr using source text/Callee name.
++    // Heuristic allocator detection for CallExpr using callee id or source text.
+     static bool callExprLooksLikeAllocator(const CallExpr *CE, CheckerContext &C) {
+       if (!CE)
+         return false;
+@@ -158,8 +158,11 @@   bool isFalsePositive(const MemberExpr *FreedME, const CallEvent &Call,
+                        const LabelStmt *EnclosingLabel, CheckerContext &C) const;
+
+-  // Gating heuristic: return the ParmVarDecl if the base of a MemberExpr resolves directly to a function parameter.
++  // Gating heuristic: return the ParmVarDecl if the base of a MemberExpr resolves to a function parameter.
+   const ParmVarDecl *getDirectBaseParam(const Expr *BaseE) const;
++
++  // Utility: returns true if ultimate base decl is a local automatic VarDecl.
++  bool baseIsLocalAutomatic(const Expr *BaseE) const;
+
+   void reportFreeUnownedInSharedLabel(const CallEvent &Call, CheckerContext &C) const;
+ };
+@@ -201,16 +204,28 @@ }
+
+ bool SAGenTestChecker::isAllocatorCall(const CallEvent &Call, CheckerContext &C) const {
++  if (const IdentifierInfo *II = Call.getCalleeIdentifier()) {
++    StringRef Name = II->getName();
++    static const char *Names[] = {
++        "kmalloc", "kzalloc", "kcalloc", "kvzalloc", "kvmalloc", "krealloc",
++        "kmalloc_node", "kzalloc_node", "kcalloc_node", "kmalloc_array",
++        "devm_kmalloc", "devm_kzalloc", "devm_kcalloc", "__kmalloc"
++    };
++    for (const char *N : Names)
++      if (Name.equals(N))
++        return true;
++  }
++
+   const Expr *E = Call.getOriginExpr();
+   if (!E)
+     return false;
+
+-  static const char *Names[] = {
++  static const char *NamesTxt[] = {
+       "kmalloc", "kzalloc", "kcalloc", "kvzalloc", "kvmalloc", "krealloc",
+       "kmalloc_node", "kzalloc_node", "kcalloc_node", "kmalloc_array",
+       "devm_kmalloc", "devm_kzalloc", "devm_kcalloc", "__kmalloc"
+   };
+-  for (const char *N : Names) {
++  for (const char *N : NamesTxt) {
+     if (ExprHasName(E, N, C))
+       return true;
+   }
+@@ -218,12 +233,20 @@ }
+
+ bool SAGenTestChecker::isFreeLikeCall(const CallEvent &Call, CheckerContext &C) const {
++  if (const IdentifierInfo *II = Call.getCalleeIdentifier()) {
++    StringRef Name = II->getName();
++    static const char *Names[] = {"kfree", "kvfree", "vfree"};
++    for (const char *N : Names)
++      if (Name.equals(N))
++        return true;
++  }
++
+   const Expr *E = Call.getOriginExpr();
+   if (!E)
+     return false;
+
+-  static const char *Names[] = {"kfree", "kvfree", "vfree"};
+-  for (const char *N : Names) {
++  static const char *NamesTxt[] = {"kfree", "kvfree", "vfree"};
++  for (const char *N : NamesTxt) {
+     if (ExprHasName(E, N, C))
+       return true;
+   }
+@@ -290,11 +313,7 @@   }
+ }
+
+-const ParmVarDecl *SAGenTestChecker::getDirectBaseParam(const Expr *BaseE) const {
+-  if (!BaseE)
+-    return nullptr;
+-
+-  const Expr *E = BaseE;
++static const Expr *stripCastsAndUnary(const Expr *E) {
+   while (true) {
+     E = E->IgnoreParenImpCasts();
+     if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+@@ -308,19 +327,49 @@       E = ASE->getBase();
+       continue;
+     }
++    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
++      E = ME->getBase();
++      continue;
++    }
+     break;
+   }
+-
++  return E;
++}
++
++const ParmVarDecl *SAGenTestChecker::getDirectBaseParam(const Expr *BaseE) const {
++  if (!BaseE)
++    return nullptr;
++
++  const Expr *E = stripCastsAndUnary(BaseE);
+   if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+     return dyn_cast<ParmVarDecl>(DRE->getDecl());
+   }
+   return nullptr;
++}
++
++bool SAGenTestChecker::baseIsLocalAutomatic(const Expr *BaseE) const {
++  if (!BaseE)
++    return false;
++  const Expr *E = stripCastsAndUnary(BaseE);
++  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++      return VD->hasLocalStorage();
++    }
++  }
++  return false;
+ }
+
+ bool SAGenTestChecker::isFalsePositive(const MemberExpr *FreedME,
+                                        const CallEvent &Call,
+                                        const LabelStmt *EnclosingLabel,
+                                        CheckerContext &C) const {
++  // 0) If the field clearly belongs to a local automatic variable (e.g., new_map.forward),
++  //    this function owns it, and freeing in a shared label is typically fine.
++  if (FreedME) {
++    if (baseIsLocalAutomatic(FreedME->getBase()))
++      return true;
++  }
++
+   // 1) If the argument is definitely the literal NULL at this point, kfree(NULL) is a no-op.
+   SVal ArgVal = C.getSVal(Call.getArgExpr(0));
+   if (ArgVal.isZeroConstant())
+@@ -409,8 +458,9 @@   if (!FreedME)
+     return;
+
+-  // New gating: Only warn when the freed field belongs directly to a function parameter.
+-  // This matches the target buggy pattern (e.g., mt->fc) and suppresses common cleanup of local/private state (e.g., priv->...).
++  // Gate: Only warn when the freed field belongs (ultimately) to a function parameter.
++  // This matches the target buggy pattern (e.g., mt->fc) and suppresses common cleanup
++  // of local/private state (e.g., new_map.forward).
+   const Expr *BaseE = FreedME->getBase();
+   const ParmVarDecl *BaseParam = getDirectBaseParam(BaseE);
+   if (!BaseParam)
+@@ -441,7 +491,7 @@   if (Count < 2)
+     return;
+
+-  // Suppress known false positives.
++  // Suppress known false positives (NULL frees, locally-owned, or lexically-safe labels).
+   if (isFalsePositive(FreedME, Call, EnclosingLabel, C))
+     return;

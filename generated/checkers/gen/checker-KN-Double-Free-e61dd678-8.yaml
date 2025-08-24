@@ -1,0 +1,376 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: e61dd678601eac53d501dda1eb1bcffec7b11bd6
+commit_type: Double-Free
+index: 8
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"llvm/ADT/ImmutableSet.h\"\n#include\
+  \ \"llvm/ADT/SmallVector.h\"\n#include \"llvm/ADT/StringRef.h\"\n#include <string>\n\
+  #include <vector>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\nusing TokenSet = llvm::ImmutableSet<const IdentifierInfo *>;\nREGISTER_MAP_WITH_PROGRAMSTATE(ExplicitFreedTokensMap,\
+  \ const MemRegion*, TokenSet)\nREGISTER_MAP_WITH_PROGRAMSTATE(HelperFreedTokensMap,\
+  \  const MemRegion*, TokenSet)\n\nnamespace {\nclass SAGenTestChecker : public Checker<check::PreCall,\
+  \ check::BeginFunction> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Double free of struct member\"\
+  , \"Memory Management\")) {}\n\n      void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkBeginFunction(CheckerContext &C) const;\n\n   private:\n\
+  \      // Recognizers\n      bool callNameIs(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef Name) const;\n      bool isDeallocatorCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      bool isHelperFree(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef &OutName) const;\n\n      // Token helpers\n      static bool isGenericFreeWord(StringRef\
+  \ Tok);\n      static std::string primaryPrefixToken(StringRef FieldName);\n   \
+  \   void collectHelperTokens(StringRef CalleeName,\n                           \
+  \    SmallVectorImpl<const IdentifierInfo*> &Out,\n                            \
+  \   ASTContext &ACtx) const;\n\n      ProgramStateRef addTokensToMap(ProgramStateRef\
+  \ State, bool IsExplicit,\n                                     const MemRegion\
+  \ *BaseReg,\n                                     ArrayRef<const IdentifierInfo*>\
+  \ Tokens) const;\n\n      const TokenSet *getTokensFromMap(ProgramStateRef State,\
+  \ bool IsExplicit,\n                                       const MemRegion *BaseReg)\
+  \ const;\n\n      bool anyTokenInSet(const TokenSet *SetPtr,\n                 \
+  \        ArrayRef<const IdentifierInfo*> Tokens) const;\n\n      void reportDoubleFree(const\
+  \ Stmt *Anchor, StringRef HelperName,\n                            CheckerContext\
+  \ &C) const;\n};\n\n// -------- Utility implementations --------\n\nbool SAGenTestChecker::callNameIs(const\
+  \ CallEvent &Call, CheckerContext &C, StringRef Name) const {\n  const Expr *OE\
+  \ = Call.getOriginExpr();\n  if (!OE) return false;\n  return ExprHasName(OE, Name,\
+  \ C);\n}\n\nbool SAGenTestChecker::isDeallocatorCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  // Use ExprHasName to verify known deallocators\n  return callNameIs(Call,\
+  \ C, \"kfree\") || callNameIs(Call, C, \"kvfree\") || callNameIs(Call, C, \"vfree\"\
+  );\n}\n\nbool SAGenTestChecker::isHelperFree(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef &OutName) const {\n  const IdentifierInfo *ID = Call.getCalleeIdentifier();\n\
+  \  if (!ID)\n    return false;\n\n  StringRef Name = ID->getName();\n  OutName =\
+  \ Name;\n\n  // Must contain \"free\" to be considered a free-like helper,\n  //\
+  \ but exclude the raw deallocators we treat separately.\n  if (!Name.contains_lower(\"\
+  free\"))\n    return false;\n\n  if (Name.equals(\"kfree\") || Name.equals(\"kvfree\"\
+  ) || Name.equals(\"vfree\"))\n    return false;\n\n  return true;\n}\n\nbool SAGenTestChecker::isGenericFreeWord(StringRef\
+  \ Tok) {\n  // Ignore generic free-related words\n  static const char *Ignored[]\
+  \ = {\n    \"free\",\"put\",\"del\",\"exit\",\"destroy\",\"cleanup\",\"release\"\
+  ,\"uninit\",\"remove\"\n  };\n  for (const char *I : Ignored)\n    if (Tok.equals_lower(I))\n\
+  \      return true;\n  return false;\n}\n\nstd::string SAGenTestChecker::primaryPrefixToken(StringRef\
+  \ FieldName) {\n  // Return substring before first '_' if present, else the whole\
+  \ name\n  std::pair<StringRef, StringRef> P = FieldName.split('_');\n  return P.first.str();\n\
+  }\n\nvoid SAGenTestChecker::collectHelperTokens(StringRef CalleeName,\n        \
+  \                                   SmallVectorImpl<const IdentifierInfo*> &Out,\n\
+  \                                           ASTContext &ACtx) const {\n  SmallVector<StringRef,\
+  \ 8> Parts;\n  CalleeName.split(Parts, '_');\n  for (StringRef P : Parts) {\n  \
+  \  if (P.empty()) continue;\n    if (isGenericFreeWord(P)) continue;\n    const\
+  \ IdentifierInfo &II = ACtx.Idents.get(P);\n    Out.push_back(&II);\n  }\n}\n\n\
+  ProgramStateRef SAGenTestChecker::addTokensToMap(ProgramStateRef State, bool IsExplicit,\n\
+  \                                                 const MemRegion *BaseReg,\n  \
+  \                                               ArrayRef<const IdentifierInfo*>\
+  \ Tokens) const {\n  if (!BaseReg)\n    return State;\n\n  BaseReg = BaseReg->getBaseRegion();\n\
+  \  if (!BaseReg)\n    return State;\n\n  TokenSet::Factory &F = State->get_context<TokenSet>();\n\
+  \  const TokenSet *Existing = IsExplicit\n                             ? State->get<ExplicitFreedTokensMap>(BaseReg)\n\
+  \                             : State->get<HelperFreedTokensMap>(BaseReg);\n  TokenSet\
+  \ S = Existing ? *Existing : F.getEmptySet();\n\n  for (const IdentifierInfo *II\
+  \ : Tokens) {\n    S = F.add(II, S);\n  }\n\n  if (IsExplicit)\n    State = State->set<ExplicitFreedTokensMap>(BaseReg,\
+  \ S);\n  else\n    State = State->set<HelperFreedTokensMap>(BaseReg, S);\n\n  return\
+  \ State;\n}\n\nconst TokenSet *SAGenTestChecker::getTokensFromMap(ProgramStateRef\
+  \ State, bool IsExplicit,\n                                                   const\
+  \ MemRegion *BaseReg) const {\n  if (!BaseReg)\n    return nullptr;\n  BaseReg =\
+  \ BaseReg->getBaseRegion();\n  if (!BaseReg)\n    return nullptr;\n  return IsExplicit\
+  \ ? State->get<ExplicitFreedTokensMap>(BaseReg)\n                    : State->get<HelperFreedTokensMap>(BaseReg);\n\
+  }\n\nbool SAGenTestChecker::anyTokenInSet(const TokenSet *SetPtr,\n            \
+  \                         ArrayRef<const IdentifierInfo*> Tokens) const {\n  if\
+  \ (!SetPtr)\n    return false;\n  const TokenSet &S = *SetPtr;\n  for (const IdentifierInfo\
+  \ *II : Tokens)\n    if (S.contains(II))\n      return true;\n  return false;\n\
+  }\n\nvoid SAGenTestChecker::reportDoubleFree(const Stmt *Anchor, StringRef HelperName,\n\
+  \                                        CheckerContext &C) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  std::string Msg\
+  \ = \"Double free of struct member via kfree() and helper\";\n  if (!HelperName.empty())\
+  \ {\n    Msg += \" '\";\n    Msg += HelperName.str();\n    Msg += \"'\";\n  }\n\n\
+  \  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);\n  if (Anchor)\n\
+  \    R->addRange(Anchor->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n\
+  // -------- Checker callbacks --------\n\nvoid SAGenTestChecker::checkBeginFunction(CheckerContext\
+  \ &C) const {\n  // Per-function tracking is naturally path-local; no explicit clearing\
+  \ required.\n  // Still, ensure a transition exists for the engine.\n  C.addTransition(C.getState());\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  ProgramStateRef State = C.getState();\n  ASTContext &ACtx = C.getASTContext();\n\
+  \n  // Case A: Explicit deallocation like kfree/kvfree/vfree of a struct member.\n\
+  \  if (isDeallocatorCall(Call, C)) {\n    if (Call.getNumArgs() == 0) {\n      C.addTransition(State);\n\
+  \      return;\n    }\n\n    const Expr *Arg0E = Call.getArgExpr(0);\n    if (!Arg0E)\
+  \ {\n      C.addTransition(State);\n      return;\n    }\n\n    // We only consider\
+  \ kfree of a MemberExpr (struct member), as per plan.\n    const MemberExpr *ME\
+  \ = dyn_cast<MemberExpr>(Arg0E->IgnoreParenCasts());\n    if (!ME) {\n      C.addTransition(State);\n\
+  \      return;\n    }\n\n    const ValueDecl *VD = ME->getMemberDecl();\n    const\
+  \ FieldDecl *FD = dyn_cast_or_null<FieldDecl>(VD);\n    if (!FD) {\n      C.addTransition(State);\n\
+  \      return;\n    }\n\n    // Base object region (e.g., 'ca' in ca->field)\n \
+  \   const MemRegion *BaseReg = getMemRegionFromExpr(ME->getBase(), C);\n    if (!BaseReg)\
+  \ {\n      C.addTransition(State);\n      return;\n    }\n    BaseReg = BaseReg->getBaseRegion();\n\
+  \    if (!BaseReg) {\n      C.addTransition(State);\n      return;\n    }\n\n  \
+  \  // Tokens: full field name and primary prefix\n    StringRef FullName = FD->getName();\n\
+  \    std::string Prefix = primaryPrefixToken(FullName);\n\n    SmallVector<const\
+  \ IdentifierInfo*, 4> FieldTokens;\n    const IdentifierInfo &II_Full   = ACtx.Idents.get(FullName);\n\
+  \    FieldTokens.push_back(&II_Full);\n\n    const IdentifierInfo &II_Prefix = ACtx.Idents.get(Prefix);\n\
+  \    FieldTokens.push_back(&II_Prefix);\n\n    // Update explicit-free tokens for\
+  \ this base object\n    State = addTokensToMap(State, /*IsExplicit=*/true, BaseReg,\
+  \ FieldTokens);\n\n    // If helper-free tokens already include these, report\n\
+  \    const TokenSet *HelperSet = getTokensFromMap(State, /*IsExplicit=*/false, BaseReg);\n\
+  \    if (anyTokenInSet(HelperSet, FieldTokens)) {\n      reportDoubleFree(Arg0E,\
+  \ StringRef(), C);\n      C.addTransition(State);\n      return;\n    }\n\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Case B: Helper free calls whose names contain \"free\"\
+  \ (not the raw deallocators)\n  StringRef HelperName;\n  if (isHelperFree(Call,\
+  \ C, HelperName)) {\n    // Collect tokens from the helper function name (excluding\
+  \ generic words)\n    SmallVector<const IdentifierInfo*, 8> HelperTokens;\n    collectHelperTokens(HelperName,\
+  \ HelperTokens, ACtx);\n\n    bool Reported = false;\n    // For each argument,\
+  \ map tokens to the base object region and check intersection\n    for (unsigned\
+  \ I = 0; I < Call.getNumArgs(); ++I) {\n      const Expr *ArgE = Call.getArgExpr(I);\n\
+  \      if (!ArgE) continue;\n\n      const MemRegion *MR = getMemRegionFromExpr(ArgE,\
+  \ C);\n      if (!MR) continue;\n      MR = MR->getBaseRegion();\n      if (!MR)\
+  \ continue;\n\n      // Update helper-free tokens for this base region\n      State\
+  \ = addTokensToMap(State, /*IsExplicit=*/false, MR, HelperTokens);\n\n      // Compare\
+  \ with explicit-free tokens for the same base\n      const TokenSet *ExplicitSet\
+  \ = getTokensFromMap(State, /*IsExplicit=*/true, MR);\n      if (anyTokenInSet(ExplicitSet,\
+  \ HelperTokens)) {\n        reportDoubleFree(Call.getOriginExpr(), HelperName, C);\n\
+  \        Reported = true;\n        // Continue processing to keep state consistent;\
+  \ but we already reported.\n      }\n    }\n\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  // Default path\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects double free of a struct member\
+  \ freed both via kfree() and a helper function\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbcachefs: Fix double free of ca->buckets_nouse\n\n\
+  Reported-by: Dan Carpenter <dan.carpenter@linaro.org>\nFixes: ffcbec6076 (\"bcachefs:\
+  \ Kill opts.buckets_nouse\")\nSigned-off-by: Kent Overstreet <kent.overstreet@linux.dev>\n\
+  \n## Buggy Code\n\n```c\n// Function: bch2_dev_free in fs/bcachefs/super.c\nstatic\
+  \ void bch2_dev_free(struct bch_dev *ca)\n{\n\tcancel_work_sync(&ca->io_error_work);\n\
+  \n\tif (ca->kobj.state_in_sysfs &&\n\t    ca->disk_sb.bdev)\n\t\tsysfs_remove_link(bdev_kobj(ca->disk_sb.bdev),\
+  \ \"bcachefs\");\n\n\tif (ca->kobj.state_in_sysfs)\n\t\tkobject_del(&ca->kobj);\n\
+  \n\tkfree(ca->buckets_nouse);\n\tbch2_free_super(&ca->disk_sb);\n\tbch2_dev_allocator_background_exit(ca);\n\
+  \tbch2_dev_journal_exit(ca);\n\n\tfree_percpu(ca->io_done);\n\tbch2_dev_buckets_free(ca);\n\
+  \tfree_page((unsigned long) ca->sb_read_scratch);\n\n\tbch2_time_stats_quantiles_exit(&ca->io_latency[WRITE]);\n\
+  \tbch2_time_stats_quantiles_exit(&ca->io_latency[READ]);\n\n\tpercpu_ref_exit(&ca->io_ref);\n\
+  #ifndef CONFIG_BCACHEFS_DEBUG\n\tpercpu_ref_exit(&ca->ref);\n#endif\n\tkobject_put(&ca->kobj);\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/bcachefs/super.c b/fs/bcachefs/super.c\n\
+  index 0455a1001fec..e7fa2de35014 100644\n--- a/fs/bcachefs/super.c\n+++ b/fs/bcachefs/super.c\n\
+  @@ -1193,7 +1193,6 @@ static void bch2_dev_free(struct bch_dev *ca)\n \tif (ca->kobj.state_in_sysfs)\n\
+  \ \t\tkobject_del(&ca->kobj);\n \n-\tkfree(ca->buckets_nouse);\n \tbch2_free_super(&ca->disk_sb);\n\
+  \ \tbch2_dev_allocator_background_exit(ca);\n \tbch2_dev_journal_exit(ca);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Double free of a struct member due to redundant deallocation: a member pointer (ca->buckets_nouse)
+  is explicitly kfree()''d in the top-level teardown function while another cleanup
+  helper called in the same path (e.g., bch2_dev_buckets_free(ca)) also frees that
+  same member. This duplicated ownership/cleanup leads to freeing the same memory
+  twice.'
+plan: "1) Program state\n\n- Define two per-function maps to track \u201Cwho freed\
+  \ what\u201D using lightweight name tokens:\n  - REGISTER_MAP_WITH_PROGRAMSTATE(ExplicitFreedTokensMap,\
+  \ const MemRegion*, TokenSet)\n  - REGISTER_MAP_WITH_PROGRAMSTATE(HelperFreedTokensMap,\
+  \ const MemRegion*, TokenSet)\n  Where TokenSet is an immutable set of const IdentifierInfo*\
+  \ (tokens interned in ASTContext). Each map associates a \u201Cbase object\u201D\
+  \ region (e.g., ca) with a set of tokens representing members or subsystems that\
+  \ were freed.\n- Rationale:\n  - ExplicitFreedTokensMap records tokens extracted\
+  \ from member names freed by direct kfree-like calls, e.g., kfree(ca->buckets_nouse)\
+  \ => tokens \u201Cbuckets_nouse\u201D and its prefix \u201Cbuckets\u201D.\n  - HelperFreedTokensMap\
+  \ records tokens extracted from helper function names that contain \u201Cfree\u201D\
+  \ and take the base object pointer as an argument, e.g., bch2_dev_buckets_free(ca)\
+  \ => tokens \u201Cbch2\u201D, \u201Cdev\u201D, \u201Cbuckets\u201D (ignoring \u201C\
+  free\u201D and other generic free words).\n  - A double-free is reported when the\
+  \ same token appears both in ExplicitFreedTokensMap and HelperFreedTokensMap for\
+  \ the same base region.\n\n2) Helper utilities\n\n- Token extraction\n  - Field\
+  \ tokenization: from FieldDecl->getNameAsString(), derive:\n    - Full token: the\
+  \ full field name, e.g., \u201Cbuckets_nouse\u201D\n    - Primary token: the prefix\
+  \ before the first underscore, e.g., \u201Cbuckets\u201D\n  - Helper function name\
+  \ tokenization: split the callee name by '_' and collect tokens such as \u201Cbch2\u201D\
+  , \u201Cdev\u201D, \u201Cbuckets\u201D. Ignore generic free-related words:\n   \
+  \ - Ignore list: {\"free\",\"put\",\"del\",\"exit\",\"destroy\",\"cleanup\",\"release\"\
+  ,\"uninit\",\"remove\"}\n  - Intern every token into ASTContext\u2019s IdentifierTable\
+  \ so we can store const IdentifierInfo* in program state.\n- Base region extraction\n\
+  \  - For kfree(arg) where arg is a MemberExpr, use getMemRegionFromExpr on the member\u2019\
+  s base expression to obtain the base object region (e.g., ca).\n- Provided utility\
+  \ functions to use\n  - getMemRegionFromExpr(E, C) to obtain MemRegion* for base\
+  \ arguments.\n  - ExprHasName can help in any final heuristic checks if needed (optional).\n\
+  - Recognizers\n  - isDeallocatorCall(Call): true if callee name is in {\"kfree\"\
+  ,\"kvfree\",\"vfree\"}.\n  - isHelperFree(Call): true if callee name contains \u201C\
+  free\u201D and is not a deallocator per above.\n  - MemberExprOnly: only treat explicit\
+  \ frees as relevant if the argument to kfree-like is a MemberExpr (struct member).\n\
+  \n3) Callbacks and logic\n\n- checkBeginFunction(Ctx)\n  - Initialize per-function\
+  \ state by ensuring both maps are empty for the new function (reset behavior is\
+  \ typical, but explicitly ensure no cross-function contamination).\n- checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C)\n  - Case A: explicit free via kfree-like\
+  \ calls\n    - If isDeallocatorCall(Call):\n      - Let Arg0 be the first argument.\n\
+  \      - If Arg0 is a MemberExpr ME:\n        - Extract FD = ME->getMemberDecl()\
+  \ as FieldDecl*, and BaseReg = getMemRegionFromExpr(ME->getBase(), C).\n       \
+  \ - Compute tokens:\n          - T_full = FD->getNameAsString()\n          - T_prefix\
+  \ = substring before first \u2018_\u2019 (or same as full if no underscore)\n  \
+  \        - Intern both tokens into IdentifierInfo* via C.getASTContext().Idents.get(...)\n\
+  \        - Update ExplicitFreedTokensMap[BaseReg] by inserting T_full and T_prefix.\n\
+  \        - Check for double-free:\n          - If HelperFreedTokensMap[BaseReg]\
+  \ contains either T_full or T_prefix, report a bug: \u201CDouble free of struct\
+  \ member via kfree() and helper\u201D.\n      - Else (not a MemberExpr): ignore\
+  \ (we only target struct-member frees).\n  - Case B: helper free call\n    - If\
+  \ isHelperFree(Call):\n      - For each argument Arg_i of Call:\n        - Reg_i\
+  \ = getMemRegionFromExpr(Arg_i, C). If null, continue.\n        - Tokenize callee\
+  \ name by \u2018_\u2019, ignore the generic words listed above, intern the remaining\
+  \ tokens as IdentifierInfo*.\n        - Insert all collected tokens into HelperFreedTokensMap[Reg_i].\n\
+  \        - For each inserted token t, check if ExplicitFreedTokensMap[Reg_i] contains\
+  \ t.\n          - If yes, report a bug: \u201CDouble free of struct member via kfree()\
+  \ and %func%\u201D.\n    - Note: do not treat standard kfree-like allocators as\
+  \ helpers; only proceed if callee name contains \u201Cfree\u201D and not in the\
+  \ deallocator list.\n- checkEndFunction / checkEndAnalysis\n  - No action required;\
+  \ we report at the point of the second free being recognized.\n\n4) Bug report emission\n\
+  \n- When a match is found (intersection of tokens for the same base region):\n \
+  \ - Create a non-fatal error node with generateNonFatalErrorNode().\n  - Emit a\
+  \ short message using PathSensitiveBugReport:\n    - \u201CDouble free of struct\
+  \ member: freed via kfree() and helper function\u201D\n  - Anchor the report to:\n\
+  \    - For explicit kfree: the kfree call expression\u2019s argument source range.\n\
+  \    - For helper free: the helper call\u2019s callee range or call location.\n\n\
+  5) Heuristics and constraints to reduce false positives\n\n- Only consider explicit\
+  \ frees where the freed expression is a MemberExpr (struct member), not arbitrary\
+  \ pointers.\n- Only consider helper calls whose names contain \u201Cfree\u201D and\
+  \ accept the same base object region as an argument.\n- Require a name-token match\
+  \ between:\n  - member name tokens (full and prefix), and\n  - helper function name\
+  \ tokens (minus generic free words).\n- Keep all tracking per-function scope (cleared\
+  \ at function entry) to ensure both operations are in the same teardown path.\n\n\
+  6) Notes\n\n- This checker focuses on the common kernel teardown pattern: kfree(base->field)\
+  \ combined with calling a helper that frees \u201Cfield\u201D via a function named\
+  \ like \u201C\u2026<field>\u2026_free(base)\u201D.\n- The token-based matching (field\
+  \ name/prefix and helper name) captures the target patch scenario: kfree(ca->buckets_nouse)\
+  \ combined with bch2_dev_buckets_free(ca)."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"llvm/ADT/ImmutableSet.h\"\n#include\
+  \ \"llvm/ADT/SmallVector.h\"\n#include \"llvm/ADT/StringRef.h\"\n#include <memory>\n\
+  #include <string>\n#include <vector>\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\nusing TokenSet = llvm::ImmutableSet<const IdentifierInfo\
+  \ *>;\nREGISTER_MAP_WITH_PROGRAMSTATE(ExplicitFreedTokensMap, const MemRegion*,\
+  \ TokenSet)\nREGISTER_MAP_WITH_PROGRAMSTATE(HelperFreedTokensMap,  const MemRegion*,\
+  \ TokenSet)\n\nnamespace {\nclass SAGenTestChecker : public Checker<check::PreCall,\
+  \ check::BeginFunction> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Double free of struct member\"\
+  , \"Memory Management\")) {}\n\n      void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkBeginFunction(CheckerContext &C) const;\n\n   private:\n\
+  \      // Recognizers\n      bool callNameIs(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef Name) const;\n      bool isDeallocatorCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      bool isHelperFree(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef &OutName) const;\n\n      // Token helpers\n      static bool isGenericFreeWord(StringRef\
+  \ Tok);\n      static bool containsInsensitive(StringRef S, StringRef Sub);\n  \
+  \    static std::string primaryPrefixToken(StringRef FieldName);\n      void collectHelperTokens(StringRef\
+  \ CalleeName,\n                               SmallVectorImpl<const IdentifierInfo*>\
+  \ &Out,\n                               ASTContext &ACtx) const;\n\n      ProgramStateRef\
+  \ addTokensToMap(ProgramStateRef State, bool IsExplicit,\n                     \
+  \                const MemRegion *BaseReg,\n                                   \
+  \  ArrayRef<const IdentifierInfo*> Tokens) const;\n\n      const TokenSet *getTokensFromMap(ProgramStateRef\
+  \ State, bool IsExplicit,\n                                       const MemRegion\
+  \ *BaseReg) const;\n\n      bool anyTokenInSet(const TokenSet *SetPtr,\n       \
+  \                  ArrayRef<const IdentifierInfo*> Tokens) const;\n\n      void\
+  \ reportDoubleFree(const Stmt *Anchor, StringRef HelperName,\n                 \
+  \           CheckerContext &C) const;\n};\n\n// -------- Utility implementations\
+  \ --------\n\nbool SAGenTestChecker::callNameIs(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef Name) const {\n  const Expr *OE = Call.getOriginExpr();\n  if (!OE)\
+  \ return false;\n  return ExprHasName(OE, Name, C);\n}\n\nbool SAGenTestChecker::isDeallocatorCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  // Use ExprHasName to verify known\
+  \ deallocators\n  return callNameIs(Call, C, \"kfree\") || callNameIs(Call, C, \"\
+  kvfree\") || callNameIs(Call, C, \"vfree\");\n}\n\nbool SAGenTestChecker::isHelperFree(const\
+  \ CallEvent &Call, CheckerContext &C, StringRef &OutName) const {\n  const IdentifierInfo\
+  \ *ID = Call.getCalleeIdentifier();\n  if (!ID)\n    return false;\n\n  StringRef\
+  \ Name = ID->getName();\n  OutName = Name;\n\n  // Must contain \"free\" to be considered\
+  \ a free-like helper,\n  // but exclude the raw deallocators we treat separately.\n\
+  \  if (!containsInsensitive(Name, \"free\"))\n    return false;\n\n  if (Name.equals(\"\
+  kfree\") || Name.equals(\"kvfree\") || Name.equals(\"vfree\"))\n    return false;\n\
+  \n  return true;\n}\n\nbool SAGenTestChecker::containsInsensitive(StringRef S, StringRef\
+  \ Sub) {\n  std::string SL = S.lower();\n  std::string SubL = Sub.lower();\n  return\
+  \ SL.find(SubL) != std::string::npos;\n}\n\nbool SAGenTestChecker::isGenericFreeWord(StringRef\
+  \ Tok) {\n  // Ignore generic free-related words\n  static const char *Ignored[]\
+  \ = {\n    \"free\",\"put\",\"del\",\"exit\",\"destroy\",\"cleanup\",\"release\"\
+  ,\"uninit\",\"remove\"\n  };\n  for (const char *I : Ignored)\n    if (Tok.equals_insensitive(I))\n\
+  \      return true;\n  return false;\n}\n\nstd::string SAGenTestChecker::primaryPrefixToken(StringRef\
+  \ FieldName) {\n  // Return substring before first '_' if present, else the whole\
+  \ name\n  std::pair<StringRef, StringRef> P = FieldName.split('_');\n  return P.first.str();\n\
+  }\n\nvoid SAGenTestChecker::collectHelperTokens(StringRef CalleeName,\n        \
+  \                                   SmallVectorImpl<const IdentifierInfo*> &Out,\n\
+  \                                           ASTContext &ACtx) const {\n  SmallVector<StringRef,\
+  \ 8> Parts;\n  CalleeName.split(Parts, '_');\n  for (StringRef P : Parts) {\n  \
+  \  if (P.empty()) continue;\n    if (isGenericFreeWord(P)) continue;\n    const\
+  \ IdentifierInfo &II = ACtx.Idents.get(P);\n    Out.push_back(&II);\n  }\n}\n\n\
+  ProgramStateRef SAGenTestChecker::addTokensToMap(ProgramStateRef State, bool IsExplicit,\n\
+  \                                                 const MemRegion *BaseReg,\n  \
+  \                                               ArrayRef<const IdentifierInfo*>\
+  \ Tokens) const {\n  if (!BaseReg)\n    return State;\n\n  BaseReg = BaseReg->getBaseRegion();\n\
+  \  if (!BaseReg)\n    return State;\n\n  const TokenSet *Existing = IsExplicit\n\
+  \                             ? State->get<ExplicitFreedTokensMap>(BaseReg)\n  \
+  \                           : State->get<HelperFreedTokensMap>(BaseReg);\n\n  //\
+  \ Create a factory backed by the state's allocator.\n  TokenSet::Factory F(State->getStateManager().getAllocator());\n\
+  \  TokenSet S = Existing ? *Existing : F.getEmptySet();\n\n  for (const IdentifierInfo\
+  \ *II : Tokens) {\n    S = F.add(S, II);\n  }\n\n  if (IsExplicit)\n    State =\
+  \ State->set<ExplicitFreedTokensMap>(BaseReg, S);\n  else\n    State = State->set<HelperFreedTokensMap>(BaseReg,\
+  \ S);\n\n  return State;\n}\n\nconst TokenSet *SAGenTestChecker::getTokensFromMap(ProgramStateRef\
+  \ State, bool IsExplicit,\n                                                   const\
+  \ MemRegion *BaseReg) const {\n  if (!BaseReg)\n    return nullptr;\n  BaseReg =\
+  \ BaseReg->getBaseRegion();\n  if (!BaseReg)\n    return nullptr;\n  return IsExplicit\
+  \ ? State->get<ExplicitFreedTokensMap>(BaseReg)\n                    : State->get<HelperFreedTokensMap>(BaseReg);\n\
+  }\n\nbool SAGenTestChecker::anyTokenInSet(const TokenSet *SetPtr,\n            \
+  \                         ArrayRef<const IdentifierInfo*> Tokens) const {\n  if\
+  \ (!SetPtr)\n    return false;\n  const TokenSet &S = *SetPtr;\n  for (const IdentifierInfo\
+  \ *II : Tokens)\n    if (S.contains(II))\n      return true;\n  return false;\n\
+  }\n\nvoid SAGenTestChecker::reportDoubleFree(const Stmt *Anchor, StringRef HelperName,\n\
+  \                                        CheckerContext &C) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  std::string Msg\
+  \ = \"Double free of struct member via kfree() and helper\";\n  if (!HelperName.empty())\
+  \ {\n    Msg += \" '\";\n    Msg += HelperName.str();\n    Msg += \"'\";\n  }\n\n\
+  \  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);\n  if (Anchor)\n\
+  \    R->addRange(Anchor->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n\
+  // -------- Checker callbacks --------\n\nvoid SAGenTestChecker::checkBeginFunction(CheckerContext\
+  \ &C) const {\n  // Per-function tracking is naturally path-local; no explicit clearing\
+  \ required.\n  // Still, ensure a transition exists for the engine.\n  C.addTransition(C.getState());\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  ProgramStateRef State = C.getState();\n  ASTContext &ACtx = C.getASTContext();\n\
+  \n  // Case A: Explicit deallocation like kfree/kvfree/vfree of a struct member.\n\
+  \  if (isDeallocatorCall(Call, C)) {\n    if (Call.getNumArgs() == 0) {\n      C.addTransition(State);\n\
+  \      return;\n    }\n\n    const Expr *Arg0E = Call.getArgExpr(0);\n    if (!Arg0E)\
+  \ {\n      C.addTransition(State);\n      return;\n    }\n\n    // We only consider\
+  \ kfree of a MemberExpr (struct member), as per plan.\n    const MemberExpr *ME\
+  \ = dyn_cast<MemberExpr>(Arg0E->IgnoreParenCasts());\n    if (!ME) {\n      C.addTransition(State);\n\
+  \      return;\n    }\n\n    const ValueDecl *VD = ME->getMemberDecl();\n    const\
+  \ FieldDecl *FD = dyn_cast_or_null<FieldDecl>(VD);\n    if (!FD) {\n      C.addTransition(State);\n\
+  \      return;\n    }\n\n    // Base object region (e.g., 'ca' in ca->field)\n \
+  \   const MemRegion *BaseReg = getMemRegionFromExpr(ME->getBase(), C);\n    if (!BaseReg)\
+  \ {\n      C.addTransition(State);\n      return;\n    }\n    BaseReg = BaseReg->getBaseRegion();\n\
+  \    if (!BaseReg) {\n      C.addTransition(State);\n      return;\n    }\n\n  \
+  \  // Tokens: full field name and primary prefix\n    StringRef FullName = FD->getName();\n\
+  \    std::string Prefix = primaryPrefixToken(FullName);\n\n    SmallVector<const\
+  \ IdentifierInfo*, 4> FieldTokens;\n    const IdentifierInfo &II_Full   = ACtx.Idents.get(FullName);\n\
+  \    FieldTokens.push_back(&II_Full);\n\n    const IdentifierInfo &II_Prefix = ACtx.Idents.get(Prefix);\n\
+  \    FieldTokens.push_back(&II_Prefix);\n\n    // Update explicit-free tokens for\
+  \ this base object\n    State = addTokensToMap(State, /*IsExplicit=*/true, BaseReg,\
+  \ FieldTokens);\n\n    // If helper-free tokens already include these, report\n\
+  \    const TokenSet *HelperSet = getTokensFromMap(State, /*IsExplicit=*/false, BaseReg);\n\
+  \    if (anyTokenInSet(HelperSet, FieldTokens)) {\n      reportDoubleFree(Arg0E,\
+  \ StringRef(), C);\n      C.addTransition(State);\n      return;\n    }\n\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Case B: Helper free calls whose names contain \"free\"\
+  \ (not the raw deallocators)\n  StringRef HelperName;\n  if (isHelperFree(Call,\
+  \ C, HelperName)) {\n    // Collect tokens from the helper function name (excluding\
+  \ generic words)\n    SmallVector<const IdentifierInfo*, 8> HelperTokens;\n    collectHelperTokens(HelperName,\
+  \ HelperTokens, ACtx);\n\n    // For each argument, map tokens to the base object\
+  \ region and check intersection\n    for (unsigned I = 0; I < Call.getNumArgs();\
+  \ ++I) {\n      const Expr *ArgE = Call.getArgExpr(I);\n      if (!ArgE) continue;\n\
+  \n      const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n      if (!MR) continue;\n\
+  \      MR = MR->getBaseRegion();\n      if (!MR) continue;\n\n      // Update helper-free\
+  \ tokens for this base region\n      State = addTokensToMap(State, /*IsExplicit=*/false,\
+  \ MR, HelperTokens);\n\n      // Compare with explicit-free tokens for the same\
+  \ base\n      const TokenSet *ExplicitSet = getTokensFromMap(State, /*IsExplicit=*/true,\
+  \ MR);\n      if (anyTokenInSet(ExplicitSet, HelperTokens)) {\n        reportDoubleFree(Call.getOriginExpr(),\
+  \ HelperName, C);\n        // Continue processing to keep state consistent.\n  \
+  \    }\n    }\n\n    C.addTransition(State);\n    return;\n  }\n\n  // Default path\n\
+  \  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\nextern \"C\" void\
+  \ clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects double free of a struct member\
+  \ freed both via kfree() and a helper function\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

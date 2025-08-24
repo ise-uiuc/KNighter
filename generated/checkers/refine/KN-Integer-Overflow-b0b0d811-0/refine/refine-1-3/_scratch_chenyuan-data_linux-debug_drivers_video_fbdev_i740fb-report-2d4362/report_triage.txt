@@ -1,0 +1,7 @@
+- Decision: NotABug
+- Reason: The flagged line computes info->screen_size = i740inb(par, XRX + 1) * 1024 * 1024;. Here:
+  - i740inb returns u8 (0..255).
+  - The constants 1024 are int; usual integer promotions make the multiplication occur in 32-bit int.
+  - Max value is 255 * 1,048,576 = 267,386,880, which fits well within 32-bit signed int (INT_MAX ≈ 2.1e9). So there is no overflow in the intermediate multiplication.
+  - Assigning this to info->screen_size (likely size_t/unsigned long) does not introduce any loss or overflow; even if widened to 64-bit, the intermediate result is already correct.
+  - The target bug pattern concerns cases where a u32×u32 or mixed-width multiplication can overflow before being widened to u64/dma_addr_t. Here, by tight bounds on the u8 operand, overflow cannot occur, so the report does not match the target pattern and is not a real bug.

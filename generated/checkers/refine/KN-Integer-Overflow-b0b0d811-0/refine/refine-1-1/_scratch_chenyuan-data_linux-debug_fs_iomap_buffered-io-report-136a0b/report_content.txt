@@ -1,0 +1,517 @@
+### Report Summary
+
+File:| /scratch/chenyuan-data/linux-debug/fs/iomap/buffered-io.c
+---|---
+Warning:| line 268, column 10
+Multiplication occurs in a narrower type and is widened after; possible
+overflow before assignment/addition to wide type
+
+### Annotated Source Code
+
+
+4     |  * Copyright (C) 2016-2023 Christoph Hellwig.
+5     |  */
+6     | #include <linux/module.h>
+7     | #include <linux/compiler.h>
+8     | #include <linux/fs.h>
+9     | #include <linux/iomap.h>
+10    | #include <linux/pagemap.h>
+11    | #include <linux/uio.h>
+12    | #include <linux/buffer_head.h>
+13    | #include <linux/dax.h>
+14    | #include <linux/writeback.h>
+15    | #include <linux/list_sort.h>
+16    | #include <linux/swap.h>
+17    | #include <linux/bio.h>
+18    | #include <linux/sched/signal.h>
+19    | #include <linux/migrate.h>
+20    | #include "trace.h"
+21    |
+22    | #include "../internal.h"
+23    |
+24    | #define IOEND_BATCH_SIZE	4096
+25    |
+26    | typedef int (*iomap_punch_t)(struct inode *inode, loff_t offset, loff_t length);
+27    | /*
+28    |  * Structure allocated for each folio to track per-block uptodate, dirty state
+29    |  * and I/O completions.
+30    |  */
+31    | struct iomap_folio_state {
+32    | 	spinlock_t		state_lock;
+33    |  unsigned int		read_bytes_pending;
+34    | 	atomic_t		write_bytes_pending;
+35    |
+36    |  /*
+37    |  * Each block has two bits in this bitmap:
+38    |  * Bits [0..blocks_per_folio) has the uptodate status.
+39    |  * Bits [b_p_f...(2*b_p_f))   has the dirty status.
+40    |  */
+41    |  unsigned long		state[];
+42    | };
+43    |
+44    | static struct bio_set iomap_ioend_bioset;
+45    |
+46    | static inline bool ifs_is_fully_uptodate(struct folio *folio,
+47    |  struct iomap_folio_state *ifs)
+48    | {
+49    |  struct inode *inode = folio->mapping->host;
+50    |
+51    |  return bitmap_full(ifs->state, i_blocks_per_folio(inode, folio));
+52    | }
+53    |
+54    | static inline bool ifs_block_is_uptodate(struct iomap_folio_state *ifs,
+55    |  unsigned int block)
+56    | {
+57    |  return test_bit(block, ifs->state);
+58    | }
+59    |
+60    | static bool ifs_set_range_uptodate(struct folio *folio,
+61    |  struct iomap_folio_state *ifs, size_t off, size_t len)
+62    | {
+63    |  struct inode *inode = folio->mapping->host;
+64    |  unsigned int first_blk = off >> inode->i_blkbits;
+65    |  unsigned int last_blk = (off + len - 1) >> inode->i_blkbits;
+66    |  unsigned int nr_blks = last_blk - first_blk + 1;
+67    |
+68    | 	bitmap_set(ifs->state, first_blk, nr_blks);
+69    |  return ifs_is_fully_uptodate(folio, ifs);
+70    | }
+71    |
+72    | static void iomap_set_range_uptodate(struct folio *folio, size_t off,
+73    | 		size_t len)
+74    | {
+75    |  struct iomap_folio_state *ifs = folio->private;
+76    |  unsigned long flags;
+77    | 	bool uptodate = true;
+78    |
+79    |  if (ifs) {
+80    |  spin_lock_irqsave(&ifs->state_lock, flags);
+81    | 		uptodate = ifs_set_range_uptodate(folio, ifs, off, len);
+82    | 		spin_unlock_irqrestore(&ifs->state_lock, flags);
+83    | 	}
+84    |
+85    |  if (uptodate)
+86    | 		folio_mark_uptodate(folio);
+87    | }
+132   |  return ifs_find_dirty_range(folio, ifs, range_start, range_end);
+133   |  return range_end - *range_start;
+134   | }
+135   |
+136   | static void ifs_clear_range_dirty(struct folio *folio,
+137   |  struct iomap_folio_state *ifs, size_t off, size_t len)
+138   | {
+139   |  struct inode *inode = folio->mapping->host;
+140   |  unsigned int blks_per_folio = i_blocks_per_folio(inode, folio);
+141   |  unsigned int first_blk = (off >> inode->i_blkbits);
+142   |  unsigned int last_blk = (off + len - 1) >> inode->i_blkbits;
+143   |  unsigned int nr_blks = last_blk - first_blk + 1;
+144   |  unsigned long flags;
+145   |
+146   |  spin_lock_irqsave(&ifs->state_lock, flags);
+147   | 	bitmap_clear(ifs->state, first_blk + blks_per_folio, nr_blks);
+148   | 	spin_unlock_irqrestore(&ifs->state_lock, flags);
+149   | }
+150   |
+151   | static void iomap_clear_range_dirty(struct folio *folio, size_t off, size_t len)
+152   | {
+153   |  struct iomap_folio_state *ifs = folio->private;
+154   |
+155   |  if (ifs)
+156   | 		ifs_clear_range_dirty(folio, ifs, off, len);
+157   | }
+158   |
+159   | static void ifs_set_range_dirty(struct folio *folio,
+160   |  struct iomap_folio_state *ifs, size_t off, size_t len)
+161   | {
+162   |  struct inode *inode = folio->mapping->host;
+163   |  unsigned int blks_per_folio = i_blocks_per_folio(inode, folio);
+164   |  unsigned int first_blk = (off >> inode->i_blkbits);
+165   |  unsigned int last_blk = (off + len - 1) >> inode->i_blkbits;
+166   |  unsigned int nr_blks = last_blk - first_blk + 1;
+167   |  unsigned long flags;
+168   |
+169   |  spin_lock_irqsave(&ifs->state_lock, flags);
+170   | 	bitmap_set(ifs->state, first_blk + blks_per_folio, nr_blks);
+171   | 	spin_unlock_irqrestore(&ifs->state_lock, flags);
+172   | }
+173   |
+174   | static void iomap_set_range_dirty(struct folio *folio, size_t off, size_t len)
+175   | {
+176   |  struct iomap_folio_state *ifs = folio->private;
+177   |
+178   |  if (ifs)
+179   | 		ifs_set_range_dirty(folio, ifs, off, len);
+180   | }
+181   |
+182   | static struct iomap_folio_state *ifs_alloc(struct inode *inode,
+183   |  struct folio *folio, unsigned int flags)
+184   | {
+185   |  struct iomap_folio_state *ifs = folio->private;
+186   |  unsigned int nr_blocks = i_blocks_per_folio(inode, folio);
+187   | 	gfp_t gfp;
+188   |
+189   |  if (ifs || nr_blocks <= 1)
+190   |  return ifs;
+191   |
+192   |  if (flags & IOMAP_NOWAIT)
+193   | 		gfp = GFP_NOWAIT;
+194   |  else
+195   | 		gfp = GFP_NOFS | __GFP_NOFAIL;
+196   |
+197   |  /*
+198   |  * ifs->state tracks two sets of state flags when the
+199   |  * filesystem block size is smaller than the folio size.
+200   |  * The first state tracks per-block uptodate and the
+201   |  * second tracks per-block dirty state.
+202   |  */
+203   | 	ifs = kzalloc(struct_size(ifs, state,
+204   |  BITS_TO_LONGS(2 * nr_blocks)), gfp);
+205   |  if (!ifs)
+206   |  return ifs;
+207   |
+208   |  spin_lock_init(&ifs->state_lock);
+209   |  if (folio_test_uptodate(folio))
+210   | 		bitmap_set(ifs->state, 0, nr_blocks);
+211   |  if (folio_test_dirty(folio))
+212   | 		bitmap_set(ifs->state, nr_blocks, nr_blocks);
+213   | 	folio_attach_private(folio, ifs);
+214   |
+215   |  return ifs;
+216   | }
+217   |
+218   | static void ifs_free(struct folio *folio)
+219   | {
+220   |  struct iomap_folio_state *ifs = folio_detach_private(folio);
+221   |
+222   |  if (!ifs)
+223   |  return;
+224   |  WARN_ON_ONCE(ifs->read_bytes_pending != 0);
+225   |  WARN_ON_ONCE(atomic_read(&ifs->write_bytes_pending));
+226   |  WARN_ON_ONCE(ifs_is_fully_uptodate(folio, ifs) !=
+227   |  folio_test_uptodate(folio));
+228   | 	kfree(ifs);
+229   | }
+230   |
+231   | /*
+232   |  * Calculate the range inside the folio that we actually need to read.
+233   |  */
+234   | static void iomap_adjust_read_range(struct inode *inode, struct folio *folio,
+235   | 		loff_t *pos, loff_t length, size_t *offp, size_t *lenp)
+236   | {
+237   |  struct iomap_folio_state *ifs = folio->private;
+238   | 	loff_t orig_pos = *pos;
+239   | 	loff_t isize = i_size_read(inode);
+240   |  unsigned block_bits = inode->i_blkbits;
+241   |  unsigned block_size = (1 << block_bits);
+    10←Assuming right operand of bit shift is less than 32→
+242   |  size_t poff = offset_in_folio(folio, *pos);
+243   |  size_t plen = min_t(loff_t, folio_size(folio) - poff, length);
+    11←Assuming '__UNIQUE_ID___x1481' is >= '__UNIQUE_ID___y1482'→
+    12←'?' condition is false→
+244   |  unsigned first = poff >> block_bits;
+245   |  unsigned last = (poff + plen - 1) >> block_bits;
+246   |
+247   |  /*
+248   |  * If the block size is smaller than the page size, we need to check the
+249   |  * per-block uptodate status and adjust the offset and length if needed
+250   |  * to avoid reading in already uptodate ranges.
+251   |  */
+252   |  if (ifs12.1'ifs' is non-null) {
+    13←Taking true branch→
+253   |  unsigned int i;
+254   |
+255   |  /* move forward for each leading block marked uptodate */
+256   |  for (i = first; i <= last; i++) {
+    14←Assuming 'i' is <= 'last'→
+    15←Loop condition is true.  Entering loop body→
+257   |  if (!ifs_block_is_uptodate(ifs, i))
+    16←Assuming the condition is true→
+    17←Taking true branch→
+258   |  break;
+259   | 			*pos += block_size;
+260   | 			poff += block_size;
+261   | 			plen -= block_size;
+262   | 			first++;
+263   | 		}
+264   |
+265   |  /* truncate len if we find any trailing uptodate block(s) */
+266   |  for ( ; i18.1'i' is <= 'last' <= last; i++) {
+    18← Execution continues on line 266→
+    19←Loop condition is true.  Entering loop body→
+267   |  if (ifs_block_is_uptodate(ifs, i)) {
+    20←Assuming the condition is true→
+    21←Taking true branch→
+268   |  plen -= (last - i + 1) * block_size;
+    22←Multiplication occurs in a narrower type and is widened after; possible overflow before assignment/addition to wide type
+269   | 				last = i - 1;
+270   |  break;
+271   | 			}
+272   | 		}
+273   | 	}
+274   |
+275   |  /*
+276   |  * If the extent spans the block that contains the i_size, we need to
+277   |  * handle both halves separately so that we properly zero data in the
+278   |  * page cache for blocks that are entirely outside of i_size.
+279   |  */
+280   |  if (orig_pos <= isize && orig_pos + length > isize) {
+281   |  unsigned end = offset_in_folio(folio, isize - 1) >> block_bits;
+282   |
+283   |  if (first <= end && last > end)
+284   | 			plen -= (last - end) * block_size;
+285   | 	}
+286   |
+287   | 	*offp = poff;
+288   | 	*lenp = plen;
+289   | }
+290   |
+291   | static void iomap_finish_folio_read(struct folio *folio, size_t off,
+292   | 		size_t len, int error)
+293   | {
+294   |  struct iomap_folio_state *ifs = folio->private;
+295   | 	bool uptodate = !error;
+296   | 	bool finished = true;
+297   |
+298   |  if (ifs) {
+321   | 		iomap_finish_folio_read(fi.folio, fi.offset, fi.length, error);
+322   | 	bio_put(bio);
+323   | }
+324   |
+325   | struct iomap_readpage_ctx {
+326   |  struct folio		*cur_folio;
+327   | 	bool			cur_folio_in_bio;
+328   |  struct bio		*bio;
+329   |  struct readahead_control *rac;
+330   | };
+331   |
+332   | /**
+333   |  * iomap_read_inline_data - copy inline data into the page cache
+334   |  * @iter: iteration structure
+335   |  * @folio: folio to copy to
+336   |  *
+337   |  * Copy the inline data in @iter into @folio and zero out the rest of the folio.
+338   |  * Only a single IOMAP_INLINE extent is allowed at the end of each file.
+339   |  * Returns zero for success to complete the read, or the usual negative errno.
+340   |  */
+341   | static int iomap_read_inline_data(const struct iomap_iter *iter,
+342   |  struct folio *folio)
+343   | {
+344   |  const struct iomap *iomap = iomap_iter_srcmap(iter);
+345   | 	size_t size = i_size_read(iter->inode) - iomap->offset;
+346   | 	size_t offset = offset_in_folio(folio, iomap->offset);
+347   |
+348   |  if (folio_test_uptodate(folio))
+349   |  return 0;
+350   |
+351   |  if (WARN_ON_ONCE(size > iomap->length))
+352   |  return -EIO;
+353   |  if (offset > 0)
+354   | 		ifs_alloc(iter->inode, folio, iter->flags);
+355   |
+356   | 	folio_fill_tail(folio, offset, iomap->inline_data, size);
+357   | 	iomap_set_range_uptodate(folio, offset, folio_size(folio) - offset);
+358   |  return 0;
+359   | }
+360   |
+361   | static inline bool iomap_block_needs_zeroing(const struct iomap_iter *iter,
+362   | 		loff_t pos)
+363   | {
+364   |  const struct iomap *srcmap = iomap_iter_srcmap(iter);
+365   |
+366   |  return srcmap->type != IOMAP_MAPPED ||
+367   | 		(srcmap->flags & IOMAP_F_NEW) ||
+368   | 		pos >= i_size_read(iter->inode);
+369   | }
+370   |
+371   | static loff_t iomap_readpage_iter(const struct iomap_iter *iter,
+372   |  struct iomap_readpage_ctx *ctx, loff_t offset)
+373   | {
+374   |  const struct iomap *iomap = &iter->iomap;
+375   | 	loff_t pos = iter->pos + offset;
+376   | 	loff_t length = iomap_length(iter) - offset;
+377   |  struct folio *folio = ctx->cur_folio;
+378   |  struct iomap_folio_state *ifs;
+379   | 	loff_t orig_pos = pos;
+380   | 	size_t poff, plen;
+381   | 	sector_t sector;
+382   |
+383   |  if (iomap->type == IOMAP_INLINE)
+    7←Assuming field 'type' is not equal to IOMAP_INLINE→
+    8←Taking false branch→
+384   |  return iomap_read_inline_data(iter, folio);
+385   |
+386   |  /* zero post-eof blocks as the page may be mapped */
+387   |  ifs = ifs_alloc(iter->inode, folio, iter->flags);
+388   |  iomap_adjust_read_range(iter->inode, folio, &pos, length, &poff, &plen);
+    9←Calling 'iomap_adjust_read_range'→
+389   |  if (plen == 0)
+390   |  goto done;
+391   |
+392   |  if (iomap_block_needs_zeroing(iter, pos)) {
+393   | 		folio_zero_range(folio, poff, plen);
+394   | 		iomap_set_range_uptodate(folio, poff, plen);
+395   |  goto done;
+396   | 	}
+397   |
+398   | 	ctx->cur_folio_in_bio = true;
+399   |  if (ifs) {
+400   | 		spin_lock_irq(&ifs->state_lock);
+401   | 		ifs->read_bytes_pending += plen;
+402   | 		spin_unlock_irq(&ifs->state_lock);
+403   | 	}
+404   |
+405   | 	sector = iomap_sector(iomap, pos);
+406   |  if (!ctx->bio ||
+407   |  bio_end_sector(ctx->bio) != sector ||
+408   | 	    !bio_add_folio(ctx->bio, folio, plen, poff)) {
+409   | 		gfp_t gfp = mapping_gfp_constraint(folio->mapping, GFP_KERNEL);
+410   | 		gfp_t orig_gfp = gfp;
+411   |  unsigned int nr_vecs = DIV_ROUND_UP(length, PAGE_SIZE);
+412   |
+413   |  if (ctx->bio)
+414   | 			submit_bio(ctx->bio);
+415   |
+416   |  if (ctx->rac) /* same as readahead_gfp_mask */
+417   | 			gfp |= __GFP_NORETRY | __GFP_NOWARN;
+418   | 		ctx->bio = bio_alloc(iomap->bdev, bio_max_segs(nr_vecs),
+433   | 		bio_add_folio_nofail(ctx->bio, folio, plen, poff);
+434   | 	}
+435   |
+436   | done:
+437   |  /*
+438   |  * Move the caller beyond our range so that it keeps making progress.
+439   |  * For that, we have to include any leading non-uptodate ranges, but
+440   |  * we can skip trailing ones as they will be handled in the next
+441   |  * iteration.
+442   |  */
+443   |  return pos - orig_pos + plen;
+444   | }
+445   |
+446   | int iomap_read_folio(struct folio *folio, const struct iomap_ops *ops)
+447   | {
+448   |  struct iomap_iter iter = {
+449   | 		.inode		= folio->mapping->host,
+450   | 		.pos		= folio_pos(folio),
+451   | 		.len		= folio_size(folio),
+452   | 	};
+453   |  struct iomap_readpage_ctx ctx = {
+454   | 		.cur_folio	= folio,
+455   | 	};
+456   |  int ret;
+457   |
+458   | 	trace_iomap_readpage(iter.inode, 1);
+459   |
+460   |  while ((ret = iomap_iter(&iter, ops)) > 0)
+461   | 		iter.processed = iomap_readpage_iter(&iter, &ctx, 0);
+462   |
+463   |  if (ret < 0)
+464   | 		folio_set_error(folio);
+465   |
+466   |  if (ctx.bio) {
+467   | 		submit_bio(ctx.bio);
+468   |  WARN_ON_ONCE(!ctx.cur_folio_in_bio);
+469   | 	} else {
+470   |  WARN_ON_ONCE(ctx.cur_folio_in_bio);
+471   | 		folio_unlock(folio);
+472   | 	}
+473   |
+474   |  /*
+475   |  * Just like mpage_readahead and block_read_full_folio, we always
+476   |  * return 0 and just set the folio error flag on errors.  This
+477   |  * should be cleaned up throughout the stack eventually.
+478   |  */
+479   |  return 0;
+480   | }
+481   | EXPORT_SYMBOL_GPL(iomap_read_folio);
+482   |
+483   | static loff_t iomap_readahead_iter(const struct iomap_iter *iter,
+484   |  struct iomap_readpage_ctx *ctx)
+485   | {
+486   |  loff_t length = iomap_length(iter);
+487   | 	loff_t done, ret;
+488   |
+489   |  for (done = 0; done < length; done += ret) {
+    4←Assuming 'done' is < 'length'→
+490   |  if (ctx->cur_folio4.1Field 'cur_folio' is null &&
+491   |  offset_in_folio(ctx->cur_folio, iter->pos + done) == 0) {
+492   |  if (!ctx->cur_folio_in_bio)
+493   | 				folio_unlock(ctx->cur_folio);
+494   | 			ctx->cur_folio = NULL;
+495   | 		}
+496   |  if (!ctx->cur_folio4.2Field 'cur_folio' is null) {
+    5←Taking true branch→
+497   |  ctx->cur_folio = readahead_folio(ctx->rac);
+498   |  ctx->cur_folio_in_bio = false;
+499   | 		}
+500   |  ret = iomap_readpage_iter(iter, ctx, done);
+    6←Calling 'iomap_readpage_iter'→
+501   |  if (ret <= 0)
+502   |  return ret;
+503   | 	}
+504   |
+505   |  return done;
+506   | }
+507   |
+508   | /**
+509   |  * iomap_readahead - Attempt to read pages from a file.
+510   |  * @rac: Describes the pages to be read.
+511   |  * @ops: The operations vector for the filesystem.
+512   |  *
+513   |  * This function is for filesystems to call to implement their readahead
+514   |  * address_space operation.
+515   |  *
+516   |  * Context: The @ops callbacks may submit I/O (eg to read the addresses of
+517   |  * blocks from disc), and may wait for it.  The caller may be trying to
+518   |  * access a different page, and so sleeping excessively should be avoided.
+519   |  * It may allocate memory, but should avoid costly allocations.  This
+520   |  * function is called with memalloc_nofs set, so allocations will not cause
+521   |  * the filesystem to be reentered.
+522   |  */
+523   | void iomap_readahead(struct readahead_control *rac, const struct iomap_ops *ops)
+524   | {
+525   |  struct iomap_iter iter = {
+526   | 		.inode	= rac->mapping->host,
+527   | 		.pos	= readahead_pos(rac),
+528   | 		.len	= readahead_length(rac),
+529   | 	};
+530   |  struct iomap_readpage_ctx ctx = {
+531   | 		.rac	= rac,
+532   | 	};
+533   |
+534   | 	trace_iomap_readahead(rac->mapping->host, readahead_count(rac));
+535   |
+536   |  while (iomap_iter(&iter, ops) > 0)
+    1Assuming the condition is true→
+    2←Loop condition is true.  Entering loop body→
+537   |  iter.processed = iomap_readahead_iter(&iter, &ctx);
+    3←Calling 'iomap_readahead_iter'→
+538   |
+539   |  if (ctx.bio)
+540   | 		submit_bio(ctx.bio);
+541   |  if (ctx.cur_folio) {
+542   |  if (!ctx.cur_folio_in_bio)
+543   | 			folio_unlock(ctx.cur_folio);
+544   | 	}
+545   | }
+546   | EXPORT_SYMBOL_GPL(iomap_readahead);
+547   |
+548   | /*
+549   |  * iomap_is_partially_uptodate checks whether blocks within a folio are
+550   |  * uptodate or not.
+551   |  *
+552   |  * Returns true if all blocks which correspond to the specified part
+553   |  * of the folio are uptodate.
+554   |  */
+555   | bool iomap_is_partially_uptodate(struct folio *folio, size_t from, size_t count)
+556   | {
+557   |  struct iomap_folio_state *ifs = folio->private;
+558   |  struct inode *inode = folio->mapping->host;
+559   |  unsigned first, last, i;
+560   |
+561   |  if (!ifs)
+562   |  return false;
+563   |
+564   |  /* Caller's range may extend past the end of this folio */
+565   | 	count = min(folio_size(folio) - from, count);
+566   |
+567   |  /* First and last blocks in range within folio */

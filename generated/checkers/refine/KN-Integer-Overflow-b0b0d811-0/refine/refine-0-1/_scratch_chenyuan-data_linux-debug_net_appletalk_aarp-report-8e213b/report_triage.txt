@@ -1,0 +1,6 @@
+- Decision: NotABug
+- Reason: The warning flags a multiplication in int (sysctl_aarp_expiry_time * 10) whose result is then added to jiffies (unsigned long). While this is a narrower-type multiplication followed by addition to a wider type on 64-bit, it does not constitute a real overflow bug here:
+  - Types: sysctl_aarp_expiry_time is an int; 10 is an int literal; the product is int. a->expires_at and jiffies are unsigned long. On 32-bit, unsigned long is not wider than int; on 64-bit it is wider.
+  - Numeric feasibility: The int product would only overflow if sysctl_aarp_expiry_time > INT_MAX/10 (~214,748,364). In practice, AppleTalk AARP timing sysctls are small (seconds/tenths of seconds), typically bounded via sysctl min/max handlers to modest values, so the product remains far below overflow. Even without explicit bounds, setting such extreme values is unrealistic.
+  - The target bug pattern focuses on overflow in size/address arithmetic (u64/dma_addr_t scenarios) where pre-widen overflow is plausible. Here the arithmetic is computing a timeout in jiffies; there is no credible path to overflow the int multiplication under real-world settings.
+  - Therefore, while the code matches the syntactic pattern, it is not a real bug in context and does not warrant the cast/widening fix implied by the target pattern.

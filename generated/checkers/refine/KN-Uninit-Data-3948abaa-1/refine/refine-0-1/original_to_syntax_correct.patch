@@ -1,0 +1,189 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -48,7 +48,6 @@ // - ExprHasName
+
+ namespace {
+-/* The checker callbacks are to be decided. */
+ class SAGenTestChecker : public Checker<
+                              check::PostCall,
+                              check::PreCall,
+@@ -74,6 +73,7 @@
+       // Producer modeling helpers
+       bool functionKnownToInitBuffer(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx, unsigned &LenPtrParamIdx) const;
++      bool functionKnownToInitLenIsReturn(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const;
+       SymbolRef getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const;
+       bool isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
+ };
+@@ -85,9 +85,7 @@   if (!Base)
+     return nullptr;
+
+-  // Follow alias chain to a fixed point (both directions are stored, but forward is enough).
+   const MemRegion *Cur = Base;
+-  // Limit steps to avoid cycles.
+   for (unsigned i = 0; i < 8; ++i) {
+     if (const MemRegion *const *NextP = State->get<PtrAliasMap>(Cur)) {
+       const MemRegion *Next = *NextP;
+@@ -161,11 +159,9 @@     return;
+
+   uint64_t Len = EvalRes.getZExtValue();
+-  // Record the max of existing length and new length.
+   const uint64_t *Old = State->get<ZeroInitSizeMap>(DstReg);
+   uint64_t NewLen = Old ? std::max(*Old, Len) : Len;
+   State = State->set<ZeroInitSizeMap>(DstReg, NewLen);
+-  // Producer info not needed for explicit init; clear to be safe.
+   State = State->remove<ProducerLenSymMap>(DstReg);
+   State = State->remove<ProducerStatusSymMap>(DstReg);
+   C.addTransition(State);
+@@ -186,13 +182,8 @@ // Recognize known producer that fills an output buffer up to length returned in len-pointer on success.
+ // For this false positive, we need to recognize efi.get_variable(name, guid, attr, data_size_ptr, data_ptr).
+ bool SAGenTestChecker::functionKnownToInitBuffer(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx, unsigned &LenPtrParamIdx) const {
+-  // Use textual match on the origin expression to tolerate function pointers / struct members.
+-  // We purposefully search for the leaf name to handle expressions like "efi.get_variable(...)".
+   if (const Expr *Origin = Call.getOriginExpr()) {
+-    // Match "get_variable" in the call text; avoid accidental matches by including underscore+name.
+-    // This is intentionally conservative and specific to the EFI API we need.
+     if (ExprHasName(Origin, "get_variable", C)) {
+-      // Expect at least 5 args: name, vendor, attr*, len*, data
+       if (Call.getNumArgs() >= 5) {
+         BufParamIdx = 4;
+         LenPtrParamIdx = 3;
+@@ -203,13 +194,26 @@   return false;
+ }
+
++// Recognize producers that return the number of bytes initialized in the buffer.
++bool SAGenTestChecker::functionKnownToInitLenIsReturn(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const {
++  if (const Expr *Origin = Call.getOriginExpr()) {
++    // usb_control_msg(dev, pipe, req, reqtype, value, index, data, size, timeout)
++    if (ExprHasName(Origin, "usb_control_msg", C)) {
++      if (Call.getNumArgs() >= 9) {
++        BufParamIdx = 6;
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
+ SymbolRef SAGenTestChecker::getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+   SVal PtrV = Call.getArgSVal(Idx);
+   const MemRegion *PtrReg = PtrV.getAsRegion();
+   if (!PtrReg)
+     return nullptr;
+-  // Load the value at the pointer location; we only need its symbol.
+   SValBuilder &SVB = C.getSValBuilder();
+   Loc L = SVB.makeLoc(PtrReg);
+   SVal Pointee = State->getSVal(L);
+@@ -221,26 +225,18 @@ bool SAGenTestChecker::isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const {
+   ProgramStateRef State = C.getState();
+
+-  // We require: recorded producer length symbol for this buffer, and copy length uses the same symbol.
+   const SymbolRef *LenSymP = State->get<ProducerLenSymMap>(FromReg);
+   if (!LenSymP || !*LenSymP)
+     return false;
+
+-  // Check that the copy length arg is exactly that symbol.
+   SVal LenArgV = CopyToUserCall.getArgSVal(2);
+   SymbolRef CopyLenSym = LenArgV.getAsSymbol();
+   if (!CopyLenSym || CopyLenSym != *LenSymP)
+     return false;
+
+-  // Optional: If we can prove that the producer's status symbol is constrained to success (0),
+-  // accept this as fully initialized. If we cannot prove it, we still suppress because the
+-  // path to this call typically assumes success (guarded by a status check). This avoids FPs
+-  // while remaining specific to the producer API.
+   if (const SymbolRef *StatusSymP = State->get<ProducerStatusSymMap>(FromReg)) {
+     if (*StatusSymP) {
+-      // Try to determine if StatusSym == 0 is known on this path.
+       SValBuilder &SVB = C.getSValBuilder();
+-      // Build (Status == 0). We don't have the exact type; use 0 of 'int' which is fine for equality.
+       QualType IntTy = C.getASTContext().IntTy;
+       DefinedOrUnknownSVal Cond = SVB.evalEQ(State,
+                                              nonloc::SymbolVal(*StatusSymP),
+@@ -248,15 +244,12 @@       if (auto StTrue = State->assume(Cond, true)) {
+         auto StFalse = State->assume(Cond, false);
+         if (StTrue && !StFalse) {
+-          // Constrained to success: definitely safe
+           return true;
+         }
+       }
+-      // Not provably true; fall through to conservative suppression guarded by length-symbol match.
+-    }
+-  }
+-
+-  // Length symbol matches producer's returned length => consider safe for this specific copy.
++    }
++  }
++
+   return true;
+ }
+
+@@ -298,7 +291,7 @@
+   // Explicit initialization modeling
+   if (callNamed(Call, C, "memset")) {
+-    // memset(ptr, val, len) -> we record len as initialized for base region
++    // memset(ptr, val, len)
+     noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/2);
+     return;
+   }
+@@ -309,7 +302,7 @@     return;
+   }
+
+-  // Producer initialization modeling
++  // Producer initialization modeling (len via out-pointer)
+   unsigned BufIdx = 0, LenPtrIdx = 0;
+   if (functionKnownToInitBuffer(Call, C, BufIdx, LenPtrIdx)) {
+     const MemRegion *BufReg = getArgBaseRegion(Call, BufIdx, C);
+@@ -317,7 +310,6 @@       SymbolRef LenSym = getPointeeSymbolForPointerArg(Call, LenPtrIdx, C);
+       SymbolRef RetSym = Call.getReturnValue().getAsSymbol();
+       if (LenSym && RetSym) {
+-        // Record producer info for this buffer.
+         State = State->set<ProducerLenSymMap>(BufReg, LenSym);
+         State = State->set<ProducerStatusSymMap>(BufReg, RetSym);
+         C.addTransition(State);
+@@ -325,6 +317,22 @@     }
+     return;
+   }
++
++  // Producer initialization modeling (len is return value)
++  unsigned RetLenBufIdx = 0;
++  if (functionKnownToInitLenIsReturn(Call, C, RetLenBufIdx)) {
++    const MemRegion *BufReg = getArgBaseRegion(Call, RetLenBufIdx, C);
++    if (BufReg) {
++      SymbolRef RetSym = Call.getReturnValue().getAsSymbol();
++      if (RetSym) {
++        State = State->set<ProducerLenSymMap>(BufReg, RetSym);
++        // No separate status symbol for this API; clear any previous status.
++        State = State->remove<ProducerStatusSymMap>(BufReg);
++        C.addTransition(State);
++      }
++    }
++    return;
++  }
+ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -350,7 +358,7 @@   if (*Kind != 2)
+     return;
+
+-  // Recognize and suppress the specific false positive case:
++  // Recognize and suppress false positives when a known producer initialized exactly the copied bytes.
+   if (isFalsePositiveDueToProducer(Call, C, FromReg))
+     return;
+
+@@ -370,11 +378,9 @@   if (LenKnown) {
+     if (ZeroedBytes && *ZeroedBytes >= CopyLen)
+       return; // Fully initialized by memset/memzero_explicit
+-    // Otherwise, report
+     reportLeak(Call, C, FromReg);
+     return;
+   } else {
+-    // Length unknown: if we have no evidence of explicit initialization, report
+     if (!ZeroedBytes) {
+       reportLeak(Call, C, FromReg);
+     }
+@@ -399,7 +405,6 @@   if (!RHS)
+     return;
+
+-  // Record aliasing in both directions to resolve easily
+   const MemRegion *LC = canonical(State, LHS);
+   const MemRegion *RC = canonical(State, RHS);
+   if (!LC || !RC)

@@ -1,0 +1,565 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: df94cb2e57b2cc539f325003e7abb76d3060d55b
+commit_type: Integer-Overflow
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/Support/raw_ostream.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"llvm/ADT/StringRef.h\"\
+  \n#include <utility>\n#include <vector>\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\nREGISTER_MAP_WITH_PROGRAMSTATE(ReportedRegions,\
+  \ const MemRegion *, char)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::Bind,\
+  \ check::PreCall> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n   \
+  \   SAGenTestChecker() : BT(new BugType(this, \"Sector count truncation/format mismatch\"\
+  , \"Integer bugs\")) {}\n\n      void checkBind(SVal Loc, SVal Val, const Stmt *S,\
+  \ CheckerContext &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n\n   private:\n\n      // Helpers for truncation detection\n     \
+  \ static bool isSectorLikeName(StringRef N);\n      static bool isUnsigned32(QualType\
+  \ T, ASTContext &Ctx);\n      static bool isInt64OrWider(QualType T, ASTContext\
+  \ &Ctx);\n      static const Expr* getRHSExprFromStmt(const Stmt *S);\n      static\
+  \ std::pair<const MemRegion*, const VarDecl*> getDestRegionAndDecl(SVal Loc, CheckerContext\
+  \ &C);\n      static bool exprOrStmtMentionsMinTU64(const Stmt *S, CheckerContext\
+  \ &C);\n      static bool wasAlreadyReported(const MemRegion *R, CheckerContext\
+  \ &C);\n      static void markReported(const MemRegion *R, CheckerContext &C);\n\
+  \n      // Helpers for printf-like checking\n      static bool getPrintfLikeInfo(const\
+  \ CallEvent &Call, CheckerContext &C, unsigned &FmtIndex, const StringLiteral *&FmtSL);\n\
+  \      static void parseFormatString(StringRef Fmt, struct ASTContext &Ctx,\n  \
+  \                                  std::vector<std::pair<bool/*hasLL*/, bool/*hasSingleL*/>>\
+  \ &ConvMods,\n                                    std::vector<char> &ConvChars);\n\
+  \      static bool isIntegerConvChar(char C);\n      static bool argLooksSectorLike(const\
+  \ Expr *E, CheckerContext &C);\n};\n\n// ---- Helper implementations ----\n\nbool\
+  \ SAGenTestChecker::isSectorLikeName(StringRef N) {\n  // Case-insensitive contains\
+  \ checks for sector/reserved terminology\n  return N.contains_insensitive(\"sector\"\
+  ) ||\n         N.contains_insensitive(\"sectors\") ||\n         N.contains_insensitive(\"\
+  disk_res\") ||\n         N.contains_insensitive(\"reserved\") ||\n         N.contains_insensitive(\"\
+  sectors_free\");\n}\n\nbool SAGenTestChecker::isUnsigned32(QualType T, ASTContext\
+  \ &Ctx) {\n  if (T.isNull())\n    return false;\n  if (!T->isIntegerType())\n  \
+  \  return false;\n  if (!T->isUnsignedIntegerType())\n    return false;\n  unsigned\
+  \ W = Ctx.getTypeSize(T);\n  return W <= 32;\n}\n\nbool SAGenTestChecker::isInt64OrWider(QualType\
+  \ T, ASTContext &Ctx) {\n  if (T.isNull())\n    return false;\n  if (!T->isIntegerType())\n\
+  \    return false;\n  unsigned W = Ctx.getTypeSize(T);\n  return W >= 64;\n}\n\n\
+  std::pair<const MemRegion*, const VarDecl*>\nSAGenTestChecker::getDestRegionAndDecl(SVal\
+  \ Loc, CheckerContext &C) {\n  const MemRegion *R = Loc.getAsRegion();\n  if (!R)\n\
+  \    return {nullptr, nullptr};\n  R = R->getBaseRegion();\n  if (!R)\n    return\
+  \ {nullptr, nullptr};\n  if (const auto *VR = dyn_cast<VarRegion>(R)) {\n    const\
+  \ VarDecl *VD = dyn_cast<VarDecl>(VR->getDecl());\n    return {R, VD};\n  }\n  return\
+  \ {R, nullptr};\n}\n\nconst Expr* SAGenTestChecker::getRHSExprFromStmt(const Stmt\
+  \ *S) {\n  if (!S)\n    return nullptr;\n  if (const auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n    if (BO->isAssignmentOp())\n      return BO->getRHS();\n  } else if (const\
+  \ auto *DS = dyn_cast<DeclStmt>(S)) {\n    if (DS->isSingleDecl()) {\n      if (const\
+  \ auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl())) {\n        if (VD->hasInit())\n\
+  \          return VD->getInit();\n      }\n    }\n  }\n  return nullptr;\n}\n\n\
+  bool SAGenTestChecker::exprOrStmtMentionsMinTU64(const Stmt *S, CheckerContext &C)\
+  \ {\n  if (!S)\n    return false;\n  const Expr *E = getRHSExprFromStmt(S);\n  if\
+  \ (!E)\n    E = findSpecificTypeInChildren<Expr>(S);\n  if (!E)\n    return false;\n\
+  \  // Look for textual macro name and type token\n  if (ExprHasName(E, \"min_t(\"\
+  , C) && ExprHasName(E, \"u64\", C))\n    return true;\n  return false;\n}\n\nbool\
+  \ SAGenTestChecker::wasAlreadyReported(const MemRegion *R, CheckerContext &C) {\n\
+  \  if (!R)\n    return false;\n  ProgramStateRef St = C.getState();\n  const char\
+  \ *P = St->get<ReportedRegions>(R);\n  return P != nullptr;\n}\n\nvoid SAGenTestChecker::markReported(const\
+  \ MemRegion *R, CheckerContext &C) {\n  if (!R)\n    return;\n  ProgramStateRef\
+  \ St = C.getState();\n  St = St->set<ReportedRegions>(R, 1);\n  C.addTransition(St);\n\
+  }\n\n// Printf-like helpers\nbool SAGenTestChecker::getPrintfLikeInfo(const CallEvent\
+  \ &Call, CheckerContext &C,\n                                         unsigned &FmtIndex,\
+  \ const StringLiteral *&FmtSL) {\n  FmtSL = nullptr;\n  FmtIndex = 0;\n\n  const\
+  \ Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\n  //\
+  \ Recognize a small set of known functions:\n  bool IsPrintk = ExprHasName(Origin,\
+  \ \"printk\", C);\n  bool IsBchInconsistent = ExprHasName(Origin, \"bch2_trans_inconsistent\"\
+  , C);\n\n  if (!IsPrintk && !IsBchInconsistent)\n    return false;\n\n  if (IsPrintk)\n\
+  \    FmtIndex = 0; // printk(const char *fmt, ...)\n  if (IsBchInconsistent)\n \
+  \   FmtIndex = 1; // bch2_trans_inconsistent(trans, const char *fmt, ...)\n\n  if\
+  \ (Call.getNumArgs() <= FmtIndex)\n    return false;\n\n  const Expr *FmtExpr =\
+  \ Call.getArgExpr(FmtIndex);\n  if (!FmtExpr)\n    return false;\n\n  FmtSL = dyn_cast<StringLiteral>(FmtExpr->IgnoreImpCasts());\n\
+  \  if (!FmtSL)\n    return false;\n\n  return true;\n}\n\nbool SAGenTestChecker::isIntegerConvChar(char\
+  \ C) {\n  switch (C) {\n    case 'd': case 'i': case 'u': case 'o': case 'x': case\
+  \ 'X':\n      return true;\n    default:\n      return false;\n  }\n}\n\nvoid SAGenTestChecker::parseFormatString(StringRef\
+  \ Fmt, ASTContext &Ctx,\n                                         std::vector<std::pair<bool,bool>>\
+  \ &ConvMods,\n                                         std::vector<char> &ConvChars)\
+  \ {\n  // Very lightweight parser:\n  // Collect conversions, record if they carry\
+  \ 'll' or single 'l'\n  for (size_t i = 0, e = Fmt.size(); i < e; ++i) {\n    if\
+  \ (Fmt[i] != '%')\n      continue;\n    ++i;\n    if (i >= e) break;\n    if (Fmt[i]\
+  \ == '%') // \"%%\"\n      continue;\n\n    // Skip flags\n    while (i < e && (Fmt[i]\
+  \ == '-' || Fmt[i] == '+' || Fmt[i] == ' ' ||\n                     Fmt[i] == '#'\
+  \ || Fmt[i] == '0')) {\n      ++i;\n    }\n\n    // Skip field width\n    if (i\
+  \ < e && Fmt[i] == '*') {\n      ++i;\n    } else {\n      while (i < e && isdigit(Fmt[i]))\n\
+  \        ++i;\n    }\n\n    // Skip precision\n    if (i < e && Fmt[i] == '.') {\n\
+  \      ++i;\n      if (i < e && Fmt[i] == '*') {\n        ++i;\n      } else {\n\
+  \        while (i < e && isdigit(Fmt[i]))\n          ++i;\n      }\n    }\n\n  \
+  \  // Length modifiers: we only care about l/ll (others ignored)\n    bool hasLL\
+  \ = false;\n    bool hasL = false;\n\n    if (i + 1 < e && Fmt[i] == 'l' && Fmt[i+1]\
+  \ == 'l') {\n      hasLL = true;\n      i += 2;\n    } else if (i < e && Fmt[i]\
+  \ == 'l') {\n      hasL = true;\n      i += 1;\n    } else if (i < e && (Fmt[i]\
+  \ == 'z' || Fmt[i] == 't' || Fmt[i] == 'j' || Fmt[i] == 'h')) {\n      // consume\
+  \ but we don't use them for now\n      // Handle 'hh' quickly\n      if ((Fmt[i]\
+  \ == 'h') && (i + 1 < e) && (Fmt[i+1] == 'h'))\n        i += 2;\n      else\n  \
+  \      i += 1;\n    }\n\n    if (i >= e) break;\n    char conv = Fmt[i];\n    //\
+  \ Record every conversion to keep argument index mapping\n    ConvMods.emplace_back(hasLL,\
+  \ hasL);\n    ConvChars.push_back(conv);\n  }\n}\n\nbool SAGenTestChecker::argLooksSectorLike(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return false;\n  // Prefer DeclRefExpr\
+  \ names\n  const Expr *EI = E->IgnoreParenImpCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(EI))\
+  \ {\n    if (const auto *ND = DRE->getDecl()) {\n      return isSectorLikeName(ND->getName());\n\
+  \    }\n  }\n  // As fallback, look for sector-like tokens in the argument source\
+  \ text\n  const SourceManager &SM = C.getSourceManager();\n  const LangOptions &Lang\
+  \ = C.getLangOpts();\n  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, Lang);\n  return isSectorLikeName(Text);\n\
+  }\n\n// ---- Main callbacks ----\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal\
+  \ Val, const Stmt *S, CheckerContext &C) const {\n  // Step A: Identify the destination\
+  \ variable and its declaration\n  const MemRegion *DstR;\n  const VarDecl *VD;\n\
+  \  std::tie(DstR, VD) = getDestRegionAndDecl(Loc, C);\n  if (!VD)\n    return;\n\
+  \n  // Name filter\n  StringRef Name = VD->getName();\n  if (!isSectorLikeName(Name))\n\
+  \    return;\n\n  // Type of destination\n  QualType DstQT = VD->getType();\n  if\
+  \ (!isUnsigned32(DstQT, C.getASTContext()))\n    return;\n\n  // Step B: Determine\
+  \ RHS and whether it's 64-bit or from min_t(u64, ...)\n  const Expr *RHS = getRHSExprFromStmt(S);\n\
+  \  if (!RHS)\n    return;\n\n  bool Needs64 = isInt64OrWider(RHS->getType(), C.getASTContext());\n\
+  \  if (!Needs64 && exprOrStmtMentionsMinTU64(S, C))\n    Needs64 = true;\n\n  if\
+  \ (!Needs64)\n    return;\n\n  // Step C: Warn on likely truncation\n  if (wasAlreadyReported(DstR,\
+  \ C))\n    return;\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n\
+  \    return;\n\n  SmallString<128> Msg;\n  Msg += \"64-bit sector count stored in\
+  \ 32-bit '\";\n  Msg += Name;\n  Msg += \"'; use u64.\";\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg.str(), N);\n\n  // Add ranges for better highlighting\n  if (const auto *BO\
+  \ = dyn_cast<BinaryOperator>(S)) {\n    R->addRange(BO->getLHS()->getSourceRange());\n\
+  \    R->addRange(BO->getRHS()->getSourceRange());\n  } else if (const auto *DS =\
+  \ dyn_cast<DeclStmt>(S)) {\n    if (DS->isSingleDecl()) {\n      if (const auto\
+  \ *VD2 = dyn_cast<VarDecl>(DS->getSingleDecl())) {\n        R->addRange(VD2->getSourceRange());\n\
+  \        if (VD2->getInit())\n          R->addRange(VD2->getInit()->getSourceRange());\n\
+  \      }\n    }\n  } else if (RHS) {\n    R->addRange(RHS->getSourceRange());\n\
+  \  }\n\n  C.emitReport(std::move(R));\n  markReported(DstR, C);\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  unsigned FmtIndex = 0;\n  const\
+  \ StringLiteral *FmtSL = nullptr;\n  if (!getPrintfLikeInfo(Call, C, FmtIndex, FmtSL))\n\
+  \    return;\n\n  StringRef Fmt = FmtSL->getString();\n  std::vector<std::pair<bool,bool>>\
+  \ ConvMods; // pair<hasLL, hasL>\n  std::vector<char> ConvChars;\n  parseFormatString(Fmt,\
+  \ C.getASTContext(), ConvMods, ConvChars);\n\n  if (ConvMods.size() != ConvChars.size())\n\
+  \    return;\n\n  // Walk conversions to find integer ones, map to arguments\n \
+  \ unsigned ArgBase = FmtIndex + 1;\n  for (size_t i = 0, n = ConvChars.size(), argPos\
+  \ = 0; i < n; ++i, ++argPos) {\n    char Conv = ConvChars[i];\n    bool HasLL =\
+  \ ConvMods[i].first;\n    bool HasL  = ConvMods[i].second;\n\n    unsigned ArgIndex\
+  \ = ArgBase + argPos;\n    if (ArgIndex >= Call.getNumArgs())\n      break;\n\n\
+  \    const Expr *ArgE = Call.getArgExpr(ArgIndex);\n    if (!ArgE)\n      continue;\n\
+  \n    if (!isIntegerConvChar(Conv))\n      continue; // not an integer specifier,\
+  \ but still consumed an arg\n\n    QualType ArgT = ArgE->getType();\n    unsigned\
+  \ ArgW = C.getASTContext().getTypeSize(ArgT);\n\n    // Warn for 64-bit value printed\
+  \ with plain %u/%d/%x (no l/ll)\n    if (!HasLL && !HasL && ArgW >= 64) {\n    \
+  \  // Guard: either argument looks sector-like or format mentions 'sector'\n   \
+  \   bool Related = argLooksSectorLike(ArgE, C) ||\n                     Fmt.contains_insensitive(\"\
+  sector\");\n      if (!Related)\n        continue;\n\n      ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \      if (!N)\n        return;\n\n      auto R = std::make_unique<BasicBugReport>(\n\
+  \          *BT, \"64-bit value formatted with %u; use %llu.\", N);\n      R->addRange(FmtSL->getSourceRange());\n\
+  \      C.emitReport(std::move(R));\n      // Do not early return; multiple issues\
+  \ can coexist but it's fine to continue.\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects truncation of 64-bit sector/reservation\
+  \ values into 32-bit and wrong printf formats\",\n      \"\");\n}\n\nextern \"C\"\
+  \ const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbcachefs: Fix an integer overflow\n\nFixes:\n\nbcachefs\
+  \ (e7fdc10e-54a3-49d9-bd0c-390370889d84): disk usage increased 4294967296 more than\
+  \ 2823707312 sectors reserved)\ntransaction updates for __bchfs_fallocate journal\
+  \ seq 467859\n  update: btree=extents cached=0 bch2_trans_update+0x4e8/0x540\n \
+  \   old u64s 5 type deleted 536925940:3559337304:4294967283 len 0 ver 0\n    new\
+  \ u64s 6 type reservation 536925940:3559337304:4294967283 len 3559337304 ver 0:\
+  \ generation 0 replicas 2\n  update: btree=inodes cached=1 bch2_extent_update_i_size_sectors+0x305/0x3b0\n\
+  \    old u64s 19 type inode_v3 0:536925940:4294967283 len 0 ver 0: mode 100600 flags\
+  \ 15300000 journal_seq 467859 bi_size 0 bi_sectors 0 bi_version 0 bi_atime 40905301656446\
+  \ bi_ctime 40905301656446 bi_mtime 40905301656446 bi_otime 40905301656446 bi_uid\
+  \ 0 bi_gid 0 bi_nlink 0 bi_generation 0 bi_dev 0 bi_data_checksum 0 bi_compression\
+  \ 0 bi_project 0 bi_background_compression 0 bi_data_replicas 0 bi_promote_target\
+  \ 0 bi_foreground_target 0 bi_background_target 0 bi_erasure_code 0 bi_fields_set\
+  \ 0 bi_dir 1879048193 bi_dir_offset 3384856038735393365 bi_subvol 0 bi_parent_subvol\
+  \ 0 bi_nocow 0\n    new u64s 19 type inode_v3 0:536925940:4294967283 len 0 ver 0:\
+  \ mode 100600 flags 15300000 journal_seq 467859 bi_size 0 bi_sectors 3559337304\
+  \ bi_version 0 bi_atime 40905301656446 bi_ctime 40905301656446 bi_mtime 40905301656446\
+  \ bi_otime 40905301656446 bi_uid 0 bi_gid 0 bi_nlink 0 bi_generation 0 bi_dev 0\
+  \ bi_data_checksum 0 bi_compression 0 bi_project 0 bi_background_compression 0 bi_data_replicas\
+  \ 0 bi_promote_target 0 bi_foreground_target 0 bi_background_target 0 bi_erasure_code\
+  \ 0 bi_fields_set 0 bi_dir 1879048193 bi_dir_offset 3384856038735393365 bi_subvol\
+  \ 0 bi_parent_subvol 0 bi_nocow 0\n\nKernel panic - not syncing: bcachefs (e7fdc10e-54a3-49d9-bd0c-390370889d84):\
+  \ panic after error\nCPU: 4 PID: 5154 Comm: rsync Not tainted 6.5.9-gateway-gca1614174cc0-dirty\
+  \ #1\nHardware name: To Be Filled By O.E.M. To Be Filled By O.E.M./X570 Phantom\
+  \ Gaming 4, BIOS P4.20 08/02/2021\nCall Trace:\n <TASK>\n dump_stack_lvl+0x5a/0x90\n\
+  \ panic+0x105/0x300\n ? console_unlock+0xf1/0x130\n ? bch2_printbuf_exit+0x16/0x30\n\
+  \ ? srso_return_thunk+0x5/0x10\n bch2_inconsistent_error+0x6f/0x80\n bch2_trans_fs_usage_apply+0x279/0x3d0\n\
+  \ __bch2_trans_commit+0x112a/0x1df0\n ? bch2_extent_update+0x13a/0x1d0\n bch2_extent_update+0x13a/0x1d0\n\
+  \ bch2_extent_fallocate+0x58e/0x740\n bch2_fallocate_dispatch+0xb7c/0x1030\n ? do_filp_open+0xa0/0x140\n\
+  \ vfs_fallocate+0x18e/0x1d0\n __x64_sys_fallocate+0x46/0x70\n do_syscall_64+0x48/0xa0\n\
+  \ ? exit_to_user_mode_prepare+0x4d/0xa0\n entry_SYSCALL_64_after_hwframe+0x6e/0xd8\n\
+  RIP: 0033:0x7fc85d91bbb3\nCode: 64 89 02 b8 ff ff ff ff eb bd 66 2e 0f 1f 84 00\
+  \ 00 00 00 00 0f 1f 00 80 3d 31 da 0d 00 00 49 89 ca 74 14 b8 1d 01 00 00 0f 05\
+  \ <48> 3d 00 f0 ff ff 77 5d c3 0f 1f 40 00 48 83 ec 28 48 89 54 24 10\n\nSigned-off-by:\
+  \ Kent Overstreet <kent.overstreet@linux.dev>\n\n## Buggy Code\n\n```c\n// Complete\
+  \ file: fs/bcachefs/io_misc.h (tree-sitter fallback)\n/* SPDX-License-Identifier:\
+  \ GPL-2.0 */\n#ifndef _BCACHEFS_IO_MISC_H\n#define _BCACHEFS_IO_MISC_H\n\nint bch2_extent_fallocate(struct\
+  \ btree_trans *, subvol_inum, struct btree_iter *,\n\t\t\t  unsigned, struct bch_io_opts,\
+  \ s64 *,\n\t\t\t  struct write_point_specifier);\nint bch2_fpunch_at(struct btree_trans\
+  \ *, struct btree_iter *,\n\t\t   subvol_inum, u64, s64 *);\nint bch2_fpunch(struct\
+  \ bch_fs *c, subvol_inum, u64, u64, s64 *);\n\nvoid bch2_logged_op_truncate_to_text(struct\
+  \ printbuf *, struct bch_fs *, struct bkey_s_c);\n\n#define bch2_bkey_ops_logged_op_truncate\
+  \ ((struct bkey_ops) {\t\\\n\t.val_to_text\t= bch2_logged_op_truncate_to_text,\t\
+  \\\n\t.min_val_size\t= 24,\t\t\t\t\t\\\n})\n\nint bch2_resume_logged_op_truncate(struct\
+  \ btree_trans *, struct bkey_i *);\n\nint bch2_truncate(struct bch_fs *, subvol_inum,\
+  \ u64, u64 *);\n\nvoid bch2_logged_op_finsert_to_text(struct printbuf *, struct\
+  \ bch_fs *, struct bkey_s_c);\n\n#define bch2_bkey_ops_logged_op_finsert ((struct\
+  \ bkey_ops) {\t\\\n\t.val_to_text\t= bch2_logged_op_finsert_to_text,\t\\\n\t.min_val_size\t\
+  = 24,\t\t\t\t\t\\\n})\n\nint bch2_resume_logged_op_finsert(struct btree_trans *,\
+  \ struct bkey_i *);\n\nint bch2_fcollapse_finsert(struct bch_fs *, subvol_inum,\
+  \ u64, u64, bool, s64 *);\n\n#endif /* _BCACHEFS_IO_MISC_H */\n```\n\n```c\n// Function:\
+  \ bch2_extent_fallocate in fs/bcachefs/io_misc.c\nint bch2_extent_fallocate(struct\
+  \ btree_trans *trans,\n\t\t\t  subvol_inum inum,\n\t\t\t  struct btree_iter *iter,\n\
+  \t\t\t  unsigned sectors,\n\t\t\t  struct bch_io_opts opts,\n\t\t\t  s64 *i_sectors_delta,\n\
+  \t\t\t  struct write_point_specifier write_point)\n{\n\tstruct bch_fs *c = trans->c;\n\
+  \tstruct disk_reservation disk_res = { 0 };\n\tstruct closure cl;\n\tstruct open_buckets\
+  \ open_buckets = { 0 };\n\tstruct bkey_s_c k;\n\tstruct bkey_buf old, new;\n\tunsigned\
+  \ sectors_allocated = 0;\n\tbool have_reservation = false;\n\tbool unwritten = opts.nocow\
+  \ &&\n\t    c->sb.version >= bcachefs_metadata_version_unwritten_extents;\n\tint\
+  \ ret;\n\n\tbch2_bkey_buf_init(&old);\n\tbch2_bkey_buf_init(&new);\n\tclosure_init_stack(&cl);\n\
+  \n\tk = bch2_btree_iter_peek_slot(iter);\n\tret = bkey_err(k);\n\tif (ret)\n\t\t\
+  return ret;\n\n\tsectors = min_t(u64, sectors, k.k->p.offset - iter->pos.offset);\n\
+  \n\tif (!have_reservation) {\n\t\tunsigned new_replicas =\n\t\t\tmax(0, (int) opts.data_replicas\
+  \ -\n\t\t\t    (int) bch2_bkey_nr_ptrs_fully_allocated(k));\n\t\t/*\n\t\t * Get\
+  \ a disk reservation before (in the nocow case) calling\n\t\t * into the allocator:\n\
+  \t\t */\n\t\tret = bch2_disk_reservation_get(c, &disk_res, sectors, new_replicas,\
+  \ 0);\n\t\tif (unlikely(ret))\n\t\t\tgoto err;\n\n\t\tbch2_bkey_buf_reassemble(&old,\
+  \ c, k);\n\t}\n\n\tif (have_reservation) {\n\t\tif (!bch2_extents_match(k, bkey_i_to_s_c(old.k)))\n\
+  \t\t\tgoto err;\n\n\t\tbch2_key_resize(&new.k->k, sectors);\n\t} else if (!unwritten)\
+  \ {\n\t\tstruct bkey_i_reservation *reservation;\n\n\t\tbch2_bkey_buf_realloc(&new,\
+  \ c, sizeof(*reservation) / sizeof(u64));\n\t\treservation = bkey_reservation_init(new.k);\n\
+  \t\treservation->k.p = iter->pos;\n\t\tbch2_key_resize(&reservation->k, sectors);\n\
+  \t\treservation->v.nr_replicas = opts.data_replicas;\n\t} else {\n\t\tstruct bkey_i_extent\
+  \ *e;\n\t\tstruct bch_devs_list devs_have;\n\t\tstruct write_point *wp;\n\t\tstruct\
+  \ bch_extent_ptr *ptr;\n\n\t\tdevs_have.nr = 0;\n\n\t\tbch2_bkey_buf_realloc(&new,\
+  \ c, BKEY_EXTENT_U64s_MAX);\n\n\t\te = bkey_extent_init(new.k);\n\t\te->k.p = iter->pos;\n\
+  \n\t\tret = bch2_alloc_sectors_start_trans(trans,\n\t\t\t\topts.foreground_target,\n\
+  \t\t\t\tfalse,\n\t\t\t\twrite_point,\n\t\t\t\t&devs_have,\n\t\t\t\topts.data_replicas,\n\
+  \t\t\t\topts.data_replicas,\n\t\t\t\tBCH_WATERMARK_normal, 0, &cl, &wp);\n\t\tif\
+  \ (bch2_err_matches(ret, BCH_ERR_operation_blocked))\n\t\t\tret = -BCH_ERR_transaction_restart_nested;\n\
+  \t\tif (ret)\n\t\t\tgoto err;\n\n\t\tsectors = min(sectors, wp->sectors_free);\n\
+  \t\tsectors_allocated = sectors;\n\n\t\tbch2_key_resize(&e->k, sectors);\n\n\t\t\
+  bch2_open_bucket_get(c, wp, &open_buckets);\n\t\tbch2_alloc_sectors_append_ptrs(c,\
+  \ wp, &e->k_i, sectors, false);\n\t\tbch2_alloc_sectors_done(c, wp);\n\n\t\textent_for_each_ptr(extent_i_to_s(e),\
+  \ ptr)\n\t\t\tptr->unwritten = true;\n\t}\n\n\thave_reservation = true;\n\n\tret\
+  \ = bch2_extent_update(trans, inum, iter, new.k, &disk_res,\n\t\t\t\t 0, i_sectors_delta,\
+  \ true);\nerr:\n\tif (!ret && sectors_allocated)\n\t\tbch2_increment_clock(c, sectors_allocated,\
+  \ WRITE);\n\n\tbch2_open_buckets_put(c, &open_buckets);\n\tbch2_disk_reservation_put(c,\
+  \ &disk_res);\n\tbch2_bkey_buf_exit(&new, c);\n\tbch2_bkey_buf_exit(&old, c);\n\n\
+  \tif (closure_nr_remaining(&cl) != 1) {\n\t\tbch2_trans_unlock(trans);\n\t\tclosure_sync(&cl);\n\
+  \t}\n\n\treturn ret;\n}\n```\n\n```c\n// Function: bch2_trans_fs_usage_apply in\
+  \ fs/bcachefs/buckets.c\nint bch2_trans_fs_usage_apply(struct btree_trans *trans,\n\
+  \t\t\t      struct replicas_delta_list *deltas)\n{\n\tstruct bch_fs *c = trans->c;\n\
+  \tstatic int warned_disk_usage = 0;\n\tbool warn = false;\n\tunsigned disk_res_sectors\
+  \ = trans->disk_res ? trans->disk_res->sectors : 0;\n\tstruct replicas_delta *d,\
+  \ *d2;\n\tstruct replicas_delta *top = (void *) deltas->d + deltas->used;\n\tstruct\
+  \ bch_fs_usage *dst;\n\ts64 added = 0, should_not_have_added;\n\tunsigned i;\n\n\
+  \tpercpu_down_read(&c->mark_lock);\n\tpreempt_disable();\n\tdst = fs_usage_ptr(c,\
+  \ trans->journal_res.seq, false);\n\n\tfor (d = deltas->d; d != top; d = replicas_delta_next(d))\
+  \ {\n\t\tswitch (d->r.data_type) {\n\t\tcase BCH_DATA_btree:\n\t\tcase BCH_DATA_user:\n\
+  \t\tcase BCH_DATA_parity:\n\t\t\tadded += d->delta;\n\t\t}\n\n\t\tif (__update_replicas(c,\
+  \ dst, &d->r, d->delta))\n\t\t\tgoto need_mark;\n\t}\n\n\tdst->nr_inodes += deltas->nr_inodes;\n\
+  \n\tfor (i = 0; i < BCH_REPLICAS_MAX; i++) {\n\t\tadded\t\t\t\t+= deltas->persistent_reserved[i];\n\
+  \t\tdst->reserved\t\t\t+= deltas->persistent_reserved[i];\n\t\tdst->persistent_reserved[i]\t\
+  += deltas->persistent_reserved[i];\n\t}\n\n\t/*\n\t * Not allowed to reduce sectors_available\
+  \ except by getting a\n\t * reservation:\n\t */\n\tshould_not_have_added = added\
+  \ - (s64) disk_res_sectors;\n\tif (unlikely(should_not_have_added > 0)) {\n\t\t\
+  u64 old, new, v = atomic64_read(&c->sectors_available);\n\n\t\tdo {\n\t\t\told =\
+  \ v;\n\t\t\tnew = max_t(s64, 0, old - should_not_have_added);\n\t\t} while ((v =\
+  \ atomic64_cmpxchg(&c->sectors_available,\n\t\t\t\t\t       old, new)) != old);\n\
+  \n\t\tadded -= should_not_have_added;\n\t\twarn = true;\n\t}\n\n\tif (added > 0)\
+  \ {\n\t\ttrans->disk_res->sectors -= added;\n\t\tthis_cpu_sub(*c->online_reserved,\
+  \ added);\n\t}\n\n\tpreempt_enable();\n\tpercpu_up_read(&c->mark_lock);\n\n\tif\
+  \ (unlikely(warn) && !xchg(&warned_disk_usage, 1))\n\t\tbch2_trans_inconsistent(trans,\n\
+  \t\t\t\t\t\"disk usage increased %lli more than %u sectors reserved)\",\n\t\t\t\t\
+  \tshould_not_have_added, disk_res_sectors);\n\treturn 0;\nneed_mark:\n\t/* revert\
+  \ changes: */\n\tfor (d2 = deltas->d; d2 != d; d2 = replicas_delta_next(d2))\n\t\
+  \tBUG_ON(__update_replicas(c, dst, &d2->r, -d2->delta));\n\n\tpreempt_enable();\n\
+  \tpercpu_up_read(&c->mark_lock);\n\treturn -1;\n}\n```\n\n## Bug Fix Patch\n\n```diff\n\
+  diff --git a/fs/bcachefs/buckets.c b/fs/bcachefs/buckets.c\nindex 2acd727d3f9b..58d8c6ffd955\
+  \ 100644\n--- a/fs/bcachefs/buckets.c\n+++ b/fs/bcachefs/buckets.c\n@@ -1322,7 +1322,7\
+  \ @@ int bch2_trans_fs_usage_apply(struct btree_trans *trans,\n \tstruct bch_fs\
+  \ *c = trans->c;\n \tstatic int warned_disk_usage = 0;\n \tbool warn = false;\n\
+  -\tunsigned disk_res_sectors = trans->disk_res ? trans->disk_res->sectors : 0;\n\
+  +\tu64 disk_res_sectors = trans->disk_res ? trans->disk_res->sectors : 0;\n \tstruct\
+  \ replicas_delta *d, *d2;\n \tstruct replicas_delta *top = (void *) deltas->d +\
+  \ deltas->used;\n \tstruct bch_fs_usage *dst;\n@@ -1381,7 +1381,7 @@ int bch2_trans_fs_usage_apply(struct\
+  \ btree_trans *trans,\n \n \tif (unlikely(warn) && !xchg(&warned_disk_usage, 1))\n\
+  \ \t\tbch2_trans_inconsistent(trans,\n-\t\t\t\t\t\"disk usage increased %lli more\
+  \ than %u sectors reserved)\",\n+\t\t\t\t\t\"disk usage increased %lli more than\
+  \ %llu sectors reserved)\",\n \t\t\t\t\tshould_not_have_added, disk_res_sectors);\n\
+  \ \treturn 0;\n need_mark:\ndiff --git a/fs/bcachefs/io_misc.c b/fs/bcachefs/io_misc.c\n\
+  index 0979d5e05713..bebc11444ef5 100644\n--- a/fs/bcachefs/io_misc.c\n+++ b/fs/bcachefs/io_misc.c\n\
+  @@ -23,7 +23,7 @@\n int bch2_extent_fallocate(struct btree_trans *trans,\n \t\t\t\
+  \  subvol_inum inum,\n \t\t\t  struct btree_iter *iter,\n-\t\t\t  unsigned sectors,\n\
+  +\t\t\t  u64 sectors,\n \t\t\t  struct bch_io_opts opts,\n \t\t\t  s64 *i_sectors_delta,\n\
+  \ \t\t\t  struct write_point_specifier write_point)\n@@ -105,7 +105,7 @@ int bch2_extent_fallocate(struct\
+  \ btree_trans *trans,\n \t\tif (ret)\n \t\t\tgoto err;\n \n-\t\tsectors = min(sectors,\
+  \ wp->sectors_free);\n+\t\tsectors = min_t(u64, sectors, wp->sectors_free);\n \t\
+  \tsectors_allocated = sectors;\n \n \t\tbch2_key_resize(&e->k, sectors);\ndiff --git\
+  \ a/fs/bcachefs/io_misc.h b/fs/bcachefs/io_misc.h\nindex c9e6ed40e1b8..9cb44a7c43c1\
+  \ 100644\n--- a/fs/bcachefs/io_misc.h\n+++ b/fs/bcachefs/io_misc.h\n@@ -3,7 +3,7\
+  \ @@\n #define _BCACHEFS_IO_MISC_H\n \n int bch2_extent_fallocate(struct btree_trans\
+  \ *, subvol_inum, struct btree_iter *,\n-\t\t\t  unsigned, struct bch_io_opts, s64\
+  \ *,\n+\t\t\t  u64, struct bch_io_opts, s64 *,\n \t\t\t  struct write_point_specifier);\n\
+  \ int bch2_fpunch_at(struct btree_trans *, struct btree_iter *,\n \t\t   subvol_inum,\
+  \ u64, s64 *);\n```\n"
+pattern: "## Bug Pattern\n\nUsing 32\u2011bit types (unsigned/unsigned int) to store\
+  \ or pass sector counts and disk reservation sizes that can legitimately exceed\
+  \ 2^32\u22121, causing truncation/overflow in arithmetic and min() results, and\
+  \ then also printing them with 32\u2011bit format specifiers.\n\nTypical manifestations:\n\
+  - Local/parameter declared as unsigned for \u201Csectors\u201D or \u201Cdisk_res_sectors\u201D\
+  \ while the real values are u64.\n- Assigning a u64 min()/calculation result back\
+  \ into an unsigned variable (implicit truncation), e.g.:\n  unsigned sectors;\n\
+  \  sectors = min_t(u64, sectors, big_64bit_limit);  // u64 -> 32-bit truncation\n\
+  - Logging with %u instead of %llu for sector quantities, hiding overflow.\n\nFix:\
+  \ use u64 for sector/reservation counters, use min_t(u64, \u2026), and print with\
+  \ %llu."
+plan: "1) Program state\n- No dataflow modeling is required for this pattern. Only\
+  \ use a small \u201Creported\u201D set to avoid duplicate diagnostics:\n  - REGISTER_MAP_WITH_PROGRAMSTATE(ReportedRegions,\
+  \ const MemRegion *, char)\n\n2) Helper predicates/utilities\n- isSectorLikeName(StringRef\
+  \ N):\n  - Return true if N contains any of: \"sector\", \"sectors\", \"disk_res\"\
+  , \"reserved\", \"sectors_free\".\n- isUnsigned32(QualType T, ASTContext &Ctx):\n\
+  \  - Return true iff T is an integer type, not signed, and getTypeSize(T) <= 32.\n\
+  - isInt64OrWider(QualType T, ASTContext &Ctx):\n  - Return true iff T is an integer\
+  \ type and getTypeSize(T) >= 64.\n- getDestRegionAndDecl(SVal Loc, CheckerContext\
+  \ &C):\n  - Extract region via Loc.getAsRegion() and the corresponding VarDecl/ParmVarDecl\
+  \ if any.\n- getRHSExprFromStmt(const Stmt *S):\n  - If S is BinaryOperator and\
+  \ isAssignmentOp(), return RHS.\n  - Else if S is DeclStmt with a single VarDecl\
+  \ V that has an initializer, return V->getInit().\n  - Else return nullptr.\n- exprOrStmtMentionsMinTU64(const\
+  \ Stmt *S, CheckerContext &C):\n  - Find an Expr child via findSpecificTypeInChildren<Expr>(S)\
+  \ (or inspect the RHS Expr if available).\n  - Return true if ExprHasName(expr,\
+  \ \"min_t(\") and ExprHasName(expr, \"u64\", C).\n- wasAlreadyReported(const MemRegion\
+  \ *R, CheckerContext &C):\n  - Query ReportedRegions; if present, suppress a new\
+  \ warning.\n- markReported(const MemRegion *R, CheckerContext &C):\n  - Insert R\
+  \ into ReportedRegions.\n\n3) Detect truncation when assigning 64-bit sector values\
+  \ to 32-bit variables (core of the bug)\nCallback: checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const\n- Step A: Identify the destination variable:\n\
+  \  - Get destination region and Decl via getDestRegionAndDecl.\n  - If no Decl,\
+  \ return.\n  - If the Decl name is not sector-like (isSectorLikeName(name) == false),\
+  \ return.\n  - If the Decl type is not unsigned 32-bit (isUnsigned32(declType) ==\
+  \ false), return.\n- Step B: Determine the assigned value\u2019s type/context:\n\
+  \  - Get the RHS Expr via getRHSExprFromStmt(S) (if null, return).\n  - Let RT =\
+  \ RHS->getType().\n  - Set flag Needs64 = isInt64OrWider(RT, C.getASTContext()).\n\
+  \  - If not Needs64 and exprOrStmtMentionsMinTU64(S, C) is true, set Needs64 = true\
+  \ (handles min_t(u64, ...) macro which enforces 64-bit result even through macro\
+  \ expansion).\n- Step C: Warn on likely truncation:\n  - If Needs64 is true:\n \
+  \   - Check reported-set: if wasAlreadyReported(destRegion) return.\n    - Emit\
+  \ a PathSensitiveBugReport:\n      - Short message: \u201C64-bit sector count stored\
+  \ in 32-bit \u2018<name>\u2019; use u64.\u201D\n      - Add range on the destination\
+  \ DeclRef and RHS.\n    - markReported(destRegion, C).\n\nNotes:\n- This catches:\n\
+  \  - sectors = min_t(u64, sectors, wp->sectors_free);\n  - unsigned disk_res_sectors\
+  \ = trans->disk_res->sectors;  (if that field is u64)\n  - Any assignment/initialization\
+  \ of a 64-bit integer expression into a 32-bit unsigned variable whose name indicates\
+  \ sectors/reservations.\n\n4) Detect bad min() use with 32-bit destination (explicit\
+  \ macro signal)\nThis is covered in step 3 via exprOrStmtMentionsMinTU64(S, C).\
+  \ If min_t(u64, ...) appears in the same statement that initializes/assigns to an\
+  \ unsigned 32-bit \u201Csectors-like\u201D variable, we warn even if static type\
+  \ merges obscure the exact width.\n\n5) Detect wrong printf/printk format for 64-bit\
+  \ sector arguments\nCallback: checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const\n- Step A: Recognize printf-like kernels calls and their format-string\
+  \ index:\n  - Maintain a small table map<string, unsigned> FormatArgIndex:\n   \
+  \ - \"printk\" -> 0\n    - \"bch2_trans_inconsistent\" -> 1\n    - (Optionally include\
+  \ \"pr_info\", \"pr_warn\", etc., if they appear as real functions in the TU; if\
+  \ they are macros expanding to printk, handling printk is sufficient.)\n  - If callee\
+  \ name not found or no callee identifier, return.\n- Step B: Extract and parse the\
+  \ format string:\n  - Get the format argument as Expr; if not a StringLiteral after\
+  \ IgnoreImpCasts(), return.\n  - StringRef Fmt = SL->getString();\n  - Parse Fmt\
+  \ left-to-right and collect integer conversions in order:\n    - Only consider %d,\
+  \ %i, %u, %o, %x with modifiers: none, l, ll, z, t, etc.\n    - For each specifier,\
+  \ record \u201Cwidth modifier\u201D of interest: no-modifier (assume 32-bit), l\
+  \ (platform-dependent), ll (64-bit).\n- Step C: Map specifiers to call arguments:\n\
+  \  - For each integer specifier found, retrieve the corresponding variadic argument\
+  \ expression: ArgIndex = FormatArgIndex[Fn] + 1 + NthIntegerSpec.\n  - If ArgIndex\
+  \ is out of range, stop.\n  - Get ArgType = Call.getArgExpr(ArgIndex)->getType()\
+  \ and compute ArgWidth = getTypeSize.\n- Step D: Check for 64-bit value printed\
+  \ with 32-bit specifier:\n  - If spec has no \u2018l\u2019 or \u2018ll\u2019 modifier\
+  \ (i.e., plain %u/%d/%x), and ArgWidth >= 64:\n    - Optional guard to reduce false\
+  \ positives: proceed if either:\n      - The argument variable name is sector-like\
+  \ (isSectorLikeName(name)), or\n      - The format string contains \u201Csector\u201D\
+  \ (Fmt.contains_insensitive(\"sector\")).\n    - Emit a BasicBugReport:\n      -\
+  \ Short message: \u201C64-bit value formatted with %u; use %llu.\u201D\n      -\
+  \ Point to the StringLiteral location.\n- Notes:\n  - This flags exactly the case\
+  \ in the patch where %u was used for a disk reservation count that should be u64.\n\
+  \  - Keep it simple; no need to implement a full printf parser\u2014just enough\
+  \ to tell plain %u/%d from %llu.\n\n6) Optional: Spot parameter declarations that\
+  \ are 32-bit but used as 64-bit sectors\nYou can rely on checkBind to catch when\
+  \ such parameters participate in assignments like sectors = min_t(u64, ...). If\
+  \ you also want an early heads-up on declarations:\n- Callback: checkASTDecl(const\
+  \ FunctionDecl *D, AnalysisManager &, BugReporter &) const\n  - For each ParmVarDecl\
+  \ P:\n    - If isSectorLikeName(P->getName()) and isUnsigned32(P->getType()):\n\
+  \      - If function body exists, do nothing here (checkBind will flag real misuse).\n\
+  \      - Otherwise (no body available), you may emit a low-confidence note (off\
+  \ by default). Recommended to skip to keep false positives low.\n\n7) Emission details\
+  \ and suppression\n- Use generateNonFatalErrorNode to create an error node before\
+  \ emitting either PathSensitiveBugReport (for checkBind) or BasicBugReport (for\
+  \ checkPreCall).\n- Use the ReportedRegions set in state to avoid duplicate truncation\
+  \ diagnostics on the same destination region.\n- Keep messages short and actionable:\n\
+  \  - Truncation: \u201C64-bit sector count stored in 32-bit \u2018<name>\u2019;\
+  \ use u64.\u201D\n  - Format: \u201C64-bit value formatted with %u; use %llu.\u201D\
+  \n\n8) Summary of chosen callbacks and what they do\n- checkBind: Main detection\
+  \ of u64-to-32 truncation into sector-like variables and min_t(u64, ...) into 32-bit\
+  \ destinations.\n- checkPreCall: Detect 64-bit sector/reservation values passed\
+  \ to printf-like calls with 32-bit specifiers (%u/%d).\n- (Optional) checkASTDecl:\
+  \ skip or keep very conservative; rely on checkBind for high-confidence findings.\n\
+  \n9) How this maps to the patch\n- io_misc.{h,c}: sectors should be u64; the checker\
+  \ flags \u201Csectors = min_t(u64, ...)\u201D into an unsigned destination.\n- buckets.c:\
+  \ disk_res_sectors should be u64; the checker flags assignment from a u64 field\
+  \ to an unsigned local and the %u format used to print a 64-bit value (after the\
+  \ type is fixed)."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/Support/raw_ostream.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"llvm/ADT/StringRef.h\"\
+  \n#include <utility>\n#include <vector>\n#include <memory>\n#include <cctype>\n\n\
+  using namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nREGISTER_MAP_WITH_PROGRAMSTATE(ReportedRegions,\
+  \ const MemRegion *, char)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::Bind,\
+  \ check::PreCall> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n   \
+  \   SAGenTestChecker() : BT(new BugType(this, \"Sector count truncation/format mismatch\"\
+  , \"Integer bugs\")) {}\n\n      void checkBind(SVal Loc, SVal Val, const Stmt *S,\
+  \ CheckerContext &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n\n   private:\n\n      // Helpers for truncation detection\n     \
+  \ static bool isSectorLikeName(StringRef N);\n      static bool isUnsigned32(QualType\
+  \ T, ASTContext &Ctx);\n      static bool isInt64OrWider(QualType T, ASTContext\
+  \ &Ctx);\n      static const Expr* getRHSExprFromStmt(const Stmt *S);\n      static\
+  \ std::pair<const MemRegion*, const VarDecl*> getDestRegionAndDecl(SVal Loc, CheckerContext\
+  \ &C);\n      static bool exprOrStmtMentionsMinTU64(const Stmt *S, CheckerContext\
+  \ &C);\n      static bool wasAlreadyReported(const MemRegion *R, CheckerContext\
+  \ &C);\n      static void markReported(const MemRegion *R, CheckerContext &C);\n\
+  \n      // Helpers for printf-like checking\n      static bool getPrintfLikeInfo(const\
+  \ CallEvent &Call, CheckerContext &C, unsigned &FmtIndex, const StringLiteral *&FmtSL);\n\
+  \      static void parseFormatString(StringRef Fmt, struct ASTContext &Ctx,\n  \
+  \                                  std::vector<std::pair<bool/*hasLL*/, bool/*hasSingleL*/>>\
+  \ &ConvMods,\n                                    std::vector<char> &ConvChars);\n\
+  \      static bool isIntegerConvChar(char C);\n      static bool argLooksSectorLike(const\
+  \ Expr *E, CheckerContext &C);\n};\n\n// ---- Helper implementations ----\n\nbool\
+  \ SAGenTestChecker::isSectorLikeName(StringRef N) {\n  // Case-insensitive contains\
+  \ checks for sector/reserved terminology\n  return N.contains_insensitive(\"sector\"\
+  ) ||\n         N.contains_insensitive(\"sectors\") ||\n         N.contains_insensitive(\"\
+  disk_res\") ||\n         N.contains_insensitive(\"reserved\") ||\n         N.contains_insensitive(\"\
+  sectors_free\");\n}\n\nbool SAGenTestChecker::isUnsigned32(QualType T, ASTContext\
+  \ &Ctx) {\n  if (T.isNull())\n    return false;\n  if (!T->isIntegerType())\n  \
+  \  return false;\n  if (!T->isUnsignedIntegerType())\n    return false;\n  unsigned\
+  \ W = Ctx.getTypeSize(T);\n  return W <= 32;\n}\n\nbool SAGenTestChecker::isInt64OrWider(QualType\
+  \ T, ASTContext &Ctx) {\n  if (T.isNull())\n    return false;\n  if (!T->isIntegerType())\n\
+  \    return false;\n  unsigned W = Ctx.getTypeSize(T);\n  return W >= 64;\n}\n\n\
+  std::pair<const MemRegion*, const VarDecl*>\nSAGenTestChecker::getDestRegionAndDecl(SVal\
+  \ Loc, CheckerContext &C) {\n  const MemRegion *R = Loc.getAsRegion();\n  if (!R)\n\
+  \    return {nullptr, nullptr};\n  R = R->getBaseRegion();\n  if (!R)\n    return\
+  \ {nullptr, nullptr};\n  if (const auto *VR = dyn_cast<VarRegion>(R)) {\n    const\
+  \ VarDecl *VD = dyn_cast<VarDecl>(VR->getDecl());\n    return {R, VD};\n  }\n  return\
+  \ {R, nullptr};\n}\n\nconst Expr* SAGenTestChecker::getRHSExprFromStmt(const Stmt\
+  \ *S) {\n  if (!S)\n    return nullptr;\n  if (const auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n    if (BO->isAssignmentOp())\n      return BO->getRHS();\n  } else if (const\
+  \ auto *DS = dyn_cast<DeclStmt>(S)) {\n    if (DS->isSingleDecl()) {\n      if (const\
+  \ auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl())) {\n        if (VD->hasInit())\n\
+  \          return VD->getInit();\n      }\n    }\n  }\n  return nullptr;\n}\n\n\
+  bool SAGenTestChecker::exprOrStmtMentionsMinTU64(const Stmt *S, CheckerContext &C)\
+  \ {\n  if (!S)\n    return false;\n  const Expr *E = getRHSExprFromStmt(S);\n  if\
+  \ (!E)\n    E = findSpecificTypeInChildren<Expr>(S);\n  if (!E)\n    return false;\n\
+  \  // Look for textual macro name and type token\n  if (ExprHasName(E, \"min_t(\"\
+  , C) && ExprHasName(E, \"u64\", C))\n    return true;\n  return false;\n}\n\nbool\
+  \ SAGenTestChecker::wasAlreadyReported(const MemRegion *R, CheckerContext &C) {\n\
+  \  if (!R)\n    return false;\n  ProgramStateRef St = C.getState();\n  const char\
+  \ *P = St->get<ReportedRegions>(R);\n  return P != nullptr;\n}\n\nvoid SAGenTestChecker::markReported(const\
+  \ MemRegion *R, CheckerContext &C) {\n  if (!R)\n    return;\n  ProgramStateRef\
+  \ St = C.getState();\n  St = St->set<ReportedRegions>(R, 1);\n  C.addTransition(St);\n\
+  }\n\n// Printf-like helpers\nbool SAGenTestChecker::getPrintfLikeInfo(const CallEvent\
+  \ &Call, CheckerContext &C,\n                                         unsigned &FmtIndex,\
+  \ const StringLiteral *&FmtSL) {\n  FmtSL = nullptr;\n  FmtIndex = 0;\n\n  const\
+  \ Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\n  //\
+  \ Recognize a small set of known functions:\n  bool IsPrintk = ExprHasName(Origin,\
+  \ \"printk\", C);\n  bool IsBchInconsistent = ExprHasName(Origin, \"bch2_trans_inconsistent\"\
+  , C);\n\n  if (!IsPrintk && !IsBchInconsistent)\n    return false;\n\n  if (IsPrintk)\n\
+  \    FmtIndex = 0; // printk(const char *fmt, ...)\n  if (IsBchInconsistent)\n \
+  \   FmtIndex = 1; // bch2_trans_inconsistent(trans, const char *fmt, ...)\n\n  if\
+  \ (Call.getNumArgs() <= FmtIndex)\n    return false;\n\n  const Expr *FmtExpr =\
+  \ Call.getArgExpr(FmtIndex);\n  if (!FmtExpr)\n    return false;\n\n  FmtSL = dyn_cast<StringLiteral>(FmtExpr->IgnoreImpCasts());\n\
+  \  if (!FmtSL)\n    return false;\n\n  return true;\n}\n\nbool SAGenTestChecker::isIntegerConvChar(char\
+  \ C) {\n  switch (C) {\n    case 'd': case 'i': case 'u': case 'o': case 'x': case\
+  \ 'X':\n      return true;\n    default:\n      return false;\n  }\n}\n\nvoid SAGenTestChecker::parseFormatString(StringRef\
+  \ Fmt, ASTContext &Ctx,\n                                         std::vector<std::pair<bool,bool>>\
+  \ &ConvMods,\n                                         std::vector<char> &ConvChars)\
+  \ {\n  // Very lightweight parser:\n  // Collect conversions, record if they carry\
+  \ 'll' or single 'l'\n  for (size_t i = 0, e = Fmt.size(); i < e; ++i) {\n    if\
+  \ (Fmt[i] != '%')\n      continue;\n    ++i;\n    if (i >= e) break;\n    if (Fmt[i]\
+  \ == '%') // \"%%\"\n      continue;\n\n    // Skip flags\n    while (i < e && (Fmt[i]\
+  \ == '-' || Fmt[i] == '+' || Fmt[i] == ' ' ||\n                     Fmt[i] == '#'\
+  \ || Fmt[i] == '0')) {\n      ++i;\n    }\n\n    // Skip field width\n    if (i\
+  \ < e && Fmt[i] == '*') {\n      ++i;\n    } else {\n      while (i < e && isdigit(Fmt[i]))\n\
+  \        ++i;\n    }\n\n    // Skip precision\n    if (i < e && Fmt[i] == '.') {\n\
+  \      ++i;\n      if (i < e && Fmt[i] == '*') {\n        ++i;\n      } else {\n\
+  \        while (i < e && isdigit(Fmt[i]))\n          ++i;\n      }\n    }\n\n  \
+  \  // Length modifiers: we only care about l/ll (others ignored)\n    bool hasLL\
+  \ = false;\n    bool hasL = false;\n\n    if (i + 1 < e && Fmt[i] == 'l' && Fmt[i+1]\
+  \ == 'l') {\n      hasLL = true;\n      i += 2;\n    } else if (i < e && Fmt[i]\
+  \ == 'l') {\n      hasL = true;\n      i += 1;\n    } else if (i < e && (Fmt[i]\
+  \ == 'z' || Fmt[i] == 't' || Fmt[i] == 'j' || Fmt[i] == 'h')) {\n      // consume\
+  \ but we don't use them for now\n      // Handle 'hh' quickly\n      if ((Fmt[i]\
+  \ == 'h') && (i + 1 < e) && (Fmt[i+1] == 'h'))\n        i += 2;\n      else\n  \
+  \      i += 1;\n    }\n\n    if (i >= e) break;\n    char conv = Fmt[i];\n    //\
+  \ Record every conversion to keep argument index mapping\n    ConvMods.emplace_back(hasLL,\
+  \ hasL);\n    ConvChars.push_back(conv);\n  }\n}\n\nbool SAGenTestChecker::argLooksSectorLike(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return false;\n  // Prefer DeclRefExpr\
+  \ names\n  const Expr *EI = E->IgnoreParenImpCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(EI))\
+  \ {\n    if (const auto *ND = DRE->getDecl()) {\n      return isSectorLikeName(ND->getName());\n\
+  \    }\n  }\n  // As fallback, look for sector-like tokens in the argument source\
+  \ text\n  const SourceManager &SM = C.getSourceManager();\n  const LangOptions &Lang\
+  \ = C.getLangOpts();\n  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, Lang);\n  return isSectorLikeName(Text);\n\
+  }\n\n// ---- Main callbacks ----\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal\
+  \ Val, const Stmt *S, CheckerContext &C) const {\n  // Step A: Identify the destination\
+  \ variable and its declaration\n  const MemRegion *DstR;\n  const VarDecl *VD;\n\
+  \  std::tie(DstR, VD) = getDestRegionAndDecl(Loc, C);\n  if (!VD)\n    return;\n\
+  \n  // Name filter\n  StringRef Name = VD->getName();\n  if (!isSectorLikeName(Name))\n\
+  \    return;\n\n  // Type of destination\n  QualType DstQT = VD->getType();\n  if\
+  \ (!isUnsigned32(DstQT, C.getASTContext()))\n    return;\n\n  // Step B: Determine\
+  \ RHS and whether it's 64-bit or from min_t(u64, ...)\n  const Expr *RHS = getRHSExprFromStmt(S);\n\
+  \  if (!RHS)\n    return;\n\n  bool Needs64 = isInt64OrWider(RHS->getType(), C.getASTContext());\n\
+  \  if (!Needs64 && exprOrStmtMentionsMinTU64(S, C))\n    Needs64 = true;\n\n  if\
+  \ (!Needs64)\n    return;\n\n  // Step C: Warn on likely truncation\n  if (wasAlreadyReported(DstR,\
+  \ C))\n    return;\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n\
+  \    return;\n\n  SmallString<128> Msg;\n  Msg += \"64-bit sector count stored in\
+  \ 32-bit '\";\n  Msg += Name;\n  Msg += \"'; use u64.\";\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg.str(), N);\n\n  // Add ranges for better highlighting\n  if (const auto *BO\
+  \ = dyn_cast<BinaryOperator>(S)) {\n    R->addRange(BO->getLHS()->getSourceRange());\n\
+  \    R->addRange(BO->getRHS()->getSourceRange());\n  } else if (const auto *DS =\
+  \ dyn_cast<DeclStmt>(S)) {\n    if (DS->isSingleDecl()) {\n      if (const auto\
+  \ *VD2 = dyn_cast<VarDecl>(DS->getSingleDecl())) {\n        R->addRange(VD2->getSourceRange());\n\
+  \        if (VD2->getInit())\n          R->addRange(VD2->getInit()->getSourceRange());\n\
+  \      }\n    }\n  } else if (RHS) {\n    R->addRange(RHS->getSourceRange());\n\
+  \  }\n\n  C.emitReport(std::move(R));\n  markReported(DstR, C);\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  unsigned FmtIndex = 0;\n  const\
+  \ StringLiteral *FmtSL = nullptr;\n  if (!getPrintfLikeInfo(Call, C, FmtIndex, FmtSL))\n\
+  \    return;\n\n  StringRef Fmt = FmtSL->getString();\n  std::vector<std::pair<bool,bool>>\
+  \ ConvMods; // pair<hasLL, hasL>\n  std::vector<char> ConvChars;\n  parseFormatString(Fmt,\
+  \ C.getASTContext(), ConvMods, ConvChars);\n\n  if (ConvMods.size() != ConvChars.size())\n\
+  \    return;\n\n  // Walk conversions to find integer ones, map to arguments\n \
+  \ unsigned ArgBase = FmtIndex + 1;\n  for (size_t i = 0, n = ConvChars.size(), argPos\
+  \ = 0; i < n; ++i, ++argPos) {\n    char Conv = ConvChars[i];\n    bool HasLL =\
+  \ ConvMods[i].first;\n    bool HasL  = ConvMods[i].second;\n\n    unsigned ArgIndex\
+  \ = ArgBase + argPos;\n    if (ArgIndex >= Call.getNumArgs())\n      break;\n\n\
+  \    const Expr *ArgE = Call.getArgExpr(ArgIndex);\n    if (!ArgE)\n      continue;\n\
+  \n    if (!isIntegerConvChar(Conv))\n      continue; // not an integer specifier,\
+  \ but still consumed an arg\n\n    QualType ArgT = ArgE->getType();\n    unsigned\
+  \ ArgW = C.getASTContext().getTypeSize(ArgT);\n\n    // Warn for 64-bit value printed\
+  \ with plain %u/%d/%x (no l/ll)\n    if (!HasLL && !HasL && ArgW >= 64) {\n    \
+  \  // Guard: either argument looks sector-like or format mentions 'sector'\n   \
+  \   bool Related = argLooksSectorLike(ArgE, C) ||\n                     Fmt.contains_insensitive(\"\
+  sector\");\n      if (!Related)\n        continue;\n\n      ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \      if (!N)\n        return;\n\n      auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \          *BT, \"64-bit value formatted with %u; use %llu.\", N);\n      R->addRange(FmtSL->getSourceRange());\n\
+  \      C.emitReport(std::move(R));\n      // Do not early return; multiple issues\
+  \ can coexist but it's fine to continue.\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects truncation of 64-bit sector/reservation\
+  \ values into 32-bit and wrong printf formats\",\n      \"\");\n}\n\nextern \"C\"\
+  \ const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 2

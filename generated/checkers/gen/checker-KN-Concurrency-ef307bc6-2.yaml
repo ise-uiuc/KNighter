@@ -1,0 +1,373 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ef307bc6ef04e8c1ea843231db58e3afaafa9fa6
+commit_type: Concurrency
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/Expr.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/Support/Casting.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// Program states\nREGISTER_SET_WITH_PROGRAMSTATE(LockSet,\
+  \ const MemRegion*)\nREGISTER_SET_WITH_PROGRAMSTATE(JustUnlockedSet, const MemRegion*)\n\
+  \nnamespace {\n\nclass SAGenTestChecker : public Checker<\n  check::PostCall,\n\
+  \  check::Bind,\n  check::EndFunction\n> {\n  mutable std::unique_ptr<BugType> BT;\n\
+  \npublic:\n  SAGenTestChecker() : BT(new BugType(this, \"Unlocked clear of shared\
+  \ pointer\", \"Concurrency\")) {}\n\n  void checkPostCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt *S,\
+  \ CheckerContext &C) const;\n  void checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const;\n\nprivate:\n  // Helpers\n  bool calleeNameContains(const CallEvent\
+  \ &Call, StringRef Needle, CheckerContext &C) const;\n  bool isSpinLockCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  bool isSpinUnlockCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n  const MemRegion *lockArgRegion(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\n  bool isAssigningUrbHcprivNull(const Stmt\
+  \ *S, SVal Val, CheckerContext &C,\n                                SourceRange\
+  \ &HighlightRange) const;\n\n  ProgramStateRef clearJustUnlocked(ProgramStateRef\
+  \ State) const {\n    return State->remove<JustUnlockedSet>();\n  }\n};\n\nbool\
+  \ SAGenTestChecker::calleeNameContains(const CallEvent &Call, StringRef Needle,\n\
+  \                                          CheckerContext &C) const {\n  const Expr\
+  \ *E = Call.getOriginExpr();\n  if (!E) return false;\n  return ExprHasName(E, Needle,\
+  \ C);\n}\n\nbool SAGenTestChecker::isSpinLockCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  // Matches spin_lock, spin_lock_irqsave, spin_lock_bh, etc.\n \
+  \ return calleeNameContains(Call, \"spin_lock\", C) &&\n         !calleeNameContains(Call,\
+  \ \"spin_unlock\", C);\n}\n\nbool SAGenTestChecker::isSpinUnlockCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  // Matches spin_unlock, spin_unlock_irqrestore,\
+  \ spin_unlock_bh, etc.\n  return calleeNameContains(Call, \"spin_unlock\", C);\n\
+  }\n\nconst MemRegion *SAGenTestChecker::lockArgRegion(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (Call.getNumArgs() == 0)\n    return nullptr;\n  const Expr\
+  \ *Arg0 = Call.getArgExpr(0);\n  if (!Arg0)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(Arg0, C);\n  if (!MR)\n    return nullptr;\n  return\
+  \ MR->getBaseRegion();\n}\n\nbool SAGenTestChecker::isAssigningUrbHcprivNull(const\
+  \ Stmt *S, SVal Val,\n                                                CheckerContext\
+  \ &C,\n                                                SourceRange &HighlightRange)\
+  \ const {\n  if (!S) return false;\n\n  const BinaryOperator *BO = dyn_cast<BinaryOperator>(S);\n\
+  \  if (!BO)\n    BO = findSpecificTypeInChildren<BinaryOperator>(S);\n  if (!BO)\n\
+  \    return false;\n  if (BO->getOpcode() != BO_Assign)\n    return false;\n\n \
+  \ const Expr *LHS = BO->getLHS();\n  if (!LHS) return false;\n  const Expr *RHS\
+  \ = BO->getRHS();\n  if (!RHS) return false;\n\n  const MemberExpr *ME = dyn_cast<MemberExpr>(LHS->IgnoreParenCasts());\n\
+  \  if (!ME)\n    return false;\n\n  // Check the member name is 'hcpriv'\n  const\
+  \ ValueDecl *VD = ME->getMemberDecl();\n  const FieldDecl *FD = dyn_cast_or_null<FieldDecl>(VD);\n\
+  \  if (!FD)\n    return false;\n  if (FD->getName() != \"hcpriv\")\n    return false;\n\
+  \n  // Check base expression text contains \"urb\" (focus on urb->hcpriv pattern)\n\
+  \  const Expr *BaseE = ME->getBase();\n  if (!BaseE)\n    return false;\n  if (!ExprHasName(BaseE,\
+  \ \"urb\", C))\n    return false;\n\n  // Check RHS is NULL/0\n  bool RHSIsNull\
+  \ = RHS->isNullPointerConstant(C.getASTContext(),\n                            \
+  \                  Expr::NPC_ValueDependentIsNull);\n  if (!RHSIsNull) {\n    llvm::APSInt\
+  \ EvalRes;\n    if (EvaluateExprToInt(EvalRes, RHS, C)) {\n      RHSIsNull = EvalRes\
+  \ == 0;\n    } else {\n      // Try via SVal if constant\n      if (auto CI = Val.getAs<nonloc::ConcreteInt>())\
+  \ {\n        RHSIsNull = CI->getValue() == 0;\n      }\n    }\n  }\n  if (!RHSIsNull)\n\
+  \    return false;\n\n  HighlightRange = ME->getSourceRange();\n  return true;\n\
+  }\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  if (isSpinLockCall(Call,\
+  \ C)) {\n    if (const MemRegion *LR = lockArgRegion(Call, C)) {\n      State =\
+  \ State->add<LockSet>(LR);\n      // entering protected region, clear any \"just\
+  \ unlocked\" marks\n      State = clearJustUnlocked(State);\n      C.addTransition(State);\n\
+  \      return;\n    }\n  }\n\n  if (isSpinUnlockCall(Call, C)) {\n    if (const\
+  \ MemRegion *LR = lockArgRegion(Call, C)) {\n      State = State->remove<LockSet>(LR);\n\
+  \      State = State->add<JustUnlockedSet>(LR);\n      C.addTransition(State);\n\
+  \      return;\n    }\n  }\n\n  // Any other call clears the \"just unlocked\" window.\n\
+  \  const JustUnlockedSetTy *JU = State->get<JustUnlockedSet>();\n  if (JU && !JU->isEmpty())\
+  \ {\n    State = clearJustUnlocked(State);\n    C.addTransition(State);\n  }\n}\n\
+  \nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  const JustUnlockedSetTy\
+  \ *JU = State->get<JustUnlockedSet>();\n\n  bool HadJustUnlocked = (JU && !JU->isEmpty());\n\
+  \  bool Reported = false;\n\n  if (HadJustUnlocked) {\n    // We only consider immediate\
+  \ next store after spin_unlock.\n    // Ensure the destination is the urb->hcpriv\
+  \ field and RHS is NULL.\n    SourceRange SR;\n    if (isAssigningUrbHcprivNull(S,\
+  \ Val, C, SR)) {\n      ExplodedNode *N = C.generateNonFatalErrorNode();\n     \
+  \ if (N) {\n        auto R = std::make_unique<PathSensitiveBugReport>(\n       \
+  \   *BT, \"urb->hcpriv cleared after spin_unlock; move assignment under the lock\"\
+  , N);\n        if (SR.isValid())\n          R->addRange(SR);\n        C.emitReport(std::move(R));\n\
+  \      }\n      Reported = true;\n    }\n  }\n\n  // Regardless of whether we reported\
+  \ or not, the \"just unlocked\" window\n  // should be cleared on the first subsequent\
+  \ bind to keep the window short.\n  if (HadJustUnlocked) {\n    State = clearJustUnlocked(State);\n\
+  \    C.addTransition(State);\n  } else if (Reported) {\n    // Defensive: in unusual\
+  \ flows, still ensure state transition if we reported.\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  State = State->remove<LockSet>();\n\
+  \  State = State->remove<JustUnlockedSet>();\n  C.addTransition(State);\n}\n\n}\
+  \ // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects urb->hcpriv = NULL immediately after spin_unlock (move under\
+  \ lock)\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nusb: dwc2: fix possible NULL pointer dereference caused\
+  \ by driver concurrency\n\nIn _dwc2_hcd_urb_enqueue(), \"urb->hcpriv = NULL\" is\
+  \ executed without\nholding the lock \"hsotg->lock\". In _dwc2_hcd_urb_dequeue():\n\
+  \n    spin_lock_irqsave(&hsotg->lock, flags);\n    ...\n\tif (!urb->hcpriv) {\n\t\
+  \tdev_dbg(hsotg->dev, \"## urb->hcpriv is NULL ##\\n\");\n\t\tgoto out;\n\t}\n \
+  \   rc = dwc2_hcd_urb_dequeue(hsotg, urb->hcpriv); // Use urb->hcpriv\n    ...\n\
+  out:\n    spin_unlock_irqrestore(&hsotg->lock, flags);\n\nWhen _dwc2_hcd_urb_enqueue()\
+  \ and _dwc2_hcd_urb_dequeue() are\nconcurrently executed, the NULL check of \"urb->hcpriv\"\
+  \ can be executed\nbefore \"urb->hcpriv = NULL\". After urb->hcpriv is NULL, it\
+  \ can be used\nin the function call to dwc2_hcd_urb_dequeue(), which can cause a\
+  \ NULL\npointer dereference.\n\nThis possible bug is found by an experimental static\
+  \ analysis tool\ndeveloped by myself. This tool analyzes the locking APIs to extract\n\
+  function pairs that can be concurrently executed, and then analyzes the\ninstructions\
+  \ in the paired functions to identify possible concurrency\nbugs including data\
+  \ races and atomicity violations. The above possible\nbug is reported, when my tool\
+  \ analyzes the source code of Linux 6.5.\n\nTo fix this possible bug, \"urb->hcpriv\
+  \ = NULL\" should be executed with\nholding the lock \"hsotg->lock\". After using\
+  \ this patch, my tool never\nreports the possible bug, with the kernelconfiguration\
+  \ allyesconfig for\nx86_64. Because I have no associated hardware, I cannot test\
+  \ the patch\nin runtime testing, and just verify it according to the code logic.\n\
+  \nFixes: 33ad261aa62b (\"usb: dwc2: host: spinlock urb_enqueue\")\nSigned-off-by:\
+  \ Jia-Ju Bai <baijiaju@buaa.edu.cn>\nLink: https://lore.kernel.org/r/20230926024404.832096-1-baijiaju@buaa.edu.cn\n\
+  Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>\n\n## Buggy Code\n\
+  \n```c\n// Function: _dwc2_hcd_urb_enqueue in drivers/usb/dwc2/hcd.c\nstatic int\
+  \ _dwc2_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,\n\t\t\t\t gfp_t mem_flags)\n\
+  {\n\tstruct dwc2_hsotg *hsotg = dwc2_hcd_to_hsotg(hcd);\n\tstruct usb_host_endpoint\
+  \ *ep = urb->ep;\n\tstruct dwc2_hcd_urb *dwc2_urb;\n\tint i;\n\tint retval;\n\t\
+  int alloc_bandwidth = 0;\n\tu8 ep_type = 0;\n\tu32 tflags = 0;\n\tvoid *buf;\n\t\
+  unsigned long flags;\n\tstruct dwc2_qh *qh;\n\tbool qh_allocated = false;\n\tstruct\
+  \ dwc2_qtd *qtd;\n\tstruct dwc2_gregs_backup *gr;\n\n\tgr = &hsotg->gr_backup;\n\
+  \n\tif (dbg_urb(urb)) {\n\t\tdev_vdbg(hsotg->dev, \"DWC OTG HCD URB Enqueue\\n\"\
+  );\n\t\tdwc2_dump_urb_info(hcd, urb, \"urb_enqueue\");\n\t}\n\n\tif (hsotg->hibernated)\
+  \ {\n\t\tif (gr->gotgctl & GOTGCTL_CURMODE_HOST)\n\t\t\tretval = dwc2_exit_hibernation(hsotg,\
+  \ 0, 0, 1);\n\t\telse\n\t\t\tretval = dwc2_exit_hibernation(hsotg, 0, 0, 0);\n\n\
+  \t\tif (retval)\n\t\t\tdev_err(hsotg->dev,\n\t\t\t\t\"exit hibernation failed.\\\
+  n\");\n\t}\n\n\tif (hsotg->in_ppd) {\n\t\tretval = dwc2_exit_partial_power_down(hsotg,\
+  \ 0, true);\n\t\tif (retval)\n\t\t\tdev_err(hsotg->dev,\n\t\t\t\t\"exit partial_power_down\
+  \ failed\\n\");\n\t}\n\n\tif (hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE\
+  \ &&\n\t    hsotg->bus_suspended) {\n\t\tif (dwc2_is_device_mode(hsotg))\n\t\t\t\
+  dwc2_gadget_exit_clock_gating(hsotg, 0);\n\t\telse\n\t\t\tdwc2_host_exit_clock_gating(hsotg,\
+  \ 0);\n\t}\n\n\tif (!ep)\n\t\treturn -EINVAL;\n\n\tif (usb_pipetype(urb->pipe) ==\
+  \ PIPE_ISOCHRONOUS ||\n\t    usb_pipetype(urb->pipe) == PIPE_INTERRUPT) {\n\t\t\
+  spin_lock_irqsave(&hsotg->lock, flags);\n\t\tif (!dwc2_hcd_is_bandwidth_allocated(hsotg,\
+  \ ep))\n\t\t\talloc_bandwidth = 1;\n\t\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\
+  \t}\n\n\tswitch (usb_pipetype(urb->pipe)) {\n\tcase PIPE_CONTROL:\n\t\tep_type =\
+  \ USB_ENDPOINT_XFER_CONTROL;\n\t\tbreak;\n\tcase PIPE_ISOCHRONOUS:\n\t\tep_type\
+  \ = USB_ENDPOINT_XFER_ISOC;\n\t\tbreak;\n\tcase PIPE_BULK:\n\t\tep_type = USB_ENDPOINT_XFER_BULK;\n\
+  \t\tbreak;\n\tcase PIPE_INTERRUPT:\n\t\tep_type = USB_ENDPOINT_XFER_INT;\n\t\tbreak;\n\
+  \t}\n\n\tdwc2_urb = dwc2_hcd_urb_alloc(hsotg, urb->number_of_packets,\n\t\t\t\t\
+  \      mem_flags);\n\tif (!dwc2_urb)\n\t\treturn -ENOMEM;\n\n\tdwc2_hcd_urb_set_pipeinfo(hsotg,\
+  \ dwc2_urb, usb_pipedevice(urb->pipe),\n\t\t\t\t  usb_pipeendpoint(urb->pipe), ep_type,\n\
+  \t\t\t\t  usb_pipein(urb->pipe),\n\t\t\t\t  usb_endpoint_maxp(&ep->desc),\n\t\t\t\
+  \t  usb_endpoint_maxp_mult(&ep->desc));\n\n\tbuf = urb->transfer_buffer;\n\n\tif\
+  \ (hcd_uses_dma(hcd)) {\n\t\tif (!buf && (urb->transfer_dma & 3)) {\n\t\t\tdev_err(hsotg->dev,\n\
+  \t\t\t\t\"%s: unaligned transfer with no transfer_buffer\",\n\t\t\t\t__func__);\n\
+  \t\t\tretval = -EINVAL;\n\t\t\tgoto fail0;\n\t\t}\n\t}\n\n\tif (!(urb->transfer_flags\
+  \ & URB_NO_INTERRUPT))\n\t\ttflags |= URB_GIVEBACK_ASAP;\n\tif (urb->transfer_flags\
+  \ & URB_ZERO_PACKET)\n\t\ttflags |= URB_SEND_ZERO_PACKET;\n\n\tdwc2_urb->priv =\
+  \ urb;\n\tdwc2_urb->buf = buf;\n\tdwc2_urb->dma = urb->transfer_dma;\n\tdwc2_urb->length\
+  \ = urb->transfer_buffer_length;\n\tdwc2_urb->setup_packet = urb->setup_packet;\n\
+  \tdwc2_urb->setup_dma = urb->setup_dma;\n\tdwc2_urb->flags = tflags;\n\tdwc2_urb->interval\
+  \ = urb->interval;\n\tdwc2_urb->status = -EINPROGRESS;\n\n\tfor (i = 0; i < urb->number_of_packets;\
+  \ ++i)\n\t\tdwc2_hcd_urb_set_iso_desc_params(dwc2_urb, i,\n\t\t\t\t\t\t urb->iso_frame_desc[i].offset,\n\
+  \t\t\t\t\t\t urb->iso_frame_desc[i].length);\n\n\turb->hcpriv = dwc2_urb;\n\tqh\
+  \ = (struct dwc2_qh *)ep->hcpriv;\n\t/* Create QH for the endpoint if it doesn't\
+  \ exist */\n\tif (!qh) {\n\t\tqh = dwc2_hcd_qh_create(hsotg, dwc2_urb, mem_flags);\n\
+  \t\tif (!qh) {\n\t\t\tretval = -ENOMEM;\n\t\t\tgoto fail0;\n\t\t}\n\t\tep->hcpriv\
+  \ = qh;\n\t\tqh_allocated = true;\n\t}\n\n\tqtd = kzalloc(sizeof(*qtd), mem_flags);\n\
+  \tif (!qtd) {\n\t\tretval = -ENOMEM;\n\t\tgoto fail1;\n\t}\n\n\tspin_lock_irqsave(&hsotg->lock,\
+  \ flags);\n\tretval = usb_hcd_link_urb_to_ep(hcd, urb);\n\tif (retval)\n\t\tgoto\
+  \ fail2;\n\n\tretval = dwc2_hcd_urb_enqueue(hsotg, dwc2_urb, qh, qtd);\n\tif (retval)\n\
+  \t\tgoto fail3;\n\n\tif (alloc_bandwidth) {\n\t\tdwc2_allocate_bus_bandwidth(hcd,\n\
+  \t\t\t\tdwc2_hcd_get_ep_bandwidth(hsotg, ep),\n\t\t\t\turb);\n\t}\n\n\tspin_unlock_irqrestore(&hsotg->lock,\
+  \ flags);\n\n\treturn 0;\n\nfail3:\n\tdwc2_urb->priv = NULL;\n\tusb_hcd_unlink_urb_from_ep(hcd,\
+  \ urb);\n\tif (qh_allocated && qh->channel && qh->channel->qh == qh)\n\t\tqh->channel->qh\
+  \ = NULL;\nfail2:\n\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\turb->hcpriv\
+  \ = NULL;\n\tkfree(qtd);\nfail1:\n\tif (qh_allocated) {\n\t\tstruct dwc2_qtd *qtd2,\
+  \ *qtd2_tmp;\n\n\t\tep->hcpriv = NULL;\n\t\tdwc2_hcd_qh_unlink(hsotg, qh);\n\t\t\
+  /* Free each QTD in the QH's QTD list */\n\t\tlist_for_each_entry_safe(qtd2, qtd2_tmp,\
+  \ &qh->qtd_list,\n\t\t\t\t\t qtd_list_entry)\n\t\t\tdwc2_hcd_qtd_unlink_and_free(hsotg,\
+  \ qtd2, qh);\n\t\tdwc2_hcd_qh_free(hsotg, qh);\n\t}\nfail0:\n\tkfree(dwc2_urb);\n\
+  \n\treturn retval;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/usb/dwc2/hcd.c\
+  \ b/drivers/usb/dwc2/hcd.c\nindex 657f1f659ffa..35c7a4df8e71 100644\n--- a/drivers/usb/dwc2/hcd.c\n\
+  +++ b/drivers/usb/dwc2/hcd.c\n@@ -4769,8 +4769,8 @@ static int _dwc2_hcd_urb_enqueue(struct\
+  \ usb_hcd *hcd, struct urb *urb,\n \tif (qh_allocated && qh->channel && qh->channel->qh\
+  \ == qh)\n \t\tqh->channel->qh = NULL;\n fail2:\n-\tspin_unlock_irqrestore(&hsotg->lock,\
+  \ flags);\n \turb->hcpriv = NULL;\n+\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\
+  \ \tkfree(qtd);\n fail1:\n \tif (qh_allocated) {\n```\n"
+pattern: '## Bug Pattern
+
+
+  Clearing or modifying a shared pointer (here, urb->hcpriv) outside the spinlock
+  that protects it, while other paths read and use that pointer under the lock. Specifically:
+
+  - Reader: holds hsotg->lock, checks if (urb->hcpriv) and then uses urb->hcpriv.
+
+  - Writer: releases hsotg->lock (or never takes it) and then does urb->hcpriv = NULL.
+
+
+  This inconsistent locking creates a race where the reader passes the NULL check
+  under the lock but the writer concurrently nulls the pointer, leading to a NULL
+  pointer dereference during the subsequent use. The fix is to perform urb->hcpriv
+  = NULL while holding hsotg->lock (before unlocking).'
+plan: "1) Program state\n\n- LockSet: set of currently-held spinlock regions.\n  -\
+  \ REGISTER_SET_WITH_PROGRAMSTATE(LockSet, const MemRegion*)\n- JustUnlocked: set\
+  \ of spinlock regions that were just released by the previous call (used to catch\
+  \ the \u201Cimmediately after unlock\u201D assignment).\n  - REGISTER_SET_WITH_PROGRAMSTATE(JustUnlockedSet,\
+  \ const MemRegion*)\n\nNotes:\n- We use getMemRegionFromExpr on the first argument\
+  \ of spin_{lock,unlock}* to identify the lock\u2019s region.\n- We keep JustUnlocked\
+  \ very short-lived to reduce false positives: it is populated on unlock and cleared\
+  \ at the next relevant operation (next call or next bind, whichever comes first).\n\
+  \n\n2) Callbacks and detailed logic\n\nA. checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C)\n- Goal: Track acquiring/releasing spinlocks and manage LockSet/JustUnlockedSet.\n\
+  \n- Identify spin lock/unlock calls:\n  - Consider at least: spin_lock, spin_lock_irqsave,\
+  \ spin_lock_bh, spin_unlock, spin_unlock_irqrestore, spin_unlock_bh.\n  - Helper:\
+  \ isSpinLock(const CallEvent&) and isSpinUnlock(const CallEvent&).\n    - Return\
+  \ true if callee name matches any above; also return the lock-argument Expr (index\
+  \ 0).\n- For a spin_lock*:\n  - Get lock MemRegion via getMemRegionFromExpr on argument\
+  \ #0.\n  - State\u2019 = State.add<LockSet>(LockRegion)\n  - Also clear JustUnlockedSet\
+  \ (we are now inside a critical section).\n- For a spin_unlock*:\n  - Get lock MemRegion\
+  \ as above.\n  - State\u2019 = State.remove<LockSet>(LockRegion)\n  - State\u2019\
+  \ = State.add<JustUnlockedSet>(LockRegion)  // mark that we just unlocked this lock\n\
+  - For any other call:\n  - If JustUnlockedSet is non-empty, clear it.\n    - Rationale:\
+  \ we only want to catch assignments that occur immediately after an unlock; any\
+  \ call in between cancels the \u201Cimmediate\u201D window.\n\nImplementation notes:\n\
+  - Use Call.getCalleeIdentifier() to get function name.\n- Use getMemRegionFromExpr\
+  \ on Call.getArgExpr(0).\n- Update state via add/remove on immutable sets.\n\nB.\
+  \ checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C)\n- Goal: Detect\
+  \ the specific write pattern immediately after unlock:\n  - A store to a pointer\
+  \ field (e.g., urb->hcpriv = NULL) that is performed right after a spin_unlock.\n\
+  \n- Steps:\n  1) If JustUnlockedSet is empty, return early.\n  2) Try to obtain\
+  \ the destination field:\n     - If Loc.getAsRegion() is a FieldRegion, get FieldDecl\
+  \ FD.\n     - Else return.\n  3) Narrow to the bug pattern to reduce false positives:\n\
+  \     - Field name must be \u201Chcpriv\u201D:\n       - if (FD->getNameAsString()\
+  \ != \"hcpriv\") return;\n     - The RHS Val should be NULL/0:\n       - If Val.isZeroConstant()\
+  \ OR, if needed, evaluate RHS using EvaluateExprToInt on the RHS expr extracted\
+  \ from S (BinaryOperator) and check equals 0.\n     - Optional precision filter\
+  \ (recommended):\n       - Extract the MemberExpr for the LHS from S using findSpecificTypeInChildren<MemberExpr>(S).\n\
+  \       - If found, check the base expression\u2019s text using ExprHasName(BaseExpr,\
+  \ \"urb\", C). If not found, return. This keeps the checker focused on urb->hcpriv.\n\
+  \  4) If the above all hold and JustUnlockedSet is non-empty:\n     - Report a bug:\
+  \ \u201Curb->hcpriv cleared after spin_unlock; move the assignment under the lock\u201D\
+  .\n     - After reporting, clear JustUnlockedSet to avoid duplicate reports.\n\n\
+  C. checkEndFunction(const ReturnStmt *RS, CheckerContext &C)\n- Clear both LockSet\
+  \ and JustUnlockedSet (defensive; the analyzer usually drops state at function boundaries\
+  \ but explicit clear keeps the state well-scoped).\n\nD. Optional: checkPostStmt(const\
+  \ DeclStmt *DS, CheckerContext &C)\n- No action needed. We keep the checker minimal.\n\
+  \nE. Optional: checkBranchCondition(const Stmt *Condition, CheckerContext &Ctx)\n\
+  - No action needed for the basic detection. If desired in the future, this can learn\
+  \ \u201Creader-under-lock\u201D patterns (if (!ptr) ... use ptr) to generalize beyond\
+  \ hcpriv, but is not required for the target pattern.\n\n\n3) Helper routines\n\n\
+  - bool isSpinLock(const CallEvent &Call, const Expr* &LockArg)\n  - Return true\
+  \ if callee name is one of: spin_lock, spin_lock_irqsave, spin_lock_bh, with LockArg\
+  \ = Call.getArgExpr(0).\n- bool isSpinUnlock(const CallEvent &Call, const Expr*\
+  \ &LockArg)\n  - Return true if callee name is one of: spin_unlock, spin_unlock_irqrestore,\
+  \ spin_unlock_bh, with LockArg = Call.getArgExpr(0).\n\n- Extracting the lock region:\n\
+  \  - const MemRegion *LR = getMemRegionFromExpr(LockArg, C);\n\n- Extracting the\
+  \ LHS MemberExpr in checkBind:\n  - const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(S);\n\
+  \  - Then ME->getBase() provides the base expression to check \u201Curb\u201D with\
+  \ ExprHasName(ME->getBase(), \"urb\", C).\n\n- Checking RHS null:\n  - If Val.isZeroConstant()\
+  \ is not available/insufficient, parse RHS:\n    - if (const auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ EvaluateExprToInt on BO->getRHS(), test equals 0.\n\n- Emitting report:\n  - Use\
+  \ generateNonFatalErrorNode(State) to get node.\n  - Create PathSensitiveBugReport\
+  \ with a short message: \u201Curb->hcpriv cleared after spin_unlock; race with readers\u201D\
+  .\n  - Add the source range of the assignment LHS (ME->getSourceRange()) for clarity.\n\
+  \n\n4) Why this detects the target patch\n\n- In the buggy code path:\n  - spin_unlock_irqrestore(&hsotg->lock,\
+  \ flags);  // checkPostCall sets JustUnlockedSet\n  - urb->hcpriv = NULL;      \
+  \                     // checkBind sees hcpriv=NULL right after unlock\n- The checker\
+  \ flags this immediate post-unlock clearing of a shared pointer, which is exactly\
+  \ what the patch fixes by moving the assignment before the unlock.\n- The filters\
+  \ (field name \u201Chcpriv\u201D and base name containing \u201Curb\u201D) keep\
+  \ the checker precise and focused on the Linux USB HC pattern, reducing false positives.\n\
+  \n\n5) Summary of minimal implementation steps\n\n- Register LockSet and JustUnlockedSet\
+  \ with ProgramState.\n- Implement isSpinLock/isSpinUnlock helpers.\n- Implement\
+  \ checkPostCall to manage LockSet/JustUnlockedSet and clear JustUnlockedSet on any\
+  \ non-unlock call.\n- Implement checkBind to detect \u201Chcpriv = NULL\u201D immediately\
+  \ after unlock, optionally ensuring base contains \u201Curb\u201D.\n- Emit a concise\
+  \ PathSensitiveBugReport and clear JustUnlockedSet after reporting."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/Expr.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/Support/Casting.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n#include <memory>\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\n// Program states\nREGISTER_SET_WITH_PROGRAMSTATE(LockSet,\
+  \ const MemRegion*)\nREGISTER_SET_WITH_PROGRAMSTATE(JustUnlockedSet, const MemRegion*)\n\
+  \nnamespace {\n\nclass SAGenTestChecker : public Checker<\n  check::PostCall,\n\
+  \  check::Bind,\n  check::EndFunction\n> {\n  mutable std::unique_ptr<BugType> BT;\n\
+  \npublic:\n  SAGenTestChecker() : BT(new BugType(this, \"Unlocked clear of shared\
+  \ pointer\", \"Concurrency\")) {}\n\n  void checkPostCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt *S,\
+  \ CheckerContext &C) const;\n  void checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const;\n\nprivate:\n  // Helpers\n  bool calleeNameContains(const CallEvent\
+  \ &Call, StringRef Needle, CheckerContext &C) const;\n  bool isSpinLockCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  bool isSpinUnlockCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n  const MemRegion *lockArgRegion(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\n  bool isAssigningUrbHcprivNull(const Stmt\
+  \ *S, SVal Val, CheckerContext &C,\n                                SourceRange\
+  \ &HighlightRange) const;\n\n  ProgramStateRef clearJustUnlocked(ProgramStateRef\
+  \ State) const {\n    return State->remove<JustUnlockedSet>();\n  }\n};\n\nbool\
+  \ SAGenTestChecker::calleeNameContains(const CallEvent &Call, StringRef Needle,\n\
+  \                                          CheckerContext &C) const {\n  const Expr\
+  \ *E = Call.getOriginExpr();\n  if (!E) return false;\n  return ExprHasName(E, Needle,\
+  \ C);\n}\n\nbool SAGenTestChecker::isSpinLockCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  // Matches spin_lock, spin_lock_irqsave, spin_lock_bh, etc.\n \
+  \ return calleeNameContains(Call, \"spin_lock\", C) &&\n         !calleeNameContains(Call,\
+  \ \"spin_unlock\", C);\n}\n\nbool SAGenTestChecker::isSpinUnlockCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  // Matches spin_unlock, spin_unlock_irqrestore,\
+  \ spin_unlock_bh, etc.\n  return calleeNameContains(Call, \"spin_unlock\", C);\n\
+  }\n\nconst MemRegion *SAGenTestChecker::lockArgRegion(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (Call.getNumArgs() == 0)\n    return nullptr;\n  const Expr\
+  \ *Arg0 = Call.getArgExpr(0);\n  if (!Arg0)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(Arg0, C);\n  if (!MR)\n    return nullptr;\n  return\
+  \ MR->getBaseRegion();\n}\n\nbool SAGenTestChecker::isAssigningUrbHcprivNull(const\
+  \ Stmt *S, SVal Val,\n                                                CheckerContext\
+  \ &C,\n                                                SourceRange &HighlightRange)\
+  \ const {\n  if (!S) return false;\n\n  const BinaryOperator *BO = dyn_cast<BinaryOperator>(S);\n\
+  \  if (!BO)\n    BO = findSpecificTypeInChildren<BinaryOperator>(S);\n  if (!BO)\n\
+  \    return false;\n  if (BO->getOpcode() != BO_Assign)\n    return false;\n\n \
+  \ const Expr *LHS = BO->getLHS();\n  if (!LHS) return false;\n  const Expr *RHS\
+  \ = BO->getRHS();\n  if (!RHS) return false;\n\n  const MemberExpr *ME = dyn_cast<MemberExpr>(LHS->IgnoreParenCasts());\n\
+  \  if (!ME)\n    return false;\n\n  // Check the member name is 'hcpriv'\n  const\
+  \ ValueDecl *VD = ME->getMemberDecl();\n  const FieldDecl *FD = dyn_cast_or_null<FieldDecl>(VD);\n\
+  \  if (!FD)\n    return false;\n  if (FD->getName() != \"hcpriv\")\n    return false;\n\
+  \n  // Check base expression text contains \"urb\" (focus on urb->hcpriv pattern)\n\
+  \  const Expr *BaseE = ME->getBase();\n  if (!BaseE)\n    return false;\n  if (!ExprHasName(BaseE,\
+  \ \"urb\", C))\n    return false;\n\n  // Check RHS is NULL/0\n  bool RHSIsNull\
+  \ = RHS->isNullPointerConstant(C.getASTContext(),\n                            \
+  \                  Expr::NPC_ValueDependentIsNull);\n  if (!RHSIsNull) {\n    llvm::APSInt\
+  \ EvalRes;\n    if (EvaluateExprToInt(EvalRes, RHS, C)) {\n      RHSIsNull = EvalRes\
+  \ == 0;\n    } else {\n      // Try via SVal if constant\n      if (auto CI = Val.getAs<nonloc::ConcreteInt>())\
+  \ {\n        RHSIsNull = CI->getValue() == 0;\n      }\n    }\n  }\n  if (!RHSIsNull)\n\
+  \    return false;\n\n  HighlightRange = ME->getSourceRange();\n  return true;\n\
+  }\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  if (isSpinLockCall(Call,\
+  \ C)) {\n    if (const MemRegion *LR = lockArgRegion(Call, C)) {\n      State =\
+  \ State->add<LockSet>(LR);\n      // entering protected region, clear any \"just\
+  \ unlocked\" marks\n      State = clearJustUnlocked(State);\n      C.addTransition(State);\n\
+  \      return;\n    }\n  }\n\n  if (isSpinUnlockCall(Call, C)) {\n    if (const\
+  \ MemRegion *LR = lockArgRegion(Call, C)) {\n      State = State->remove<LockSet>(LR);\n\
+  \      State = State->add<JustUnlockedSet>(LR);\n      C.addTransition(State);\n\
+  \      return;\n    }\n  }\n\n  // Any other call clears the \"just unlocked\" window.\n\
+  \  JustUnlockedSetTy JU = State->get<JustUnlockedSet>();\n  if (!JU.isEmpty()) {\n\
+  \    State = clearJustUnlocked(State);\n    C.addTransition(State);\n  }\n}\n\n\
+  void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  JustUnlockedSetTy JU =\
+  \ State->get<JustUnlockedSet>();\n\n  bool HadJustUnlocked = !JU.isEmpty();\n  bool\
+  \ Reported = false;\n\n  if (HadJustUnlocked) {\n    // We only consider immediate\
+  \ next store after spin_unlock.\n    // Ensure the destination is the urb->hcpriv\
+  \ field and RHS is NULL.\n    SourceRange SR;\n    if (isAssigningUrbHcprivNull(S,\
+  \ Val, C, SR)) {\n      ExplodedNode *N = C.generateNonFatalErrorNode();\n     \
+  \ if (N) {\n        auto R = std::make_unique<PathSensitiveBugReport>(\n       \
+  \   *BT, \"urb->hcpriv cleared after spin_unlock; move assignment under the lock\"\
+  , N);\n        if (SR.isValid())\n          R->addRange(SR);\n        C.emitReport(std::move(R));\n\
+  \      }\n      Reported = true;\n    }\n  }\n\n  // Regardless of whether we reported\
+  \ or not, the \"just unlocked\" window\n  // should be cleared on the first subsequent\
+  \ bind to keep the window short.\n  if (HadJustUnlocked) {\n    State = clearJustUnlocked(State);\n\
+  \    C.addTransition(State);\n  } else if (Reported) {\n    // Defensive: in unusual\
+  \ flows, still ensure state transition if we reported.\n    C.addTransition(State);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  State = State->remove<LockSet>();\n\
+  \  State = State->remove<JustUnlockedSet>();\n  C.addTransition(State);\n}\n\n}\
+  \ // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects urb->hcpriv = NULL immediately after spin_unlock (move under\
+  \ lock)\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

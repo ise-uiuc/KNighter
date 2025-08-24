@@ -1,0 +1,577 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Manually computing the byte count for a memory operation as sizeof(element) * count where count can come from userspace, without overflow checking. This open-coded multiplication can overflow size_t and wrap around, causing copy_from_user (or similar APIs) to operate on an incorrect size. The correct pattern is to use overflow-checked helpers like array_size(element_size, count) (or struct_size) for size calculations passed to copy/alloc functions.
+
+## Bug Pattern
+
+Manually computing the byte count for a memory operation as sizeof(element) * count where count can come from userspace, without overflow checking. This open-coded multiplication can overflow size_t and wrap around, causing copy_from_user (or similar APIs) to operate on an incorrect size. The correct pattern is to use overflow-checked helpers like array_size(element_size, count) (or struct_size) for size calculations passed to copy/alloc functions.
+
+# Report
+
+### Report Summary
+
+File:| fs/aio.c
+---|---
+Warning:| line 1277, column 14
+Size is computed as sizeof(x) * count; use array_size() to avoid overflow
+
+### Annotated Source Code
+
+
+1031  |  * aio_complete() from updating tail by holding
+1032  |  * ctx->completion_lock.  Even if head is invalid, the check
+1033  |  * against ctx->completed_events below will make sure we do the
+1034  |  * safe/right thing.
+1035  |  */
+1036  | 		ring = page_address(ctx->ring_pages[0]);
+1037  | 		head = ring->head;
+1038  |
+1039  | 		refill_reqs_available(ctx, head, ctx->tail);
+1040  | 	}
+1041  |
+1042  | 	spin_unlock_irq(&ctx->completion_lock);
+1043  | }
+1044  |
+1045  | static bool get_reqs_available(struct kioctx *ctx)
+1046  | {
+1047  |  if (__get_reqs_available(ctx))
+1048  |  return true;
+1049  | 	user_refill_reqs_available(ctx);
+1050  |  return __get_reqs_available(ctx);
+1051  | }
+1052  |
+1053  | /* aio_get_req
+1054  |  *	Allocate a slot for an aio request.
+1055  |  * Returns NULL if no requests are free.
+1056  |  *
+1057  |  * The refcount is initialized to 2 - one for the async op completion,
+1058  |  * one for the synchronous code that does this.
+1059  |  */
+1060  | static inline struct aio_kiocb *aio_get_req(struct kioctx *ctx)
+1061  | {
+1062  |  struct aio_kiocb *req;
+1063  |
+1064  | 	req = kmem_cache_alloc(kiocb_cachep, GFP_KERNEL);
+1065  |  if (unlikely(!req))
+1066  |  return NULL;
+1067  |
+1068  |  if (unlikely(!get_reqs_available(ctx))) {
+1069  | 		kmem_cache_free(kiocb_cachep, req);
+1070  |  return NULL;
+1071  | 	}
+1072  |
+1073  | 	percpu_ref_get(&ctx->reqs);
+1074  | 	req->ki_ctx = ctx;
+1075  | 	INIT_LIST_HEAD(&req->ki_list);
+1076  | 	refcount_set(&req->ki_refcnt, 2);
+1077  | 	req->ki_eventfd = NULL;
+1078  |  return req;
+1079  | }
+1080  |
+1081  | static struct kioctx *lookup_ioctx(unsigned long ctx_id)
+1082  | {
+1083  |  struct aio_ring __user *ring  = (void __user *)ctx_id;
+1084  |  struct mm_struct *mm = current->mm;
+1085  |  struct kioctx *ctx, *ret = NULL;
+1086  |  struct kioctx_table *table;
+1087  |  unsigned id;
+1088  |
+1089  |  if (get_user(id, &ring->id))
+1090  |  return NULL;
+1091  |
+1092  | 	rcu_read_lock();
+1093  | 	table = rcu_dereference(mm->ioctx_table);
+1094  |
+1095  |  if (!table || id >= table->nr)
+1096  |  goto out;
+1097  |
+1098  | 	id = array_index_nospec(id, table->nr);
+1099  | 	ctx = rcu_dereference(table->table[id]);
+1100  |  if (ctx && ctx->user_id == ctx_id) {
+1101  |  if (percpu_ref_tryget_live(&ctx->users))
+1102  | 			ret = ctx;
+1103  | 	}
+1104  | out:
+1105  | 	rcu_read_unlock();
+1106  |  return ret;
+1107  | }
+1108  |
+1109  | static inline void iocb_destroy(struct aio_kiocb *iocb)
+1110  | {
+1111  |  if (iocb->ki_eventfd)
+1112  | 		eventfd_ctx_put(iocb->ki_eventfd);
+1113  |  if (iocb->ki_filp)
+1114  | 		fput(iocb->ki_filp);
+1115  | 	percpu_ref_put(&iocb->ki_ctx->reqs);
+1116  | 	kmem_cache_free(kiocb_cachep, iocb);
+1117  | }
+1118  |
+1119  | struct aio_waiter {
+1120  |  struct wait_queue_entry	w;
+1121  | 	size_t			min_nr;
+1122  | };
+1123  |
+1124  | /* aio_complete
+1125  |  *	Called when the io request on the given iocb is complete.
+1126  |  */
+1127  | static void aio_complete(struct aio_kiocb *iocb)
+1128  | {
+1129  |  struct kioctx	*ctx = iocb->ki_ctx;
+1130  |  struct aio_ring	*ring;
+1131  |  struct io_event	*ev_page, *event;
+1132  |  unsigned tail, pos, head, avail;
+1133  |  unsigned long	flags;
+1134  |
+1135  |  /*
+1136  |  * Add a completion event to the ring buffer. Must be done holding
+1174  |
+1175  | 	avail = tail > head
+1176  | 		? tail - head
+1177  | 		: tail + ctx->nr_events - head;
+1178  | 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
+1179  |
+1180  |  pr_debug("added to ring %p at [%u]\n", iocb, tail);
+1181  |
+1182  |  /*
+1183  |  * Check if the user asked us to deliver the result through an
+1184  |  * eventfd. The eventfd_signal() function is safe to be called
+1185  |  * from IRQ context.
+1186  |  */
+1187  |  if (iocb->ki_eventfd)
+1188  | 		eventfd_signal(iocb->ki_eventfd);
+1189  |
+1190  |  /*
+1191  |  * We have to order our ring_info tail store above and test
+1192  |  * of the wait list below outside the wait lock.  This is
+1193  |  * like in wake_up_bit() where clearing a bit has to be
+1194  |  * ordered with the unlocked test.
+1195  |  */
+1196  |  smp_mb();
+1197  |
+1198  |  if (waitqueue_active(&ctx->wait)) {
+1199  |  struct aio_waiter *curr, *next;
+1200  |  unsigned long flags;
+1201  |
+1202  |  spin_lock_irqsave(&ctx->wait.lock, flags);
+1203  |  list_for_each_entry_safe(curr, next, &ctx->wait.head, w.entry)
+1204  |  if (avail >= curr->min_nr) {
+1205  | 				wake_up_process(curr->w.private);
+1206  | 				list_del_init_careful(&curr->w.entry);
+1207  | 			}
+1208  | 		spin_unlock_irqrestore(&ctx->wait.lock, flags);
+1209  | 	}
+1210  | }
+1211  |
+1212  | static inline void iocb_put(struct aio_kiocb *iocb)
+1213  | {
+1214  |  if (refcount_dec_and_test(&iocb->ki_refcnt)) {
+1215  | 		aio_complete(iocb);
+1216  | 		iocb_destroy(iocb);
+1217  | 	}
+1218  | }
+1219  |
+1220  | /* aio_read_events_ring
+1221  |  *	Pull an event off of the ioctx's event ring.  Returns the number of
+1222  |  *	events fetched
+1223  |  */
+1224  | static long aio_read_events_ring(struct kioctx *ctx,
+1225  |  struct io_event __user *event, long nr)
+1226  | {
+1227  |  struct aio_ring *ring;
+1228  |  unsigned head, tail, pos;
+1229  |  long ret = 0;
+1230  |  int copy_ret;
+1231  |
+1232  |  /*
+1233  |  * The mutex can block and wake us up and that will cause
+1234  |  * wait_event_interruptible_hrtimeout() to schedule without sleeping
+1235  |  * and repeat. This should be rare enough that it doesn't cause
+1236  |  * peformance issues. See the comment in read_events() for more detail.
+1237  |  */
+1238  |  sched_annotate_sleep();
+1239  |  mutex_lock(&ctx->ring_lock);
+1240  |
+1241  |  /* Access to ->ring_pages here is protected by ctx->ring_lock. */
+1242  | 	ring = page_address(ctx->ring_pages[0]);
+1243  | 	head = ring->head;
+1244  |  tail = ring->tail;
+1245  |
+1246  |  /*
+1247  |  * Ensure that once we've read the current tail pointer, that
+1248  |  * we also see the events that were stored up to the tail.
+1249  |  */
+1250  |  smp_rmb();
+    17←Loop condition is false.  Exiting loop→
+    18←Loop condition is false.  Exiting loop→
+    19←Loop condition is false.  Exiting loop→
+    20←Loop condition is false.  Exiting loop→
+1251  |
+1252  |  pr_debug("h%u t%u m%u\n", head, tail, ctx->nr_events);
+    21←Taking false branch→
+    22←Loop condition is false.  Exiting loop→
+    23←Taking false branch→
+    24←Taking true branch→
+    25←Assuming 'branch' is false→
+    26←Taking false branch→
+    27←Loop condition is false.  Exiting loop→
+1253  |
+1254  |  if (head == tail)
+    28←Assuming 'head' is not equal to 'tail'→
+    29←Taking false branch→
+1255  |  goto out;
+1256  |
+1257  |  head %= ctx->nr_events;
+1258  | 	tail %= ctx->nr_events;
+1259  |
+1260  |  while (ret < nr) {
+    30←Assuming 'ret' is < 'nr'→
+    31←Loop condition is true.  Entering loop body→
+1261  |  long avail;
+1262  |  struct io_event *ev;
+1263  |  struct page *page;
+1264  |
+1265  |  avail = (head <= tail ?  tail : ctx->nr_events) - head;
+    32←Assuming 'head' is <= 'tail'→
+    33←'?' condition is true→
+1266  |  if (head == tail)
+    34←Assuming 'head' is not equal to 'tail'→
+    35←Taking false branch→
+1267  |  break;
+1268  |
+1269  |  pos = head + AIO_EVENTS_OFFSET;
+1270  | 		page = ctx->ring_pages[pos / AIO_EVENTS_PER_PAGE];
+1271  |  pos %= AIO_EVENTS_PER_PAGE;
+1272  |
+1273  |  avail = min(avail, nr - ret);
+    36←Assuming '__UNIQUE_ID___x1374' is >= '__UNIQUE_ID___y1375'→
+    37←'?' condition is false→
+1274  |  avail = min_t(long, avail, AIO_EVENTS_PER_PAGE - pos);
+    38←Assuming '__UNIQUE_ID___x1376' is >= '__UNIQUE_ID___y1377'→
+    39←'?' condition is false→
+1275  |
+1276  | 		ev = page_address(page);
+1277  |  copy_ret = copy_to_user(event + ret, ev + pos,
+    40←Size is computed as sizeof(x) * count; use array_size() to avoid overflow
+1278  |  sizeof(*ev) * avail);
+1279  |
+1280  |  if (unlikely(copy_ret)) {
+1281  | 			ret = -EFAULT;
+1282  |  goto out;
+1283  | 		}
+1284  |
+1285  | 		ret += avail;
+1286  | 		head += avail;
+1287  | 		head %= ctx->nr_events;
+1288  | 	}
+1289  |
+1290  | 	ring = page_address(ctx->ring_pages[0]);
+1291  | 	ring->head = head;
+1292  | 	flush_dcache_page(ctx->ring_pages[0]);
+1293  |
+1294  |  pr_debug("%li  h%u t%u\n", ret, head, tail);
+1295  | out:
+1296  | 	mutex_unlock(&ctx->ring_lock);
+1297  |
+1298  |  return ret;
+1299  | }
+1300  |
+1301  | static bool aio_read_events(struct kioctx *ctx, long min_nr, long nr,
+1302  |  struct io_event __user *event, long *i)
+1303  | {
+1304  |  long ret = aio_read_events_ring(ctx, event + *i, nr - *i);
+    16←Calling 'aio_read_events_ring'→
+1305  |
+1306  |  if (ret > 0)
+1307  | 		*i += ret;
+1308  |
+1309  |  if (unlikely(atomic_read(&ctx->dead)))
+1310  | 		ret = -EINVAL;
+1311  |
+1312  |  if (!*i)
+1313  | 		*i = ret;
+1314  |
+1315  |  return ret < 0 || *i >= min_nr;
+1316  | }
+1317  |
+1318  | static long read_events(struct kioctx *ctx, long min_nr, long nr,
+1319  |  struct io_event __user *event,
+1320  | 			ktime_t until)
+1321  | {
+1322  |  struct hrtimer_sleeper	t;
+1323  |  struct aio_waiter	w;
+1324  |  long ret = 0, ret2 = 0;
+1325  |
+1326  |  /*
+1327  |  * Note that aio_read_events() is being called as the conditional - i.e.
+1328  |  * we're calling it after prepare_to_wait() has set task state to
+1329  |  * TASK_INTERRUPTIBLE.
+1330  |  *
+1331  |  * But aio_read_events() can block, and if it blocks it's going to flip
+1332  |  * the task state back to TASK_RUNNING.
+1333  |  *
+1334  |  * This should be ok, provided it doesn't flip the state back to
+1335  |  * TASK_RUNNING and return 0 too much - that causes us to spin. That
+1336  |  * will only happen if the mutex_lock() call blocks, and we then find
+1337  |  * the ringbuffer empty. So in practice we should be ok, but it's
+1338  |  * something to be aware of when touching this code.
+1339  |  */
+1340  |  aio_read_events(ctx, min_nr, nr, event, &ret);
+    15←Calling 'aio_read_events'→
+1341  |  if (until == 0 || ret < 0 || ret >= min_nr)
+1342  |  return ret;
+1343  |
+1344  | 	hrtimer_init_sleeper_on_stack(&t, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+1345  |  if (until != KTIME_MAX) {
+1346  | 		hrtimer_set_expires_range_ns(&t.timer, until, current->timer_slack_ns);
+1347  | 		hrtimer_sleeper_start_expires(&t, HRTIMER_MODE_REL);
+1348  | 	}
+1349  |
+1350  |  init_wait(&w.w);
+1351  |
+1352  |  while (1) {
+1353  |  unsigned long nr_got = ret;
+1354  |
+1355  | 		w.min_nr = min_nr - ret;
+1356  |
+1357  | 		ret2 = prepare_to_wait_event(&ctx->wait, &w.w, TASK_INTERRUPTIBLE);
+1358  |  if (!ret2 && !t.task)
+1359  | 			ret2 = -ETIME;
+1360  |
+1361  |  if (aio_read_events(ctx, min_nr, nr, event, &ret) || ret2)
+1362  |  break;
+1363  |
+1364  |  if (nr_got == ret)
+1365  | 			schedule();
+1366  | 	}
+1367  |
+1368  | 	finish_wait(&ctx->wait, &w.w);
+1369  | 	hrtimer_cancel(&t.timer);
+1370  | 	destroy_hrtimer_on_stack(&t.timer);
+2174  |  *	copied into the memory pointed to by result without being placed
+2175  |  *	into the completion queue and 0 is returned.  May fail with
+2176  |  *	-EFAULT if any of the data structures pointed to are invalid.
+2177  |  *	May fail with -EINVAL if aio_context specified by ctx_id is
+2178  |  *	invalid.  May fail with -EAGAIN if the iocb specified was not
+2179  |  *	cancelled.  Will fail with -ENOSYS if not implemented.
+2180  |  */
+2181  | SYSCALL_DEFINE3(io_cancel, aio_context_t, ctx_id, struct iocb __user *, iocb,
+2182  |  struct io_event __user *, result)
+2183  | {
+2184  |  struct kioctx *ctx;
+2185  |  struct aio_kiocb *kiocb;
+2186  |  int ret = -EINVAL;
+2187  | 	u32 key;
+2188  | 	u64 obj = (u64)(unsigned long)iocb;
+2189  |
+2190  |  if (unlikely(get_user(key, &iocb->aio_key)))
+2191  |  return -EFAULT;
+2192  |  if (unlikely(key != KIOCB_KEY))
+2193  |  return -EINVAL;
+2194  |
+2195  | 	ctx = lookup_ioctx(ctx_id);
+2196  |  if (unlikely(!ctx))
+2197  |  return -EINVAL;
+2198  |
+2199  | 	spin_lock_irq(&ctx->ctx_lock);
+2200  |  /* TODO: use a hash or array, this sucks. */
+2201  |  list_for_each_entry(kiocb, &ctx->active_reqs, ki_list) {
+2202  |  if (kiocb->ki_res.obj == obj) {
+2203  | 			ret = kiocb->ki_cancel(&kiocb->rw);
+2204  | 			list_del_init(&kiocb->ki_list);
+2205  |  break;
+2206  | 		}
+2207  | 	}
+2208  | 	spin_unlock_irq(&ctx->ctx_lock);
+2209  |
+2210  |  if (!ret) {
+2211  |  /*
+2212  |  * The result argument is no longer used - the io_event is
+2213  |  * always delivered via the ring buffer. -EINPROGRESS indicates
+2214  |  * cancellation is progress:
+2215  |  */
+2216  | 		ret = -EINPROGRESS;
+2217  | 	}
+2218  |
+2219  | 	percpu_ref_put(&ctx->users);
+2220  |
+2221  |  return ret;
+2222  | }
+2223  |
+2224  | static long do_io_getevents(aio_context_t ctx_id,
+2225  |  long min_nr,
+2226  |  long nr,
+2227  |  struct io_event __user *events,
+2228  |  struct timespec64 *ts)
+2229  | {
+2230  |  ktime_t until = ts8.1'ts' is null ? timespec64_to_ktime(*ts) : KTIME_MAX;
+    9←'?' condition is false→
+2231  |  struct kioctx *ioctx = lookup_ioctx(ctx_id);
+2232  |  long ret = -EINVAL;
+2233  |
+2234  |  if (likely(ioctx)) {
+    10←Taking true branch→
+2235  |  if (likely(min_nr <= nr && min_nr >= 0))
+    11←Assuming 'min_nr' is <= 'nr'→
+    12←Assuming 'min_nr' is >= 0→
+    13←Taking true branch→
+2236  |  ret = read_events(ioctx, min_nr, nr, events, until);
+    14←Calling 'read_events'→
+2237  | 		percpu_ref_put(&ioctx->users);
+2238  | 	}
+2239  |
+2240  |  return ret;
+2241  | }
+2242  |
+2243  | /* io_getevents:
+2244  |  *	Attempts to read at least min_nr events and up to nr events from
+2245  |  *	the completion queue for the aio_context specified by ctx_id. If
+2246  |  *	it succeeds, the number of read events is returned. May fail with
+2247  |  *	-EINVAL if ctx_id is invalid, if min_nr is out of range, if nr is
+2248  |  *	out of range, if timeout is out of range.  May fail with -EFAULT
+2249  |  *	if any of the memory specified is invalid.  May return 0 or
+2250  |  *	< min_nr if the timeout specified by timeout has elapsed
+2251  |  *	before sufficient events are available, where timeout == NULL
+2252  |  *	specifies an infinite timeout. Note that the timeout pointed to by
+2253  |  *	timeout is relative.  Will fail with -ENOSYS if not implemented.
+2254  |  */
+2255  | #ifdef CONFIG_64BIT
+2256  |
+2257  | SYSCALL_DEFINE5(io_getevents, aio_context_t, ctx_id,
+2258  |  long, min_nr,
+2259  |  long, nr,
+2260  |  struct io_event __user *, events,
+2261  |  struct __kernel_timespec __user *, timeout)
+2262  | {
+2263  |  struct timespec64	ts;
+2264  |  int			ret;
+2265  |
+2266  |  if (timeout && unlikely(get_timespec64(&ts, timeout)))
+2369  | 		ret = -EINTR;
+2370  |  return ret;
+2371  | }
+2372  |
+2373  | #endif
+2374  |
+2375  | #ifdef CONFIG_COMPAT
+2376  |
+2377  | struct __compat_aio_sigset {
+2378  | 	compat_uptr_t		sigmask;
+2379  | 	compat_size_t		sigsetsize;
+2380  | };
+2381  |
+2382  | #if defined(CONFIG_COMPAT_32BIT_TIME)
+2383  |
+2384  | COMPAT_SYSCALL_DEFINE6(io_pgetevents,
+2385  |  compat_aio_context_t, ctx_id,
+2386  |  compat_long_t, min_nr,
+2387  |  compat_long_t, nr,
+2388  |  struct io_event __user *, events,
+2389  |  struct old_timespec32 __user *, timeout,
+2390  |  const struct __compat_aio_sigset __user *, usig)
+2391  | {
+2392  |  struct __compat_aio_sigset ksig = { 0, };
+2393  |  struct timespec64 t;
+2394  | 	bool interrupted;
+2395  |  int ret;
+2396  |
+2397  |  if (timeout && get_old_timespec32(&t, timeout))
+2398  |  return -EFAULT;
+2399  |
+2400  |  if (usig && copy_from_user(&ksig, usig, sizeof(ksig)))
+2401  |  return -EFAULT;
+2402  |
+2403  | 	ret = set_compat_user_sigmask(compat_ptr(ksig.sigmask), ksig.sigsetsize);
+2404  |  if (ret)
+2405  |  return ret;
+2406  |
+2407  | 	ret = do_io_getevents(ctx_id, min_nr, nr, events, timeout ? &t : NULL);
+2408  |
+2409  | 	interrupted = signal_pending(current);
+2410  | 	restore_saved_sigmask_unless(interrupted);
+2411  |  if (interrupted && !ret)
+2412  | 		ret = -ERESTARTNOHAND;
+2413  |
+2414  |  return ret;
+2415  | }
+2416  |
+2417  | #endif
+2418  |
+2419  | COMPAT_SYSCALL_DEFINE6(io_pgetevents_time64,
+    1Calling '__se_compat_sys_io_pgetevents_time64'→
+    2←Calling '__do_compat_sys_io_pgetevents_time64'→
+2420  |  compat_aio_context_t, ctx_id,
+2421  |  compat_long_t, min_nr,
+2422  |  compat_long_t, nr,
+2423  |  struct io_event __user *, events,
+2424  |  struct __kernel_timespec __user *, timeout,
+2425  |  const struct __compat_aio_sigset __user *, usig)
+2426  | {
+2427  |  struct __compat_aio_sigset ksig = { 0, };
+2428  |  struct timespec64 t;
+2429  | 	bool interrupted;
+2430  |  int ret;
+2431  |
+2432  |  if (timeout && get_timespec64(&t, timeout))
+    3←Assuming 'timeout' is null→
+2433  |  return -EFAULT;
+2434  |
+2435  |  if (usig && copy_from_user(&ksig, usig, sizeof(ksig)))
+    4←Assuming 'usig' is null→
+2436  |  return -EFAULT;
+2437  |
+2438  |  ret = set_compat_user_sigmask(compat_ptr(ksig.sigmask), ksig.sigsetsize);
+2439  |  if (ret)
+    5←Assuming 'ret' is 0→
+    6←Taking false branch→
+2440  |  return ret;
+2441  |
+2442  |  ret = do_io_getevents(ctx_id, min_nr, nr, events, timeout6.1'timeout' is null ? &t : NULL);
+    7←'?' condition is false→
+    8←Calling 'do_io_getevents'→
+2443  |
+2444  | 	interrupted = signal_pending(current);
+2445  | 	restore_saved_sigmask_unless(interrupted);
+2446  |  if (interrupted && !ret)
+2447  | 		ret = -ERESTARTNOHAND;
+2448  |
+2449  |  return ret;
+2450  | }
+2451  | #endif
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

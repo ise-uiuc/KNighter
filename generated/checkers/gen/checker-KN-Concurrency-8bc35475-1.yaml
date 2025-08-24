@@ -1,0 +1,423 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 8bc35475ef1a23b0e224f3242eb11c76cab0ea88
+commit_type: Concurrency
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"llvm/ADT/SmallPtrSet.h\"\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// No custom program states are necessary for\
+  \ this checker.\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::BranchCondition>\
+  \ {\n  mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n \
+  \     : BT(new BugType(this, \"Unconditional shared read before guard\",\n     \
+  \                  \"Concurrency\")) {}\n\n  void checkBranchCondition(const Stmt\
+  \ *Condition, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  static const\
+  \ BinaryOperator *getTopLevelLogicalAnd(const Expr *E);\n  static bool isNonConstantExpr(const\
+  \ Expr *E, ASTContext &ACtx);\n  static void collectVarsInExpr(const Expr *E,\n\
+  \                                llvm::SmallPtrSet<const VarDecl *, 8> &Out);\n\
+  \  static bool exprReferencesVar(const Expr *E, const VarDecl *VD);\n  static bool\
+  \ containsReadOnce(const Expr *E, CheckerContext &C);\n  static bool containsCallNamed(const\
+  \ Expr *E, StringRef Name,\n                                CheckerContext &C);\n\
+  \  static bool containsMemberNamedData(const Expr *E);\n  static bool containsDerefLike(const\
+  \ Expr *E);\n  static bool refersToParamOrGlobal(const Expr *E);\n\n  static const\
+  \ Expr *getAssignmentRHSIfAssigningVar(const Stmt *S,\n                        \
+  \                            const VarDecl *TargetVD);\n  static const Expr *getInitExprIfDeclaringVar(const\
+  \ Stmt *S,\n                                               const VarDecl *TargetVD);\n\
+  \  void report(const Expr *ReadE, const Expr *GuardE, CheckerContext &C) const;\n\
+  };\n\nconst BinaryOperator *SAGenTestChecker::getTopLevelLogicalAnd(const Expr *E)\
+  \ {\n  if (!E)\n    return nullptr;\n  const Expr *I = E->IgnoreParenImpCasts();\n\
+  \  if (const auto *BO = dyn_cast<BinaryOperator>(I)) {\n    if (BO->getOpcode()\
+  \ == BO_LAnd)\n      return BO;\n  }\n  return nullptr;\n}\n\nbool SAGenTestChecker::isNonConstantExpr(const\
+  \ Expr *E, ASTContext &ACtx) {\n  if (!E)\n    return false;\n  // If it's an integer\
+  \ constant expression, treat as constant guard (not useful).\n  Expr::EvalResult\
+  \ R;\n  if (E->isIntegerConstantExpr(R, ACtx))\n    return false;\n  return true;\n\
+  }\n\nvoid SAGenTestChecker::collectVarsInExpr(\n    const Expr *E, llvm::SmallPtrSet<const\
+  \ VarDecl *, 8> &Out) {\n  if (!E)\n    return;\n  E = E->IgnoreParenImpCasts();\n\
+  \n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    if (const auto *VD =\
+  \ dyn_cast<VarDecl>(DRE->getDecl()))\n      Out.insert(VD);\n  }\n\n  for (const\
+  \ Stmt *Child : E->children()) {\n    if (const auto *CE = dyn_cast_or_null<Expr>(Child))\n\
+  \      collectVarsInExpr(CE, Out);\n  }\n}\n\nbool SAGenTestChecker::exprReferencesVar(const\
+  \ Expr *E, const VarDecl *VD) {\n  if (!E || !VD)\n    return false;\n  E = E->IgnoreParenImpCasts();\n\
+  \  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    return DRE->getDecl()\
+  \ == VD;\n  }\n  for (const Stmt *Child : E->children()) {\n    if (const auto *CE\
+  \ = dyn_cast_or_null<Expr>(Child))\n      if (exprReferencesVar(CE, VD))\n     \
+  \   return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::containsReadOnce(const\
+  \ Expr *E, CheckerContext &C) {\n  return ExprHasName(E, \"READ_ONCE\", C);\n}\n\
+  \nbool SAGenTestChecker::containsCallNamed(const Expr *E, StringRef Name,\n    \
+  \                                     CheckerContext &C) {\n  return ExprHasName(E,\
+  \ Name, C);\n}\n\nbool SAGenTestChecker::containsMemberNamedData(const Expr *E)\
+  \ {\n  if (!E)\n    return false;\n  E = E->IgnoreParenImpCasts();\n\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(E)) {\n    if (const ValueDecl *VD = ME->getMemberDecl())\
+  \ {\n      if (VD->getName().contains(\"data\"))\n        return true;\n    }\n\
+  \  }\n  for (const Stmt *Child : E->children()) {\n    if (const auto *CE = dyn_cast_or_null<Expr>(Child))\n\
+  \      if (containsMemberNamedData(CE))\n        return true;\n  }\n  return false;\n\
+  }\n\nbool SAGenTestChecker::containsDerefLike(const Expr *E) {\n  if (!E)\n    return\
+  \ false;\n  E = E->IgnoreParenImpCasts();\n\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_Deref)\n      return true;\n  }\n  if (const\
+  \ auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {\n    (void)ASE;\n    return true;\n\
+  \  }\n  if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    if (ME->isArrow())\n\
+  \      return true;\n  }\n\n  for (const Stmt *Child : E->children()) {\n    if\
+  \ (const auto *CE = dyn_cast_or_null<Expr>(Child))\n      if (containsDerefLike(CE))\n\
+  \        return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::refersToParamOrGlobal(const\
+  \ Expr *E) {\n  if (!E)\n    return false;\n  E = E->IgnoreParenImpCasts();\n\n\
+  \  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    const ValueDecl *VD =\
+  \ DRE->getDecl();\n    if (isa<ParmVarDecl>(VD))\n      return true;\n    if (const\
+  \ auto *V = dyn_cast<VarDecl>(VD)) {\n      if (V->hasGlobalStorage())\n       \
+  \ return true;\n    }\n  }\n  for (const Stmt *Child : E->children()) {\n    if\
+  \ (const auto *CE = dyn_cast_or_null<Expr>(Child))\n      if (refersToParamOrGlobal(CE))\n\
+  \        return true;\n  }\n  return false;\n}\n\nconst Expr *SAGenTestChecker::getAssignmentRHSIfAssigningVar(\n\
+  \    const Stmt *S, const VarDecl *TargetVD) {\n  if (!S || !TargetVD)\n    return\
+  \ nullptr;\n\n  const auto *BO = dyn_cast<BinaryOperator>(S);\n  if (!BO || BO->getOpcode()\
+  \ != BO_Assign)\n    return nullptr;\n\n  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \  if (const auto *LHSRef = dyn_cast<DeclRefExpr>(LHS)) {\n    if (LHSRef->getDecl()\
+  \ == TargetVD)\n      return BO->getRHS();\n  }\n  return nullptr;\n}\n\nconst Expr\
+  \ *SAGenTestChecker::getInitExprIfDeclaringVar(\n    const Stmt *S, const VarDecl\
+  \ *TargetVD) {\n  if (!S || !TargetVD)\n    return nullptr;\n\n  const auto *DS\
+  \ = dyn_cast<DeclStmt>(S);\n  if (!DS)\n    return nullptr;\n\n  for (const Decl\
+  \ *D : DS->decls()) {\n    if (const auto *VD = dyn_cast<VarDecl>(D)) {\n      if\
+  \ (VD == TargetVD && VD->hasInit())\n        return VD->getInit();\n    }\n  }\n\
+  \  return nullptr;\n}\n\nvoid SAGenTestChecker::report(const Expr *ReadE, const\
+  \ Expr *GuardE,\n                              CheckerContext &C) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT,\n      \"Unconditional read of shared state before guard; move the read\
+  \ under \"\n      \"the guard to avoid races\",\n      N);\n\n  if (ReadE)\n   \
+  \ R->addRange(ReadE->getSourceRange());\n  if (GuardE)\n    R->addRange(GuardE->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition,\n                                            CheckerContext &C)\
+  \ const {\n  const auto *CondE = dyn_cast_or_null<Expr>(Condition);\n  if (!CondE)\n\
+  \    return;\n\n  const auto *TopAnd = getTopLevelLogicalAnd(CondE);\n  if (!TopAnd)\n\
+  \    return;\n\n  const Expr *LHS = TopAnd->getLHS()->IgnoreParenImpCasts();\n \
+  \ const Expr *RHS = TopAnd->getRHS()->IgnoreParenImpCasts();\n  if (!LHS || !RHS)\n\
+  \    return;\n\n  // Basic sanity/heuristic: LHS should be a non-constant \"guard\"\
+  -like expr.\n  if (!isNonConstantExpr(LHS, C.getASTContext()))\n    return;\n\n\
+  \  // Collect variables used on RHS of &&\n  llvm::SmallPtrSet<const VarDecl *,\
+  \ 8> RHSVars;\n  collectVarsInExpr(RHS, RHSVars);\n  if (RHSVars.empty())\n    return;\n\
+  \n  // Locate the containing IfStmt\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IfS)\n    return;\n\n  // Locate the parent compound statement to\
+  \ find the previous sibling\n  const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IfS,\
+  \ C);\n  if (!CS)\n    return;\n\n  const Stmt *PrevS = nullptr;\n  for (auto I\
+  \ = CS->body_begin(), E = CS->body_end(); I != E; ++I) {\n    if (*I == IfS) {\n\
+  \      if (I != CS->body_begin()) {\n        PrevS = *(I - 1);\n      }\n      break;\n\
+  \    }\n  }\n  if (!PrevS)\n    return;\n\n  // For each variable used on the RHS,\
+  \ check if PrevS assigns/initializes it\n  // via a raw memory read (without READ_ONCE).\n\
+  \  for (const VarDecl *VD : RHSVars) {\n    // Avoid cases where the guard itself\
+  \ references the variable (self-guarded).\n    if (exprReferencesVar(LHS, VD))\n\
+  \      continue;\n\n    const Expr *SuspiciousRead = nullptr;\n\n    if (const Expr\
+  \ *R = getAssignmentRHSIfAssigningVar(PrevS, VD)) {\n      SuspiciousRead = R;\n\
+  \    } else if (const Expr *R = getInitExprIfDeclaringVar(PrevS, VD)) {\n      SuspiciousRead\
+  \ = R;\n    }\n\n    if (!SuspiciousRead)\n      continue;\n\n    // Heuristics\
+  \ to decide it's a likely unsynchronized shared read:\n    // - It's a deref-like\
+  \ expression OR contains a member named 'data'\n    //   OR calls a function like\
+  \ work_data_bits.\n    // - It does NOT contain READ_ONCE (already atomic).\n  \
+  \  // - It refers to a parameter or global somewhere (shared input).\n    bool RawLike\
+  \ = containsDerefLike(SuspiciousRead) ||\n                   containsMemberNamedData(SuspiciousRead)\
+  \ ||\n                   containsCallNamed(SuspiciousRead, \"work_data_bits\", C);\n\
+  \n    if (!RawLike)\n      continue;\n\n    if (containsReadOnce(SuspiciousRead,\
+  \ C))\n      continue;\n\n    if (!refersToParamOrGlobal(SuspiciousRead))\n    \
+  \  continue;\n\n    // Found the pattern: Unconditional raw read feeding the RHS\
+  \ of a guarded &&\n    // condition. Report once per match.\n    report(SuspiciousRead,\
+  \ LHS, C);\n    // Prevent duplicate reports for multiple RHS vars in the same pattern.\n\
+  \    break;\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unconditional reads of shared/concurrently-updated fields that\
+  \ \"\n      \"occur before a guarding condition (e.g., reading work->data before\
+  \ \"\n      \"checking from_cancel)\",\n      \"\");\n}\n\nextern \"C\" const char\
+  \ clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nworkqueue: Fix spruious data race in __flush_work()\n\
+  \nWhen flushing a work item for cancellation, __flush_work() knows that it\nexclusively\
+  \ owns the work item through its PENDING bit. 134874e2eee9\n(\"workqueue: Allow\
+  \ cancel_work_sync() and disable_work() from atomic\ncontexts on BH work items\"\
+  ) added a read of @work->data to determine whether\nto use busy wait for BH work\
+  \ items that are being canceled. While the read\nis safe when @from_cancel, @work->data\
+  \ was read before testing @from_cancel\nto simplify code structure:\n\n\tdata =\
+  \ *work_data_bits(work);\n\tif (from_cancel &&\n\t    !WARN_ON_ONCE(data & WORK_STRUCT_PWQ)\
+  \ && (data & WORK_OFFQ_BH)) {\n\nWhile the read data was never used if !@from_cancel,\
+  \ this could trigger\nKCSAN data race detection spuriously:\n\n  ==================================================================\n\
+  \  BUG: KCSAN: data-race in __flush_work / __flush_work\n\n  write to 0xffff8881223aa3e8\
+  \ of 8 bytes by task 3998 on cpu 0:\n   instrument_write include/linux/instrumented.h:41\
+  \ [inline]\n   ___set_bit include/asm-generic/bitops/instrumented-non-atomic.h:28\
+  \ [inline]\n   insert_wq_barrier kernel/workqueue.c:3790 [inline]\n   start_flush_work\
+  \ kernel/workqueue.c:4142 [inline]\n   __flush_work+0x30b/0x570 kernel/workqueue.c:4178\n\
+  \   flush_work kernel/workqueue.c:4229 [inline]\n   ...\n\n  read to 0xffff8881223aa3e8\
+  \ of 8 bytes by task 50 on cpu 1:\n   __flush_work+0x42a/0x570 kernel/workqueue.c:4188\n\
+  \   flush_work kernel/workqueue.c:4229 [inline]\n   flush_delayed_work+0x66/0x70\
+  \ kernel/workqueue.c:4251\n   ...\n\n  value changed: 0x0000000000400000 -> 0xffff88810006c00d\n\
+  \nReorganize the code so that @from_cancel is tested before @work->data is\naccessed.\
+  \ The only problem is triggering KCSAN detection spuriously. This\nshouldn't need\
+  \ READ_ONCE() or other access qualifiers.\n\nNo functional changes.\n\nSigned-off-by:\
+  \ Tejun Heo <tj@kernel.org>\nReported-by: syzbot+b3e4f2f51ed645fd5df2@syzkaller.appspotmail.com\n\
+  Fixes: 134874e2eee9 (\"workqueue: Allow cancel_work_sync() and disable_work() from\
+  \ atomic contexts on BH work items\")\nLink: http://lkml.kernel.org/r/000000000000ae429e061eea2157@google.com\n\
+  Cc: Jens Axboe <axboe@kernel.dk>\n\n## Buggy Code\n\n```c\n// Function: __flush_work\
+  \ in kernel/workqueue.c\nstatic bool __flush_work(struct work_struct *work, bool\
+  \ from_cancel)\n{\n\tstruct wq_barrier barr;\n\tunsigned long data;\n\n\tif (WARN_ON(!wq_online))\n\
+  \t\treturn false;\n\n\tif (WARN_ON(!work->func))\n\t\treturn false;\n\n\tif (!start_flush_work(work,\
+  \ &barr, from_cancel))\n\t\treturn false;\n\n\t/*\n\t * start_flush_work() returned\
+  \ %true. If @from_cancel is set, we know\n\t * that @work must have been executing\
+  \ during start_flush_work() and\n\t * can't currently be queued. Its data must contain\
+  \ OFFQ bits. If @work\n\t * was queued on a BH workqueue, we also know that it was\
+  \ running in the\n\t * BH context and thus can be busy-waited.\n\t */\n\tdata =\
+  \ *work_data_bits(work);\n\tif (from_cancel &&\n\t    !WARN_ON_ONCE(data & WORK_STRUCT_PWQ)\
+  \ && (data & WORK_OFFQ_BH)) {\n\t\t/*\n\t\t * On RT, prevent a live lock when %current\
+  \ preempted soft\n\t\t * interrupt processing or prevents ksoftirqd from running\
+  \ by\n\t\t * keeping flipping BH. If the BH work item runs on a different\n\t\t\
+  \ * CPU then this has no effect other than doing the BH\n\t\t * disable/enable dance\
+  \ for nothing. This is copied from\n\t\t * kernel/softirq.c::tasklet_unlock_spin_wait().\n\
+  \t\t */\n\t\twhile (!try_wait_for_completion(&barr.done)) {\n\t\t\tif (IS_ENABLED(CONFIG_PREEMPT_RT))\
+  \ {\n\t\t\t\tlocal_bh_disable();\n\t\t\t\tlocal_bh_enable();\n\t\t\t} else {\n\t\
+  \t\t\tcpu_relax();\n\t\t\t}\n\t\t}\n\t} else {\n\t\twait_for_completion(&barr.done);\n\
+  \t}\n\n\tdestroy_work_on_stack(&barr.work);\n\treturn true;\n}\n```\n\n## Bug Fix\
+  \ Patch\n\n```diff\ndiff --git a/kernel/workqueue.c b/kernel/workqueue.c\nindex\
+  \ d56bd2277e58..ef174d8c1f63 100644\n--- a/kernel/workqueue.c\n+++ b/kernel/workqueue.c\n\
+  @@ -4166,7 +4166,6 @@ static bool start_flush_work(struct work_struct *work, struct\
+  \ wq_barrier *barr,\n static bool __flush_work(struct work_struct *work, bool from_cancel)\n\
+  \ {\n \tstruct wq_barrier barr;\n-\tunsigned long data;\n \n \tif (WARN_ON(!wq_online))\n\
+  \ \t\treturn false;\n@@ -4184,29 +4183,35 @@ static bool __flush_work(struct work_struct\
+  \ *work, bool from_cancel)\n \t * was queued on a BH workqueue, we also know that\
+  \ it was running in the\n \t * BH context and thus can be busy-waited.\n \t */\n\
+  -\tdata = *work_data_bits(work);\n-\tif (from_cancel &&\n-\t    !WARN_ON_ONCE(data\
+  \ & WORK_STRUCT_PWQ) && (data & WORK_OFFQ_BH)) {\n-\t\t/*\n-\t\t * On RT, prevent\
+  \ a live lock when %current preempted soft\n-\t\t * interrupt processing or prevents\
+  \ ksoftirqd from running by\n-\t\t * keeping flipping BH. If the BH work item runs\
+  \ on a different\n-\t\t * CPU then this has no effect other than doing the BH\n\
+  -\t\t * disable/enable dance for nothing. This is copied from\n-\t\t * kernel/softirq.c::tasklet_unlock_spin_wait().\n\
+  -\t\t */\n-\t\twhile (!try_wait_for_completion(&barr.done)) {\n-\t\t\tif (IS_ENABLED(CONFIG_PREEMPT_RT))\
+  \ {\n-\t\t\t\tlocal_bh_disable();\n-\t\t\t\tlocal_bh_enable();\n-\t\t\t} else {\n\
+  -\t\t\t\tcpu_relax();\n+\tif (from_cancel) {\n+\t\tunsigned long data = *work_data_bits(work);\n\
+  +\n+\t\tif (!WARN_ON_ONCE(data & WORK_STRUCT_PWQ) &&\n+\t\t    (data & WORK_OFFQ_BH))\
+  \ {\n+\t\t\t/*\n+\t\t\t * On RT, prevent a live lock when %current preempted\n+\t\
+  \t\t * soft interrupt processing or prevents ksoftirqd from\n+\t\t\t * running by\
+  \ keeping flipping BH. If the BH work item\n+\t\t\t * runs on a different CPU then\
+  \ this has no effect other\n+\t\t\t * than doing the BH disable/enable dance for\
+  \ nothing.\n+\t\t\t * This is copied from\n+\t\t\t * kernel/softirq.c::tasklet_unlock_spin_wait().\n\
+  +\t\t\t */\n+\t\t\twhile (!try_wait_for_completion(&barr.done)) {\n+\t\t\t\tif (IS_ENABLED(CONFIG_PREEMPT_RT))\
+  \ {\n+\t\t\t\t\tlocal_bh_disable();\n+\t\t\t\t\tlocal_bh_enable();\n+\t\t\t\t} else\
+  \ {\n+\t\t\t\t\tcpu_relax();\n+\t\t\t\t}\n \t\t\t}\n+\t\t\tgoto out_destroy;\n \t\
+  \t}\n-\t} else {\n-\t\twait_for_completion(&barr.done);\n \t}\n \n+\twait_for_completion(&barr.done);\n\
+  +\n+out_destroy:\n \tdestroy_work_on_stack(&barr.work);\n \treturn true;\n }\n```\n"
+pattern: '## Bug Pattern
+
+
+  Premature, unconditional read of a shared/concurrently-updated field before checking
+  the condition that establishes exclusive access/serialization.
+
+
+  Concretely:
+
+  - Code reads a non-atomic shared state (e.g., data = *work_data_bits(work)) outside
+  of or prior to the guard (e.g., from_cancel) that guarantees ownership/safety.
+
+  - Even if the value is only used under the guard, the mere unconditional read can
+  race with writers and trigger data-race detectors (KCSAN).
+
+  - Correct pattern is to move the read inside the conditional that proves exclusivity,
+  or otherwise synchronize the read.'
+plan: "Plan\n\n1) Program state\n- No custom program state is necessary. This checker\
+  \ is primarily a local AST/pattern check around if-conditions and immediately preceding\
+  \ statements.\n\n2) Callbacks\n- Use only checkBranchCondition to hook every if-condition\
+  \ and analyze the surrounding AST context. This keeps the checker simple and focused\
+  \ on the pattern.\n\n3) Detection logic in checkBranchCondition\n- Goal: Flag an\
+  \ unconditional read of a shared field/state that happens right before an if-condition\
+  \ that gates access (via a guard on the left side of &&), when the read value is\
+  \ consumed in the condition or guarded block.\n\nStep-by-step:\na) Filter to If\
+  \ conditions with logical-and:\n   - From the callback input Stmt* Condition, find\
+  \ a BinaryOperator with operator &&.\n     - Use findSpecificTypeInChildren<BinaryOperator>(Condition)\
+  \ and ensure it is a logical-and (Opcode == BO_LAnd).\n     - Support nested &&\
+  \ by recursively flattening or by focusing on the top-level left-right split (it\
+  \ is sufficient to analyze the leftmost LHS and the immediate RHS for the primary\
+  \ pattern).\nb) Identify the guard:\n   - Extract LHS of the top-level LogicalAnd\
+  \ (LHS).\n   - Heuristic filter to reduce false positives:\n     - Prefer LHS that\
+  \ references a boolean guard-ish variable (DeclRefExpr of bool/Bit type).\n    \
+  \ - Optionally use ExprHasName on LHS or entire Condition to prefer variables with\
+  \ names like \"from\", \"cancel\" (e.g., ExprHasName(LHS, \"from\") or ExprHasName(Condition,\
+  \ \"cancel\")).\n     - If this heuristic is too restrictive, fall back to any LHS\
+  \ that is a non-constant expression.\nc) Identify RHS variables used in the condition:\n\
+  \   - Collect DeclRefExprs in the RHS (right-hand of &&).\n   - Focus on identifiers\
+  \ used as rvalues in RHS (e.g., \u201Cdata\u201D in (data & CONST)).\n   - Record\
+  \ the VarDecl* for each candidate variable V that appears on RHS.\nd) Locate the\
+  \ statement immediately preceding the IfStmt:\n   - Climb to the enclosing IfStmt\
+  \ with findSpecificTypeInParents<IfStmt>(Condition, C).\n   - Then climb to the\
+  \ parent CompoundStmt with findSpecificTypeInParents<CompoundStmt>(IfStmt, C).\n\
+  \   - Iterate CompoundStmt\u2019s body to find the index of the IfStmt; if there\
+  \ is a previous sibling statement PrevS, analyze it. If not, return.\ne) Check if\
+  \ PrevS computes/reads the RHS variable(s) from a shared/concurrently-updated field:\n\
+  \   - Handle these patterns:\n     1) Assignment statement:\n        - PrevS is\
+  \ a BinaryOperator with opcode BO_Assign.\n        - LHS is a DeclRefExpr to one\
+  \ of the RHS variables V seen in step (c).\n        - RHS is a \u201Craw memory\
+  \ read\u201D expression (see criteria below).\n     2) Decl with init:\n       \
+  \ - PrevS is a DeclStmt with a single VarDecl VD where VD == V and VD has an initializer.\n\
+  \        - Init is a \u201Craw memory read\u201D expression.\n   - Raw memory read\
+  \ criteria (any one true):\n     - RHS is UnaryOperator UO_Deref (e.g., *expr).\n\
+  \     - RHS is a MemberExpr with isArrow() (e.g., ptr->field).\n     - RHS is ArraySubscriptExpr\
+  \ where the base is a pointer-like expression.\n     - RHS is UnaryOperator UO_Deref\
+  \ of a CallExpr whose callee name contains \u201Cdata\u201D (e.g., work_data_bits).\
+  \ Use ExprHasName(RHS, \"data\") or check the CallExpr callee identifier.\n    \
+  \ - RHS contains a MemberExpr accessing a field with name \u201Cdata\u201D (use\
+  \ ExprHasName(RHS, \"->data\") or ExprHasName(RHS, \".data\")).\n   - Additional\
+  \ heuristics to reduce false positives:\n     - If RHS source contains \u201CREAD_ONCE\u201D\
+  \ (ExprHasName(RHS, \"READ_ONCE\")), skip (already using atomic accessor).\n   \
+  \  - If RHS base expression references a function parameter or a global (likely\
+  \ shared), prefer reporting; for MemberExpr, check base is DeclRefExpr to ParmVarDecl\
+  \ or global VarDecl.\nf) Confirm the suspicious pattern:\n   - We have: previous\
+  \ statement performs a raw memory read into a local variable V; the if-condition\
+  \ is of the form (Guard && RHS_using_V).\n   - This implies the non-atomic read\
+  \ of shared state happens unconditionally before the guard that supposedly establishes\
+  \ safety/ownership.\ng) Emit a report:\n   - Use C.generateNonFatalErrorNode();\
+  \ if null, return.\n   - Create a PathSensitiveBugReport with a short message:\n\
+  \     - \u201CUnconditional read of shared state before guard; move the read under\
+  \ the guard to avoid races.\u201D\n   - Highlight the read expression range (the\
+  \ RHS of the assignment/init).\n   - Optionally add a note range for the guard expression\
+  \ (LHS of &&).\n\n4) Utility functions usage\n- findSpecificTypeInParents:\n  -\
+  \ To find the surrounding IfStmt and then the parent CompoundStmt.\n- findSpecificTypeInChildren:\n\
+  \  - To find BinaryOperator \u2018&&\u2019 inside the condition.\n- ExprHasName:\n\
+  \  - To heuristically detect names like \"data\", \"->data\", \".data\", \"READ_ONCE\"\
+  , \u201Cwork_data_bits\u201D, or guard-ish cues like \u201Cfrom\u201D/\u201Ccancel\u201D\
+  .\n\n5) Edge cases and de-duplication\n- Only analyze the immediate previous sibling\
+  \ statement. This keeps the checker simple and reduces FPs; it matches the common\
+  \ \u201Ccompute then if (guard && use)\u201D layout.\n- Skip if the RHS variable\
+  \ V is also assigned in the same If condition (rare) or if LHS of && references\
+  \ V (avoid weird self-guarded patterns).\n- Skip if the previous read is clearly\
+  \ atomic (READ_ONCE present).\n- No state storage is required; each If condition\
+  \ is analyzed once when seen.\n\n6) Summary of the minimal algorithm\n- On each\
+  \ if-condition:\n  - If it is \u201CA && B\u201D, collect variables in B.\n  - Look\
+  \ at the immediate previous statement; if it assigns/initializes one of those variables\
+  \ using a raw memory read (pointer deref/member access) without atomic macro, warn.\n\
+  - This directly captures the kernel pattern: data = *work_data_bits(work); if (from_cancel\
+  \ && (data & ...)) \u2026 and suggests moving the data read inside the guard."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"llvm/ADT/SmallPtrSet.h\"\n#include <memory>\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\n// No custom program states are\
+  \ necessary for this checker.\n\nnamespace {\n\nclass SAGenTestChecker : public\
+  \ Checker<check::BranchCondition> {\n  mutable std::unique_ptr<BugType> BT;\n\n\
+  public:\n  SAGenTestChecker()\n      : BT(new BugType(this, \"Unconditional shared\
+  \ read before guard\",\n                       \"Concurrency\")) {}\n\n  void checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  static\
+  \ const BinaryOperator *getTopLevelLogicalAnd(const Expr *E);\n  static bool isNonConstantExpr(const\
+  \ Expr *E, ASTContext &ACtx);\n  static void collectVarsInExpr(const Expr *E,\n\
+  \                                llvm::SmallPtrSet<const VarDecl *, 8> &Out);\n\
+  \  static bool exprReferencesVar(const Expr *E, const VarDecl *VD);\n  static bool\
+  \ containsReadOnce(const Expr *E, CheckerContext &C);\n  static bool containsCallNamed(const\
+  \ Expr *E, StringRef Name,\n                                CheckerContext &C);\n\
+  \  static bool containsMemberNamedData(const Expr *E);\n  static bool containsDerefLike(const\
+  \ Expr *E);\n  static bool refersToParamOrGlobal(const Expr *E);\n\n  static const\
+  \ Expr *getAssignmentRHSIfAssigningVar(const Stmt *S,\n                        \
+  \                            const VarDecl *TargetVD);\n  static const Expr *getInitExprIfDeclaringVar(const\
+  \ Stmt *S,\n                                               const VarDecl *TargetVD);\n\
+  \  void report(const Expr *ReadE, const Expr *GuardE, CheckerContext &C) const;\n\
+  };\n\nconst BinaryOperator *SAGenTestChecker::getTopLevelLogicalAnd(const Expr *E)\
+  \ {\n  if (!E)\n    return nullptr;\n  const Expr *I = E->IgnoreParenImpCasts();\n\
+  \  if (const auto *BO = dyn_cast<BinaryOperator>(I)) {\n    if (BO->getOpcode()\
+  \ == BO_LAnd)\n      return BO;\n  }\n  return nullptr;\n}\n\nbool SAGenTestChecker::isNonConstantExpr(const\
+  \ Expr *E, ASTContext &ACtx) {\n  if (!E)\n    return false;\n  // If it's an integer\
+  \ constant expression, treat as constant guard (not useful).\n  if (E->isIntegerConstantExpr(ACtx))\n\
+  \    return false;\n  return true;\n}\n\nvoid SAGenTestChecker::collectVarsInExpr(\n\
+  \    const Expr *E, llvm::SmallPtrSet<const VarDecl *, 8> &Out) {\n  if (!E)\n \
+  \   return;\n  E = E->IgnoreParenImpCasts();\n\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n      Out.insert(VD);\n\
+  \  }\n\n  for (const Stmt *Child : E->children()) {\n    if (const auto *CE = dyn_cast_or_null<Expr>(Child))\n\
+  \      collectVarsInExpr(CE, Out);\n  }\n}\n\nbool SAGenTestChecker::exprReferencesVar(const\
+  \ Expr *E, const VarDecl *VD) {\n  if (!E || !VD)\n    return false;\n  E = E->IgnoreParenImpCasts();\n\
+  \  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    return DRE->getDecl()\
+  \ == VD;\n  }\n  for (const Stmt *Child : E->children()) {\n    if (const auto *CE\
+  \ = dyn_cast_or_null<Expr>(Child))\n      if (exprReferencesVar(CE, VD))\n     \
+  \   return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::containsReadOnce(const\
+  \ Expr *E, CheckerContext &C) {\n  return ExprHasName(E, \"READ_ONCE\", C);\n}\n\
+  \nbool SAGenTestChecker::containsCallNamed(const Expr *E, StringRef Name,\n    \
+  \                                     CheckerContext &C) {\n  return ExprHasName(E,\
+  \ Name, C);\n}\n\nbool SAGenTestChecker::containsMemberNamedData(const Expr *E)\
+  \ {\n  if (!E)\n    return false;\n  E = E->IgnoreParenImpCasts();\n\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(E)) {\n    if (const ValueDecl *VD = ME->getMemberDecl())\
+  \ {\n      if (VD->getName().contains(\"data\"))\n        return true;\n    }\n\
+  \  }\n  for (const Stmt *Child : E->children()) {\n    if (const auto *CE = dyn_cast_or_null<Expr>(Child))\n\
+  \      if (containsMemberNamedData(CE))\n        return true;\n  }\n  return false;\n\
+  }\n\nbool SAGenTestChecker::containsDerefLike(const Expr *E) {\n  if (!E)\n    return\
+  \ false;\n  E = E->IgnoreParenImpCasts();\n\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_Deref)\n      return true;\n  }\n  if (const\
+  \ auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {\n    (void)ASE;\n    return true;\n\
+  \  }\n  if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    if (ME->isArrow())\n\
+  \      return true;\n  }\n\n  for (const Stmt *Child : E->children()) {\n    if\
+  \ (const auto *CE = dyn_cast_or_null<Expr>(Child))\n      if (containsDerefLike(CE))\n\
+  \        return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::refersToParamOrGlobal(const\
+  \ Expr *E) {\n  if (!E)\n    return false;\n  E = E->IgnoreParenImpCasts();\n\n\
+  \  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    const ValueDecl *VD =\
+  \ DRE->getDecl();\n    if (isa<ParmVarDecl>(VD))\n      return true;\n    if (const\
+  \ auto *V = dyn_cast<VarDecl>(VD)) {\n      if (V->hasGlobalStorage())\n       \
+  \ return true;\n    }\n  }\n  for (const Stmt *Child : E->children()) {\n    if\
+  \ (const auto *CE = dyn_cast_or_null<Expr>(Child))\n      if (refersToParamOrGlobal(CE))\n\
+  \        return true;\n  }\n  return false;\n}\n\nconst Expr *SAGenTestChecker::getAssignmentRHSIfAssigningVar(\n\
+  \    const Stmt *S, const VarDecl *TargetVD) {\n  if (!S || !TargetVD)\n    return\
+  \ nullptr;\n\n  const auto *BO = dyn_cast<BinaryOperator>(S);\n  if (!BO || BO->getOpcode()\
+  \ != BO_Assign)\n    return nullptr;\n\n  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \  if (const auto *LHSRef = dyn_cast<DeclRefExpr>(LHS)) {\n    if (LHSRef->getDecl()\
+  \ == TargetVD)\n      return BO->getRHS();\n  }\n  return nullptr;\n}\n\nconst Expr\
+  \ *SAGenTestChecker::getInitExprIfDeclaringVar(\n    const Stmt *S, const VarDecl\
+  \ *TargetVD) {\n  if (!S || !TargetVD)\n    return nullptr;\n\n  const auto *DS\
+  \ = dyn_cast<DeclStmt>(S);\n  if (!DS)\n    return nullptr;\n\n  for (const Decl\
+  \ *D : DS->decls()) {\n    if (const auto *VD = dyn_cast<VarDecl>(D)) {\n      if\
+  \ (VD == TargetVD && VD->hasInit())\n        return VD->getInit();\n    }\n  }\n\
+  \  return nullptr;\n}\n\nvoid SAGenTestChecker::report(const Expr *ReadE, const\
+  \ Expr *GuardE,\n                              CheckerContext &C) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT,\n      \"Unconditional read of shared state before guard; move the read\
+  \ under \"\n      \"the guard to avoid races\",\n      N);\n\n  if (ReadE)\n   \
+  \ R->addRange(ReadE->getSourceRange());\n  if (GuardE)\n    R->addRange(GuardE->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition,\n                                            CheckerContext &C)\
+  \ const {\n  const auto *CondE = dyn_cast_or_null<Expr>(Condition);\n  if (!CondE)\n\
+  \    return;\n\n  const auto *TopAnd = getTopLevelLogicalAnd(CondE);\n  if (!TopAnd)\n\
+  \    return;\n\n  const Expr *LHS = TopAnd->getLHS()->IgnoreParenImpCasts();\n \
+  \ const Expr *RHS = TopAnd->getRHS()->IgnoreParenImpCasts();\n  if (!LHS || !RHS)\n\
+  \    return;\n\n  // Basic sanity/heuristic: LHS should be a non-constant \"guard\"\
+  -like expr.\n  if (!isNonConstantExpr(LHS, C.getASTContext()))\n    return;\n\n\
+  \  // Collect variables used on RHS of &&\n  llvm::SmallPtrSet<const VarDecl *,\
+  \ 8> RHSVars;\n  collectVarsInExpr(RHS, RHSVars);\n  if (RHSVars.empty())\n    return;\n\
+  \n  // Locate the containing IfStmt\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IfS)\n    return;\n\n  // Locate the parent compound statement to\
+  \ find the previous sibling\n  const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IfS,\
+  \ C);\n  if (!CS)\n    return;\n\n  const Stmt *PrevS = nullptr;\n  for (auto I\
+  \ = CS->body_begin(), E = CS->body_end(); I != E; ++I) {\n    if (*I == IfS) {\n\
+  \      if (I != CS->body_begin()) {\n        PrevS = *(I - 1);\n      }\n      break;\n\
+  \    }\n  }\n  if (!PrevS)\n    return;\n\n  // For each variable used on the RHS,\
+  \ check if PrevS assigns/initializes it\n  // via a raw memory read (without READ_ONCE).\n\
+  \  for (const VarDecl *VD : RHSVars) {\n    // Avoid cases where the guard itself\
+  \ references the variable (self-guarded).\n    if (exprReferencesVar(LHS, VD))\n\
+  \      continue;\n\n    const Expr *SuspiciousRead = nullptr;\n\n    if (const Expr\
+  \ *R = getAssignmentRHSIfAssigningVar(PrevS, VD)) {\n      SuspiciousRead = R;\n\
+  \    } else if (const Expr *R = getInitExprIfDeclaringVar(PrevS, VD)) {\n      SuspiciousRead\
+  \ = R;\n    }\n\n    if (!SuspiciousRead)\n      continue;\n\n    // Heuristics\
+  \ to decide it's a likely unsynchronized shared read:\n    // - It's a deref-like\
+  \ expression OR contains a member named 'data'\n    //   OR calls a function like\
+  \ work_data_bits.\n    // - It does NOT contain READ_ONCE (already atomic).\n  \
+  \  // - It refers to a parameter or global somewhere (shared input).\n    bool RawLike\
+  \ = containsDerefLike(SuspiciousRead) ||\n                   containsMemberNamedData(SuspiciousRead)\
+  \ ||\n                   containsCallNamed(SuspiciousRead, \"work_data_bits\", C);\n\
+  \n    if (!RawLike)\n      continue;\n\n    if (containsReadOnce(SuspiciousRead,\
+  \ C))\n      continue;\n\n    if (!refersToParamOrGlobal(SuspiciousRead))\n    \
+  \  continue;\n\n    // Found the pattern: Unconditional raw read feeding the RHS\
+  \ of a guarded &&\n    // condition. Report once per match.\n    report(SuspiciousRead,\
+  \ LHS, C);\n    // Prevent duplicate reports for multiple RHS vars in the same pattern.\n\
+  \    break;\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unconditional reads of shared/concurrently-updated fields that\
+  \ \"\n      \"occur before a guarding condition (e.g., reading work->data before\
+  \ \"\n      \"checking from_cancel)\",\n      \"\");\n}\n\nextern \"C\" const char\
+  \ clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

@@ -1,0 +1,368 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 3948abaa4e2be938ccdfc289385a27342fb13d43
+commit_type: Uninit-Data
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Type.h\"\n#include \"llvm/ADT/APSInt.h\"\
+  \n#include <cstdint>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program state maps\n// 0 = Unknown/not tracked, 1 = Zeroed allocation\
+  \ (kzalloc/kcalloc), 2 = Possibly-uninitialized (kmalloc/*)\nREGISTER_MAP_WITH_PROGRAMSTATE(AllocKindMap,\
+  \ const MemRegion*, unsigned)\n// Records last known initialized byte size via memset/memzero_explicit\
+  \ for the base region.\nREGISTER_MAP_WITH_PROGRAMSTATE(ZeroInitSizeMap, const MemRegion*,\
+  \ uint64_t)\n// Tracks pointer aliases.\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n\nnamespace {\n/* The checker callbacks are\
+  \ to be decided. */\nclass SAGenTestChecker : public Checker<check::PostCall, check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Kernel information leak\", \"Security\")) {}\n\n    \
+  \  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n      void\
+  \ checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n      void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;\n\n   private:\n\n\
+  \      // Helpers\n      const MemRegion *canonical(ProgramStateRef State, const\
+  \ MemRegion *R) const;\n      ProgramStateRef setAllocKind(ProgramStateRef State,\
+  \ const MemRegion *R, unsigned Kind) const;\n      bool callNamed(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name) const;\n      const MemRegion *getArgBaseRegion(const\
+  \ CallEvent &Call, unsigned Idx, CheckerContext &C) const;\n      void noteExplicitInitLen(const\
+  \ CallEvent &Call, CheckerContext &C, unsigned PtrArgIndex, unsigned LenArgIndex)\
+  \ const;\n      void reportLeak(const CallEvent &Call, CheckerContext &C, const\
+  \ MemRegion *SrcReg) const;\n};\n\nconst MemRegion *SAGenTestChecker::canonical(ProgramStateRef\
+  \ State, const MemRegion *R) const {\n  if (!R)\n    return nullptr;\n  const MemRegion\
+  \ *Base = R->getBaseRegion();\n  if (!Base)\n    return nullptr;\n\n  // Follow\
+  \ alias chain to a fixed point (both directions are stored, but forward is enough).\n\
+  \  const MemRegion *Cur = Base;\n  // Limit steps to avoid cycles.\n  for (unsigned\
+  \ i = 0; i < 8; ++i) {\n    if (const MemRegion *Next = State->get<PtrAliasMap>(Cur))\
+  \ {\n      if (Next == Cur)\n        break;\n      Cur = Next->getBaseRegion();\n\
+  \      continue;\n    }\n    break;\n  }\n  return Cur;\n}\n\nProgramStateRef SAGenTestChecker::setAllocKind(ProgramStateRef\
+  \ State, const MemRegion *R, unsigned Kind) const {\n  if (!R)\n    return State;\n\
+  \  R = R->getBaseRegion();\n  if (!R)\n    return State;\n  const MemRegion *Canon\
+  \ = canonical(State, R);\n  if (!Canon)\n    return State;\n  State = State->set<AllocKindMap>(Canon,\
+  \ Kind);\n  // Reset any previous explicit-init info; a fresh allocation supersedes\
+  \ it.\n  State = State->remove<ZeroInitSizeMap>(Canon);\n  return State;\n}\n\n\
+  bool SAGenTestChecker::callNamed(const CallEvent &Call, CheckerContext &C, StringRef\
+  \ Name) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n\
+  \    return false;\n  return ExprHasName(Origin, Name, C);\n}\n\nconst MemRegion\
+  \ *SAGenTestChecker::getArgBaseRegion(const CallEvent &Call, unsigned Idx, CheckerContext\
+  \ &C) const {\n  const Expr *ArgE = Call.getArgExpr(Idx);\n  const MemRegion *MR\
+  \ = nullptr;\n  if (ArgE)\n    MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR) {\n\
+  \    SVal V = Call.getArgSVal(Idx);\n    MR = V.getAsRegion();\n  }\n  if (!MR)\n\
+  \    return nullptr;\n  MR = MR->getBaseRegion();\n  if (!MR)\n    return nullptr;\n\
+  \  ProgramStateRef State = C.getState();\n  return canonical(State, MR);\n}\n\n\
+  void SAGenTestChecker::noteExplicitInitLen(const CallEvent &Call, CheckerContext\
+  \ &C,\n                                           unsigned PtrArgIndex, unsigned\
+  \ LenArgIndex) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion\
+  \ *DstReg = getArgBaseRegion(Call, PtrArgIndex, C);\n  if (!DstReg)\n    return;\n\
+  \n  const Expr *LenE = Call.getArgExpr(LenArgIndex);\n  if (!LenE)\n    return;\n\
+  \n  llvm::APSInt EvalRes;\n  if (!EvaluateExprToInt(EvalRes, LenE, C))\n    return;\n\
+  \n  uint64_t Len = EvalRes.getZExtValue();\n  // Record the max of existing length\
+  \ and new length.\n  const uint64_t *Old = State->get<ZeroInitSizeMap>(DstReg);\n\
+  \  uint64_t NewLen = Old ? std::max(*Old, Len) : Len;\n  State = State->set<ZeroInitSizeMap>(DstReg,\
+  \ NewLen);\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::reportLeak(const\
+  \ CallEvent &Call, CheckerContext &C, const MemRegion *SrcReg) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"copy_to_user may leak uninitialized kernel memory from kmalloc buffer;\
+  \ use kzalloc or memset\", N);\n  if (const Expr *E = Call.getOriginExpr())\n  \
+  \  R->addRange(E->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Allocation modeling\n  if (callNamed(Call, C, \"kzalloc\") || callNamed(Call,\
+  \ C, \"kcalloc\")) {\n    const MemRegion *RetReg = Call.getReturnValue().getAsRegion();\n\
+  \    if (!RetReg) {\n      if (const Expr *OE = Call.getOriginExpr())\n        RetReg\
+  \ = getMemRegionFromExpr(OE, C);\n    }\n    if (RetReg) {\n      RetReg = RetReg->getBaseRegion();\n\
+  \      if (RetReg) {\n        State = setAllocKind(State, canonical(State, RetReg),\
+  \ 1);\n        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  if\
+  \ (callNamed(Call, C, \"kmalloc\") || callNamed(Call, C, \"kmalloc_array\") || callNamed(Call,\
+  \ C, \"kmalloc_node\")) {\n    const MemRegion *RetReg = Call.getReturnValue().getAsRegion();\n\
+  \    if (!RetReg) {\n      if (const Expr *OE = Call.getOriginExpr())\n        RetReg\
+  \ = getMemRegionFromExpr(OE, C);\n    }\n    if (RetReg) {\n      RetReg = RetReg->getBaseRegion();\n\
+  \      if (RetReg) {\n        State = setAllocKind(State, canonical(State, RetReg),\
+  \ 2);\n        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  //\
+  \ Explicit initialization modeling\n  if (callNamed(Call, C, \"memset\")) {\n  \
+  \  // memset(ptr, val, len) -> we record len as initialized for base region\n  \
+  \  noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/2);\n    return;\n\
+  \  }\n\n  if (callNamed(Call, C, \"memzero_explicit\")) {\n    // memzero_explicit(ptr,\
+  \ len)\n    noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/1);\n\
+  \    return;\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  if (!callNamed(Call, C, \"copy_to_user\"))\n   \
+  \ return;\n\n  ProgramStateRef State = C.getState();\n\n  // copy_to_user(to, from,\
+  \ len)\n  const MemRegion *FromReg = getArgBaseRegion(Call, 1, C);\n  if (!FromReg)\n\
+  \    return;\n\n  const unsigned *Kind = State->get<AllocKindMap>(FromReg);\n  if\
+  \ (!Kind)\n    return;\n\n  // Zeroed allocation (safe)\n  if (*Kind == 1)\n   \
+  \ return;\n\n  // Only warn for possibly-uninitialized allocations\n  if (*Kind\
+  \ != 2)\n    return;\n\n  // Evaluate length if possible\n  const Expr *LenE = Call.getArgExpr(2);\n\
+  \  uint64_t CopyLen = 0;\n  bool LenKnown = false;\n  if (LenE) {\n    llvm::APSInt\
+  \ EvalRes;\n    if (EvaluateExprToInt(EvalRes, LenE, C)) {\n      CopyLen = EvalRes.getZExtValue();\n\
+  \      LenKnown = true;\n    }\n  }\n\n  const uint64_t *ZeroedBytes = State->get<ZeroInitSizeMap>(FromReg);\n\
+  \  if (LenKnown) {\n    if (ZeroedBytes && *ZeroedBytes >= CopyLen)\n      return;\
+  \ // Fully initialized by memset/memzero_explicit\n    // Otherwise, report\n  \
+  \  reportLeak(Call, C, FromReg);\n    return;\n  } else {\n    // Length unknown:\
+  \ if we have no evidence of explicit initialization, report\n    if (!ZeroedBytes)\
+  \ {\n      reportLeak(Call, C, FromReg);\n    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n\n  const MemRegion *LHS = Loc.getAsRegion();\n  if (!LHS)\n\
+  \    return;\n  LHS = LHS->getBaseRegion();\n  if (!LHS)\n    return;\n\n  const\
+  \ MemRegion *RHS = Val.getAsRegion();\n  if (!RHS)\n    return;\n  RHS = RHS->getBaseRegion();\n\
+  \  if (!RHS)\n    return;\n\n  // Record aliasing in both directions to resolve\
+  \ easily\n  const MemRegion *LC = canonical(State, LHS);\n  const MemRegion *RC\
+  \ = canonical(State, RHS);\n  if (!LC || !RC)\n    return;\n\n  State = State->set<PtrAliasMap>(LC,\
+  \ RC);\n  State = State->set<PtrAliasMap>(RC, LC);\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect kmalloc buffers copied to userspace without full initialization\
+  \ (kernel info leak)\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ndo_sys_name_to_handle(): use kzalloc() to fix kernel-infoleak\n\
+  \nsyzbot identified a kernel information leak vulnerability in\ndo_sys_name_to_handle()\
+  \ and issued the following report [1].\n\n[1]\n\"BUG: KMSAN: kernel-infoleak in\
+  \ instrument_copy_to_user include/linux/instrumented.h:114 [inline]\nBUG: KMSAN:\
+  \ kernel-infoleak in _copy_to_user+0xbc/0x100 lib/usercopy.c:40\n instrument_copy_to_user\
+  \ include/linux/instrumented.h:114 [inline]\n _copy_to_user+0xbc/0x100 lib/usercopy.c:40\n\
+  \ copy_to_user include/linux/uaccess.h:191 [inline]\n do_sys_name_to_handle fs/fhandle.c:73\
+  \ [inline]\n __do_sys_name_to_handle_at fs/fhandle.c:112 [inline]\n __se_sys_name_to_handle_at+0x949/0xb10\
+  \ fs/fhandle.c:94\n __x64_sys_name_to_handle_at+0xe4/0x140 fs/fhandle.c:94\n ...\n\
+  \nUninit was created at:\n slab_post_alloc_hook+0x129/0xa70 mm/slab.h:768\n slab_alloc_node\
+  \ mm/slub.c:3478 [inline]\n __kmem_cache_alloc_node+0x5c9/0x970 mm/slub.c:3517\n\
+  \ __do_kmalloc_node mm/slab_common.c:1006 [inline]\n __kmalloc+0x121/0x3c0 mm/slab_common.c:1020\n\
+  \ kmalloc include/linux/slab.h:604 [inline]\n do_sys_name_to_handle fs/fhandle.c:39\
+  \ [inline]\n __do_sys_name_to_handle_at fs/fhandle.c:112 [inline]\n __se_sys_name_to_handle_at+0x441/0xb10\
+  \ fs/fhandle.c:94\n __x64_sys_name_to_handle_at+0xe4/0x140 fs/fhandle.c:94\n ...\n\
+  \nBytes 18-19 of 20 are uninitialized\nMemory access of size 20 starts at ffff888128a46380\n\
+  Data copied to user address 0000000020000240\"\n\nPer Chuck Lever's suggestion,\
+  \ use kzalloc() instead of kmalloc() to\nsolve the problem.\n\nFixes: 990d6c2d7aee\
+  \ (\"vfs: Add name to file handle conversion support\")\nSuggested-by: Chuck Lever\
+  \ III <chuck.lever@oracle.com>\nReported-and-tested-by: <syzbot+09b349b3066c2e0b1e96@syzkaller.appspotmail.com>\n\
+  Signed-off-by: Nikita Zhandarovich <n.zhandarovich@fintech.ru>\nLink: https://lore.kernel.org/r/20240119153906.4367-1-n.zhandarovich@fintech.ru\n\
+  Reviewed-by: Jan Kara <jack@suse.cz>\nSigned-off-by: Christian Brauner <brauner@kernel.org>\n\
+  \n## Buggy Code\n\n```c\n// Function: do_sys_name_to_handle in fs/fhandle.c\nstatic\
+  \ long do_sys_name_to_handle(const struct path *path,\n\t\t\t\t  struct file_handle\
+  \ __user *ufh,\n\t\t\t\t  int __user *mnt_id, int fh_flags)\n{\n\tlong retval;\n\
+  \tstruct file_handle f_handle;\n\tint handle_dwords, handle_bytes;\n\tstruct file_handle\
+  \ *handle = NULL;\n\n\t/*\n\t * We need to make sure whether the file system support\
+  \ decoding of\n\t * the file handle if decodeable file handle was requested.\n\t\
+  \ */\n\tif (!exportfs_can_encode_fh(path->dentry->d_sb->s_export_op, fh_flags))\n\
+  \t\treturn -EOPNOTSUPP;\n\n\tif (copy_from_user(&f_handle, ufh, sizeof(struct file_handle)))\n\
+  \t\treturn -EFAULT;\n\n\tif (f_handle.handle_bytes > MAX_HANDLE_SZ)\n\t\treturn\
+  \ -EINVAL;\n\n\thandle = kmalloc(sizeof(struct file_handle) + f_handle.handle_bytes,\n\
+  \t\t\t GFP_KERNEL);\n\tif (!handle)\n\t\treturn -ENOMEM;\n\n\t/* convert handle\
+  \ size to multiple of sizeof(u32) */\n\thandle_dwords = f_handle.handle_bytes >>\
+  \ 2;\n\n\t/* we ask for a non connectable maybe decodeable file handle */\n\tretval\
+  \ = exportfs_encode_fh(path->dentry,\n\t\t\t\t    (struct fid *)handle->f_handle,\n\
+  \t\t\t\t    &handle_dwords, fh_flags);\n\thandle->handle_type = retval;\n\t/* convert\
+  \ handle size to bytes */\n\thandle_bytes = handle_dwords * sizeof(u32);\n\thandle->handle_bytes\
+  \ = handle_bytes;\n\tif ((handle->handle_bytes > f_handle.handle_bytes) ||\n\t \
+  \   (retval == FILEID_INVALID) || (retval < 0)) {\n\t\t/* As per old exportfs_encode_fh\
+  \ documentation\n\t\t * we could return ENOSPC to indicate overflow\n\t\t * But\
+  \ file system returned 255 always. So handle\n\t\t * both the values\n\t\t */\n\t\
+  \tif (retval == FILEID_INVALID || retval == -ENOSPC)\n\t\t\tretval = -EOVERFLOW;\n\
+  \t\t/*\n\t\t * set the handle size to zero so we copy only\n\t\t * non variable\
+  \ part of the file_handle\n\t\t */\n\t\thandle_bytes = 0;\n\t} else\n\t\tretval\
+  \ = 0;\n\t/* copy the mount id */\n\tif (put_user(real_mount(path->mnt)->mnt_id,\
+  \ mnt_id) ||\n\t    copy_to_user(ufh, handle,\n\t\t\t sizeof(struct file_handle)\
+  \ + handle_bytes))\n\t\tretval = -EFAULT;\n\tkfree(handle);\n\treturn retval;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/fhandle.c b/fs/fhandle.c\n\
+  index 18b3ba8dc8ea..57a12614addf 100644\n--- a/fs/fhandle.c\n+++ b/fs/fhandle.c\n\
+  @@ -36,7 +36,7 @@ static long do_sys_name_to_handle(const struct path *path,\n \t\
+  if (f_handle.handle_bytes > MAX_HANDLE_SZ)\n \t\treturn -EINVAL;\n \n-\thandle =\
+  \ kmalloc(sizeof(struct file_handle) + f_handle.handle_bytes,\n+\thandle = kzalloc(sizeof(struct\
+  \ file_handle) + f_handle.handle_bytes,\n \t\t\t GFP_KERNEL);\n \tif (!handle)\n\
+  \ \t\treturn -ENOMEM;\n```\n"
+pattern: '## Bug Pattern
+
+
+  Allocating a kernel buffer with kmalloc() and then copying it to userspace (via
+  copy_to_user) without guaranteeing that every byte in the copied region has been
+  initialized. This leaves padding/tail bytes uninitialized, causing a kernel information
+  leak. The fix is to zero-initialize the buffer (e.g., with kzalloc or memset) or
+  ensure the entire copied size is explicitly initialized before copy_to_user.'
+plan: "Plan\n\n1) Program state customization\n- REGISTER_MAP_WITH_PROGRAMSTATE(AllocKindMap,\
+  \ const MemRegion*, unsigned)\n  - 0 = Unknown/not tracked\n  - 1 = Zeroed allocation\
+  \ (kzalloc/kcalloc)\n  - 2 = Possibly-uninitialized allocation (kmalloc/kmalloc_array/kmalloc_node)\n\
+  - REGISTER_MAP_WITH_PROGRAMSTATE(ZeroInitSizeMap, const MemRegion*, uint64_t)\n\
+  \  - Records the last known byte count explicitly initialized via memset/memzero_explicit\
+  \ that starts at the base pointer. If length can\u2019t be evaluated to a constant,\
+  \ do not record.\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*,\
+  \ const MemRegion*)\n  - Tracks pointer aliases so we can resolve the \u201Cfrom\u201D\
+  \ argument in copy_to_user back to the original allocation.\n\nHelper utilities\
+  \ to implement:\n- const MemRegion* canonical(const MemRegion* R):\n  - Return R\
+  \ ? R->getBaseRegion() : nullptr.\n  - Resolve transitive aliases via PtrAliasMap\
+  \ until a fixed point is reached.\n- void setAllocKind(ProgramStateRef, const MemRegion*,\
+  \ unsigned):\n  - Store into AllocKindMap for canonical region and erase ZeroInitSizeMap\
+  \ entry.\n- Optional: wipe maps entries when region is not a pointer anymore or\
+  \ is null; keep it simple and rely on path-sensitivity.\n\n2) Allocation modeling\
+  \ (checkPostCall)\n- Identify allocation functions by callee name:\n  - Uninitialized:\
+  \ \"kmalloc\", \"kmalloc_array\", \"kmalloc_node\"\n  - Zeroed: \"kzalloc\", \"\
+  kcalloc\"\n- Get the returned region:\n  - const MemRegion* RetReg = Call.getReturnValue().getAsRegion();\
+  \ if null, try getMemRegionFromExpr(Call.getOriginExpr(), C). Apply canonical().\n\
+  - Update state:\n  - For kzalloc/kcalloc: setAllocKind(State, RetReg, 1)\n  - For\
+  \ kmalloc/kmalloc_array/kmalloc_node: setAllocKind(State, RetReg, 2)\n- We do not\
+  \ need to compute allocation sizes for this checker.\n\n3) Track explicit initialization\
+  \ (checkPostCall)\n- Detect calls that initialize memory:\n  - \"memset\" and \"\
+  memzero_explicit\"\n- Extract arguments:\n  - dest = arg0, value = arg1 (for memset),\
+  \ len = arg2\n- Get canonical region of dest with canonical(getMemRegionFromExpr(arg0,\
+  \ C)).\n- Evaluate length with EvaluateExprToInt; if it succeeds, store the length\
+  \ (as uint64_t) in ZeroInitSizeMap for that canonical region.\n  - For memset: it\
+  \ does not matter whether the value is 0 or not; any fill initializes bytes. If\
+  \ length is known, record it.\n  - For memzero_explicit: record the length similarly.\n\
+  - If length cannot be evaluated to a constant, do not update ZeroInitSizeMap (keep\
+  \ it simple to avoid false positives assumptions).\n\n4) Alias tracking (checkBind)\n\
+  - When a pointer value is assigned to another pointer (e.g., p2 = p1):\n  - Extract\
+  \ MemRegion for LHS and RHS via getMemRegionFromExpr; restrict to pointer-typed\
+  \ regions.\n  - Compute canonical regions for both.\n  - If canonical RHS is tracked\
+  \ (in AllocKindMap or ZeroInitSizeMap), record PtrAliasMap[LHS_canon] = RHS_canon\
+  \ to propagate provenance.\n  - Do not copy the maps; rely on canonical lookup to\
+  \ resolve.\n- Also handle simple initializations in DeclStmt (post-visit of DeclStmt\
+  \ can be handled by checkBind path-sensitively; no extra work needed).\n\n5) Reporting\
+  \ at copy_to_user (checkPreCall)\n- Match callee \"copy_to_user\".\n- Extract arguments:\n\
+  \  - to = arg0, from = arg1, len = arg2.\n- Resolve the \u201Cfrom\u201D region:\n\
+  \  - FromReg = canonical(getMemRegionFromExpr(arg1, C)).\n  - If FromReg is null,\
+  \ return.\n- Query AllocKindMap[FromReg]:\n  - If kind == 1 (Zeroed): safe; return.\n\
+  \  - If kind != 2 (not tracked): return.\n  - If kind == 2 (Possibly-uninitialized):\n\
+  \    - Try to EvaluateExprToInt on len; if success set CopyLen.\n    - Look up ZeroInitSizeMap[FromReg]:\n\
+  \      - If present and ZeroedBytes >= CopyLen (when CopyLen known) => safe; return.\n\
+  \      - Otherwise, this is a potential info leak. Report.\n    - If CopyLen is\
+  \ unknown and ZeroInitSizeMap has no entry for FromReg, report (we did not observe\
+  \ any bulk initialization; keep it simple).\n\n6) Optional robustness (keep simple)\n\
+  - We do not attempt to track partial writes, field writes, or initialization via\
+  \ struct literals.\n- We do not attempt range-based initialization; we only use\
+  \ bulk memset/memzero_explicit and zeroed allocators.\n- We only match the plain\
+  \ \"copy_to_user\" callee name at source; instrumented or inlined variants will\
+  \ still present as \"copy_to_user\" in typical kernel sources.\n\n7) Bug report\n\
+  - Create a Checker BugType once: \"Kernel info leak\".\n- On detection in checkPreCall:\n\
+  \  - Generate a non-fatal error node and emit a PathSensitiveBugReport.\n  - Message:\
+  \ \"copy_to_user may leak uninitialized kernel memory from kmalloc buffer. Use kzalloc\
+  \ or memset to initialize.\"\n  - Add the call expression range of copy_to_user\
+  \ as the primary range.\n  - Optionally, if available, note the allocation site\
+  \ by attaching a trackback visitor or storing the last allocation CallExpr region\
+  \ (keep it simple: primary range is sufficient).\n\n8) Summary of callbacks implemented\n\
+  - checkPostCall:\n  - Handle kmalloc/kzalloc/kmalloc_array/kcalloc/kmalloc_node\
+  \ to set allocation kind.\n  - Handle memset/memzero_explicit to record last initialized\
+  \ size for the region.\n- checkBind:\n  - Track pointer aliases p2 = p1 in PtrAliasMap.\n\
+  - checkPreCall:\n  - On copy_to_user, check if the source buffer originates from\
+  \ kmalloc and is not fully initialized (no zeroed alloc and no sufficient memset).\
+  \ If so, report.\n\nThis plan detects the target pattern in the patch: kmalloc buffer\
+  \ passed to copy_to_user without whole-buffer initialization, and it naturally stops\
+  \ warning when kzalloc (or a full memset) is used."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Type.h\"\n#include \"llvm/ADT/APSInt.h\"\
+  \n#include <cstdint>\n#include <algorithm>\n#include <memory>\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state maps\n\
+  // 0 = Unknown/not tracked, 1 = Zeroed allocation (kzalloc/kcalloc), 2 = Possibly-uninitialized\
+  \ (kmalloc/*)\nREGISTER_MAP_WITH_PROGRAMSTATE(AllocKindMap, const MemRegion*, unsigned)\n\
+  // Records last known initialized byte size via memset/memzero_explicit for the\
+  \ base region.\nREGISTER_MAP_WITH_PROGRAMSTATE(ZeroInitSizeMap, const MemRegion*,\
+  \ uint64_t)\n// Tracks pointer aliases.\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n\nnamespace {\n/* The checker callbacks are\
+  \ to be decided. */\nclass SAGenTestChecker : public Checker<check::PostCall, check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Kernel information leak\", \"Security\")) {}\n\n    \
+  \  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n      void\
+  \ checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n      void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;\n\n   private:\n\n\
+  \      // Helpers\n      const MemRegion *canonical(ProgramStateRef State, const\
+  \ MemRegion *R) const;\n      ProgramStateRef setAllocKind(ProgramStateRef State,\
+  \ const MemRegion *R, unsigned Kind) const;\n      bool callNamed(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name) const;\n      const MemRegion *getArgBaseRegion(const\
+  \ CallEvent &Call, unsigned Idx, CheckerContext &C) const;\n      void noteExplicitInitLen(const\
+  \ CallEvent &Call, CheckerContext &C, unsigned PtrArgIndex, unsigned LenArgIndex)\
+  \ const;\n      void reportLeak(const CallEvent &Call, CheckerContext &C, const\
+  \ MemRegion *SrcReg) const;\n};\n\nconst MemRegion *SAGenTestChecker::canonical(ProgramStateRef\
+  \ State, const MemRegion *R) const {\n  if (!R)\n    return nullptr;\n  const MemRegion\
+  \ *Base = R->getBaseRegion();\n  if (!Base)\n    return nullptr;\n\n  // Follow\
+  \ alias chain to a fixed point (both directions are stored, but forward is enough).\n\
+  \  const MemRegion *Cur = Base;\n  // Limit steps to avoid cycles.\n  for (unsigned\
+  \ i = 0; i < 8; ++i) {\n    if (const MemRegion *const *NextP = State->get<PtrAliasMap>(Cur))\
+  \ {\n      const MemRegion *Next = *NextP;\n      if (Next == Cur)\n        break;\n\
+  \      Cur = Next->getBaseRegion();\n      continue;\n    }\n    break;\n  }\n \
+  \ return Cur;\n}\n\nProgramStateRef SAGenTestChecker::setAllocKind(ProgramStateRef\
+  \ State, const MemRegion *R, unsigned Kind) const {\n  if (!R)\n    return State;\n\
+  \  R = R->getBaseRegion();\n  if (!R)\n    return State;\n  const MemRegion *Canon\
+  \ = canonical(State, R);\n  if (!Canon)\n    return State;\n  State = State->set<AllocKindMap>(Canon,\
+  \ Kind);\n  // Reset any previous explicit-init info; a fresh allocation supersedes\
+  \ it.\n  State = State->remove<ZeroInitSizeMap>(Canon);\n  return State;\n}\n\n\
+  bool SAGenTestChecker::callNamed(const CallEvent &Call, CheckerContext &C, StringRef\
+  \ Name) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n\
+  \    return false;\n  return ExprHasName(Origin, Name, C);\n}\n\nconst MemRegion\
+  \ *SAGenTestChecker::getArgBaseRegion(const CallEvent &Call, unsigned Idx, CheckerContext\
+  \ &C) const {\n  const Expr *ArgE = Call.getArgExpr(Idx);\n  const MemRegion *MR\
+  \ = nullptr;\n  if (ArgE)\n    MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR) {\n\
+  \    SVal V = Call.getArgSVal(Idx);\n    MR = V.getAsRegion();\n  }\n  if (!MR)\n\
+  \    return nullptr;\n  MR = MR->getBaseRegion();\n  if (!MR)\n    return nullptr;\n\
+  \  ProgramStateRef State = C.getState();\n  return canonical(State, MR);\n}\n\n\
+  void SAGenTestChecker::noteExplicitInitLen(const CallEvent &Call, CheckerContext\
+  \ &C,\n                                           unsigned PtrArgIndex, unsigned\
+  \ LenArgIndex) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion\
+  \ *DstReg = getArgBaseRegion(Call, PtrArgIndex, C);\n  if (!DstReg)\n    return;\n\
+  \n  const Expr *LenE = Call.getArgExpr(LenArgIndex);\n  if (!LenE)\n    return;\n\
+  \n  llvm::APSInt EvalRes;\n  if (!EvaluateExprToInt(EvalRes, LenE, C))\n    return;\n\
+  \n  uint64_t Len = EvalRes.getZExtValue();\n  // Record the max of existing length\
+  \ and new length.\n  const uint64_t *Old = State->get<ZeroInitSizeMap>(DstReg);\n\
+  \  uint64_t NewLen = Old ? std::max(*Old, Len) : Len;\n  State = State->set<ZeroInitSizeMap>(DstReg,\
+  \ NewLen);\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::reportLeak(const\
+  \ CallEvent &Call, CheckerContext &C, const MemRegion *SrcReg) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"copy_to_user may leak uninitialized kernel memory from kmalloc buffer;\
+  \ use kzalloc or memset\", N);\n  if (const Expr *E = Call.getOriginExpr())\n  \
+  \  R->addRange(E->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Allocation modeling\n  if (callNamed(Call, C, \"kzalloc\") || callNamed(Call,\
+  \ C, \"kcalloc\")) {\n    const MemRegion *RetReg = Call.getReturnValue().getAsRegion();\n\
+  \    if (!RetReg) {\n      if (const Expr *OE = Call.getOriginExpr())\n        RetReg\
+  \ = getMemRegionFromExpr(OE, C);\n    }\n    if (RetReg) {\n      RetReg = RetReg->getBaseRegion();\n\
+  \      if (RetReg) {\n        State = setAllocKind(State, canonical(State, RetReg),\
+  \ 1);\n        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  if\
+  \ (callNamed(Call, C, \"kmalloc\") || callNamed(Call, C, \"kmalloc_array\") || callNamed(Call,\
+  \ C, \"kmalloc_node\")) {\n    const MemRegion *RetReg = Call.getReturnValue().getAsRegion();\n\
+  \    if (!RetReg) {\n      if (const Expr *OE = Call.getOriginExpr())\n        RetReg\
+  \ = getMemRegionFromExpr(OE, C);\n    }\n    if (RetReg) {\n      RetReg = RetReg->getBaseRegion();\n\
+  \      if (RetReg) {\n        State = setAllocKind(State, canonical(State, RetReg),\
+  \ 2);\n        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  //\
+  \ Explicit initialization modeling\n  if (callNamed(Call, C, \"memset\")) {\n  \
+  \  // memset(ptr, val, len) -> we record len as initialized for base region\n  \
+  \  noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/2);\n    return;\n\
+  \  }\n\n  if (callNamed(Call, C, \"memzero_explicit\")) {\n    // memzero_explicit(ptr,\
+  \ len)\n    noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/1);\n\
+  \    return;\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  if (!callNamed(Call, C, \"copy_to_user\"))\n   \
+  \ return;\n\n  ProgramStateRef State = C.getState();\n\n  // copy_to_user(to, from,\
+  \ len)\n  const MemRegion *FromReg = getArgBaseRegion(Call, 1, C);\n  if (!FromReg)\n\
+  \    return;\n\n  const unsigned *Kind = State->get<AllocKindMap>(FromReg);\n  if\
+  \ (!Kind)\n    return;\n\n  // Zeroed allocation (safe)\n  if (*Kind == 1)\n   \
+  \ return;\n\n  // Only warn for possibly-uninitialized allocations\n  if (*Kind\
+  \ != 2)\n    return;\n\n  // Evaluate length if possible\n  const Expr *LenE = Call.getArgExpr(2);\n\
+  \  uint64_t CopyLen = 0;\n  bool LenKnown = false;\n  if (LenE) {\n    llvm::APSInt\
+  \ EvalRes;\n    if (EvaluateExprToInt(EvalRes, LenE, C)) {\n      CopyLen = EvalRes.getZExtValue();\n\
+  \      LenKnown = true;\n    }\n  }\n\n  const uint64_t *ZeroedBytes = State->get<ZeroInitSizeMap>(FromReg);\n\
+  \  if (LenKnown) {\n    if (ZeroedBytes && *ZeroedBytes >= CopyLen)\n      return;\
+  \ // Fully initialized by memset/memzero_explicit\n    // Otherwise, report\n  \
+  \  reportLeak(Call, C, FromReg);\n    return;\n  } else {\n    // Length unknown:\
+  \ if we have no evidence of explicit initialization, report\n    if (!ZeroedBytes)\
+  \ {\n      reportLeak(Call, C, FromReg);\n    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n\n  const MemRegion *LHS = Loc.getAsRegion();\n  if (!LHS)\n\
+  \    return;\n  LHS = LHS->getBaseRegion();\n  if (!LHS)\n    return;\n\n  const\
+  \ MemRegion *RHS = Val.getAsRegion();\n  if (!RHS)\n    return;\n  RHS = RHS->getBaseRegion();\n\
+  \  if (!RHS)\n    return;\n\n  // Record aliasing in both directions to resolve\
+  \ easily\n  const MemRegion *LC = canonical(State, LHS);\n  const MemRegion *RC\
+  \ = canonical(State, RHS);\n  if (!LC || !RC)\n    return;\n\n  State = State->set<PtrAliasMap>(LC,\
+  \ RC);\n  State = State->set<PtrAliasMap>(RC, LC);\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect kmalloc buffers copied to userspace without full initialization\
+  \ (kernel info leak)\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

@@ -1,0 +1,385 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -187,7 +187,7 @@     return false;
+   }
+
+-  // Extended to also return the bound expression used in the comparison.
++  // Analyze loop condition; extract bound expression.
+   static bool analyzeLoopCondition(const Expr *Cond, const VarDecl *V,
+                                    bool &IsStrictUpper,
+                                    bool &IsMinusOneAdjusted,
+@@ -312,7 +312,7 @@     return false;
+   }
+
+-  // Normalize/compare base expressions (array object) for equivalence.
++  // Normalize base expressions.
+   static const Expr *stripCastsAndParens(const Expr *E) {
+     if (!E)
+       return nullptr;
+@@ -334,7 +334,6 @@     B = stripCastsAndParens(B);
+
+     if (A->getStmtClass() != B->getStmtClass()) {
+-      // Allow MemberExpr through implicit conversion mismatch (dot vs arrow cast).
+       const auto *MA = dyn_cast<MemberExpr>(A);
+       const auto *MB = dyn_cast<MemberExpr>(B);
+       if (!(MA && MB))
+@@ -359,7 +358,6 @@       const auto *FB = MB->getMemberDecl();
+       if (!FA || !FB || FA->getCanonicalDecl() != FB->getCanonicalDecl())
+         return false;
+-      // Compare the base of the member.
+       return sameBaseExpr(MA->getBase()->IgnoreImpCasts(),
+                           MB->getBase()->IgnoreImpCasts());
+     }
+@@ -370,68 +368,16 @@         return false;
+       if (UA->getOpcode() != UB->getOpcode())
+         return false;
+-      // Only compare address/deref op structurally.
+       if (UA->getOpcode() != UO_AddrOf && UA->getOpcode() != UO_Deref)
+         return false;
+       return sameBaseExpr(UA->getSubExpr()->IgnoreImpCasts(),
+                           UB->getSubExpr()->IgnoreImpCasts());
+     }
+
+-    // Fallback: be conservative.
+-    return false;
+-  }
+-
+-  static bool isIndexVarOnly(const Expr *E, const VarDecl *V) {
+-    return isRefToVar(E, V);
+-  }
+-
+-  static bool hasPairedIndexAccessToSameBase(const Stmt *Scope,
+-                                             const Expr *TargetBase,
+-                                             const VarDecl *IVar,
+-                                             const ArraySubscriptExpr *Skip) {
+-    if (!Scope || !TargetBase || !IVar)
+-      return false;
+-
+-    struct Finder : public RecursiveASTVisitor<Finder> {
+-      const Expr *TargetBase;
+-      const VarDecl *IVar;
+-      const ArraySubscriptExpr *Skip;
+-      bool Found = false;
+-      static const Expr *strip(const Expr *E) {
+-        return E ? E->IgnoreParenImpCasts() : nullptr;
+-      }
+-      Finder(const Expr *TargetBase, const VarDecl *IVar,
+-             const ArraySubscriptExpr *Skip)
+-          : TargetBase(TargetBase), IVar(IVar), Skip(Skip) {}
+-
+-      bool VisitArraySubscriptExpr(ArraySubscriptExpr *ASE) {
+-        if (Found)
+-          return true;
+-        if (ASE == Skip)
+-          return true;
+-
+-        const Expr *Base = strip(ASE->getBase());
+-        const Expr *Idx = strip(ASE->getIdx());
+-        if (!Base || !Idx)
+-          return true;
+-
+-        if (sameBaseExpr(TargetBase, Base) && isRefToVar(Idx, IVar)) {
+-          Found = true;
+-        }
+-
+-        return true;
+-      }
+-    };
+-
+-    Finder F(TargetBase, IVar, Skip);
+-    F.TraverseStmt(const_cast<Stmt *>(Scope));
+-    return F.Found;
++    return false;
+   }
+
+   // Attempt to recover the constant array size from the base expression.
+-  // Supports:
+-  //  - DeclRefExpr to VarDecl of ConstantArrayType
+-  //  - MemberExpr to FieldDecl of ConstantArrayType (e.g., dc->links)
+   static bool getConstantArraySizeFromBase(const Expr *Base, llvm::APInt &Size) {
+     Base = stripCastsAndParens(Base);
+     if (!Base)
+@@ -457,7 +403,6 @@     return false;
+   }
+
+-  // Evaluate an expression as integer constant. Returns true on success.
+   static bool evaluateExprToAPSInt(const Expr *E, ASTContext &Ctx,
+                                    llvm::APSInt &Res) {
+     if (!E)
+@@ -470,24 +415,101 @@     return false;
+   }
+
+-  // Additional FP filter: ensure the loop bound equals the constant array size.
+-  // Returns true if both values are known and equal.
+   static bool loopBoundEqualsArraySize(const Expr *BoundExpr,
+                                        const Expr *ArrayBase,
+                                        ASTContext &Ctx) {
+     llvm::APInt ArrSize(64, 0);
+     if (!getConstantArraySizeFromBase(ArrayBase, ArrSize))
+-      return false; // Not a constant-sized array: avoid reporting.
++      return false;
+
+     llvm::APSInt BoundVal;
+     if (!evaluateExprToAPSInt(BoundExpr, Ctx, BoundVal))
+-      return false; // Non-constant bound: avoid reporting.
++      return false;
+
+     uint64_t ArrSz = ArrSize.getLimitedValue(UINT64_MAX);
+     uint64_t BVal = BoundVal.getLimitedValue(UINT64_MAX);
+     return ArrSz == BVal;
+   }
+
++  static bool isMacroExpansion(const Stmt *S, ASTContext &Ctx) {
++    if (!S) return false;
++    SourceManager &SM = Ctx.getSourceManager();
++    SourceLocation Loc = S->getBeginLoc();
++    return Loc.isMacroID();
++  }
++
++  static const CallExpr *getParentCall(const Expr *E, ASTContext &Ctx) {
++    if (!E) return nullptr;
++    DynTypedNode Node = DynTypedNode::create<const Stmt>(*E);
++    auto Parents = Ctx.getParents(Node);
++    if (Parents.empty()) return nullptr;
++    for (const auto &P : Parents) {
++      if (const auto *CE = P.get<CallExpr>())
++        return CE;
++      if (const auto *ICE = P.get<ImplicitCastExpr>()) {
++        // Climb through implicit casts to find parent call.
++        if (const CallExpr *CE2 = getParentCall(ICE, Ctx))
++          return CE2;
++      }
++      if (const auto *PE = P.get<ParenExpr>()) {
++        if (const CallExpr *CE2 = getParentCall(PE, Ctx))
++          return CE2;
++      }
++    }
++    return nullptr;
++  }
++
++  static bool calleeNameIs(const CallExpr *CE, StringRef Name) {
++    if (!CE) return false;
++    const FunctionDecl *FD = CE->getDirectCallee();
++    if (!FD) return false;
++    if (const IdentifierInfo *II = FD->getIdentifier()) {
++      return II->getName() == Name;
++    }
++    return false;
++  }
++
++  static bool isKnownHWIOFunction(const CallExpr *CE) {
++    if (!CE) return false;
++    // Common low-level I/O routines and wrappers.
++    static const char *Names[] = {
++      "outb", "outb_p", "outw", "outl",
++      "inb", "inb_p", "inw", "inl",
++      "ei_outb", "ei_outb_p",
++      "writeb", "writew", "writel",
++      "readb", "readw", "readl",
++      "iowrite8", "iowrite16", "iowrite32",
++      "ioread8", "ioread16", "ioread32"
++    };
++    for (const char *N : Names)
++      if (calleeNameIs(CE, N))
++        return true;
++    return false;
++  }
++
++  static bool isASEArgOfKnownHWIO(const ArraySubscriptExpr *ASE,
++                                  ASTContext &Ctx) {
++    if (!ASE) return false;
++    const CallExpr *CE = getParentCall(ASE, Ctx);
++    if (!CE) return false;
++    return isKnownHWIOFunction(CE);
++  }
++
++  static bool isFalsePositive(const ArraySubscriptExpr *ASE,
++                              const ForStmt *FS,
++                              const VarDecl *IVar,
++                              ASTContext &Ctx) {
++    // Ignore macro-origin subscripts to avoid macro tricks confusing the pattern.
++    if (isMacroExpansion(ASE, Ctx))
++      return true;
++
++    // Ignore subscripts used as arguments to known HW I/O functions.
++    if (isASEArgOfKnownHWIO(ASE, Ctx))
++      return true;
++
++    return false;
++  }
++
+   void analyzeForStmt(const ForStmt *FS, ASTContext &Ctx,
+                       BugReporter &BR) const {
+     if (!FS)
+@@ -497,8 +519,7 @@     if (!IVar)
+       return;
+
+-    // Require your loop to start from 0 to match the target bug pattern and
+-    // avoid stencil/edge-handling loops that often start from 1.
++    // Loop must start from 0 to match the target bug pattern.
+     if (!isInitZero(FS->getInit(), IVar))
+       return;
+
+@@ -516,7 +537,7 @@     if (IsMinusOneAdjusted)
+       return;
+
+-    // We only flag loops with strict upper bounds like i < N or N > i.
++    // Require strict upper bound like i < N or N > i.
+     if (!IsStrictUpper)
+       return;
+
+@@ -524,76 +545,97 @@     if (!isUnitStepIncrement(FS->getInc(), IVar))
+       return;
+
+-    // Traverse the loop body and find a[i + 1] with required paired access a[i].
+-    struct BodyVisitor : public RecursiveASTVisitor<BodyVisitor> {
+-      const SAGenTestChecker *Checker;
+-      const ForStmt *FS;
++    // Collect array accesses in the body grouped by base, and record [i] and [i+1].
++    struct UseInfo {
++      llvm::SmallVector<const ArraySubscriptExpr *, 4> IPlusOneUses;
++      bool HasIUse = false;
++      const Expr *Base = nullptr;
++    };
++
++    struct Collector : public RecursiveASTVisitor<Collector> {
+       const VarDecl *IVar;
+       ASTContext &Ctx;
+-      BugReporter &BR;
+-      const BugType &BT;
+-      const Expr *BoundExpr;
+-
+-      BodyVisitor(const SAGenTestChecker *Checker, const ForStmt *FS,
+-                  const VarDecl *IVar, ASTContext &Ctx, BugReporter &BR,
+-                  const BugType &BT, const Expr *BoundExpr)
+-          : Checker(Checker), FS(FS), IVar(IVar), Ctx(Ctx), BR(BR), BT(BT),
+-            BoundExpr(BoundExpr) {}
++      llvm::SmallVector<std::unique_ptr<UseInfo>, 8> AllUses;
++
++      Collector(const VarDecl *IVar, ASTContext &Ctx) : IVar(IVar), Ctx(Ctx) {}
++
++      static const Expr *strip(const Expr *E) { return E ? E->IgnoreParenImpCasts() : nullptr; }
++
++      UseInfo *getUseForBase(const Expr *Base) {
++        for (auto &U : AllUses) {
++          if (U->Base && SAGenTestChecker::sameBaseExpr(U->Base, Base))
++            return U.get();
++        }
++        auto U = std::make_unique<UseInfo>();
++        U->Base = Base;
++        AllUses.push_back(std::move(U));
++        return AllUses.back().get();
++      }
+
+       bool VisitArraySubscriptExpr(ArraySubscriptExpr *ASE) {
++        const Expr *Base = strip(ASE->getBase());
++        const Expr *Idx  = strip(ASE->getIdx());
++        if (!Base || !Idx)
++          return true;
++
++        UseInfo *U = getUseForBase(Base);
++        if (!U) return true;
++
++        if (SAGenTestChecker::isVarPlusOne(Idx, IVar)) {
++          U->IPlusOneUses.push_back(ASE);
++        } else if (SAGenTestChecker::isRefToVar(Idx, IVar)) {
++          U->HasIUse = true;
++        }
++
++        return true;
++      }
++    };
++
++    Collector Col(IVar, Ctx);
++    if (const Stmt *Body = FS->getBody())
++      Col.TraverseStmt(const_cast<Stmt *>(Body));
++
++    // Process collected uses.
++    for (const auto &UPtr : Col.AllUses) {
++      const UseInfo &U = *UPtr;
++      if (!U.HasIUse)
++        continue; // Need a[i] too to match the target pattern.
++
++      if (U.IPlusOneUses.empty())
++        continue; // No a[i+1] -> not our bug pattern.
++
++      // Additional FP filter: ensure loop bound is the actual size of this array base.
++      if (!loopBoundEqualsArraySize(BoundExpr, U.Base, Ctx))
++        continue;
++
++      // For each a[i+1] use, check guards and FP filters, then report.
++      for (const ArraySubscriptExpr *ASE : U.IPlusOneUses) {
+         if (!ASE)
+-          return true;
+-        const Expr *Idx = ASE->getIdx()->IgnoreParenImpCasts();
+-        // Only consider indices of the form i + 1 or 1 + i.
+-        if (!Checker->isVarPlusOne(Idx, IVar))
+-          return true;
+-
+-        // Check for a local guard like "if (i + 1 < X)" or "if (i < X - 1)".
+-        if (Checker->hasLocalGuardForASE(Ctx, ASE, FS, IVar))
+-          return true;
+-
+-        // Additional FP filter: ensure the loop bound is the actual size of this array base.
+-        const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
+-        if (!Base || !BoundExpr)
+-          return true;
+-
+-        if (!loopBoundEqualsArraySize(BoundExpr, Base, Ctx))
+-          return true; // The loop bound doesn't tie to this array's size; likely false positive.
+-
+-        // Only warn if the same base array is also accessed with index [i]
+-        // within the same loop body (matches the target bug pattern and
+-        // suppresses stencil-style code accessing neighbor elements).
+-        const Stmt *Body = FS->getBody();
+-        if (!Body)
+-          return true;
+-
+-        if (!Checker->hasPairedIndexAccessToSameBase(Body, Base, IVar, ASE))
+-          return true; // Not the targeted pattern; likely benign or out of scope.
+-
+-        // Report the potential off-by-one.
++          continue;
++
++        // Filter out local guards like if(i+1 < N) or if(i < N-1).
++        if (hasLocalGuardForASE(Ctx, ASE, FS, IVar))
++          continue;
++
++        // Additional FP filters (macro-origin, HW I/O contexts).
++        if (isFalsePositive(ASE, FS, IVar, Ctx))
++          continue;
++
+         PathDiagnosticLocation ELoc =
+             PathDiagnosticLocation::createBegin(ASE, BR.getSourceManager(),
+                                                 nullptr);
+
+         auto R = std::make_unique<BasicBugReport>(
+-            BT, "Possible off-by-one: loop uses i < bound but also accesses "
+-                "a[i + 1]",
++            *BT, "Possible off-by-one: loop uses i < bound but also accesses "
++                 "a[i + 1]",
+             ELoc);
+         R->addRange(ASE->getSourceRange());
+-
+-        // Highlight the loop condition too.
+-        if (const Expr *Cond = FS->getCond()) {
+-          R->addRange(Cond->getSourceRange());
++        if (const Expr *Cnd = FS->getCond()) {
++          R->addRange(Cnd->getSourceRange());
+         }
+-
+         BR.emitReport(std::move(R));
+-        return true;
+-      }
+-    };
+-
+-    BodyVisitor V(this, FS, IVar, Ctx, BR, *BT, BoundExpr);
+-    if (const Stmt *Body = FS->getBody())
+-      V.TraverseStmt(const_cast<Stmt *>(Body));
++      }
++    }
+   }
+ };
+
+@@ -634,3 +676,4 @@
+ extern "C" const char clang_analyzerAPIVersionString[] =
+     CLANG_ANALYZER_API_VERSION_STRING;
++

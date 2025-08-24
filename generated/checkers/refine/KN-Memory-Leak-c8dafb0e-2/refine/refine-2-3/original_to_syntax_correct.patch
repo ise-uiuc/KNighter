@@ -1,0 +1,286 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -22,61 +22,74 @@
+ // Map: return-symbol of hwrm_req_init() -> req MemRegion*
+ REGISTER_MAP_WITH_PROGRAMSTATE(PendingInitMap, SymbolRef, const MemRegion *)
+-// Set: Acquired req MemRegion*s that require hwrm_req_drop() before exit
++// Set: Acquired req MemRegion*s that require hwrm_req_drop() before exiting
+ REGISTER_SET_WITH_PROGRAMSTATE(AcquiredReqs, const MemRegion *)
+
+ namespace {
+
+-static bool isCallTo(const CallEvent &Call, StringRef Name, CheckerContext &C) {
+-  const Expr *Origin = Call.getOriginExpr();
+-  if (!Origin)
+-    return false;
+-  return ExprHasName(Origin, Name, C);
+-}
+-
+-/* The checker callbacks are to be decided. */
++static bool isCallNamed(const CallEvent &Call, StringRef Name) {
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    return ID->getName() == Name;
++  }
++  return false;
++}
++
++static const MemRegion *getReqBaseRegionFromArg(const CallEvent &Call,
++                                                unsigned ArgIdx,
++                                                CheckerContext &C) {
++  if (Call.getNumArgs() <= ArgIdx)
++    return nullptr;
++  const Expr *ArgE = Call.getArgExpr(ArgIdx);
++  if (!ArgE)
++    return nullptr;
++  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);
++  if (!MR)
++    return nullptr;
++  return MR->getBaseRegion();
++}
++
++static const StackFrameContext *getOwningFrameOfRegion(const MemRegion *MR) {
++  if (!MR)
++    return nullptr;
++  MR = MR->getBaseRegion();
++  if (const auto *VR = dyn_cast<VarRegion>(MR))
++    return VR->getStackFrame();
++  return nullptr;
++}
++
+ class SAGenTestChecker : public Checker<
+     check::PostCall,
+     check::PreStmt<ReturnStmt>,
+     check::EndFunction,
+     eval::Assume> {
+-   mutable std::unique_ptr<BugType> BT;
+-
+-   public:
+-      SAGenTestChecker() {
+-        BT = std::make_unique<BugType>(
+-            this,
+-            "Missing hwrm_req_drop() after hwrm_req_init()",
+-            "Resource management");
+-      }
+-
+-      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+-      void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;
+-      void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;
+-      ProgramStateRef evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const;
+-
+-   private:
+-
+-      void reportLeak(CheckerContext &C, const Stmt *S) const;
++  mutable std::unique_ptr<BugType> BT;
++
++public:
++  SAGenTestChecker() {
++    BT = std::make_unique<BugType>(
++        this,
++        "Missing hwrm_req_drop() after hwrm_req_init()",
++        "Resource management");
++  }
++
++  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
++  void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;
++  void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;
++  ProgramStateRef evalAssume(ProgramStateRef State, SVal Cond,
++                             bool Assumption) const;
++
++private:
++  void reportLeaksInCurrentFrame(CheckerContext &C, const Stmt *S) const;
+ };
+
+-void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
++void SAGenTestChecker::checkPostCall(const CallEvent &Call,
++                                     CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+
+   // Track hwrm_req_init(bp, req, ...)
+-  if (isCallTo(Call, "hwrm_req_init", C)) {
+-    // Ensure we have at least 2 args: 0: bp, 1: req
+-    if (Call.getNumArgs() < 2)
+-      return;
+-
+-    const Expr *ReqExpr = Call.getArgExpr(1);
+-    if (!ReqExpr)
+-      return;
+-
+-    const MemRegion *ReqMR = getMemRegionFromExpr(ReqExpr, C);
+-    if (!ReqMR)
+-      return;
+-    ReqMR = ReqMR->getBaseRegion();
++  if (isCallNamed(Call, "hwrm_req_init")) {
++    // Get the 'req' arg (index 1)
++    const MemRegion *ReqMR = getReqBaseRegionFromArg(Call, 1, C);
+     if (!ReqMR)
+       return;
+
+@@ -84,29 +97,18 @@     if (!RetSym)
+       return;
+
+-    // Record pending init: we'll determine success in evalAssume
++    // Record pending init keyed by the return symbol; we'll confirm success in evalAssume().
+     State = State->set<PendingInitMap>(RetSym, ReqMR);
+     C.addTransition(State);
+     return;
+   }
+
+   // Track hwrm_req_drop(bp, req)
+-  if (isCallTo(Call, "hwrm_req_drop", C)) {
+-    if (Call.getNumArgs() < 2)
+-      return;
+-
+-    const Expr *ReqExpr = Call.getArgExpr(1);
+-    if (!ReqExpr)
+-      return;
+-
+-    const MemRegion *ReqMR = getMemRegionFromExpr(ReqExpr, C);
++  if (isCallNamed(Call, "hwrm_req_drop")) {
++    const MemRegion *ReqMR = getReqBaseRegionFromArg(Call, 1, C);
+     if (!ReqMR)
+       return;
+-    ReqMR = ReqMR->getBaseRegion();
+-    if (!ReqMR)
+-      return;
+-
+-    // On drop, remove from acquired set (if present)
++
+     auto Set = State->get<AcquiredReqs>();
+     if (Set.contains(ReqMR)) {
+       State = State->remove<AcquiredReqs>(ReqMR);
+@@ -116,46 +118,49 @@   }
+ }
+
+-ProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const {
++ProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef State, SVal Cond,
++                                             bool Assumption) const {
+   if (!State)
+     return State;
+
+-  // Handle pattern: if (rc) or if (!rc) or if (rc == 0) / if (rc != 0)
++  // We want to detect when "ret == 0" (success) for the return value symbol
++  // of hwrm_req_init() that we saved in PendingInitMap. Then, we move the
++  // associated req MemRegion* to AcquiredReqs.
++  auto TransferOnSuccess = [&](SymbolRef Sym, bool IsSuccess) -> ProgramStateRef {
++    if (!Sym)
++      return State;
++    const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
++    if (!PendingReq)
++      return State;
++    ProgramStateRef NewState = State->remove<PendingInitMap>(Sym);
++    if (IsSuccess) {
++      NewState = NewState->add<AcquiredReqs>(*PendingReq);
++    }
++    return NewState;
++  };
++
+   if (std::optional<NonLoc> NL = Cond.getAs<NonLoc>()) {
+-    // Case 1: plain symbolic value 'rc'
++    // Case 1: if (rc)
+     if (SymbolRef Sym = NL->getAsSymbol()) {
+-      const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
+-      if (PendingReq) {
+-        // if (rc) with Assumption == false means rc == 0 (success)
+-        if (!Assumption) {
+-          State = State->add<AcquiredReqs>(*PendingReq);
+-        }
+-        // Consume the pending mapping either way
+-        State = State->remove<PendingInitMap>(Sym);
+-      }
++      // if (rc) being assumed false means rc == 0 (success path)
++      State = TransferOnSuccess(Sym, /*IsSuccess=*/!Assumption);
+       return State;
+     }
+
+-    // Case 2: symbolic comparison with integer, usually rc == 0 or rc != 0
++    // Case 2: if (rc == 0) or if (rc != 0)
+     if (SymbolRef SE = Cond.getAsSymbol()) {
+       if (const auto *SIE = dyn_cast<SymIntExpr>(SE)) {
+         BinaryOperator::Opcode Op = SIE->getOpcode();
+-        SymbolRef Sym = SIE->getLHS();
++        SymbolRef LHS = SIE->getLHS();
+         const llvm::APSInt &RHS = SIE->getRHS();
+-        if (Sym) {
+-          const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
+-          if (PendingReq && RHS == 0) {
+-            bool SuccessBranch = false;
+-            if (Op == BO_EQ && Assumption)
+-              SuccessBranch = true;        // (rc == 0) assumed true
+-            else if (Op == BO_NE && !Assumption)
+-              SuccessBranch = true;        // (rc != 0) assumed false
+-
+-            if (SuccessBranch) {
+-              State = State->add<AcquiredReqs>(*PendingReq);
+-            }
+-            State = State->remove<PendingInitMap>(Sym);
+-          }
++        if (RHS == 0 && LHS) {
++          bool SuccessBranch = false;
++          if (Op == BO_EQ && Assumption)
++            SuccessBranch = true;   // (rc == 0) assumed true
++          else if (Op == BO_NE && !Assumption)
++            SuccessBranch = true;   // (rc != 0) assumed false
++          State = TransferOnSuccess(LHS, SuccessBranch);
++          return State;
+         }
+       }
+     }
+@@ -164,25 +169,21 @@   return State;
+ }
+
+-void SAGenTestChecker::checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const {
+-  if (!RS)
+-    return;
+-
++void SAGenTestChecker::reportLeaksInCurrentFrame(CheckerContext &C,
++                                                 const Stmt *S) const {
+   ProgramStateRef State = C.getState();
+-  // If any acquired req is still live, report a leak.
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
+-    reportLeak(C, RS);
+-  }
+-}
+-
+-void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+-  ProgramStateRef State = C.getState();
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
+-    reportLeak(C, nullptr);
+-  }
+-}
+-
+-void SAGenTestChecker::reportLeak(CheckerContext &C, const Stmt *S) const {
++  const StackFrameContext *CurFrame = C.getStackFrame();
++
++  // Filter AcquiredReqs to only those whose owning frame matches CurFrame
++  llvm::SmallVector<const MemRegion *, 4> LeakedHere;
++  for (const MemRegion *MR : State->get<AcquiredReqs>()) {
++    if (getOwningFrameOfRegion(MR) == CurFrame)
++      LeakedHere.push_back(MR);
++  }
++
++  if (LeakedHere.empty())
++    return;
++
+   ExplodedNode *N = C.generateNonFatalErrorNode();
+   if (!N)
+     return;
+@@ -194,6 +195,22 @@   C.emitReport(std::move(R));
+ }
+
++void SAGenTestChecker::checkPreStmt(const ReturnStmt *RS,
++                                    CheckerContext &C) const {
++  if (!RS)
++    return;
++  // Only report leaks owned by the current frame; this avoids spurious
++  // reports from inlined helper functions (e.g., in headers).
++  reportLeaksInCurrentFrame(C, RS);
++}
++
++void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS,
++                                        CheckerContext &C) const {
++  // Only report leaks owned by the current frame; this ensures we report
++  // at the end of the function that performed hwrm_req_init().
++  reportLeaksInCurrentFrame(C, RS);
++}
++
+ } // end anonymous namespace
+
+ extern "C" void clang_registerCheckers(CheckerRegistry &registry) {

@@ -1,0 +1,5 @@
+- Decision: NotABug
+- Reason: The reported loop indexes two arrays: ttc_params->dests[tt] and hp->indir_tir[tt].
+  - For ttc_params->dests[tt]: struct ttc_params defines dests sized by MLX5_NUM_TT. The loop runs for tt in [0, MLX5_NUM_TT-1], so indexing is within bounds.
+  - For hp->indir_tir[tt]: the array is sized MLX5E_NUM_INDIR_TIRS, which equals MLX5_NUM_TT - 1. The code only indexes hp->indir_tir[tt] when tt != MLX5_TT_ANY. In mlx5, MLX5_TT_ANY is the last traffic type (value MLX5_NUM_TT - 1). Thus, the maximum tt used for indir_tir is MLX5_NUM_TT - 2, which is within the array’s capacity (0..MLX5_NUM_TT - 2).
+  - Therefore, no out-of-bounds access occurs and there is no mismatch between loop bound and array capacity as per the target bug pattern.

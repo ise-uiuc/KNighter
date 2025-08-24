@@ -1,0 +1,546 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -21,11 +21,94 @@ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/SmallPtrSet.h"
++#include "clang/AST/ParentMapContext.h"
+ #include <memory>
+
+ using namespace clang;
+ using namespace ento;
+ using namespace taint;
++
++// Utility functions (from prompt)
++const IfStmt* findIfStmtInParents(const Stmt *S, CheckerContext &C);
++const LabelStmt* findLabelStmtInParents(const Stmt *S, CheckerContext &C);
++
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C) {
++  Expr::EvalResult ExprRes;
++  if (expr->EvaluateAsInt(ExprRes, C.getASTContext())) {
++    EvalRes = ExprRes.Val.getInt();
++    return true;
++  }
++  return false;
++}
++
++// Unused helper; return nullptr in this build to avoid relying on non-existent APIs.
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C) {
++  (void)Sym;
++  (void)C;
++  return nullptr;
++}
++
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E) {
++  if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E->IgnoreImplicit())) {
++    if (const VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++      QualType QT = VD->getType();
++      if (const ConstantArrayType *ArrayType = dyn_cast<ConstantArrayType>(QT.getTypePtr())) {
++        ArraySize = ArrayType->getSize();
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool getStringSize(llvm::APInt &StringSize, const Expr *E) {
++  if (const auto *SL = dyn_cast<StringLiteral>(E->IgnoreImpCasts())) {
++    StringSize = llvm::APInt(32, SL->getLength());
++    return true;
++  }
++  return false;
++}
++
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C) {
++  ProgramStateRef State = C.getState();
++  return State->getSVal(E, C.getLocationContext()).getAsRegion();
++}
++
++struct KnownDerefFunction {
++  const char *Name;
++  llvm::SmallVector<unsigned, 4> Params;
++};
++
++bool functionKnownToDeref(const CallEvent &Call,
++                                 llvm::SmallVectorImpl<unsigned> &DerefParams) {
++  // Provide a non-empty sentinel entry to avoid zero-sized array issues.
++  static const KnownDerefFunction DerefTable[] = {
++    {"", {}}
++  };
++
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    StringRef FnName = ID->getName();
++
++    for (const auto &Entry : DerefTable) {
++      if (FnName.equals(Entry.Name) && *Entry.Name != '\0') {
++        DerefParams.append(Entry.Params.begin(), Entry.Params.end());
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C) {
++  if (!E)
++    return false;
++
++  const SourceManager &SM = C.getSourceManager();
++  const LangOptions &LangOpts = C.getLangOpts();
++  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());
++  StringRef ExprText = Lexer::getSourceText(Range, SM, LangOpts);
++  return ExprText.contains(Name);
++}
+
+ // Program state: symbols returned by allocators.
+ REGISTER_SET_WITH_PROGRAMSTATE(AllocSymSet, SymbolRef)
+@@ -54,7 +137,6 @@   // Per-function: earliest source location where a given FieldDecl is assigned from a function call.
+   mutable llvm::DenseMap<const FunctionDecl*, llvm::DenseMap<const FieldDecl*, SourceLocation>> FuncFieldFirstSetByCallLoc;
+
+-  // New: Per-function maps keyed by FieldDecl -> ParmVarDecl -> locations.
+   using ParmToLocsMap = llvm::DenseMap<const ParmVarDecl*, llvm::SmallVector<SourceLocation, 4>>;
+   using FieldParmLocsMap = llvm::DenseMap<const FieldDecl*, ParmToLocsMap>;
+
+@@ -64,6 +146,8 @@   mutable llvm::DenseMap<const FunctionDecl*, FieldParmLocsMap> FuncFieldNullSetLocs;
+   // Locations where param-field is assigned from allocator-like calls.
+   mutable llvm::DenseMap<const FunctionDecl*, FieldParmLocsMap> FuncFieldAllocAssignLocs;
++  // NEW: Locations where param-field is assigned from ANY function call in this function.
++  mutable llvm::DenseMap<const FunctionDecl*, FieldParmLocsMap> FuncFieldAnyCallAssignLocs;
+
+ public:
+   SAGenTestChecker()
+@@ -76,7 +160,6 @@   void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+
+ private:
+-  // Helper to perform case-insensitive substring search using lowercase conversion.
+   static bool containsLower(StringRef Haystack, StringRef Needle) {
+     std::string Lower = Haystack.lower();
+     return StringRef(Lower).contains(Needle);
+@@ -86,8 +169,6 @@     return QT->isPointerType() || QT->isAnyPointerType();
+   }
+
+-  // Helper to collect labels, gotos, and fields locally assigned from function calls,
+-  // as well as free/nullset/allocator-assign locations per (param, field).
+   struct FuncInfoCollector : public RecursiveASTVisitor<FuncInfoCollector> {
+     CheckerContext &C;
+     llvm::DenseMap<const LabelDecl *, const LabelStmt *> LabelMap;
+@@ -98,8 +179,8 @@     FieldParmLocsMap FreeLocs;
+     FieldParmLocsMap NullSetLocs;
+     FieldParmLocsMap AllocAssignLocs;
+-
+-    // New: Variables assigned from allocator-like calls: VarDecl -> locations.
++    FieldParmLocsMap AnyCallAssignLocs; // NEW
++
+     llvm::DenseMap<const VarDecl*, llvm::SmallVector<SourceLocation, 4>> VarAllocLocs;
+
+     FuncInfoCollector(CheckerContext &Ctx) : C(Ctx) {}
+@@ -140,7 +221,6 @@       return dyn_cast_or_null<MemberExpr>(S);
+     }
+
+-    // Resolve base to a function parameter if possible.
+     static const ParmVarDecl *getDirectBaseParam(const Expr *BaseE) {
+       if (!BaseE) return nullptr;
+       const Expr *E = BaseE;
+@@ -182,7 +262,6 @@             return true;
+       }
+
+-      // Fallback to source text substring match.
+       for (const char *N : AllocNames) {
+         if (ExprHasName(CE, N, C))
+           return true;
+@@ -224,8 +303,7 @@       const SourceLocation CurLoc = BO->getBeginLoc();
+       const SourceManager &SM = C.getSourceManager();
+
+-      // Track fields assigned from call expressions (potential allocators),
+-      // and record the earliest location.
++      // Track fields assigned from call expressions (potential allocators and any calls).
+       if (const auto *ME = dyn_cast<MemberExpr>(LHS)) {
+         const ValueDecl *VD = ME->getMemberDecl();
+         if (const auto *FD = dyn_cast_or_null<FieldDecl>(VD)) {
+@@ -235,14 +313,15 @@             if (isExplicitNullExpr(RHS)) {
+               NullSetLocs[FD->getCanonicalDecl()][BaseP].push_back(CurLoc);
+             }
+-            // Allocator-assignment tracking when RHS is a call.
++            // ANY-call assignment tracking.
+             if (const auto *RCE = dyn_cast<CallExpr>(RHS)) {
++              AnyCallAssignLocs[FD->getCanonicalDecl()][BaseP].push_back(CurLoc);
++              // Additionally track allocator-specific assignments.
+               if (callExprLooksLikeAllocator(RCE, C)) {
+                 AllocAssignLocs[FD->getCanonicalDecl()][BaseP].push_back(CurLoc);
+               }
+             }
+-            // New: Allocator-assignment tracking when RHS is a variable previously
+-            //       assigned from an allocator in this function.
++            // Allocator-assignment via variable previously set from allocator.
+             if (const auto *RDRE = dyn_cast<DeclRefExpr>(RHS)) {
+               if (const auto *RVD = dyn_cast<VarDecl>(RDRE->getDecl())) {
+                 auto It = VarAllocLocs.find(RVD->getCanonicalDecl());
+@@ -276,13 +355,12 @@         }
+       }
+
+-      // Existing tracking of "assigned from any call" for other heuristics.
++      // Existing tracking for "fields assigned from any call" (field-only).
+       const auto *ME = dyn_cast<MemberExpr>(LHS);
+       const auto *CE = dyn_cast<CallExpr>(RHS);
+       if (!ME || !CE)
+         return true;
+
+-      // Only consider assignments of pointer-typed fields from function calls.
+       const ValueDecl *VD = ME->getMemberDecl();
+       if (!VD)
+         return true;
+@@ -339,23 +417,18 @@
+   bool isAllocatorCall(const CallEvent &Call, CheckerContext &C) const;
+
+-  // Identify free-like functions and which parameter indices are the freed pointers.
+   bool getFreeLikeParamIndices(const CallEvent &Call,
+                                llvm::SmallVectorImpl<unsigned> &Idxs) const;
+
+-  // Returns true if the reported scenario is a false positive and should be suppressed.
+   bool isFalsePositive(const Expr *FreedArgE, const MemberExpr *FreedME,
+                        const ParmVarDecl *BaseParam,
+                        const CallEvent &Call, const LabelStmt *EnclosingLabel,
+                        CheckerContext &C) const;
+
+-  // Gating heuristic: return the ParmVarDecl if the base of a MemberExpr resolves directly to a function parameter.
+   const ParmVarDecl *getDirectBaseParam(const Expr *BaseE) const;
+
+-  // Additional gating: check whether the target label has any error-like incoming goto.
+   bool labelHasErrorishIncoming(const FunctionDecl *FD, const LabelStmt *LS, CheckerContext &C) const;
+
+-  // Helpers for "error-ish" classification.
+   bool labelNameLooksErrorish(const LabelStmt *LS) const;
+   bool gotoLooksErrorish(const GotoStmt *GS, CheckerContext &C) const;
+   bool condLooksErrorish(const Expr *Cond, CheckerContext &C) const;
+@@ -393,17 +466,16 @@   FuncLocallySetByCallFields[FD] = std::move(Collector.LocallySetByCallFields);
+   FuncLabelGotos[FD] = std::move(LabelToGotos);
+
+-  // Store earliest assignment-from-call locations for fields.
+   llvm::DenseMap<const FieldDecl*, SourceLocation> Earliest;
+   for (const auto &P : Collector.FirstSetLoc) {
+     Earliest[P.first->getCanonicalDecl()] = P.second;
+   }
+   FuncFieldFirstSetByCallLoc[FD] = std::move(Earliest);
+
+-  // Store fine-grained per-(param,field) location data for FP suppression.
+   FuncFieldFreeLocs[FD] = std::move(Collector.FreeLocs);
+   FuncFieldNullSetLocs[FD] = std::move(Collector.NullSetLocs);
+   FuncFieldAllocAssignLocs[FD] = std::move(Collector.AllocAssignLocs);
++  FuncFieldAnyCallAssignLocs[FD] = std::move(Collector.AnyCallAssignLocs);
+ }
+
+ bool SAGenTestChecker::isAllocatorCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -432,13 +504,12 @@     return false;
+
+   StringRef Name = FD->getName();
+-  // Only consider heap-free routines tied to the target pattern; exclude vfree().
+   if (Name.equals("kfree") || Name.equals("kvfree")) {
+     if (Call.getNumArgs() >= 1)
+       Idxs.push_back(0);
+   } else if (Name.equals("devm_kfree")) {
+     if (Call.getNumArgs() >= 2)
+-      Idxs.push_back(1); // freed pointer is the second argument
++      Idxs.push_back(1);
+   } else {
+     return false;
+   }
+@@ -449,7 +520,6 @@   const FunctionDecl *FD = getCurrentFunction(C);
+   if (!FD)
+     return;
+-  // Build per-function metadata (labels and locally-assigned-from-call fields).
+   buildPerFunctionInfo(FD, C);
+ }
+
+@@ -457,7 +527,6 @@   const FunctionDecl *FD = getCurrentFunction(C);
+   if (!FD)
+     return;
+-  // Clean per-function metadata.
+   FuncLabelIncoming.erase(FD);
+   FuncLocallySetByCallFields.erase(FD);
+   FuncLabelGotos.erase(FD);
+@@ -465,6 +534,7 @@   FuncFieldFreeLocs.erase(FD);
+   FuncFieldNullSetLocs.erase(FD);
+   FuncFieldAllocAssignLocs.erase(FD);
++  FuncFieldAnyCallAssignLocs.erase(FD);
+ }
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -495,11 +565,9 @@     return;
+
+   if (State->contains<AllocSymSet>(RHSym)) {
+-    // Mark the precise region as owned.
+     if (!State->contains<OwnedRegionSet>(DstReg)) {
+       State = State->add<OwnedRegionSet>(DstReg);
+     }
+-    // Also mark the base region to be robust against field/base conversions.
+     const MemRegion *Base = DstReg->getBaseRegion();
+     if (Base && !State->contains<OwnedRegionSet>(Base)) {
+       State = State->add<OwnedRegionSet>(Base);
+@@ -540,7 +608,6 @@   while (const auto *CE = dyn_cast_or_null<CallExpr>(Cur)) {
+     const FunctionDecl *FD = CE->getDirectCallee();
+     StringRef Name = FD ? FD->getName() : StringRef();
+-    // Common kernel wrappers/macros lowered as calls we want to peel.
+     if (Name.equals("unlikely") || Name.equals("likely") ||
+         Name.equals("__builtin_expect")) {
+       if (CE->getNumArgs() > 0) {
+@@ -561,7 +628,6 @@   if (!E)
+     return false;
+
+-  // if (ret) or if (!ret) patterns where 'ret' is a typical error code variable.
+   auto LooksLikeErrVar = [](StringRef N) {
+     return N.equals("ret") || N.equals("rc") || N.equals("err") || N.equals("error") || N.equals("status");
+   };
+@@ -588,7 +654,7 @@       const Expr *R = BO->getRHS()->IgnoreParenImpCasts();
+       auto IsZeroOrNegConst = [](const Expr *X) -> bool {
+         if (const auto *IL = dyn_cast<IntegerLiteral>(X)) {
+-          return IL->getValue().isZero(); // zero
++          return IL->getValue().isZero();
+         }
+         return false;
+       };
+@@ -598,20 +664,17 @@             return LooksLikeErrVar(VD->getName());
+         return false;
+       };
+-      // ret != 0, ret < 0, 0 != ret, etc.
+       if ((IsErrVar(L) && IsZeroOrNegConst(R)) || (IsErrVar(R) && IsZeroOrNegConst(L)))
+         return true;
+     }
+   }
+
+-  // if (IS_ERR(ptr)) or IS_ERR_OR_NULL(ptr)
+   if (const auto *CE = dyn_cast<CallExpr>(E)) {
+     if (const FunctionDecl *FD = CE->getDirectCallee()) {
+       StringRef N = FD->getName();
+       if (N.equals("IS_ERR") || N.equals("IS_ERR_OR_NULL") || N.equals("IS_ERR_VALUE"))
+         return true;
+     } else {
+-      // Fallback: text search in the expression for kernel helpers.
+       if (ExprHasName(E, "IS_ERR", C) || ExprHasName(E, "IS_ERR_OR_NULL", C) || ExprHasName(E, "IS_ERR_VALUE", C))
+         return true;
+     }
+@@ -624,7 +687,6 @@   if (!LS || !LS->getDecl())
+     return false;
+   StringRef N = LS->getDecl()->getName();
+-  // Common error cleanup labels in kernel code.
+   return containsLower(N, "err") || containsLower(N, "error") ||
+          containsLower(N, "fail") || containsLower(N, "free") ||
+          containsLower(N, "cleanup") || containsLower(N, "out_err");
+@@ -634,15 +696,13 @@   if (!GS)
+     return false;
+
+-  // If there's an enclosing if-statement, examine its condition.
+-  if (const IfStmt *IS = findSpecificTypeInParents<IfStmt>(GS, C)) {
++  if (const IfStmt *IS = findIfStmtInParents(GS, C)) {
+     if (const Expr *Cond = IS->getCond()) {
+       if (condLooksErrorish(Cond, C))
+         return true;
+     }
+   }
+
+-  // Otherwise, fall back to label name being errorish.
+   const LabelDecl *LD = GS->getLabel();
+   if (LD) {
+     StringRef N = LD->getName();
+@@ -664,7 +724,6 @@   if (It == ItF->second.end())
+     return false;
+
+-  // If label name looks errorish, that's sufficient.
+   if (labelNameLooksErrorish(LS))
+     return true;
+
+@@ -682,20 +741,16 @@                                        const CallEvent &Call,
+                                        const LabelStmt *EnclosingLabel,
+                                        CheckerContext &C) const {
+-  // 0) If the label does not look like an error path for any of its incoming gotos,
+-  //    this is very likely a normal cleanup label (e.g. "out") -> suppress.
+   const FunctionDecl *FD = getCurrentFunction(C);
+   if (FD && EnclosingLabel && !labelHasErrorishIncoming(FD, EnclosingLabel, C))
+     return true;
+
+-  // 1) If the argument is definitely the literal NULL at this point, kfree(NULL) is a no-op.
+   if (FreedArgE) {
+     SVal ArgVal = C.getSVal(FreedArgE);
+     if (ArgVal.isZeroConstant())
+       return true;
+   }
+
+-  // 2) If this function path-sensitively owns the region (or its base), don't warn on this path.
+   if (FreedArgE) {
+     const MemRegion *FreedReg = getMemRegionFromExpr(FreedArgE, C);
+     if (FreedReg) {
+@@ -708,9 +763,39 @@     }
+   }
+
+-  // 2.4) Intrafunction allocator-assignment suppression (path-insensitive):
+-  // If this param-field is ever assigned from an allocator anywhere in this function,
+-  // treat it as locally-owned in general and suppress (avoids FPs when path predicates skip the allocation).
++  // NEW: Intrafunction "any-call" assignment suppression, parameter-specific.
++  // If the same param-field was assigned from ANY function call earlier in this function,
++  // consider it owned/managed by this function, and suppress.
++  if (FD && FreedME && BaseParam) {
++    const auto *FDField = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
++    if (FDField) {
++      const FieldDecl *CanonFD = FDField->getCanonicalDecl();
++      auto ItAnyF = FuncFieldAnyCallAssignLocs.find(FD);
++      if (ItAnyF != FuncFieldAnyCallAssignLocs.end()) {
++        const auto &AnyMapField = ItAnyF->second;
++        auto ItAnyParmMap = AnyMapField.find(CanonFD);
++        if (ItAnyParmMap != AnyMapField.end()) {
++          auto ItLocs = ItAnyParmMap->second.find(BaseParam);
++          if (ItLocs != ItAnyParmMap->second.end()) {
++            const auto &AssignLocs = ItLocs->second;
++            if (!AssignLocs.empty()) {
++              const SourceManager &SM = C.getSourceManager();
++              SourceLocation CurLoc = Call.getOriginExpr()
++                                          ? Call.getOriginExpr()->getBeginLoc()
++                                          : Call.getSourceRange().getBegin();
++              for (SourceLocation Lassign : AssignLocs) {
++                if (SM.isBeforeInTranslationUnit(Lassign, CurLoc)) {
++                  return true;
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++
++  // Intrafunction allocator-assignment suppression (path-insensitive).
+   if (FD && FreedME && BaseParam) {
+     const FieldDecl *CanonFD = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
+     if (CanonFD) {
+@@ -730,9 +815,7 @@     }
+   }
+
+-  // 2.5) Intrafunction allocator-assignment suppression (ordered variant):
+-  // If this same param-field was assigned from an allocator in this function
+-  // before the current free call, treat it as locally-owned and suppress.
++  // Intrafunction allocator-assignment suppression (ordered).
+   if (FD && FreedME && BaseParam) {
+     const FieldDecl *CanonFD = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
+     if (CanonFD) {
+@@ -762,9 +845,7 @@     }
+   }
+
+-  // 2.6) Post-free nullification suppression:
+-  // If there exists an assignment "param->field = NULL" after this free within the function,
+-  // consider it a strong cleanup idiom and suppress to avoid FPs.
++  // Post-free nullification suppression.
+   if (FD && FreedME && BaseParam) {
+     const FieldDecl *CanonFD = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
+     if (CanonFD) {
+@@ -794,9 +875,7 @@     }
+   }
+
+-  // 3) AST-based suppression for the "reset and reallocate" idiom:
+-  //    If there exists a prior free(field) followed by field = NULL (or 0) and then
+-  //    an allocator assignment to the same field, all before this free -> suppress.
++  // Reset-null-realloc idiom suppression.
+   if (FD && FreedME && BaseParam) {
+     const FieldDecl *CanonFD = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
+     if (CanonFD) {
+@@ -828,7 +907,6 @@             SourceLocation CurLoc = Call.getOriginExpr()
+                                         ? Call.getOriginExpr()->getBeginLoc()
+                                         : Call.getSourceRange().getBegin();
+-            // Check for free < null < alloc < current
+             for (SourceLocation Lfree : FreeVec) {
+               if (!SM.isBeforeInTranslationUnit(Lfree, CurLoc))
+                 continue;
+@@ -846,7 +924,6 @@                   }
+                 }
+                 if (HasAllocBetween) {
+-                  // All three conditions satisfied for this path -> suppress.
+                   return true;
+                 }
+               }
+@@ -880,7 +957,7 @@   if (!Origin)
+     return;
+
+-  const LabelStmt *EnclosingLabel = findSpecificTypeInParents<LabelStmt>(Origin, C);
++  const LabelStmt *EnclosingLabel = findLabelStmtInParents(Origin, C);
+   if (!EnclosingLabel)
+     return;
+
+@@ -896,44 +973,76 @@   auto Lit = IncomingMap.find(EnclosingLabel);
+   unsigned Count = (Lit == IncomingMap.end()) ? 0u : Lit->second;
+
+-  // Only consider shared labels (2 or more incoming gotos).
+   if (Count < 2)
+     return;
+
+-  // Only consider labels that look like error paths.
+   if (!labelHasErrorishIncoming(FD, EnclosingLabel, C))
+     return;
+
+-  // Check each freed argument.
+   for (unsigned ArgIndex : FreeIdxs) {
+     const Expr *ArgE = Call.getArgExpr(ArgIndex);
+     if (!ArgE)
+       continue;
+
+-    // Only consider freeing a struct/union field like mt->fc.
+     const Expr *Stripped = ArgE->IgnoreParenImpCasts();
+     const auto *FreedME = dyn_cast<MemberExpr>(Stripped);
+     if (!FreedME)
+       continue;
+
+-    // Only warn when the freed field belongs directly to a function parameter.
+-    // This matches the target buggy pattern (e.g., mt->fc) and suppresses cleanup of local/private state.
+     const Expr *BaseE = FreedME->getBase();
+     const ParmVarDecl *BaseParam = getDirectBaseParam(BaseE);
+     if (!BaseParam)
+       continue;
+
+-    // Suppress known false positives (ownership known on path, non-error labels, or reset+realloc/local-alloc idioms).
+     if (isFalsePositive(ArgE, FreedME, BaseParam, Call, EnclosingLabel, C))
+       continue;
+
+     reportFreeUnownedInSharedLabel(Call, C);
+-    // One report per call site is sufficient.
+     return;
+   }
+ }
+
+ } // end anonymous namespace
++
++// Template-free helpers for finding specific parent statements.
++
++const IfStmt* findIfStmtInParents(const Stmt *S, CheckerContext &C) {
++  if (!S)
++    return nullptr;
++  const Stmt *Cur = S;
++  ASTContext &ACtx = C.getASTContext();
++  while (Cur) {
++    auto Parents = ACtx.getParents(*Cur);
++    if (Parents.empty())
++      return nullptr;
++    const Stmt *ParentStmt = Parents[0].get<Stmt>();
++    if (!ParentStmt)
++      return nullptr;
++    if (const IfStmt *Found = dyn_cast<IfStmt>(ParentStmt))
++      return Found;
++    Cur = ParentStmt;
++  }
++  return nullptr;
++}
++
++const LabelStmt* findLabelStmtInParents(const Stmt *S, CheckerContext &C) {
++  if (!S)
++    return nullptr;
++  const Stmt *Cur = S;
++  ASTContext &ACtx = C.getASTContext();
++  while (Cur) {
++    auto Parents = ACtx.getParents(*Cur);
++    if (Parents.empty())
++      return nullptr;
++    const Stmt *ParentStmt = Parents[0].get<Stmt>();
++    if (!ParentStmt)
++      return nullptr;
++    if (const LabelStmt *Found = dyn_cast<LabelStmt>(ParentStmt))
++      return Found;
++    Cur = ParentStmt;
++  }
++  return nullptr;
++}
+
+ extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+   registry.addChecker<SAGenTestChecker>(

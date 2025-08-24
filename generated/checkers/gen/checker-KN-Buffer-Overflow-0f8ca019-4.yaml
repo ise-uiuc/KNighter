@@ -1,0 +1,495 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 0f8ca019544a252d1afb468ce840c6dcbac73af4
+commit_type: Buffer-Overflow
+index: 4
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/RecursiveASTVisitor.h\"\
+  \n#include \"clang/AST/ParentMapContext.h\"\n#include \"llvm/ADT/APInt.h\"\n#include\
+  \ \"llvm/ADT/APSInt.h\"\n#include \"llvm/Support/Casting.h\"\n#include <memory>\n\
+  \nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// No\
+  \ custom program states are necessary for this AST-only checker.\n\nnamespace {\n\
+  \n// Forward declarations of helpers\nstatic bool evalInt(const ASTContext &Ctx,\
+  \ const Expr *E, llvm::APSInt &Res);\nstatic bool containsDeclRefToVar(const Expr\
+  \ *E, const VarDecl *V);\nstatic bool getArrayConstSizeFromBase(const ASTContext\
+  \ &Ctx, const Expr *Base, uint64_t &CapOut);\nstatic bool stmtContains(const Stmt\
+  \ *Root, const Stmt *Target);\nstatic bool isGuardedByEnclosingIfLtCap(const ASTContext\
+  \ &Ctx, const ArraySubscriptExpr *ASE,\n                                       \
+  \ const VarDecl *IVar, uint64_t Cap);\nstatic bool isGuardedByPrevIfGeBreak(const\
+  \ ASTContext &Ctx, const ArraySubscriptExpr *ASE,\n                            \
+  \         const VarDecl *IVar, uint64_t Cap);\nstatic bool isGuardedBeforeUse(const\
+  \ ASTContext &Ctx, const ArraySubscriptExpr *ASE,\n                            \
+  \   const VarDecl *IVar, uint64_t Cap);\n\nclass SAGenTestChecker : public Checker<check::ASTCodeBody>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \    : BT(std::make_unique<BugType>(this, \"Loop bound exceeds array capacity\"\
+  , \"Memory Error\")) {}\n\n  void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n\nprivate:\n  // Extract loop index variable and\
+  \ bounds from a ForStmt.\n  // Returns true on success and sets IVar, LB, UBExclusive.\n\
+  \  static bool getLoopIndexAndBounds(const ForStmt *FS, const ASTContext &Ctx,\n\
+  \                                    const VarDecl *&IVar, llvm::APSInt &LB,\n \
+  \                                   llvm::APSInt &UBExclusive);\n\n  // Process\
+  \ a single ForStmt: find array subscripts using IVar and check against Cap.\n  void\
+  \ processForStmt(const ForStmt *FS, const ASTContext &Ctx, BugReporter &BR) const;\n\
+  \n  // Emit a report for a problematic array access.\n  void reportIssue(const ArraySubscriptExpr\
+  \ *ASE, const VarDecl *IVar,\n                   uint64_t UBExclusive, uint64_t\
+  \ Cap,\n                   BugReporter &BR, const ASTContext &Ctx) const;\n};\n\n\
+  //====================== Helper implementations ======================\n\nstatic\
+  \ bool evalInt(const ASTContext &Ctx, const Expr *E, llvm::APSInt &Res) {\n  if\
+  \ (!E) return false;\n  Expr::EvalResult ER;\n  if (E->EvaluateAsInt(ER, Ctx)) {\n\
+  \    Res = ER.Val.getInt();\n    return true;\n  }\n  return false;\n}\n\nstatic\
+  \ bool containsDeclRefToVar(const Expr *E, const VarDecl *V) {\n  if (!E || !V)\
+  \ return false;\n  struct LocalVisitor : public RecursiveASTVisitor<LocalVisitor>\
+  \ {\n    const VarDecl *Var;\n    bool Found;\n    LocalVisitor(const VarDecl *V)\
+  \ : Var(V), Found(false) {}\n    bool VisitDeclRefExpr(const DeclRefExpr *DRE) {\n\
+  \      if (DRE->getDecl() == Var) {\n        Found = true;\n        return false;\n\
+  \      }\n      return true;\n    }\n  };\n  LocalVisitor Vst(V);\n  const_cast<Expr*>(E)->walk(Vst);\n\
+  \  return Vst.Found;\n}\n\nstatic bool getArrayConstSizeFromBase(const ASTContext\
+  \ &Ctx, const Expr *Base, uint64_t &CapOut) {\n  if (!Base) return false;\n  const\
+  \ Expr *E = Base->IgnoreParenImpCasts();\n\n  auto ExtractFromQT = [&](QualType\
+  \ QT) -> bool {\n    if (QT.isNull()) return false;\n    if (const auto *CAT = Ctx.getAsConstantArrayType(QT))\
+  \ {\n      CapOut = CAT->getSize().getLimitedValue();\n      return true;\n    }\n\
+  \    return false;\n  };\n\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n\
+  \    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n      return ExtractFromQT(VD->getType());\n\
+  \    }\n  } else if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    if (const\
+  \ auto *VD = dyn_cast<ValueDecl>(ME->getMemberDecl())) {\n      return ExtractFromQT(VD->getType());\n\
+  \    }\n  }\n  return false;\n}\n\nstatic bool stmtContains(const Stmt *Root, const\
+  \ Stmt *Target) {\n  if (!Root || !Target) return false;\n  if (Root == Target)\
+  \ return true;\n  for (const Stmt *Child : Root->children()) {\n    if (Child &&\
+  \ stmtContains(Child, Target))\n      return true;\n  }\n  return false;\n}\n\n\
+  static bool parseGuardCondition(const ASTContext &Ctx, const Expr *Cond, const VarDecl\
+  \ *IVar,\n                                uint64_t Cap, bool &IsLTorLE, bool &IsGEorGT)\
+  \ {\n  IsLTorLE = false;\n  IsGEorGT = false;\n  if (!Cond) return false;\n  Cond\
+  \ = Cond->IgnoreParenImpCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(Cond);\n\
+  \  if (!BO) return false;\n\n  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \  const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();\n\n  const Expr *PtrSide\
+  \ = nullptr;\n  const Expr *ConstSide = nullptr;\n  // We expect the loop variable\
+  \ on one side and a constant on the other.\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(LHS))\
+  \ {\n    if (DRE->getDecl() == IVar) {\n      PtrSide = LHS;\n      ConstSide =\
+  \ RHS;\n    }\n  } else if (const auto *DRE = dyn_cast<DeclRefExpr>(RHS)) {\n  \
+  \  if (DRE->getDecl() == IVar) {\n      PtrSide = RHS;\n      ConstSide = LHS;\n\
+  \    }\n  }\n  if (!PtrSide || !ConstSide) return false;\n\n  llvm::APSInt CVal;\n\
+  \  if (!evalInt(Ctx, ConstSide, CVal)) return false;\n  uint64_t Num = CVal.getLimitedValue();\n\
+  \n  // Must match the same Cap\n  if (Num != Cap) return false;\n\n  switch (BO->getOpcode())\
+  \ {\n  case BO_LT:\n  case BO_LE:\n    IsLTorLE = true;\n    return true;\n  case\
+  \ BO_GE:\n  case BO_GT:\n    IsGEorGT = true;\n    return true;\n  default:\n  \
+  \  break;\n  }\n  return false;\n}\n\nstatic bool isGuardedByEnclosingIfLtCap(const\
+  \ ASTContext &Ctx, const ArraySubscriptExpr *ASE,\n                            \
+  \            const VarDecl *IVar, uint64_t Cap) {\n  if (!ASE) return false;\n\n\
+  \  // Walk up the parents and look for an IfStmt where ASE is located within the\
+  \ 'then' branch\n  // and the condition is i < Cap (or i <= Cap).\n  const Stmt\
+  \ *Curr = ASE;\n  while (true) {\n    const Stmt *ParentS = nullptr;\n    auto Parents\
+  \ = Ctx.getParents(*Curr);\n    if (Parents.empty()) break;\n    ParentS = Parents[0].get<Stmt>();\n\
+  \    if (!ParentS) break;\n\n    if (const auto *IS = dyn_cast<IfStmt>(ParentS))\
+  \ {\n      bool IsLTorLE = false, IsGEorGT = false;\n      if (parseGuardCondition(Ctx,\
+  \ IS->getCond(), IVar, Cap, IsLTorLE, IsGEorGT)) {\n        if (IsLTorLE) {\n  \
+  \        const Stmt *Then = IS->getThen();\n          if (Then && stmtContains(Then,\
+  \ ASE))\n            return true;\n        }\n      }\n    }\n    Curr = ParentS;\n\
+  \  }\n\n  return false;\n}\n\nstatic bool isGuardedByPrevIfGeBreak(const ASTContext\
+  \ &Ctx, const ArraySubscriptExpr *ASE,\n                                     const\
+  \ VarDecl *IVar, uint64_t Cap) {\n  if (!ASE) return false;\n\n  // Find the nearest\
+  \ enclosing CompoundStmt and check previous siblings.\n  const Stmt *Containing\
+  \ = ASE;\n  const CompoundStmt *CS = nullptr;\n  while (true) {\n    auto Parents\
+  \ = Ctx.getParents(*Containing);\n    if (Parents.empty()) break;\n    const Stmt\
+  \ *P = Parents[0].get<Stmt>();\n    if (!P) break;\n    if ((CS = dyn_cast<CompoundStmt>(P)))\n\
+  \      break;\n    Containing = P;\n  }\n  if (!CS) return false;\n\n  // Find which\
+  \ immediate child statement of CS contains ASE.\n  const Stmt *ContainerChild =\
+  \ nullptr;\n  unsigned Index = 0, FoundIndex = 0;\n  for (const Stmt *Child : CS->body())\
+  \ {\n    if (Child && stmtContains(Child, ASE)) {\n      ContainerChild = Child;\n\
+  \      FoundIndex = Index;\n      break;\n    }\n    ++Index;\n  }\n  if (!ContainerChild)\
+  \ return false;\n\n  // Scan previous statements for if (i >= Cap) { break; } or\
+  \ return;\n  Index = 0;\n  for (const Stmt *Child : CS->body()) {\n    if (Index\
+  \ >= FoundIndex) break;\n    ++Index;\n\n    const auto *IS = dyn_cast<IfStmt>(Child);\n\
+  \    if (!IS) continue;\n\n    bool IsLTorLE = false, IsGEorGT = false;\n    if\
+  \ (!parseGuardCondition(Ctx, IS->getCond(), IVar, Cap, IsLTorLE, IsGEorGT))\n  \
+  \    continue;\n\n    if (!IsGEorGT)\n      continue;\n\n    const Stmt *Then =\
+  \ IS->getThen();\n    if (!Then) continue;\n\n    // Look for a BreakStmt or ReturnStmt\
+  \ inside the then-branch.\n    bool HasBreakOrReturn = false;\n    struct FindTerminator\
+  \ : public RecursiveASTVisitor<FindTerminator> {\n      bool Found = false;\n  \
+  \    bool VisitBreakStmt(BreakStmt *) { Found = true; return false; }\n      bool\
+  \ VisitReturnStmt(ReturnStmt *) { Found = true; return false; }\n    } Finder;\n\
+  \    const_cast<Stmt*>(Then)->walk(Finder);\n    HasBreakOrReturn = Finder.Found;\n\
+  \n    if (HasBreakOrReturn)\n      return true;\n  }\n\n  return false;\n}\n\nstatic\
+  \ bool isGuardedBeforeUse(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,\n\
+  \                               const VarDecl *IVar, uint64_t Cap) {\n  // Two heuristics:\n\
+  \  // 1) ASE is inside an enclosing if (i < Cap) { ... ASE ... }\n  if (isGuardedByEnclosingIfLtCap(Ctx,\
+  \ ASE, IVar, Cap))\n    return true;\n\n  // 2) Just before ASE in the same block,\
+  \ there is if (i >= Cap) { break; } or return;\n  if (isGuardedByPrevIfGeBreak(Ctx,\
+  \ ASE, IVar, Cap))\n    return true;\n\n  return false;\n}\n\nbool SAGenTestChecker::getLoopIndexAndBounds(const\
+  \ ForStmt *FS, const ASTContext &Ctx,\n                                        \
+  \     const VarDecl *&IVar, llvm::APSInt &LB,\n                                \
+  \             llvm::APSInt &UBExclusive) {\n  IVar = nullptr;\n\n  // Parse init:\
+  \ either \"int i = 0\" or \"i = 0\"\n  const Stmt *Init = FS->getInit();\n  if (!Init)\
+  \ return false;\n\n  const VarDecl *IdxVar = nullptr;\n  llvm::APSInt InitVal;\n\
+  \n  if (const auto *DS = dyn_cast<DeclStmt>(Init)) {\n    if (!DS->isSingleDecl())\
+  \ return false;\n    const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl());\n\
+  \    if (!VD) return false;\n    if (!VD->hasInit()) return false;\n    if (!evalInt(Ctx,\
+  \ VD->getInit(), InitVal)) return false;\n    IdxVar = VD;\n  } else if (const auto\
+  \ *BO = dyn_cast<BinaryOperator>(Init)) {\n    if (BO->getOpcode() != BO_Assign)\
+  \ return false;\n    const auto *LHS = dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreParenImpCasts());\n\
+  \    if (!LHS) return false;\n    const auto *VD = dyn_cast<VarDecl>(LHS->getDecl());\n\
+  \    if (!VD) return false;\n    if (!evalInt(Ctx, BO->getRHS(), InitVal)) return\
+  \ false;\n    IdxVar = VD;\n  } else {\n    return false;\n  }\n\n  // We only handle\
+  \ LB == 0\n  if (InitVal != 0) return false;\n\n  // Parse condition: i < N or i\
+  \ <= N\n  const Expr *Cond = FS->getCond();\n  if (!Cond) return false;\n  const\
+  \ auto *CBO = dyn_cast<BinaryOperator>(Cond->IgnoreParenImpCasts());\n  if (!CBO)\
+  \ return false;\n\n  BinaryOperator::Opcode Op = CBO->getOpcode();\n  if (Op !=\
+  \ BO_LT && Op != BO_LE) return false;\n\n  const auto *LHS = dyn_cast<DeclRefExpr>(CBO->getLHS()->IgnoreParenImpCasts());\n\
+  \  if (!LHS) return false;\n  if (LHS->getDecl() != IdxVar) return false;\n\n  llvm::APSInt\
+  \ RHSVal;\n  if (!evalInt(Ctx, CBO->getRHS(), RHSVal)) return false;\n\n  // Compute\
+  \ UBExclusive\n  if (Op == BO_LT) {\n    UBExclusive = RHSVal;\n  } else {\n   \
+  \ // i <= N  => UBExclusive = N + 1\n    UBExclusive = RHSVal + 1;\n  }\n\n  LB\
+  \ = InitVal;\n  IVar = IdxVar;\n  return true;\n}\n\nvoid SAGenTestChecker::reportIssue(const\
+  \ ArraySubscriptExpr *ASE, const VarDecl *IVar,\n                              \
+  \     uint64_t UBExclusive, uint64_t Cap,\n                                   BugReporter\
+  \ &BR, const ASTContext &Ctx) const {\n  if (!ASE || !IVar) return;\n\n  SmallString<128>\
+  \ Msg;\n  llvm::raw_svector_ostream OS(Msg);\n  OS << \"Loop bound exceeds array\
+  \ capacity: index '\" << IVar->getName()\n     << \"' goes up to \" << (UBExclusive\
+  \ ? (UBExclusive - 1) : 0)\n     << \" but array size is \" << Cap;\n\n  PathDiagnosticLocation\
+  \ ELoc =\n      PathDiagnosticLocation::createBegin(ASE->getIdx(), BR.getSourceManager(),\
+  \ Ctx);\n  auto R = std::make_unique<BasicBugReport>(*BT, OS.str(), ELoc);\n  R->addRange(ASE->getSourceRange());\n\
+  \  BR.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::processForStmt(const\
+  \ ForStmt *FS, const ASTContext &Ctx, BugReporter &BR) const {\n  const VarDecl\
+  \ *IVar = nullptr;\n  llvm::APSInt LB, UBEx;\n  if (!getLoopIndexAndBounds(FS, Ctx,\
+  \ IVar, LB, UBEx))\n    return;\n\n  // Only consider LB == 0 (already filtered)\n\
+  \  uint64_t UBExclusive = UBEx.getLimitedValue();\n\n  // Traverse the loop body\
+  \ to find array subscripts using IVar.\n  struct ASEVisitor : public RecursiveASTVisitor<ASEVisitor>\
+  \ {\n    const ASTContext &Ctx;\n    const VarDecl *IVar;\n    uint64_t UBExclusive;\n\
+  \    BugReporter &BR;\n    const SAGenTestChecker *Checker;\n\n    ASEVisitor(const\
+  \ ASTContext &C, const VarDecl *V, uint64_t UB, BugReporter &B,\n              \
+  \ const SAGenTestChecker *Ch)\n      : Ctx(C), IVar(V), UBExclusive(UB), BR(B),\
+  \ Checker(Ch) {}\n\n    bool VisitArraySubscriptExpr(ArraySubscriptExpr *ASE) {\n\
+  \      const Expr *Idx = ASE->getIdx();\n      if (!Idx) return true;\n      if\
+  \ (!containsDeclRefToVar(Idx, IVar))\n        return true;\n\n      uint64_t Cap\
+  \ = 0;\n      if (!getArrayConstSizeFromBase(Ctx, ASE->getBase(), Cap))\n      \
+  \  return true;\n\n      // If guarded appropriately, skip.\n      if (isGuardedBeforeUse(Ctx,\
+  \ ASE, IVar, Cap))\n        return true;\n\n      if (UBExclusive > Cap) {\n   \
+  \     Checker->reportIssue(ASE, IVar, UBExclusive, Cap, BR, Ctx);\n      }\n\n \
+  \     return true;\n    }\n  };\n\n  if (const Stmt *Body = FS->getBody()) {\n \
+  \   ASEVisitor V(Ctx, IVar, UBExclusive, BR, this);\n    const_cast<Stmt*>(Body)->walk(V);\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const {\n  if (!D) return;\n  const Stmt *Body = D->getBody();\n\
+  \  if (!Body) return;\n  const ASTContext &Ctx = Mgr.getASTContext();\n\n  struct\
+  \ ForVisitor : public RecursiveASTVisitor<ForVisitor> {\n    const ASTContext &Ctx;\n\
+  \    BugReporter &BR;\n    const SAGenTestChecker *Checker;\n\n    ForVisitor(const\
+  \ ASTContext &C, BugReporter &B, const SAGenTestChecker *Ch)\n      : Ctx(C), BR(B),\
+  \ Checker(Ch) {}\n\n    bool VisitForStmt(ForStmt *FS) {\n      Checker->processForStmt(FS,\
+  \ Ctx, BR);\n      return true;\n    }\n  };\n\n  ForVisitor V(Ctx, BR, this);\n\
+  \  const_cast<Stmt*>(Body)->walk(V);\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detect loops whose upper bound exceeds\
+  \ the capacity of arrays indexed by the loop variable\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ndrm/amd/display: Prevent potential buffer overflow\
+  \ in map_hw_resources\n\nAdds a check in the map_hw_resources function to prevent\
+  \ a potential\nbuffer overflow. The function was accessing arrays using an index\
+  \ that\ncould potentially be greater than the size of the arrays, leading to a\n\
+  buffer overflow.\n\nAdds a check to ensure that the index is within the bounds of\
+  \ the\narrays. If the index is out of bounds, an error message is printed and\n\
+  break it will continue execution with just ignoring extra data early to\nprevent\
+  \ the buffer overflow.\n\nReported by smatch:\ndrivers/gpu/drm/amd/amdgpu/../display/dc/dml2/dml2_wrapper.c:79\
+  \ map_hw_resources() error: buffer overflow 'dml2->v20.scratch.dml_to_dc_pipe_mapping.disp_cfg_to_stream_id'\
+  \ 6 <= 7\ndrivers/gpu/drm/amd/amdgpu/../display/dc/dml2/dml2_wrapper.c:81 map_hw_resources()\
+  \ error: buffer overflow 'dml2->v20.scratch.dml_to_dc_pipe_mapping.disp_cfg_to_plane_id'\
+  \ 6 <= 7\n\nFixes: 7966f319c66d (\"drm/amd/display: Introduce DML2\")\nCc: Rodrigo\
+  \ Siqueira <Rodrigo.Siqueira@amd.com>\nCc: Roman Li <roman.li@amd.com>\nCc: Qingqing\
+  \ Zhuo <Qingqing.Zhuo@amd.com>\nCc: Aurabindo Pillai <aurabindo.pillai@amd.com>\n\
+  Cc: Tom Chung <chiahsuan.chung@amd.com>\nSigned-off-by: Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>\n\
+  Suggested-by: Roman Li <roman.li@amd.com>\nReviewed-by: Roman Li <roman.li@amd.com>\n\
+  Reviewed-by: Rodrigo Siqueira <Rodrigo.Siqueira@amd.com>\nSigned-off-by: Alex Deucher\
+  \ <alexander.deucher@amd.com>\n\n## Buggy Code\n\n```c\n// Function: map_hw_resources\
+  \ in drivers/gpu/drm/amd/display/dc/dml2/dml2_wrapper.c\nstatic void map_hw_resources(struct\
+  \ dml2_context *dml2,\n\t\tstruct dml_display_cfg_st *in_out_display_cfg, struct\
+  \ dml_mode_support_info_st *mode_support_info)\n{\n\tunsigned int num_pipes = 0;\n\
+  \tint i, j;\n\n\tfor (i = 0; i < __DML_NUM_PLANES__; i++) {\n\t\tin_out_display_cfg->hw.ODMMode[i]\
+  \ = mode_support_info->ODMMode[i];\n\t\tin_out_display_cfg->hw.DPPPerSurface[i]\
+  \ = mode_support_info->DPPPerSurface[i];\n\t\tin_out_display_cfg->hw.DSCEnabled[i]\
+  \ = mode_support_info->DSCEnabled[i];\n\t\tin_out_display_cfg->hw.NumberOfDSCSlices[i]\
+  \ = mode_support_info->NumberOfDSCSlices[i];\n\t\tin_out_display_cfg->hw.DLGRefClkFreqMHz\
+  \ = 24;\n\t\tif (dml2->v20.dml_core_ctx.project != dml_project_dcn35 &&\n\t\t\t\
+  dml2->v20.dml_core_ctx.project != dml_project_dcn351) {\n\t\t\t/*dGPU default as\
+  \ 50Mhz*/\n\t\t\tin_out_display_cfg->hw.DLGRefClkFreqMHz = 50;\n\t\t}\n\t\tfor (j\
+  \ = 0; j < mode_support_info->DPPPerSurface[i]; j++) {\n\t\t\tdml2->v20.scratch.dml_to_dc_pipe_mapping.dml_pipe_idx_to_stream_id[num_pipes]\
+  \ = dml2->v20.scratch.dml_to_dc_pipe_mapping.disp_cfg_to_stream_id[i];\n\t\t\tdml2->v20.scratch.dml_to_dc_pipe_mapping.dml_pipe_idx_to_stream_id_valid[num_pipes]\
+  \ = true;\n\t\t\tdml2->v20.scratch.dml_to_dc_pipe_mapping.dml_pipe_idx_to_plane_id[num_pipes]\
+  \ = dml2->v20.scratch.dml_to_dc_pipe_mapping.disp_cfg_to_plane_id[i];\n\t\t\tdml2->v20.scratch.dml_to_dc_pipe_mapping.dml_pipe_idx_to_plane_id_valid[num_pipes]\
+  \ = true;\n\t\t\tnum_pipes++;\n\t\t}\n\t}\n}\n```\n\n## Bug Fix Patch\n\n```diff\n\
+  diff --git a/drivers/gpu/drm/amd/display/dc/dml2/dml2_wrapper.c b/drivers/gpu/drm/amd/display/dc/dml2/dml2_wrapper.c\n\
+  index 26307e599614..2a58a7687bdb 100644\n--- a/drivers/gpu/drm/amd/display/dc/dml2/dml2_wrapper.c\n\
+  +++ b/drivers/gpu/drm/amd/display/dc/dml2/dml2_wrapper.c\n@@ -76,6 +76,11 @@ static\
+  \ void map_hw_resources(struct dml2_context *dml2,\n \t\t\tin_out_display_cfg->hw.DLGRefClkFreqMHz\
+  \ = 50;\n \t\t}\n \t\tfor (j = 0; j < mode_support_info->DPPPerSurface[i]; j++)\
+  \ {\n+\t\t\tif (i >= __DML2_WRAPPER_MAX_STREAMS_PLANES__) {\n+\t\t\t\tdml_print(\"\
+  DML::%s: Index out of bounds: i=%d, __DML2_WRAPPER_MAX_STREAMS_PLANES__=%d\\n\"\
+  ,\n+\t\t\t\t\t  __func__, i, __DML2_WRAPPER_MAX_STREAMS_PLANES__);\n+\t\t\t\tbreak;\n\
+  +\t\t\t}\n \t\t\tdml2->v20.scratch.dml_to_dc_pipe_mapping.dml_pipe_idx_to_stream_id[num_pipes]\
+  \ = dml2->v20.scratch.dml_to_dc_pipe_mapping.disp_cfg_to_stream_id[i];\n \t\t\t\
+  dml2->v20.scratch.dml_to_dc_pipe_mapping.dml_pipe_idx_to_stream_id_valid[num_pipes]\
+  \ = true;\n \t\t\tdml2->v20.scratch.dml_to_dc_pipe_mapping.dml_pipe_idx_to_plane_id[num_pipes]\
+  \ = dml2->v20.scratch.dml_to_dc_pipe_mapping.disp_cfg_to_plane_id[i];\n```\n"
+pattern: "## Bug Pattern\n\nIndexing an array using a loop bound defined for a larger\
+  \ dimension than the array\u2019s actual capacity (mismatched macro sizes), without\
+  \ validating the index:\n\nfor (i = 0; i < __DML_NUM_PLANES__; i++) {\n    // disp_cfg_to_*\
+  \ arrays have size __DML2_WRAPPER_MAX_STREAMS_PLANES__\n    use disp_cfg_to_stream_id[i];\n\
+  \    use disp_cfg_to_plane_id[i];\n}\n\nWhen __DML_NUM_PLANES__ > __DML2_WRAPPER_MAX_STREAMS_PLANES__,\
+  \ this causes out-of-bounds access. The fix adds an explicit check to ensure i <\
+  \ __DML2_WRAPPER_MAX_STREAMS_PLANES__ before indexing."
+plan: "Plan to detect \u201Cloop upper bound exceeds array capacity\u201D (mismatched\
+  \ macro sizes)\n\n1) Program state\n- No custom program states are necessary. This\
+  \ is a purely AST-based structural check.\n\n2) Callback choice\n- Use checkASTCodeBody.\
+  \ We only need a one-shot AST walk per function body to correlate:\n  - a for-loop\u2019\
+  s index variable and upper bound, and\n  - array subscripts inside the loop body\
+  \ that use that variable,\n  - the declared constant size of the array being indexed.\n\
+  \n3) Detailed steps in checkASTCodeBody\n- Walk the body\u2019s AST and visit every\
+  \ ForStmt. For each ForStmt FS do:\n\n  3.1 Extract loop index variable and numeric\
+  \ bounds\n  - Parse FS->getInit():\n    - Accept either:\n      - DeclStmt with\
+  \ a single VarDecl having an initializer (e.g., for (int i = 0; ...))\n      - Or\
+  \ a BinaryOperator \u201Ci = <init>\u201D (e.g., for (i = 0; ...))\n    - Using\
+  \ EvaluateExprToInt, get initial value LB. Proceed only if LB == 0 (to keep the\
+  \ checker simple and avoid false positives on non-zero starting indices).\n  - Parse\
+  \ FS->getCond():\n    - Expect a BinaryOperator with the loop variable on the LHS\
+  \ (DeclRefExpr to IVar).\n    - Supported operators:\n      - \u201C<\u201D  =>\
+  \ UBExclusive = EvaluateExprToInt(RHS)\n      - \u201C<=\u201D => UBExclusive =\
+  \ EvaluateExprToInt(RHS) + 1\n    - If evaluation fails or operator is not supported,\
+  \ skip this loop.\n  - Record IVar (the VarDecl for the loop index) and the computed\
+  \ LB and UBExclusive.\n\n  3.2 Collect array subscripts using the loop index\n \
+  \ - Recursively traverse FS->getBody() to find all ArraySubscriptExpr nodes ASE.\n\
+  \  - For each ASE:\n    - Determine whether its index expression uses IVar:\n  \
+  \    - Check if ASE->getIdx()->IgnoreParenImpCasts() is a DeclRefExpr to IVar, or\n\
+  \      - As a slightly more permissive check, walk the index expression and see\
+  \ if any DeclRefExpr refers to IVar (a small helper \u201CcontainsDeclRefToVar\u201D\
+  ).\n      - If it doesn\u2019t use IVar, skip.\n    - Obtain the array capacity\
+  \ Cap from the array base:\n      - Base = ASE->getBase()->IgnoreParenImpCasts()\n\
+  \      - If Base is DeclRefExpr to a VarDecl whose type is ConstantArrayType, read\
+  \ ConstantArrayType->getSize() to APInt => Cap.\n      - Else if Base is MemberExpr\
+  \ referencing a FieldDecl whose type is ConstantArrayType, read ConstantArrayType->getSize()\
+  \ => Cap.\n      - Otherwise (pointers, unknown, or non-constant arrays), skip (we\
+  \ only warn when we are certain).\n    - If LB != 0 or UBExclusive not known, skip\
+  \ (already filtered above).\n\n  3.3 Optional guard suppression (simple and local)\n\
+  \  - To reduce false positives when a simple guard exists (like the patch), implement\
+  \ a minimal guard check for the immediate loop body:\n    - Find the nearest enclosing\
+  \ CompoundStmt that directly contains ASE (use findSpecificTypeInParents<CompoundStmt>).\n\
+  \    - Within that CompoundStmt, find the statement that lexically contains ASE,\
+  \ and scan the statements before it for an IfStmt that:\n      - Has a condition\
+  \ of the form \u201Ci >= Cap\u201D or \u201Ci < Cap\u201D (try both directions):\n\
+  \        - Parse the If condition as a BinaryOperator with one side being DeclRefExpr\
+  \ to IVar, and the other side a constant integral expression equal to Cap (EvaluateExprToInt\
+  \ on that side).\n        - Ops to accept:\n          - i >= Cap (then-branch has\
+  \ \u201Cbreak\u201D or \u201Creturn\u201D): safe-guard; skip warning for ASE inside\
+  \ the rest of the block.\n          - i < Cap and ASE is in the then-branch subtree:\
+  \ safe-guard; skip.\n      - Use findSpecificTypeInChildren to detect BreakStmt/ReturnStmt\
+  \ in the guarded branch for the \u201Ci >= Cap\u201D case, or check subtree containment\
+  \ to ensure ASE is inside the guarded \u201Cthen\u201D for the \u201Ci < Cap\u201D\
+  \ case.\n    - If such guard is found before ASE, do not warn for this ASE. If not\
+  \ found, continue.\n\n  3.4 Compare loop upper bound vs array capacity\n  - If UBExclusive\
+  \ > Cap:\n    - Emit a diagnostic. This is the core mismatch: the loop will drive\
+  \ the index beyond the array\u2019s last valid index.\n\n  3.5 Reporting\n  - Create\
+  \ a non-fatal node and emit a BasicBugReport or PathSensitiveBugReport (either is\
+  \ fine here because we\u2019re in checkASTCodeBody).\n  - Location: highlight the\
+  \ ArraySubscriptExpr\u2019s index or the ForStmt condition; prefer ASE to point\
+  \ at the actual OOB use site.\n  - Message: short and clear, e.g.:\n    - \u201C\
+  Loop bound exceeds array capacity: index \u2018i\u2019 goes up to N-1 but array\
+  \ size is S.\u201D\n  - If available, include short notes:\n    - \u201Cfor-condition\
+  \ upper bound: N\u201D\n    - \u201Carray declared size: S\u201D\n    - Use EvaluateExprToInt\
+  \ results and ConstantArrayType size for N and S.\n\n4) Helper routines to implement\n\
+  - getLoopIndexAndBounds(const ForStmt*, VarDecl*& IVar, llvm::APSInt& LB, llvm::APSInt&\
+  \ UBExclusive):\n  - Implements 3.1 using EvaluateExprToInt.\n- containsDeclRefToVar(const\
+  \ Expr *E, const VarDecl *V):\n  - Walk E\u2019s subtree to find a DeclRefExpr to\
+  \ V.\n- getArrayConstSizeFromBase(const Expr *Base, llvm::APInt &Cap):\n  - Implements\
+  \ 3.2 for DeclRefExpr/MemberExpr with ConstantArrayType.\n- isGuardedBeforeUse(const\
+  \ ArraySubscriptExpr *ASE, const VarDecl *IVar, uint64_t Cap):\n  - Implements the\
+  \ lightweight guard detection in 3.3 using:\n    - findSpecificTypeInParents<CompoundStmt>\n\
+  \    - findSpecificTypeInParents<IfStmt>\n    - findSpecificTypeInChildren<BreakStmt>/findSpecificTypeInChildren<ReturnStmt>\n\
+  \    - EvaluateExprToInt for guard constants.\n    - Optional ExprHasName to quickly\
+  \ filter if needed.\n\n5) Notes and simplifications\n- We only warn on clear, compile-time\
+  \ provable cases:\n  - lower bound 0,\n  - condition operators \u201C<\u201D or\
+  \ \u201C<=\u201D,\n  - constant array size known via ConstantArrayType,\n  - index\
+  \ directly tied to the loop variable.\n- This is sufficient to detect the target\
+  \ bug pattern:\n  - for (i = 0; i < __DML_NUM_PLANES__; i++) index arrays of size\
+  \ __DML2_WRAPPER_MAX_STREAMS_PLANES__.\n- The minimal guard suppression matches\
+  \ the posted fix pattern: an \u201Cif (i >= SIZE) { ... break; }\u201D before the\
+  \ data use. If present, we suppress the warning for that ASE."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\n\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/RecursiveASTVisitor.h\"\
+  \n#include \"clang/AST/ParentMapContext.h\"\n#include \"llvm/ADT/APInt.h\"\n#include\
+  \ \"llvm/ADT/APSInt.h\"\n#include \"llvm/ADT/SmallString.h\"\n#include \"llvm/Support/Casting.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include <memory>\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// No custom program\
+  \ states are necessary for this AST-only checker.\n\nnamespace {\n\n// Forward declarations\
+  \ of helpers\nstatic bool evalInt(const ASTContext &Ctx, const Expr *E, llvm::APSInt\
+  \ &Res);\nstatic bool containsDeclRefToVar(const Expr *E, const VarDecl *V);\nstatic\
+  \ bool getArrayConstSizeFromBase(const ASTContext &Ctx, const Expr *Base, uint64_t\
+  \ &CapOut);\nstatic bool stmtContains(const Stmt *Root, const Stmt *Target);\nstatic\
+  \ bool isGuardedByEnclosingIfLtCap(const ASTContext &Ctx, const ArraySubscriptExpr\
+  \ *ASE,\n                                        const VarDecl *IVar, uint64_t Cap);\n\
+  static bool isGuardedByPrevIfGeBreak(const ASTContext &Ctx, const ArraySubscriptExpr\
+  \ *ASE,\n                                     const VarDecl *IVar, uint64_t Cap);\n\
+  static bool isGuardedBeforeUse(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,\n\
+  \                               const VarDecl *IVar, uint64_t Cap);\n\nclass SAGenTestChecker\
+  \ : public Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\
+  \npublic:\n  SAGenTestChecker()\n    : BT(std::make_unique<BugType>(this, \"Loop\
+  \ bound exceeds array capacity\", \"Memory Error\")) {}\n\n  void checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const;\n\nprivate:\n  // Extract\
+  \ loop index variable and bounds from a ForStmt.\n  // Returns true on success and\
+  \ sets IVar, LB, UBExclusive.\n  static bool getLoopIndexAndBounds(const ForStmt\
+  \ *FS, const ASTContext &Ctx,\n                                    const VarDecl\
+  \ *&IVar, llvm::APSInt &LB,\n                                    llvm::APSInt &UBExclusive);\n\
+  \n  // Process a single ForStmt: find array subscripts using IVar and check against\
+  \ Cap.\n  void processForStmt(const ForStmt *FS, const ASTContext &Ctx, BugReporter\
+  \ &BR) const;\n\n  // Emit a report for a problematic array access.\n  void reportIssue(const\
+  \ ArraySubscriptExpr *ASE, const VarDecl *IVar,\n                   uint64_t UBExclusive,\
+  \ uint64_t Cap,\n                   BugReporter &BR, const ASTContext &Ctx) const;\n\
+  };\n\n//====================== Helper implementations ======================\n\n\
+  static bool evalInt(const ASTContext &Ctx, const Expr *E, llvm::APSInt &Res) {\n\
+  \  if (!E) return false;\n  Expr::EvalResult ER;\n  if (E->EvaluateAsInt(ER, const_cast<ASTContext\
+  \ &>(Ctx))) {\n    Res = ER.Val.getInt();\n    return true;\n  }\n  return false;\n\
+  }\n\nstatic bool containsDeclRefToVar(const Expr *E, const VarDecl *V) {\n  if (!E\
+  \ || !V) return false;\n  struct LocalVisitor : public RecursiveASTVisitor<LocalVisitor>\
+  \ {\n    const VarDecl *Var;\n    bool Found;\n    LocalVisitor(const VarDecl *V)\
+  \ : Var(V), Found(false) {}\n    bool VisitDeclRefExpr(const DeclRefExpr *DRE) {\n\
+  \      if (DRE->getDecl() == Var) {\n        Found = true;\n        return false;\n\
+  \      }\n      return true;\n    }\n  };\n  LocalVisitor Vst(V);\n  Vst.TraverseStmt(const_cast<Expr*>(E));\n\
+  \  return Vst.Found;\n}\n\nstatic bool getArrayConstSizeFromBase(const ASTContext\
+  \ &Ctx, const Expr *Base, uint64_t &CapOut) {\n  if (!Base) return false;\n  const\
+  \ Expr *E = Base->IgnoreParenImpCasts();\n\n  auto ExtractFromQT = [&](QualType\
+  \ QT) -> bool {\n    if (QT.isNull()) return false;\n    if (const auto *CAT = Ctx.getAsConstantArrayType(QT))\
+  \ {\n      CapOut = CAT->getSize().getLimitedValue();\n      return true;\n    }\n\
+  \    return false;\n  };\n\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n\
+  \    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n      return ExtractFromQT(VD->getType());\n\
+  \    }\n  } else if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    if (const\
+  \ auto *VD = dyn_cast<ValueDecl>(ME->getMemberDecl())) {\n      return ExtractFromQT(VD->getType());\n\
+  \    }\n  }\n  return false;\n}\n\nstatic bool stmtContains(const Stmt *Root, const\
+  \ Stmt *Target) {\n  if (!Root || !Target) return false;\n  if (Root == Target)\
+  \ return true;\n  for (const Stmt *Child : Root->children()) {\n    if (Child &&\
+  \ stmtContains(Child, Target))\n      return true;\n  }\n  return false;\n}\n\n\
+  static bool parseGuardCondition(const ASTContext &Ctx, const Expr *Cond, const VarDecl\
+  \ *IVar,\n                                uint64_t Cap, bool &IsLTorLE, bool &IsGEorGT)\
+  \ {\n  IsLTorLE = false;\n  IsGEorGT = false;\n  if (!Cond) return false;\n  Cond\
+  \ = Cond->IgnoreParenImpCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(Cond);\n\
+  \  if (!BO) return false;\n\n  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \  const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();\n\n  const Expr *PtrSide\
+  \ = nullptr;\n  const Expr *ConstSide = nullptr;\n  // We expect the loop variable\
+  \ on one side and a constant on the other.\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(LHS))\
+  \ {\n    if (DRE->getDecl() == IVar) {\n      PtrSide = LHS;\n      ConstSide =\
+  \ RHS;\n    }\n  } else if (const auto *DRE = dyn_cast<DeclRefExpr>(RHS)) {\n  \
+  \  if (DRE->getDecl() == IVar) {\n      PtrSide = RHS;\n      ConstSide = LHS;\n\
+  \    }\n  }\n  if (!PtrSide || !ConstSide) return false;\n\n  llvm::APSInt CVal;\n\
+  \  if (!evalInt(Ctx, ConstSide, CVal)) return false;\n  uint64_t Num = CVal.getLimitedValue();\n\
+  \n  // Must match the same Cap\n  if (Num != Cap) return false;\n\n  switch (BO->getOpcode())\
+  \ {\n  case BO_LT:\n  case BO_LE:\n    IsLTorLE = true;\n    return true;\n  case\
+  \ BO_GE:\n  case BO_GT:\n    IsGEorGT = true;\n    return true;\n  default:\n  \
+  \  break;\n  }\n  return false;\n}\n\nstatic bool isGuardedByEnclosingIfLtCap(const\
+  \ ASTContext &Ctx, const ArraySubscriptExpr *ASE,\n                            \
+  \            const VarDecl *IVar, uint64_t Cap) {\n  if (!ASE) return false;\n\n\
+  \  // Walk up the parents and look for an IfStmt where ASE is located within the\
+  \ 'then' branch\n  // and the condition is i < Cap (or i <= Cap).\n  const Stmt\
+  \ *Curr = ASE;\n  while (true) {\n    const Stmt *ParentS = nullptr;\n    auto Parents\
+  \ = const_cast<ASTContext &>(Ctx).getParentMapContext().getParents(*Curr);\n   \
+  \ if (Parents.empty()) break;\n    ParentS = Parents[0].get<Stmt>();\n    if (!ParentS)\
+  \ break;\n\n    if (const auto *IS = dyn_cast<IfStmt>(ParentS)) {\n      bool IsLTorLE\
+  \ = false, IsGEorGT = false;\n      if (parseGuardCondition(Ctx, IS->getCond(),\
+  \ IVar, Cap, IsLTorLE, IsGEorGT)) {\n        if (IsLTorLE) {\n          const Stmt\
+  \ *Then = IS->getThen();\n          if (Then && stmtContains(Then, ASE))\n     \
+  \       return true;\n        }\n      }\n    }\n    Curr = ParentS;\n  }\n\n  return\
+  \ false;\n}\n\nstatic bool isGuardedByPrevIfGeBreak(const ASTContext &Ctx, const\
+  \ ArraySubscriptExpr *ASE,\n                                     const VarDecl *IVar,\
+  \ uint64_t Cap) {\n  if (!ASE) return false;\n\n  // Find the nearest enclosing\
+  \ CompoundStmt and check previous siblings.\n  const Stmt *Containing = ASE;\n \
+  \ const CompoundStmt *CS = nullptr;\n  const Stmt *Tmp = Containing;\n  while (true)\
+  \ {\n    auto Parents = const_cast<ASTContext &>(Ctx).getParentMapContext().getParents(*Tmp);\n\
+  \    if (Parents.empty()) break;\n    const Stmt *P = Parents[0].get<Stmt>();\n\
+  \    if (!P) break;\n    if ((CS = dyn_cast<CompoundStmt>(P)))\n      break;\n \
+  \   Tmp = P;\n  }\n  if (!CS) return false;\n\n  // Find which immediate child statement\
+  \ of CS contains ASE.\n  const Stmt *ContainerChild = nullptr;\n  unsigned Index\
+  \ = 0, FoundIndex = 0;\n  for (const Stmt *Child : CS->body()) {\n    if (Child\
+  \ && stmtContains(Child, ASE)) {\n      ContainerChild = Child;\n      FoundIndex\
+  \ = Index;\n      break;\n    }\n    ++Index;\n  }\n  if (!ContainerChild) return\
+  \ false;\n\n  // Scan previous statements for if (i >= Cap) { break; } or return;\n\
+  \  Index = 0;\n  for (const Stmt *Child : CS->body()) {\n    if (Index >= FoundIndex)\
+  \ break;\n    ++Index;\n\n    const auto *IS = dyn_cast<IfStmt>(Child);\n    if\
+  \ (!IS) continue;\n\n    bool IsLTorLE = false, IsGEorGT = false;\n    if (!parseGuardCondition(Ctx,\
+  \ IS->getCond(), IVar, Cap, IsLTorLE, IsGEorGT))\n      continue;\n\n    if (!IsGEorGT)\n\
+  \      continue;\n\n    const Stmt *Then = IS->getThen();\n    if (!Then) continue;\n\
+  \n    // Look for a BreakStmt or ReturnStmt inside the then-branch.\n    bool HasBreakOrReturn\
+  \ = false;\n    struct FindTerminator : public RecursiveASTVisitor<FindTerminator>\
+  \ {\n      bool Found = false;\n      bool VisitBreakStmt(BreakStmt *) { Found =\
+  \ true; return false; }\n      bool VisitReturnStmt(ReturnStmt *) { Found = true;\
+  \ return false; }\n    } Finder;\n    Finder.TraverseStmt(const_cast<Stmt*>(Then));\n\
+  \    HasBreakOrReturn = Finder.Found;\n\n    if (HasBreakOrReturn)\n      return\
+  \ true;\n  }\n\n  return false;\n}\n\nstatic bool isGuardedBeforeUse(const ASTContext\
+  \ &Ctx, const ArraySubscriptExpr *ASE,\n                               const VarDecl\
+  \ *IVar, uint64_t Cap) {\n  // Two heuristics:\n  // 1) ASE is inside an enclosing\
+  \ if (i < Cap) { ... ASE ... }\n  if (isGuardedByEnclosingIfLtCap(Ctx, ASE, IVar,\
+  \ Cap))\n    return true;\n\n  // 2) Just before ASE in the same block, there is\
+  \ if (i >= Cap) { break; } or return;\n  if (isGuardedByPrevIfGeBreak(Ctx, ASE,\
+  \ IVar, Cap))\n    return true;\n\n  return false;\n}\n\nbool SAGenTestChecker::getLoopIndexAndBounds(const\
+  \ ForStmt *FS, const ASTContext &Ctx,\n                                        \
+  \     const VarDecl *&IVar, llvm::APSInt &LB,\n                                \
+  \             llvm::APSInt &UBExclusive) {\n  IVar = nullptr;\n\n  // Parse init:\
+  \ either \"int i = 0\" or \"i = 0\"\n  const Stmt *Init = FS->getInit();\n  if (!Init)\
+  \ return false;\n\n  const VarDecl *IdxVar = nullptr;\n  llvm::APSInt InitVal;\n\
+  \n  if (const auto *DS = dyn_cast<DeclStmt>(Init)) {\n    if (!DS->isSingleDecl())\
+  \ return false;\n    const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl());\n\
+  \    if (!VD) return false;\n    if (!VD->hasInit()) return false;\n    if (!evalInt(Ctx,\
+  \ VD->getInit(), InitVal)) return false;\n    IdxVar = VD;\n  } else if (const auto\
+  \ *BO = dyn_cast<BinaryOperator>(Init)) {\n    if (BO->getOpcode() != BO_Assign)\
+  \ return false;\n    const auto *LHS = dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreParenImpCasts());\n\
+  \    if (!LHS) return false;\n    const auto *VD = dyn_cast<VarDecl>(LHS->getDecl());\n\
+  \    if (!VD) return false;\n    if (!evalInt(Ctx, BO->getRHS(), InitVal)) return\
+  \ false;\n    IdxVar = VD;\n  } else {\n    return false;\n  }\n\n  // We only handle\
+  \ LB == 0\n  if (InitVal != 0) return false;\n\n  // Parse condition: i < N or i\
+  \ <= N\n  const Expr *Cond = FS->getCond();\n  if (!Cond) return false;\n  const\
+  \ auto *CBO = dyn_cast<BinaryOperator>(Cond->IgnoreParenImpCasts());\n  if (!CBO)\
+  \ return false;\n\n  BinaryOperator::Opcode Op = CBO->getOpcode();\n  if (Op !=\
+  \ BO_LT && Op != BO_LE) return false;\n\n  const auto *LHS = dyn_cast<DeclRefExpr>(CBO->getLHS()->IgnoreParenImpCasts());\n\
+  \  if (!LHS) return false;\n  if (LHS->getDecl() != IdxVar) return false;\n\n  llvm::APSInt\
+  \ RHSVal;\n  if (!evalInt(Ctx, CBO->getRHS(), RHSVal)) return false;\n\n  // Compute\
+  \ UBExclusive\n  if (Op == BO_LT) {\n    UBExclusive = RHSVal;\n  } else {\n   \
+  \ // i <= N  => UBExclusive = N + 1\n    UBExclusive = RHSVal + 1;\n  }\n\n  LB\
+  \ = InitVal;\n  IVar = IdxVar;\n  return true;\n}\n\nvoid SAGenTestChecker::reportIssue(const\
+  \ ArraySubscriptExpr *ASE, const VarDecl *IVar,\n                              \
+  \     uint64_t UBExclusive, uint64_t Cap,\n                                   BugReporter\
+  \ &BR, const ASTContext &Ctx) const {\n  if (!ASE || !IVar) return;\n\n  SmallString<128>\
+  \ Msg;\n  llvm::raw_svector_ostream OS(Msg);\n  OS << \"Loop bound exceeds array\
+  \ capacity: index '\" << IVar->getName()\n     << \"' goes up to \" << (UBExclusive\
+  \ ? (UBExclusive - 1) : 0)\n     << \" but array size is \" << Cap;\n\n  PathDiagnosticLocation\
+  \ ELoc(ASE->getIdx()->getExprLoc(), BR.getSourceManager());\n  auto R = std::make_unique<BasicBugReport>(*BT,\
+  \ OS.str(), ELoc);\n  R->addRange(ASE->getSourceRange());\n  BR.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::processForStmt(const ForStmt *FS, const ASTContext &Ctx,\
+  \ BugReporter &BR) const {\n  const VarDecl *IVar = nullptr;\n  llvm::APSInt LB,\
+  \ UBEx;\n  if (!getLoopIndexAndBounds(FS, Ctx, IVar, LB, UBEx))\n    return;\n\n\
+  \  // Only consider LB == 0 (already filtered)\n  uint64_t UBExclusive = UBEx.getLimitedValue();\n\
+  \n  // Traverse the loop body to find array subscripts using IVar.\n  struct ASEVisitor\
+  \ : public RecursiveASTVisitor<ASEVisitor> {\n    const ASTContext &Ctx;\n    const\
+  \ VarDecl *IVar;\n    uint64_t UBExclusive;\n    BugReporter &BR;\n    const SAGenTestChecker\
+  \ *Checker;\n\n    ASEVisitor(const ASTContext &C, const VarDecl *V, uint64_t UB,\
+  \ BugReporter &B,\n               const SAGenTestChecker *Ch)\n      : Ctx(C), IVar(V),\
+  \ UBExclusive(UB), BR(B), Checker(Ch) {}\n\n    bool VisitArraySubscriptExpr(ArraySubscriptExpr\
+  \ *ASE) {\n      const Expr *Idx = ASE->getIdx();\n      if (!Idx) return true;\n\
+  \      if (!containsDeclRefToVar(Idx, IVar))\n        return true;\n\n      uint64_t\
+  \ Cap = 0;\n      if (!getArrayConstSizeFromBase(Ctx, ASE->getBase(), Cap))\n  \
+  \      return true;\n\n      // If guarded appropriately, skip.\n      if (isGuardedBeforeUse(Ctx,\
+  \ ASE, IVar, Cap))\n        return true;\n\n      if (UBExclusive > Cap) {\n   \
+  \     Checker->reportIssue(ASE, IVar, UBExclusive, Cap, BR, Ctx);\n      }\n\n \
+  \     return true;\n    }\n  };\n\n  if (const Stmt *Body = FS->getBody()) {\n \
+  \   ASEVisitor V(Ctx, IVar, UBExclusive, BR, this);\n    V.TraverseStmt(const_cast<Stmt*>(Body));\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const {\n  if (!D) return;\n  const Stmt *Body = D->getBody();\n\
+  \  if (!Body) return;\n  const ASTContext &Ctx = Mgr.getASTContext();\n\n  struct\
+  \ ForVisitor : public RecursiveASTVisitor<ForVisitor> {\n    const ASTContext &Ctx;\n\
+  \    BugReporter &BR;\n    const SAGenTestChecker *Checker;\n\n    ForVisitor(const\
+  \ ASTContext &C, BugReporter &B, const SAGenTestChecker *Ch)\n      : Ctx(C), BR(B),\
+  \ Checker(Ch) {}\n\n    bool VisitForStmt(ForStmt *FS) {\n      Checker->processForStmt(FS,\
+  \ Ctx, BR);\n      return true;\n    }\n  };\n\n  ForVisitor V(Ctx, BR, this);\n\
+  \  V.TraverseStmt(const_cast<Stmt*>(Body));\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detect loops whose upper bound exceeds\
+  \ the capacity of arrays indexed by the loop variable\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

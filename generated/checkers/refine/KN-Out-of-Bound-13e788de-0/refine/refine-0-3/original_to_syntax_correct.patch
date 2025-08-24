@@ -1,0 +1,215 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -15,6 +15,7 @@ #include "clang/StaticAnalyzer/Checkers/utility.h"
+ #include "clang/AST/ParentMapContext.h"
+ #include "clang/Lex/Lexer.h"
++#include <cctype>
+
+ using namespace clang;
+ using namespace ento;
+@@ -77,7 +78,7 @@ extern KnownDerefFunction DerefTable[];
+
+ bool functionKnownToDeref(const CallEvent &Call,
+-                                 llvm::SmallVectorImpl<unsigned> &DerefParams) {
++                          llvm::SmallVectorImpl<unsigned> &DerefParams) {
+   if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
+     StringRef FnName = ID->getName();
+
+@@ -124,7 +125,7 @@     return Lexer::getSourceText(Range, SM, LangOpts);
+   }
+
+-  // Conservative name matcher; prefers constant-like bounds.
++  // Helper: whether identifier name looks like a MAX/limit/bound.
+   static bool nameLooksLikeCountBound(StringRef Name) {
+     std::string Lower = Name.lower();
+     if (Lower.find("max") != std::string::npos)
+@@ -176,6 +177,29 @@     return false;
+   }
+
++  static bool textHasAlpha(StringRef S) {
++    for (char C : S)
++      if (std::isalpha(static_cast<unsigned char>(C)))
++        return true;
++    return false;
++  }
++
++  static bool textContainsAny(StringRef S, std::initializer_list<StringRef> Needles) {
++    for (StringRef N : Needles)
++      if (S.contains(N))
++        return true;
++    return false;
++  }
++
++  // Textual check for MAX-like RHS, to handle macros that expand to integer literals.
++  static bool rhsTextLooksMaxLike(const Expr *RHS, CheckerContext &C) {
++    StringRef Txt = getExprText(RHS, C);
++    // Be conservative: we only accept very explicit "MAX"-like tokens.
++    // Also accept common synonyms to keep true positives.
++    return textContainsAny(Txt, {"MAX", "Max", "max", "LIMIT", "Limit", "limit",
++                                 "BOUND", "Bound", "bound"});
++  }
++
+   static bool isLikelyErrorReturn(const ReturnStmt *RS, CheckerContext &C) {
+     if (!RS)
+       return false;
+@@ -208,22 +232,28 @@     return isLikelyErrorReturn(RS, C);
+   }
+
+-  static bool isPlainMaxLikeBound(const Expr *Bound, CheckerContext &C) {
++  // RHS must be MAX-like: either a simple decl/member with MAX/limit-ish name,
++  // or macro/text contains MAX/limit/bound tokens. Reject sizeof and complex exprs unless text shows MAX-ish.
++  static bool isMaxLikeBound(const Expr *Bound, CheckerContext &C) {
+     if (!Bound)
+       return false;
+
+-    Bound = Bound->IgnoreParenCasts();
+-
+-    if (isa<IntegerLiteral>(Bound))
+-      return false; // reject literal RHS outright (avoids x > 0 style guards)
+-
+-    if (isUnarySizeOf(Bound))
+-      return false;
+-
+-    if (isCompositeBoundExpr(Bound))
+-      return false;
+-
+-    return isDeclRefWithNameLikeCount(Bound);
++    const Expr *E = Bound->IgnoreParenCasts();
++
++    if (isUnarySizeOf(E))
++      return false;
++
++    // If it's a simple decl/member, rely on the identifier name.
++    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E)) {
++      return isDeclRefWithNameLikeCount(E);
++    }
++
++    // For integer literals or composite/binary expressions, accept only if the source text includes a MAX-like token (macro).
++    if (isa<IntegerLiteral>(E) || isCompositeBoundExpr(E)) {
++      return rhsTextLooksMaxLike(Bound, C);
++    }
++
++    return false;
+   }
+
+   static bool isLikelyIndexExpr(const Expr *E) {
+@@ -234,12 +264,14 @@     if (isa<IntegerLiteral>(E))
+       return false;
+
+-    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E) || isa<ArraySubscriptExpr>(E))
+-      return true;
+-
+-    return false;
+-  }
+-
++    // We consider array-subscript and member/decl refs as potentially index-like.
++    if (isa<ArraySubscriptExpr>(E) || isa<MemberExpr>(E) || isa<DeclRefExpr>(E))
++      return true;
++
++    return false;
++  }
++
++  // Buffer capacity comparison patterns we don't want (strlen/strnlen vs sizeof etc).
+   static bool isBufferCapacityComparison(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+     if (!LHS || !RHS)
+       return false;
+@@ -253,23 +285,62 @@     return false;
+   }
+
++  static bool isLengthLikeName(StringRef Name) {
++    std::string Lower = Name.lower();
++    if (Lower.find("len") != std::string::npos ||
++        Lower.find("length") != std::string::npos ||
++        Lower.find("size") != std::string::npos ||
++        Lower.find("bytes") != std::string::npos ||
++        Lower.find("space") != std::string::npos ||
++        Lower.find("cap") != std::string::npos ||
++        Lower.find("capacity") != std::string::npos)
++      return true;
++    return false;
++  }
++
++  static StringRef tryGetNameFromExpr(const Expr *E) {
++    E = E ? E->IgnoreParenCasts() : nullptr;
++    if (!E)
++      return {};
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++      if (const auto *II = DRE->getDecl()->getIdentifier())
++        return II->getName();
++    }
++    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
++      if (const auto *ND = dyn_cast<NamedDecl>(ME->getMemberDecl()))
++        return ND->getName();
++    }
++    return {};
++  }
++
++  // False-positive filter:
++  // - RHS numeric/arithmetic constants without any alpha tokens (e.g., "64 * 1024")
++  // - RHS "-1" adjustments
++  // - LHS length-like variable compared against numeric/arithmetic RHS
+   static bool isFalsePositive(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+-    (void)LHS;
+-
+-    const Expr *R = RHS ? RHS->IgnoreParenCasts() : nullptr;
+-    if (!R)
+-      return true;
+-
+-    // Reject small integer literal RHS (common guards unrelated to array bounds).
+-    if (const auto *IL = dyn_cast<IntegerLiteral>(R)) {
+-      if (IL->getValue().ule(2))
+-        return true;
+-      // In general we don't want to flag literal bounds at all in this checker.
+-      return true;
+-    }
+-
+-    StringRef Txt = getExprText(RHS, C);
+-    if (Txt.contains("- 1") || Txt.contains("-1"))
++    if (!RHS)
++      return true;
++
++    StringRef RText = getExprText(RHS, C);
++    if (RText.empty())
++      return true;
++
++    // Typical off-by-one corrected patterns are already fine; we suppress "-1" patterns explicitly.
++    if (RText.contains("- 1") || RText.contains("-1"))
++      return true;
++
++    // If RHS is a pure numeric/arithmetic expression (no alpha tokens) and doesn't look MAX-like, suppress.
++    bool RHSHasAlpha = textHasAlpha(RText);
++    if (!RHSHasAlpha && !rhsTextLooksMaxLike(RHS, C))
++      return true;
++
++    // If RHS is integer literal and doesn't look MAX-like, suppress.
++    if (isa<IntegerLiteral>(RHS->IgnoreParenCasts()) && !rhsTextLooksMaxLike(RHS, C))
++      return true;
++
++    // If LHS looks like a length/size and RHS doesn't look MAX-like, suppress.
++    StringRef LName = tryGetNameFromExpr(LHS);
++    if (!LName.empty() && isLengthLikeName(LName) && !rhsTextLooksMaxLike(RHS, C))
+       return true;
+
+     return false;
+@@ -295,7 +366,6 @@       }
+     }
+
+-    // Also traverse ternary conditions if ever present directly in the condition.
+     if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
+       collectGtComparisons(CO->getCond(), Out);
+       collectGtComparisons(CO->getTrueExpr(), Out);
+@@ -318,15 +388,14 @@     if (!isLikelyIndexExpr(LHS))
+       return false;
+
+-    if (!isPlainMaxLikeBound(RHS, C))
++    // RHS must be a MAX-like bound (by identifier or macro text).
++    if (!isMaxLikeBound(RHS, C))
+       return false;
+
+     if (isBufferCapacityComparison(LHS, RHS, C))
+       return false;
+
+-    if (isa<IntegerLiteral>(LHS))
+-      return false;
+-
++    // Filter common false positives.
+     if (isFalsePositive(LHS, RHS, C))
+       return false;

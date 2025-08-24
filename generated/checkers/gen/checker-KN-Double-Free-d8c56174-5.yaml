@@ -1,0 +1,349 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: d8c561741ef83980114b3f7f95ffac54600f3f16
+commit_type: Double-Free
+index: 5
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include \"llvm/ADT/StringRef.h\"\
+  \n#include <string>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\nnamespace {\n\n// ------------ Program state ------------\n\nstruct\
+  \ ResourceInfo {\n  unsigned Step;                // 0 = none, 1 = HW created\n\
+  \  const char *ExpectedDestroy;  // expected HW-only destroy function name (literal)\n\
+  \  bool IsParamOwned;            // resource is owned by caller (argument/parameter)\n\
+  \  ResourceInfo() : Step(0), ExpectedDestroy(nullptr), IsParamOwned(false) {}\n\
+  \  ResourceInfo(unsigned S, const char *ED, bool P)\n      : Step(S), ExpectedDestroy(ED),\
+  \ IsParamOwned(P) {}\n};\n\nREGISTER_MAP_WITH_PROGRAMSTATE(ResourceInfoMap, const\
+  \ MemRegion*, ResourceInfo)\n\n// ------------ Helper tables ------------\n\nstruct\
+  \ CreateDestroyPair {\n  const char *CreateName;\n  const char *DestroyName;\n \
+  \ unsigned ResourceArgIndex; // index of resource arg in create call\n};\n\n// We\
+  \ cover both the low-level core create and the wrapper create helper.\nstatic const\
+  \ CreateDestroyPair KnownPairs[] = {\n  // mlx5_core_create_sq(dev, in, inlen, &sq->sqn)\n\
+  \  { \"mlx5_core_create_sq\", \"mlx5_core_destroy_sq\", 3 },\n  // hws_send_ring_create_sq(mdev,\
+  \ pdn, sqc_data, queue, sq, cq)\n  { \"hws_send_ring_create_sq\", \"mlx5_core_destroy_sq\"\
+  , 4 }\n};\n\n// ------------ Utility helpers ------------\n\nstatic bool isCallNamed(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C) {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE)\n    return false;\n  return ExprHasName(OE, Name, C);\n}\n\nstatic\
+  \ bool isDestroyName(const CallEvent &Call, const char *Expected, CheckerContext\
+  \ &C) {\n  if (!Expected)\n    return false;\n  return isCallNamed(Call, Expected,\
+  \ C);\n}\n\nstatic bool isOverScopedCleanupName(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  // Prefer Identifier if present, fallback to source-based contains check.\n\
+  \  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {\n    std::string\
+  \ L = ID->getName().lower();\n    return (L.find(\"close\") != std::string::npos)\
+  \ ||\n           (L.find(\"free\") != std::string::npos) ||\n           (L.find(\"\
+  release\") != std::string::npos);\n  }\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE)\n    return false;\n  return ExprHasName(OE, \"close\", C) || ExprHasName(OE,\
+  \ \"free\", C) ||\n         ExprHasName(OE, \"release\", C);\n}\n\nstatic bool isParamRegion(const\
+  \ MemRegion *R) {\n  if (!R)\n    return false;\n  const MemRegion *Base = R->getBaseRegion();\n\
+  \  return Base && isa<ParmVarRegion>(Base);\n}\n\n// Extracts the resource base\
+  \ region from a creation call argument.\n// Handles patterns like: &sq->sqn  ->\
+  \ returns region of 'sq' base\n//                        sq        -> returns region\
+  \ of 'sq'\nstatic const MemRegion *getResourceRegionFromCreateArg(const Expr *E,\
+  \ CheckerContext &C) {\n  if (!E)\n    return nullptr;\n\n  // Address-of member,\
+  \ e.g., &sq->sqn\n  if (const auto *UO = dyn_cast<UnaryOperator>(E->IgnoreParenCasts()))\
+  \ {\n    if (UO->getOpcode() == UO_AddrOf) {\n      const Expr *Sub = UO->getSubExpr()->IgnoreParenCasts();\n\
+  \      if (const auto *ME = dyn_cast<MemberExpr>(Sub)) {\n        const Expr *BaseE\
+  \ = ME->getBase();\n        if (BaseE) {\n          if (const MemRegion *R = getMemRegionFromExpr(BaseE,\
+  \ C)) {\n            return R->getBaseRegion();\n          }\n        }\n      }\n\
+  \      // &Var (fallback)\n      if (const auto *DRE = dyn_cast<DeclRefExpr>(Sub))\
+  \ {\n        if (const MemRegion *R = getMemRegionFromExpr(DRE, C)) {\n        \
+  \  return R->getBaseRegion();\n        }\n      }\n    }\n  }\n\n  // Generic: sq\
+  \ (pointer/resource variable)\n  if (const MemRegion *R = getMemRegionFromExpr(E,\
+  \ C)) {\n    return R->getBaseRegion();\n  }\n  return nullptr;\n}\n\n// Heuristic:\
+  \ only warn inside functions that look like create/open helpers.\nstatic bool isCreationLikeFunction(CheckerContext\
+  \ &C) {\n  const LocationContext *LCtx = C.getLocationContext();\n  if (!LCtx)\n\
+  \    return false;\n  const Decl *D = LCtx->getDecl();\n  const auto *FD = dyn_cast_or_null<FunctionDecl>(D);\n\
+  \  if (!FD)\n    return false;\n  std::string Name = FD->getNameAsString();\n  for\
+  \ (auto &ch : Name) ch = std::tolower(ch);\n  return Name.find(\"create\") != std::string::npos\
+  \ ||\n         Name.find(\"open\") != std::string::npos;\n}\n\n// ------------ Checker\
+  \ ------------\n\nclass SAGenTestChecker : public Checker<\n                   \
+  \        check::PostCall,\n                           check::PreCall> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n    : BT(new BugType(this,\
+  \ \"Over-scoped cleanup in error path\", \"Resource Management\")) {}\n\n  void\
+  \ checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\nprivate:\n  void maybeRecordCreate(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  void maybeReportOverScoped(const\
+  \ CallEvent &Call,\n                             const MemRegion *ResReg,\n    \
+  \                         const ResourceInfo &Info,\n                          \
+  \   CheckerContext &C) const;\n};\n\nvoid SAGenTestChecker::maybeRecordCreate(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  for (const auto &Pair : KnownPairs) {\n    if (!isCallNamed(Call, Pair.CreateName,\
+  \ C))\n      continue;\n\n    if (Pair.ResourceArgIndex >= Call.getNumArgs())\n\
+  \      continue;\n\n    const Expr *ArgE = Call.getArgExpr(Pair.ResourceArgIndex);\n\
+  \    if (!ArgE)\n      continue;\n\n    const MemRegion *ResReg = getResourceRegionFromCreateArg(ArgE,\
+  \ C);\n    if (!ResReg)\n      continue;\n\n    bool ParamOwned = isParamRegion(ResReg);\n\
+  \    ResourceInfo Info(/*Step=*/1, /*ExpectedDestroy=*/Pair.DestroyName, /*IsParamOwned=*/ParamOwned);\n\
+  \n    State = State->set<ResourceInfoMap>(ResReg, Info);\n    C.addTransition(State);\n\
+  \    return; // only one match per call\n  }\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  // Record resource creation steps\
+  \ from known create functions.\n  maybeRecordCreate(Call, C);\n}\n\nvoid SAGenTestChecker::maybeReportOverScoped(const\
+  \ CallEvent &Call,\n                                             const MemRegion\
+  \ *ResReg,\n                                             const ResourceInfo &Info,\n\
+  \                                             CheckerContext &C) const {\n  if (!BT\
+  \ || !ResReg)\n    return;\n\n  // Heuristic narrowing: only warn in create/open-like\
+  \ functions.\n  if (!isCreationLikeFunction(C))\n    return;\n\n  // Only warn if\
+  \ the resource belongs to a parameter (owned by the caller).\n  if (!Info.IsParamOwned)\n\
+  \    return;\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n\
+  \    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\
+  \ \"Over-scoped cleanup: call HW destroy instead of close/free to avoid double free\"\
+  , N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\
+  \nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  ProgramStateRef State = C.getState();\n\n  // For each argument, see\
+  \ if it refers to a tracked resource.\n  for (unsigned i = 0, e = Call.getNumArgs();\
+  \ i != e; ++i) {\n    const Expr *ArgE = Call.getArgExpr(i);\n    if (!ArgE)\n \
+  \     continue;\n\n    const MemRegion *ArgReg = getMemRegionFromExpr(ArgE, C);\n\
+  \    if (!ArgReg)\n      continue;\n    ArgReg = ArgReg->getBaseRegion();\n\n  \
+  \  // Look up resource info for this region.\n    const ResourceInfo *Info = State->get<ResourceInfoMap>(ArgReg);\n\
+  \    if (!Info || Info->Step != 1)\n      continue;\n\n    // If this is the correct\
+  \ HW destroy, clear the state and accept it.\n    if (isDestroyName(Call, Info->ExpectedDestroy,\
+  \ C)) {\n      State = State->remove<ResourceInfoMap>(ArgReg);\n      C.addTransition(State);\n\
+  \      continue;\n    }\n\n    // If this looks like an over-scoped cleanup (close/free/release),\
+  \ report.\n    if (isOverScopedCleanupName(Call, C)) {\n      maybeReportOverScoped(Call,\
+  \ ArgReg, *Info, C);\n    }\n  }\n}\n\n} // end anonymous namespace\n\nextern \"\
+  C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects over-scoped cleanup in error\
+  \ paths (use HW destroy instead of close/free to avoid double free)\",\n      \"\
+  \");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nnet/mlx5: HWS, fixed double-free in error flow of\
+  \ creating SQ\n\nWhen SQ creation fails, call the appropriate mlx5_core destroy\
+  \ function.\n\nThis fixes the following smatch warnings:\n  divers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c:739\n\
+  \    hws_send_ring_open_sq() warn: 'sq->dep_wqe' double freed\n    hws_send_ring_open_sq()\
+  \ warn: 'sq->wq_ctrl.buf.frags' double freed\n    hws_send_ring_open_sq() warn:\
+  \ 'sq->wr_priv' double freed\n\nFixes: 2ca62599aa0b (\"net/mlx5: HWS, added send\
+  \ engine and context handling\")\nReported-by: Dan Carpenter <dan.carpenter@linaro.org>\n\
+  Closes: https://lore.kernel.org/all/e4ebc227-4b25-49bf-9e4c-14b7ea5c6a07@stanley.mountain/\n\
+  Signed-off-by: Yevgeny Kliteynik <kliteyn@nvidia.com>\nSigned-off-by: Saeed Mahameed\
+  \ <saeedm@nvidia.com>\n\n## Buggy Code\n\n```c\n// Function: hws_send_ring_create_sq\
+  \ in drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\nstatic\
+  \ int hws_send_ring_create_sq(struct mlx5_core_dev *mdev, u32 pdn,\n\t\t\t\t   void\
+  \ *sqc_data,\n\t\t\t\t   struct mlx5hws_send_engine *queue,\n\t\t\t\t   struct mlx5hws_send_ring_sq\
+  \ *sq,\n\t\t\t\t   struct mlx5hws_send_ring_cq *cq)\n{\n\tvoid *in, *sqc, *wq;\n\
+  \tint inlen, err;\n\tu8 ts_format;\n\n\tinlen = MLX5_ST_SZ_BYTES(create_sq_in) +\n\
+  \t\tsizeof(u64) * sq->wq_ctrl.buf.npages;\n\tin = kvzalloc(inlen, GFP_KERNEL);\n\
+  \tif (!in)\n\t\treturn -ENOMEM;\n\n\tsqc = MLX5_ADDR_OF(create_sq_in, in, ctx);\n\
+  \twq = MLX5_ADDR_OF(sqc, sqc, wq);\n\n\tmemcpy(sqc, sqc_data, MLX5_ST_SZ_BYTES(sqc));\n\
+  \tMLX5_SET(sqc, sqc, cqn, cq->mcq.cqn);\n\n\tMLX5_SET(sqc, sqc, state, MLX5_SQC_STATE_RST);\n\
+  \tMLX5_SET(sqc, sqc, flush_in_error_en, 1);\n\n\tts_format = mlx5_is_real_time_sq(mdev)\
+  \ ? MLX5_TIMESTAMP_FORMAT_REAL_TIME :\n\t\t\t\t\t\t MLX5_TIMESTAMP_FORMAT_FREE_RUNNING;\n\
+  \tMLX5_SET(sqc, sqc, ts_format, ts_format);\n\n\tMLX5_SET(wq, wq, wq_type, MLX5_WQ_TYPE_CYCLIC);\n\
+  \tMLX5_SET(wq, wq, uar_page, mdev->mlx5e_res.hw_objs.bfreg.index);\n\tMLX5_SET(wq,\
+  \ wq, log_wq_pg_sz, sq->wq_ctrl.buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT);\n\tMLX5_SET64(wq,\
+  \ wq, dbr_addr, sq->wq_ctrl.db.dma);\n\n\tmlx5_fill_page_frag_array(&sq->wq_ctrl.buf,\n\
+  \t\t\t\t  (__be64 *)MLX5_ADDR_OF(wq, wq, pas));\n\n\terr = mlx5_core_create_sq(mdev,\
+  \ in, inlen, &sq->sqn);\n\n\tkvfree(in);\n\n\treturn err;\n}\n```\n\n## Bug Fix\
+  \ Patch\n\n```diff\ndiff --git a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\
+  \ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\nindex a1adbb48735c..0c7989184c30\
+  \ 100644\n--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\n\
+  +++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_send.c\n@@ -653,6\
+  \ +653,12 @@ static int hws_send_ring_create_sq(struct mlx5_core_dev *mdev, u32\
+  \ pdn,\n \treturn err;\n }\n \n+static void hws_send_ring_destroy_sq(struct mlx5_core_dev\
+  \ *mdev,\n+\t\t\t\t     struct mlx5hws_send_ring_sq *sq)\n+{\n+\tmlx5_core_destroy_sq(mdev,\
+  \ sq->sqn);\n+}\n+\n static int hws_send_ring_set_sq_rdy(struct mlx5_core_dev *mdev,\
+  \ u32 sqn)\n {\n \tvoid *in, *sqc;\n@@ -696,7 +702,7 @@ static int hws_send_ring_create_sq_rdy(struct\
+  \ mlx5_core_dev *mdev, u32 pdn,\n \n \terr = hws_send_ring_set_sq_rdy(mdev, sq->sqn);\n\
+  \ \tif (err)\n-\t\thws_send_ring_close_sq(sq);\n+\t\thws_send_ring_destroy_sq(mdev,\
+  \ sq);\n \n \treturn err;\n }\n```\n"
+pattern: "## Bug Pattern\n\nUsing an over-scoped cleanup routine in an intermediate\
+  \ error path. Specifically, after partially creating an object (HW SQ created but\
+  \ not fully initialized), the code calls a high-level \u201Cclose\u201D helper that\
+  \ frees both HW and driver-owned SW resources, while the caller\u2019s error unwinding\
+  \ later frees the same SW resources again. The correct pattern is to unwind only\
+  \ the last successful step (e.g., call the HW-only destroy function) rather than\
+  \ a full \u201Cclose\u201D that also frees SW state, to avoid double free."
+plan: "Plan\n\n1. Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(ResourceInfoMap,\
+  \ const MemRegion*, ResourceInfo)\n  - ResourceInfo fields:\n    - unsigned Step;\
+  \ // 0 = None, 1 = HwCreated\n    - const char *ExpectedDestroy; // literal name\
+  \ of the HW-only destroy function\n    - bool IsParamOwned; // true if the resource\
+  \ (e.g., sq) is a function parameter\n- No other custom state is required.\n\n2.\
+  \ Helper data and small utilities\n- Define a small, fixed table of known create/destroy\
+  \ pairs and how to extract the resource from the call:\n  - struct CreateDestroyPair\
+  \ { const char *CreateName; const char *DestroyName; unsigned ResourceArgIndex;\
+  \ };\n  - KnownPairs = { { \"mlx5_core_create_sq\", \"mlx5_core_destroy_sq\", 3\
+  \ } }\n- Helper: getResourceRegionFromCreateArg(const Expr *E, CheckerContext &C)\n\
+  \  - The resource handle is passed as \"&sq->member\" for create_sq. Given the argument\
+  \ expression E:\n    - If E is UnaryOperator (&) of a MemberExpr, extract the MemberExpr\
+  \ base expression (the \u201Csq\u201D expression).\n    - Return getMemRegionFromExpr(BaseExpr,\
+  \ C).\n- Helper: isOverScopedCleanupName(StringRef Fn)\n  - Return true if the name\
+  \ contains \"close\" or \"free\" or \"release\".\n- Helper: isDestroyName(StringRef\
+  \ Fn, const char *Expected)\n  - Return Fn.equals(Expected).\n- Helper: isParamRegion(const\
+  \ MemRegion *R)\n  - Return isa<ParmVarRegion>(R) or (R->getBaseRegion() is ParmVarRegion).\n\
+  \n3. checkPostCall: record the \u201CHW created\u201D step\n- Retrieve the callee\
+  \ name (Call.getCalleeIdentifier()) and compare to KnownPairs[i].CreateName.\n-\
+  \ If matched:\n  - Find the resource argument at ResourceArgIndex.\n  - Compute\
+  \ ResourceRegion = getResourceRegionFromCreateArg(ArgExpr, C).\n  - If ResourceRegion\
+  \ is null, bail out (do nothing).\n  - Create ResourceInfo with:\n    - Step = HwCreated\n\
+  \    - ExpectedDestroy = KnownPairs[i].DestroyName\n    - IsParamOwned = isParamRegion(ResourceRegion)\n\
+  \  - State = State->set<ResourceInfoMap>(ResourceRegion, Info)\n  - C.addTransition(State)\n\
+  \n4. checkPreCall: detect over-scoped cleanup in intermediate error paths\n- Fetch\
+  \ the callee name string for current call.\n- If there is no callee identifier,\
+  \ return.\n- For each argument of the call:\n  - Get its MemRegion via getMemRegionFromExpr(ArgExpr,\
+  \ C).\n  - Look up ResourceInfoMap for that region:\n    - If not found, continue.\n\
+  \    - If found and Info.Step == HwCreated:\n      - If isDestroyName(Callee, Info.ExpectedDestroy):\n\
+  \        - This is the correct HW-level unwind; optionally remove the map entry:\n\
+  \          - State = State->remove<ResourceInfoMap>(ResourceRegion); C.addTransition(State)\n\
+  \        - Return (no report).\n      - Else if isOverScopedCleanupName(Callee):\
+  \ // e.g. close/free/release\n        - Additional filter: only warn if IsParamOwned\
+  \ == true (the resource is owned by caller; calling \u201Cclose\u201D here is suspicious).\n\
+  \        - Emit a report:\n          - Message: \"Over-scoped cleanup: call HW destroy\
+  \ instead of close/free to avoid double free.\"\n          - Use generateNonFatalErrorNode(),\
+  \ create a PathSensitiveBugReport, and C.emitReport(...)\n        - Do not transition\
+  \ state (or optionally remove the entry).\n      - Else: do nothing.\n\n5. checkEndFunction\n\
+  - No special work needed (program state will be discarded with the context), but\
+  \ optionally clear all ResourceInfoMap entries:\n  - Iterate map and remove entries.\n\
+  - This step is optional; leaving it out is fine since CSA handles per-path state.\n\
+  \n6. Optional narrow-down with simple heuristics (keep it simple)\n- To reduce false\
+  \ positives without complex path analysis:\n  - Warn only if the current function\
+  \ name suggests creation/opening (its name contains \"create\" or \"open\"). Obtain\
+  \ from the current LocationContext\u2019s Decl name.\n  - This matches the pattern\
+  \ where the function partially creates/initializes and must unwind correctly on\
+  \ failure.\n\n7. Callbacks summary and implementation details\n- checkPostCall\n\
+  \  - Identifies create calls from KnownPairs.\n  - Extracts resource base region\
+  \ from the address-of-member argument (&sq->X) using getResourceRegionFromCreateArg\
+  \ and stores ResourceInfoMap entry.\n- checkPreCall\n  - For each call, scan arguments;\
+  \ if any argument matches a tracked ResourceRegion in HW_CREATED step, check callee\
+  \ name:\n    - If matches expected destroy: OK, clear entry.\n    - If name suggests\
+  \ \u201Cclose/free/release\u201D: report over-scoped cleanup if resource is caller-owned\
+  \ (IsParamOwned).\n- checkEndFunction\n  - Optionally remove entries to be explicit.\n\
+  \n8. Notes on using provided utilities\n- getMemRegionFromExpr is used to get regions\
+  \ from expressions and to compare arguments to tracked resources.\n- findSpecificTypeInChildren\
+  \ can help to extract MemberExpr under a UnaryOperator for the create call\u2019\
+  s handle argument if you need a robust extraction. In most cases, directly examining\
+  \ the last argument expression is sufficient.\n- ExprHasName is not needed here\
+  \ because we fetch the callee\u2019s identifier name directly via Call.getCalleeIdentifier().\n\
+  \n9. Reporting\n- Use a single BugType (class-level static) such as \"Over-scoped\
+  \ cleanup in error path\".\n- Keep the message short:\n  - \"Over-scoped cleanup:\
+  \ use HW destroy instead of close/free; otherwise SW is freed twice.\"\n\nThis checker\
+  \ will flag the original pattern:\n- After mlx5_core_create_sq(..., &sq->sqn), a\
+  \ later error branch calling hws_send_ring_close_sq(sq) will be reported because:\n\
+  \  - The resource region is sq (function parameter).\n  - The expected destroy is\
+  \ mlx5_core_destroy_sq.\n  - The callee name matches \"close\" and is not the expected\
+  \ destroy."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\
+  \n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/AST/RecursiveASTVisitor.h\"\
+  \n#include \"clang/AST/StmtVisitor.h\"\n#include \"llvm/Support/raw_ostream.h\"\n\
+  #include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/Expr.h\"\
+  \n#include \"clang/AST/Decl.h\"\n#include \"llvm/ADT/StringRef.h\"\n#include \"\
+  llvm/ADT/FoldingSet.h\"\n#include \"llvm/Support/Casting.h\"\n#include \"llvm/ADT/ImmutableMap.h\"\
+  \n#include <string>\n#include <cctype>\n#include <memory>\n\nnamespace clang {\n\
+  namespace ento {\n\nusing namespace taint;\n\n// ------------ Program state ------------\n\
+  \nstruct ResourceInfo {\n  unsigned Step;                // 0 = none, 1 = HW created\n\
+  \  const char *ExpectedDestroy;  // expected HW-only destroy function name (literal)\n\
+  \  bool IsParamOwned;            // resource is owned by caller (argument/parameter)\n\
+  \n  ResourceInfo() : Step(0), ExpectedDestroy(nullptr), IsParamOwned(false) {}\n\
+  \  ResourceInfo(unsigned S, const char *ED, bool P)\n      : Step(S), ExpectedDestroy(ED),\
+  \ IsParamOwned(P) {}\n\n  // Required by ProgramState map storage.\n  void Profile(llvm::FoldingSetNodeID\
+  \ &ID) const {\n    ID.AddInteger(Step);\n    ID.AddPointer(ExpectedDestroy);\n\
+  \    ID.AddInteger(static_cast<unsigned>(IsParamOwned));\n  }\n\n  bool operator==(const\
+  \ ResourceInfo &Other) const {\n    return Step == Other.Step &&\n           ExpectedDestroy\
+  \ == Other.ExpectedDestroy &&\n           IsParamOwned == Other.IsParamOwned;\n\
+  \  }\n};\n\n// Program state trait for tracking resources.\nnamespace {\nstruct\
+  \ ResourceInfoMap {};\nusing ResourceInfoMapTy = llvm::ImmutableMap<const MemRegion\
+  \ *, ResourceInfo>;\n} // end anonymous namespace\n\ntemplate <>\nstruct ProgramStateTrait<ResourceInfoMap>\n\
+  \    : public ProgramStatePartialTrait<ResourceInfoMapTy> {\n  static void *GDMIndex()\
+  \ {\n    static int Index;\n    return &Index;\n  }\n};\n\n// ------------ Helper\
+  \ tables ------------\n\nstruct CreateDestroyPair {\n  const char *CreateName;\n\
+  \  const char *DestroyName;\n  unsigned ResourceArgIndex; // index of resource arg\
+  \ in create call\n};\n\n// We cover both the low-level core create and the wrapper\
+  \ create helper.\nstatic const CreateDestroyPair KnownPairs[] = {\n  // mlx5_core_create_sq(dev,\
+  \ in, inlen, &sq->sqn)\n  { \"mlx5_core_create_sq\", \"mlx5_core_destroy_sq\", 3\
+  \ },\n  // hws_send_ring_create_sq(mdev, pdn, sqc_data, queue, sq, cq)\n  { \"hws_send_ring_create_sq\"\
+  , \"mlx5_core_destroy_sq\", 4 }\n};\n\n// ------------ Utility helpers ------------\n\
+  \nstatic bool isCallNamed(const CallEvent &Call, StringRef Name, CheckerContext\
+  \ &C) {\n  const Expr *OE = Call.getOriginExpr();\n  if (!OE)\n    return false;\n\
+  \  return ExprHasName(OE, Name, C);\n}\n\nstatic bool isDestroyName(const CallEvent\
+  \ &Call, const char *Expected, CheckerContext &C) {\n  if (!Expected)\n    return\
+  \ false;\n  return isCallNamed(Call, Expected, C);\n}\n\nstatic bool isOverScopedCleanupName(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  // Prefer Identifier if present, fallback\
+  \ to source-based contains check.\n  if (const IdentifierInfo *ID = Call.getCalleeIdentifier())\
+  \ {\n    std::string L = ID->getName().lower();\n    return (L.find(\"close\") !=\
+  \ std::string::npos) ||\n           (L.find(\"free\") != std::string::npos) ||\n\
+  \           (L.find(\"release\") != std::string::npos);\n  }\n  const Expr *OE =\
+  \ Call.getOriginExpr();\n  if (!OE)\n    return false;\n  return ExprHasName(OE,\
+  \ \"close\", C) || ExprHasName(OE, \"free\", C) ||\n         ExprHasName(OE, \"\
+  release\", C);\n}\n\nstatic bool isParamRegion(const MemRegion *R) {\n  if (!R)\n\
+  \    return false;\n  const MemRegion *Base = R->getBaseRegion();\n  return Base\
+  \ && isa<ParamVarRegion>(Base);\n}\n\n// Extracts the resource base region from\
+  \ a creation call argument.\n// Handles patterns like: &sq->sqn  -> returns region\
+  \ of 'sq' base\n//                        sq        -> returns region of 'sq'\n\
+  static const MemRegion *getResourceRegionFromCreateArg(const Expr *E, CheckerContext\
+  \ &C) {\n  if (!E)\n    return nullptr;\n\n  // Address-of member, e.g., &sq->sqn\n\
+  \  if (const auto *UO = dyn_cast<UnaryOperator>(E->IgnoreParenCasts())) {\n    if\
+  \ (UO->getOpcode() == UO_AddrOf) {\n      const Expr *Sub = UO->getSubExpr()->IgnoreParenCasts();\n\
+  \      if (const auto *ME = dyn_cast<MemberExpr>(Sub)) {\n        const Expr *BaseE\
+  \ = ME->getBase();\n        if (BaseE) {\n          if (const MemRegion *R = getMemRegionFromExpr(BaseE,\
+  \ C)) {\n            return R->getBaseRegion();\n          }\n        }\n      }\n\
+  \      // &Var (fallback)\n      if (const auto *DRE = dyn_cast<DeclRefExpr>(Sub))\
+  \ {\n        if (const MemRegion *R = getMemRegionFromExpr(DRE, C)) {\n        \
+  \  return R->getBaseRegion();\n        }\n      }\n    }\n  }\n\n  // Generic: sq\
+  \ (pointer/resource variable)\n  if (const MemRegion *R = getMemRegionFromExpr(E,\
+  \ C)) {\n    return R->getBaseRegion();\n  }\n  return nullptr;\n}\n\n// Heuristic:\
+  \ only warn inside functions that look like create/open helpers.\nstatic bool isCreationLikeFunction(CheckerContext\
+  \ &C) {\n  const LocationContext *LCtx = C.getLocationContext();\n  if (!LCtx)\n\
+  \    return false;\n  const Decl *D = LCtx->getDecl();\n  const auto *FD = dyn_cast_or_null<FunctionDecl>(D);\n\
+  \  if (!FD)\n    return false;\n  std::string Name = FD->getNameAsString();\n  for\
+  \ (char &ch : Name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));\n\
+  \  return Name.find(\"create\") != std::string::npos ||\n         Name.find(\"open\"\
+  ) != std::string::npos;\n}\n\n// ------------ Checker ------------\n\nclass SAGenTestChecker\
+  \ : public Checker<\n                           check::PostCall,\n             \
+  \              check::PreCall> {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n\
+  \  SAGenTestChecker()\n    : BT(new BugType(this, \"Over-scoped cleanup in error\
+  \ path\", \"Resource Management\")) {}\n\n  void checkPostCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n  void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n\nprivate:\n  void maybeRecordCreate(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void maybeReportOverScoped(const CallEvent &Call,\n            \
+  \                 const MemRegion *ResReg,\n                             const ResourceInfo\
+  \ &Info,\n                             CheckerContext &C) const;\n};\n\nvoid SAGenTestChecker::maybeRecordCreate(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  for (const auto &Pair : KnownPairs) {\n    if (!isCallNamed(Call, Pair.CreateName,\
+  \ C))\n      continue;\n\n    if (Pair.ResourceArgIndex >= Call.getNumArgs())\n\
+  \      continue;\n\n    const Expr *ArgE = Call.getArgExpr(Pair.ResourceArgIndex);\n\
+  \    if (!ArgE)\n      continue;\n\n    const MemRegion *ResReg = getResourceRegionFromCreateArg(ArgE,\
+  \ C);\n    if (!ResReg)\n      continue;\n\n    bool ParamOwned = isParamRegion(ResReg);\n\
+  \    ResourceInfo Info(/*Step=*/1, /*ExpectedDestroy=*/Pair.DestroyName, /*IsParamOwned=*/ParamOwned);\n\
+  \n    State = State->set<ResourceInfoMap>(ResReg, Info);\n    C.addTransition(State);\n\
+  \    return; // only one match per call\n  }\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  // Record resource creation steps\
+  \ from known create functions.\n  maybeRecordCreate(Call, C);\n}\n\nvoid SAGenTestChecker::maybeReportOverScoped(const\
+  \ CallEvent &Call,\n                                             const MemRegion\
+  \ *ResReg,\n                                             const ResourceInfo &Info,\n\
+  \                                             CheckerContext &C) const {\n  if (!BT\
+  \ || !ResReg)\n    return;\n\n  // Heuristic narrowing: only warn in create/open-like\
+  \ functions.\n  if (!isCreationLikeFunction(C))\n    return;\n\n  // Only warn if\
+  \ the resource belongs to a parameter (owned by the caller).\n  if (!Info.IsParamOwned)\n\
+  \    return;\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n\
+  \    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\
+  \ \"Over-scoped cleanup: call HW destroy instead of close/free to avoid double free\"\
+  , N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\
+  \nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  ProgramStateRef State = C.getState();\n\n  // For each argument, see\
+  \ if it refers to a tracked resource.\n  for (unsigned i = 0, e = Call.getNumArgs();\
+  \ i != e; ++i) {\n    const Expr *ArgE = Call.getArgExpr(i);\n    if (!ArgE)\n \
+  \     continue;\n\n    const MemRegion *ArgReg = getMemRegionFromExpr(ArgE, C);\n\
+  \    if (!ArgReg)\n      continue;\n    ArgReg = ArgReg->getBaseRegion();\n\n  \
+  \  // Look up resource info for this region.\n    const ResourceInfo *Info = State->get<ResourceInfoMap>(ArgReg);\n\
+  \    if (!Info || Info->Step != 1)\n      continue;\n\n    // If this is the correct\
+  \ HW destroy, clear the state and accept it.\n    if (isDestroyName(Call, Info->ExpectedDestroy,\
+  \ C)) {\n      State = State->remove<ResourceInfoMap>(ArgReg);\n      C.addTransition(State);\n\
+  \      continue;\n    }\n\n    // If this looks like an over-scoped cleanup (close/free/release),\
+  \ report.\n    if (isOverScopedCleanupName(Call, C)) {\n      maybeReportOverScoped(Call,\
+  \ ArgReg, *Info, C);\n    }\n  }\n}\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects over-scoped cleanup in error paths (use HW destroy instead of\
+  \ close/free to avoid double free)\",\n      \"\");\n}\n\n} // namespace ento\n\
+  } // namespace clang\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

@@ -1,0 +1,403 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: c6087b82a9146826564a55c5ca0164cac40348f5
+commit_type: Buffer-Overflow
+index: 8
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Type.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Map: for a given destination array region (key), remember the region of a \"safe\
+  \ length\" variable\n// that was computed using sizeof(that array).\nREGISTER_MAP_WITH_PROGRAMSTATE(ArraySafeLenMap,\
+  \ const MemRegion*, const MemRegion*)\n// Optional fallback: symbols that we heuristically\
+  \ believe are bounded by some sizeof()\nREGISTER_SET_WITH_PROGRAMSTATE(BoundedLenSyms,\
+  \ SymbolRef)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Unbounded copy_from_user\", \"Memory Safety\")) {}\n\n\
+  \  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n  void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\nprivate:\n  // Helper\
+  \ functions\n  bool isCopyFromUser(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n  // Try to identify destination as a fixed-size array. Returns true on success\
+  \ and fills ArraySize, ArrReg, ArrName.\n  bool getDestArrayInfo(const Expr *DstArg,\
+  \ CheckerContext &C,\n                        llvm::APInt &ArraySize, const MemRegion*\
+  \ &ArrReg,\n                        std::string &ArrName) const;\n\n  // Determine\
+  \ if expression E contains sizeof() on the destination array.\n  bool exprContainsSizeofOfArray(const\
+  \ Expr *E, const MemRegion *ArrReg,\n                                 StringRef\
+  \ ArrName, CheckerContext &C) const;\n\n  // Extract region and/or symbol for length\
+  \ expression.\n  void getLenArgRegionOrSymbol(const Expr *LenArg, CheckerContext\
+  \ &C,\n                               const MemRegion* &LenReg, SymbolRef &LenSym)\
+  \ const;\n\n  void reportUnbounded(const CallEvent &Call, const Expr *Dst,\n   \
+  \                    const Expr *Len, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isCopyFromUser(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE)\n    return false;\n  // Use textual match as recommended to be robust\
+  \ with macros and wrappers.\n  if (ExprHasName(OE, \"copy_from_user\", C))\n   \
+  \ return true;\n  if (ExprHasName(OE, \"__copy_from_user\", C))\n    return true;\n\
+  \  if (ExprHasName(OE, \"raw_copy_from_user\", C))\n    return true;\n  return false;\n\
+  }\n\nbool SAGenTestChecker::getDestArrayInfo(const Expr *DstArg, CheckerContext\
+  \ &C,\n                                        llvm::APInt &ArraySize, const MemRegion*\
+  \ &ArrReg,\n                                        std::string &ArrName) const\
+  \ {\n  ArrReg = nullptr;\n  ArrName.clear();\n\n  // Identify that DstArg is a fixed-size\
+  \ array and retrieve its size\n  if (!getArraySizeFromExpr(ArraySize, DstArg))\n\
+  \    return false;\n\n  // Retrieve the region of the destination and normalize\
+  \ to base region\n  const MemRegion *MR = getMemRegionFromExpr(DstArg, C);\n  if\
+  \ (!MR)\n    return false;\n  MR = MR->getBaseRegion();\n  if (!MR)\n    return\
+  \ false;\n  ArrReg = MR;\n\n  // Try extracting the array variable name\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(DstArg->IgnoreImplicit())) {\n    if (const\
+  \ auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n      ArrName = VD->getNameAsString();\n\
+  \    }\n  }\n\n  return true;\n}\n\nbool SAGenTestChecker::exprContainsSizeofOfArray(const\
+  \ Expr *E, const MemRegion *ArrReg,\n                                          \
+  \       StringRef ArrName, CheckerContext &C) const {\n  if (!E || !ArrReg)\n  \
+  \  return false;\n\n  // AST-based check: find a sizeof(...) inside E that references\
+  \ the same array\n  if (const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(E))\
+  \ {\n    if (UE->getKind() == UETT_SizeOf) {\n      if (const Expr *Arg = UE->getArgumentExpr())\
+  \ {\n        const MemRegion *SizeofMR = getMemRegionFromExpr(Arg, C);\n       \
+  \ if (SizeofMR) {\n          SizeofMR = SizeofMR->getBaseRegion();\n          if\
+  \ (SizeofMR == ArrReg)\n            return true;\n        }\n      }\n    }\n  }\n\
+  \n  // Textual fallback heuristic: expression contains both \"sizeof\" and the array's\
+  \ name\n  if (!ArrName.empty() && ExprHasName(E, \"sizeof\", C) && ExprHasName(E,\
+  \ ArrName, C))\n    return true;\n\n  return false;\n}\n\nvoid SAGenTestChecker::getLenArgRegionOrSymbol(const\
+  \ Expr *LenArg, CheckerContext &C,\n                                           \
+  \    const MemRegion* &LenReg, SymbolRef &LenSym) const {\n  LenReg = nullptr;\n\
+  \  LenSym = nullptr;\n\n  ProgramStateRef State = C.getState();\n\n  // Try to get\
+  \ region\n  const MemRegion *MR = getMemRegionFromExpr(LenArg, C);\n  if (MR) {\n\
+  \    MR = MR->getBaseRegion();\n    LenReg = MR;\n  }\n\n  // Try to get symbol\n\
+  \  SVal SV = State->getSVal(LenArg, C.getLocationContext());\n  LenSym = SV.getAsSymbol();\n\
+  }\n\nvoid SAGenTestChecker::reportUnbounded(const CallEvent &Call, const Expr *Dst,\n\
+  \                                       const Expr *Len, CheckerContext &C) const\
+  \ {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\
+  \n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"copy_from_user\
+  \ length not bounded by destination buffer size\", N);\n  SourceRange CR = Call.getSourceRange();\n\
+  \  if (CR.isValid())\n    R->addRange(CR);\n  if (Dst)\n    R->addRange(Dst->getSourceRange());\n\
+  \  if (Len)\n    R->addRange(Len->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  if (!S)\n    return;\n\n  const auto *BO = dyn_cast<BinaryOperator>(S);\n\
+  \  if (!BO || !BO->isAssignmentOp())\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\n    return;\n\
+  \  LHSReg = LHSReg->getBaseRegion();\n  if (!LHSReg)\n    return;\n\n  const Expr\
+  \ *RHS = BO->getRHS();\n  if (!RHS)\n    return;\n\n  // Look for sizeof(array)\
+  \ in RHS; if found, associate the array with this LHS length variable\n  if (const\
+  \ auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(RHS)) {\n    if\
+  \ (UE->getKind() == UETT_SizeOf) {\n      if (const Expr *Arg = UE->getArgumentExpr())\
+  \ {\n        // Confirm it's an array decl ref\n        llvm::APInt DummySize;\n\
+  \        if (getArraySizeFromExpr(DummySize, Arg)) {\n          const MemRegion\
+  \ *ArrMR = getMemRegionFromExpr(Arg, C);\n          if (ArrMR) {\n            ArrMR\
+  \ = ArrMR->getBaseRegion();\n            if (ArrMR) {\n              State = State->set<ArraySafeLenMap>(ArrMR,\
+  \ LHSReg);\n            }\n          }\n        }\n      }\n    }\n  } else {\n\
+  \    // Weak heuristic: if RHS contains both min and sizeof, consider LHS symbol\
+  \ bounded\n    if (ExprHasName(RHS, \"min\", C) && ExprHasName(RHS, \"sizeof\",\
+  \ C)) {\n      SVal LHSSVal = State->getSVal(LHSReg, C.getLocationContext());\n\
+  \      if (SymbolRef Sym = LHSSVal.getAsSymbol())\n        State = State->add<BoundedLenSyms>(Sym);\n\
+  \    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isCopyFromUser(Call, C))\n\
+  \    return;\n\n  if (Call.getNumArgs() < 3)\n    return;\n\n  const Expr *DstArg\
+  \ = Call.getArgExpr(0);\n  const Expr *LenArg = Call.getArgExpr(2);\n  if (!DstArg\
+  \ || !LenArg)\n    return;\n\n  // Identify destination as a fixed-size array\n\
+  \  llvm::APInt ArraySizeAP;\n  const MemRegion *ArrReg = nullptr;\n  std::string\
+  \ ArrName;\n  if (!getDestArrayInfo(DstArg, C, ArraySizeAP, ArrReg, ArrName))\n\
+  \    return; // Only warn when destination is a provable fixed-size array\n\n  uint64_t\
+  \ ArraySize = ArraySizeAP.getZExtValue();\n  uint64_t SafeCopyLimit = (ArraySize\
+  \ > 0) ? (ArraySize - 1) : 0;\n\n  // 1) Len directly contains sizeof(array)\n \
+  \ if (exprContainsSizeofOfArray(LenArg, ArrReg, ArrName, C))\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  // 2) Len is a variable that we already recorded as\
+  \ safe for this array\n  const MemRegion *BoundRegForArray = State->get<ArraySafeLenMap>(ArrReg);\n\
+  \  const MemRegion *LenReg = nullptr;\n  SymbolRef LenSym = nullptr;\n  getLenArgRegionOrSymbol(LenArg,\
+  \ C, LenReg, LenSym);\n  if (BoundRegForArray && LenReg && (BoundRegForArray ==\
+  \ LenReg))\n    return;\n\n  // 3) Try to infer if Len is constant and exceeds the\
+  \ array size\n  llvm::APSInt ConstLen;\n  if (EvaluateExprToInt(ConstLen, LenArg,\
+  \ C)) {\n    // If definitely larger than the array, report.\n    if (ConstLen.isSigned()\
+  \ ? ConstLen.getSExtValue() > (int64_t)ArraySize\n                            :\
+  \ ConstLen.getZExtValue() > ArraySize) {\n      reportUnbounded(Call, DstArg, LenArg,\
+  \ C);\n      return;\n    }\n    // If definitely <= SafeCopyLimit, consider safe.\n\
+  \    if (ConstLen.isSigned() ? ConstLen.getSExtValue() <= (int64_t)SafeCopyLimit\n\
+  \                            : ConstLen.getZExtValue() <= SafeCopyLimit) {\n   \
+  \   return;\n    }\n    // Otherwise, do not early report here; continue checks.\n\
+  \  }\n\n  // 4) Infer maximal value for symbolic Len\n  if (LenSym) {\n    if (const\
+  \ llvm::APSInt *MaxV = inferSymbolMaxVal(LenSym, C)) {\n      uint64_t MaxVal =\
+  \ MaxV->isSigned() ? (uint64_t)MaxV->getSExtValue() : MaxV->getZExtValue();\n  \
+  \    if (MaxVal <= SafeCopyLimit)\n        return; // safely bounded\n      if (MaxVal\
+  \ > ArraySize) {\n        // Definitely can exceed buffer size.\n        reportUnbounded(Call,\
+  \ DstArg, LenArg, C);\n        return;\n      }\n    }\n    // Weak heuristic: if\
+  \ we heuristically said the symbol is bounded, accept it.\n    if (State->contains<BoundedLenSyms>(LenSym))\n\
+  \      return;\n  }\n\n  // 5) If none of the above proved it's safe, warn.\n  reportUnbounded(Call,\
+  \ DstArg, LenArg, C);\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unbounded copy_from_user into fixed-size buffers\",\n      \"\
+  \");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nscsi: lpfc: Prevent lpfc_debugfs_lockstat_write()\
+  \ buffer overflow\n\nA static code analysis tool flagged the possibility of buffer\
+  \ overflow when\nusing copy_from_user() for a debugfs entry.\n\nCurrently, it is\
+  \ possible that copy_from_user() copies more bytes than what\nwould fit in the mybuf\
+  \ char array.  Add a min() restriction check between\nsizeof(mybuf) - 1 and nbytes\
+  \ passed from the userspace buffer to protect\nagainst buffer overflow.\n\nLink:\
+  \ https://lore.kernel.org/r/20230301231626.9621-2-justintee8345@gmail.com\nSigned-off-by:\
+  \ Justin Tee <justin.tee@broadcom.com>\nSigned-off-by: Martin K. Petersen <martin.petersen@oracle.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: lpfc_debugfs_lockstat_write in drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  static ssize_t\nlpfc_debugfs_lockstat_write(struct file *file, const char __user\
+  \ *buf,\n\t\t\t    size_t nbytes, loff_t *ppos)\n{\n\tstruct lpfc_debug *debug =\
+  \ file->private_data;\n\tstruct lpfc_hba *phba = (struct lpfc_hba *)debug->i_private;\n\
+  \tstruct lpfc_sli4_hdw_queue *qp;\n\tchar mybuf[64];\n\tchar *pbuf;\n\tint i;\n\n\
+  \tmemset(mybuf, 0, sizeof(mybuf));\n\n\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  \t\treturn -EFAULT;\n\tpbuf = &mybuf[0];\n\n\tif ((strncmp(pbuf, \"reset\", strlen(\"\
+  reset\")) == 0) ||\n\t    (strncmp(pbuf, \"zero\", strlen(\"zero\")) == 0)) {\n\t\
+  \tfor (i = 0; i < phba->cfg_hdw_queue; i++) {\n\t\t\tqp = &phba->sli4_hba.hdwq[i];\n\
+  \t\t\tqp->lock_conflict.alloc_xri_get = 0;\n\t\t\tqp->lock_conflict.alloc_xri_put\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_xri = 0;\n\t\t\tqp->lock_conflict.wq_access\
+  \ = 0;\n\t\t\tqp->lock_conflict.alloc_pvt_pool = 0;\n\t\t\tqp->lock_conflict.mv_from_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.mv_to_pub_pool = 0;\n\t\t\tqp->lock_conflict.mv_to_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_pvt_pool = 0;\n\t\t\tqp->lock_conflict.free_pub_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.wq_access = 0;\n\t\t}\n\t}\n\treturn nbytes;\n}\n\
+  ```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/scsi/lpfc/lpfc_debugfs.c\
+  \ b/drivers/scsi/lpfc/lpfc_debugfs.c\nindex f5252e45a48a..3e365e5e194a 100644\n\
+  --- a/drivers/scsi/lpfc/lpfc_debugfs.c\n+++ b/drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  @@ -2157,10 +2157,13 @@ lpfc_debugfs_lockstat_write(struct file *file, const char\
+  \ __user *buf,\n \tchar mybuf[64];\n \tchar *pbuf;\n \tint i;\n+\tsize_t bsize;\n\
+  \ \n \tmemset(mybuf, 0, sizeof(mybuf));\n \n-\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  +\tbsize = min(nbytes, (sizeof(mybuf) - 1));\n+\n+\tif (copy_from_user(mybuf, buf,\
+  \ bsize))\n \t\treturn -EFAULT;\n \tpbuf = &mybuf[0];\n \n@@ -2181,7 +2184,7 @@\
+  \ lpfc_debugfs_lockstat_write(struct file *file, const char __user *buf,\n \t\t\t\
+  qp->lock_conflict.wq_access = 0;\n \t\t}\n \t}\n-\treturn nbytes;\n+\treturn bsize;\n\
+  \ }\n #endif\n \n```\n"
+pattern: "## Bug Pattern\n\nCopying a user-supplied number of bytes into a fixed-size\
+  \ kernel buffer without bounding the copy to the buffer size (and without ensuring\
+  \ NUL-termination for subsequent string use), e.g.:\n\nchar buf[64];\n/* nbytes\
+  \ comes from userspace and is unchecked */\nif (copy_from_user(buf, user_buf, nbytes))\n\
+  \    return -EFAULT;\n\nThis unchecked copy_from_user can overflow the stack buffer.\
+  \ The correct pattern is to clamp the length to min(nbytes, sizeof(buf) - 1) and\
+  \ use that for the copy, returning the actual copied size."
+plan: "Plan\n\n1. Program state customization\n- REGISTER_MAP_WITH_PROGRAMSTATE(ArraySafeLenMap,\
+  \ const MemRegion*, const MemRegion*)\n  - Purpose: For a specific destination array\
+  \ region (key), remember the MemRegion of a length variable (value) that was computed\
+  \ using sizeof(that array). This lets us accept patterns like bsize = min(nbytes,\
+  \ sizeof(mybuf) - 1); copy_from_user(mybuf, buf, bsize).\n- (Optional, only if you\
+  \ want a fallback) REGISTER_SET_WITH_PROGRAMSTATE(BoundedLenSyms, SymbolRef)\n \
+  \ - Purpose: Mark symbols that are computed using any sizeof(...) (not necessarily\
+  \ tied to a particular array). Use only as a weak heuristic to reduce false positives\
+  \ if ArraySafeLenMap didn\u2019t catch a pairing.\n\n2. Helper detection utilities\
+  \ (simple functions inside the checker)\n- isCopyFromUser(const CallEvent &Call)\n\
+  \  - Return true if callee name is one of: \"copy_from_user\", \"__copy_from_user\"\
+  , \"raw_copy_from_user\".\n- getDestArrayInfo(const Expr *DstArg, CheckerContext\
+  \ &C, llvm::APInt &ArraySize, const MemRegion* &ArrReg, std::string &ArrName)\n\
+  \  - Try to identify the destination as a fixed-size array:\n    - If getArraySizeFromExpr(ArraySize,\
+  \ DstArg) succeeds and getMemRegionFromExpr(DstArg, C) returns a region, set ArrReg\
+  \ and return true.\n    - Also extract array name from DstArg: if it\u2019s a DeclRefExpr\
+  \ VarDecl, use getNameAsString.\n- exprContainsSizeofOfArray(const Expr *E, StringRef\
+  \ ArrName, CheckerContext &C)\n  - Returns true if:\n    - ExprHasName(E, \"sizeof\"\
+  , C) and the source text contains ArrName, i.e., ExprHasName(E, ArrName, C).\n \
+  \   - Or AST-based search finds a UnaryExprOrTypeTraitExpr with kind UETT_SizeOf\
+  \ whose argument is a DeclRefExpr of the same VarDecl as DstArg (use findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>\
+  \ and inspect the argument).\n- getLenArgRegionOrSymbol(const Expr *LenArg, CheckerContext\
+  \ &C, const MemRegion* &LenReg, SymbolRef &LenSym)\n  - Obtain the MemRegion of\
+  \ the length expression if it\u2019s a variable (DeclRefExpr) and its SymbolRef\
+  \ from the State. Either can be used to match against ArraySafeLenMap or BoundedLenSyms.\n\
+  \n3. Track \u201Csafe length\u201D variables built from sizeof(array) (checkBind)\n\
+  - Callback: checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const\n\
+  \  - Only handle assignment statements:\n    - If S is a BinaryOperator with isAssignmentOp():\n\
+  \      - Get LHS as a variable region (MemRegion* LHSReg). If not a simple local/global/param\
+  \ variable region, skip.\n      - Inspect RHS Expr:\n        - Search for UnaryExprOrTypeTraitExpr\
+  \ (kind == UETT_SizeOf) in children:\n          - If it references a DeclRefExpr\
+  \ to a VarDecl with ConstantArrayType, get:\n            - The destination array\u2019\
+  s MemRegion* ArrReg (using getMemRegionFromExpr on that DeclRefExpr).\n        \
+  \    - Update program state: ArraySafeLenMap = ArraySafeLenMap.set(ArrReg, LHSReg).\n\
+  \        - As a weak fallback (optional): if RHS text contains \"min\" and \"sizeof\"\
+  , mark the LHS symbol as bounded:\n          - SymbolRef LHSym = State->getSValAsScalarOrLoc(LHSReg).getAsSymbol();\n\
+  \          - If LHSym, add to BoundedLenSyms.\n  - Rationale:\n    - This catches\
+  \ patterns like:\n      - bsize = min(nbytes, sizeof(mybuf) - 1);\n      - len =\
+  \ sizeof(buf) - 1;\n      - safe = sizeof(buf) (not ideal for strings but still\
+  \ useful upper bound).\n    - We pair a \u201Csafe length var\u201D specifically\
+  \ with the array whose sizeof appeared.\n\n4. Detect unsafe copy_from_user into\
+  \ a fixed-size array (checkPreCall)\n- Callback: checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const\n  - If not isCopyFromUser(Call), return.\n  - Extract\
+  \ arguments:\n    - Dst = Call.getArgExpr(0)\n    - Len = Call.getArgExpr(2)\n \
+  \ - Identify destination array info:\n    - If getDestArrayInfo(Dst, C, ArraySize,\
+  \ ArrReg, ArrName) fails, return (we only warn when we can prove it\u2019s a fixed-size\
+  \ array).\n    - Compute SafeCopyLimit = ArraySize - 1 (for string-like use) and\
+  \ also note ArraySize for general overflow checks.\n  - Test for safety (short-circuit\
+  \ in the following order):\n    1) If exprContainsSizeofOfArray(Len, ArrName, C)\
+  \ is true:\n       - Consider SAFE (typical case: min(n, sizeof(buf) - 1) or sizeof(buf)\
+  \ - 1 in the arg directly).\n    2) If Len is a DeclRefExpr and ArraySafeLenMap\
+  \ contains (ArrReg -> LenReg) where LenReg matches the Len argument\u2019s region:\n\
+  \       - Consider SAFE.\n    3) If Len has a known max:\n       - If Len is a symbol,\
+  \ const llvm::APSInt *maxVal = inferSymbolMaxVal(LenSym, C).\n       - If maxVal\
+  \ exists and maxVal <= SafeCopyLimit: SAFE.\n       - If maxVal exists and maxVal\
+  \ > ArraySize: definitely dangerous. Report.\n    4) If Len is a constant:\n   \
+  \    - If constant > ArraySize: definitely dangerous. Report.\n       - Else if\
+  \ constant <= SafeCopyLimit: SAFE.\n       - Else (constant in (SafeCopyLimit, ArraySize]):\
+  \ For overflow it\u2019s safe, but if you want to only focus on overflow, skip.\
+  \ If you also want to enforce \u201C-1\u201D for string scenarios, you may optionally\
+  \ warn; but to avoid noise, don\u2019t warn for this case unless you know later\
+  \ string ops happen.\n    5) Weak fallback (optional):\n       - If Len\u2019s symbol\
+  \ is in BoundedLenSyms: SAFE.\n  - If none of the above marked SAFE, emit a warning:\n\
+  \    - This is the common pattern \u201Ccopy_from_user(buf, user, nbytes)\u201D\
+  \ where nbytes is unchecked. Report it as potential overflow.\n  - Reporting:\n\
+  \    - Generate NonFatalErrorNode and create PathSensitiveBugReport with a short\
+  \ message:\n      - \"copy_from_user length not bounded by destination buffer size\"\
+  \n    - Add notes:\n      - Point to Dst expression: \"destination buffer here\"\
+  \n      - Point to Len expression: \"length argument is not clamped (use min(n,\
+  \ sizeof(buf) - 1))\"\n\n5. Optional: Improve precision with branch detection (checkBranchCondition)\n\
+  - Callback: checkBranchCondition(const Stmt *Condition, CheckerContext &C) const\n\
+  \  - Recognize simple clamps like:\n    - if (len > sizeof(buf) - 1) len = sizeof(buf)\
+  \ - 1; (but full flow-sensitive modeling is complex).\n  - For simplicity, skip\
+  \ implementing branch-based clamps unless you also record assignment in checkBind.\
+  \ The primary precision comes from checkBind recognizing RHS sizeof(...) when assigning\
+  \ the \u201Csafe length\u201D variable.\n\n6. Optional: Avoid false positives when\
+  \ destination is not an array\n- If getDestArrayInfo fails (e.g., dst is a pointer\
+  \ or variable-sized object), do not warn.\n\n7. Minimal function matching robustness\n\
+  - isCopyFromUser should match at least \"copy_from_user\" and \"__copy_from_user\"\
+  . If desired, include \"raw_copy_from_user\".\n- Do not rely on min() being a CallExpr;\
+  \ in the kernel it\u2019s a macro. Rely on:\n  - Presence of sizeof(array) in the\
+  \ Len argument expression; or\n  - A prior assignment that used sizeof(array) in\
+  \ RHS captured by checkBind.\n\n8. Summary of callbacks to implement\n- checkBind:\
+  \ Track assignments of size variables computed from sizeof(array) and store mapping\
+  \ ArraySafeLenMap[ArrReg] = LenVarReg. Optionally mark symbols containing min+sizeof\
+  \ as bounded in BoundedLenSyms.\n- checkPreCall: Detect unsafe copy_from_user when\
+  \ arg0 is a fixed-size array and arg2 is not obviously bounded by sizeof(array)\
+  \ or a previously tracked safe variable, nor known bounded by constraints. Emit\
+  \ report.\n- (Optional) checkBranchCondition: Skip or keep minimal; not required\
+  \ by this plan.\n\n9. Notes on using provided utility functions\n- getArraySizeFromExpr:\
+  \ Use on the destination argument to get fixed array size.\n- getMemRegionFromExpr:\
+  \ Use to map both destination array and length variables to regions for state maps.\n\
+  - EvaluateExprToInt: Try to evaluate Len as a constant when possible.\n- inferSymbolMaxVal:\
+  \ Use to infer an upper bound for Len symbol for SAFE detection.\n- ExprHasName:\
+  \ For simple textual checks on \"sizeof\" and \"min\" within an expression; use\
+  \ only as a heuristic. Prefer AST-based sizeof detection where possible.\n- findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>:\
+  \ To detect UETT_SizeOf in RHS in checkBind and in Len expressions in checkPreCall.\n\
+  \n10. Bug report messaging\n- BugType: \"Unbounded copy_from_user\"\n- Message:\
+  \ \"copy_from_user length not bounded by destination buffer size\"\n- Single, short\
+  \ message; avoid long explanations. Add one or two notes to highlight the destination\
+  \ and length expressions."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Type.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Map: for a given destination array region (key), remember the region of a \"safe\
+  \ length\" variable\n// that was computed using sizeof(that array).\nREGISTER_MAP_WITH_PROGRAMSTATE(ArraySafeLenMap,\
+  \ const MemRegion*, const MemRegion*)\n// Optional fallback: symbols that we heuristically\
+  \ believe are bounded by some sizeof()\nREGISTER_SET_WITH_PROGRAMSTATE(BoundedLenSyms,\
+  \ SymbolRef)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Unbounded copy_from_user\", \"Memory Safety\")) {}\n\n\
+  \  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n  void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\nprivate:\n  // Helper\
+  \ functions\n  bool isCopyFromUser(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n  // Try to identify destination as a fixed-size array. Returns true on success\
+  \ and fills ArraySize, ArrReg, ArrName.\n  bool getDestArrayInfo(const Expr *DstArg,\
+  \ CheckerContext &C,\n                        llvm::APInt &ArraySize, const MemRegion*\
+  \ &ArrReg,\n                        std::string &ArrName) const;\n\n  // Determine\
+  \ if expression E contains sizeof() on the destination array.\n  bool exprContainsSizeofOfArray(const\
+  \ Expr *E, const MemRegion *ArrReg,\n                                 StringRef\
+  \ ArrName, CheckerContext &C) const;\n\n  // Extract region and/or symbol for length\
+  \ expression.\n  void getLenArgRegionOrSymbol(const Expr *LenArg, CheckerContext\
+  \ &C,\n                               const MemRegion* &LenReg, SymbolRef &LenSym)\
+  \ const;\n\n  void reportUnbounded(const CallEvent &Call, const Expr *Dst,\n   \
+  \                    const Expr *Len, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isCopyFromUser(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE)\n    return false;\n  // Use textual match as recommended to be robust\
+  \ with macros and wrappers.\n  if (ExprHasName(OE, \"copy_from_user\", C))\n   \
+  \ return true;\n  if (ExprHasName(OE, \"__copy_from_user\", C))\n    return true;\n\
+  \  if (ExprHasName(OE, \"raw_copy_from_user\", C))\n    return true;\n  return false;\n\
+  }\n\nbool SAGenTestChecker::getDestArrayInfo(const Expr *DstArg, CheckerContext\
+  \ &C,\n                                        llvm::APInt &ArraySize, const MemRegion*\
+  \ &ArrReg,\n                                        std::string &ArrName) const\
+  \ {\n  ArrReg = nullptr;\n  ArrName.clear();\n\n  // Identify that DstArg is a fixed-size\
+  \ array and retrieve its size\n  if (!getArraySizeFromExpr(ArraySize, DstArg))\n\
+  \    return false;\n\n  // Retrieve the region of the destination and normalize\
+  \ to base region\n  const MemRegion *MR = getMemRegionFromExpr(DstArg, C);\n  if\
+  \ (!MR)\n    return false;\n  MR = MR->getBaseRegion();\n  if (!MR)\n    return\
+  \ false;\n  ArrReg = MR;\n\n  // Try extracting the array variable name\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(DstArg->IgnoreImplicit())) {\n    if (const\
+  \ auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n      ArrName = VD->getNameAsString();\n\
+  \    }\n  }\n\n  return true;\n}\n\nbool SAGenTestChecker::exprContainsSizeofOfArray(const\
+  \ Expr *E, const MemRegion *ArrReg,\n                                          \
+  \       StringRef ArrName, CheckerContext &C) const {\n  if (!E || !ArrReg)\n  \
+  \  return false;\n\n  // AST-based check: find a sizeof(...) inside E that references\
+  \ the same array\n  if (const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(E))\
+  \ {\n    if (UE->getKind() == UETT_SizeOf) {\n      if (const Expr *Arg = UE->getArgumentExpr())\
+  \ {\n        const MemRegion *SizeofMR = getMemRegionFromExpr(Arg, C);\n       \
+  \ if (SizeofMR) {\n          SizeofMR = SizeofMR->getBaseRegion();\n          if\
+  \ (SizeofMR == ArrReg)\n            return true;\n        }\n      }\n    }\n  }\n\
+  \n  // Textual fallback heuristic: expression contains both \"sizeof\" and the array's\
+  \ name\n  if (!ArrName.empty() && ExprHasName(E, \"sizeof\", C) && ExprHasName(E,\
+  \ ArrName, C))\n    return true;\n\n  return false;\n}\n\nvoid SAGenTestChecker::getLenArgRegionOrSymbol(const\
+  \ Expr *LenArg, CheckerContext &C,\n                                           \
+  \    const MemRegion* &LenReg, SymbolRef &LenSym) const {\n  LenReg = nullptr;\n\
+  \  LenSym = nullptr;\n\n  ProgramStateRef State = C.getState();\n\n  // Try to get\
+  \ region\n  const MemRegion *MR = getMemRegionFromExpr(LenArg, C);\n  if (MR) {\n\
+  \    MR = MR->getBaseRegion();\n    LenReg = MR;\n  }\n\n  // Try to get symbol\n\
+  \  SVal SV = State->getSVal(LenArg, C.getLocationContext());\n  LenSym = SV.getAsSymbol();\n\
+  }\n\nvoid SAGenTestChecker::reportUnbounded(const CallEvent &Call, const Expr *Dst,\n\
+  \                                       const Expr *Len, CheckerContext &C) const\
+  \ {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\
+  \n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"copy_from_user\
+  \ length not bounded by destination buffer size\", N);\n  SourceRange CR = Call.getSourceRange();\n\
+  \  if (CR.isValid())\n    R->addRange(CR);\n  if (Dst)\n    R->addRange(Dst->getSourceRange());\n\
+  \  if (Len)\n    R->addRange(Len->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  if (!S)\n    return;\n\n  const auto *BO = dyn_cast<BinaryOperator>(S);\n\
+  \  if (!BO || !BO->isAssignmentOp())\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\n    return;\n\
+  \  LHSReg = LHSReg->getBaseRegion();\n  if (!LHSReg)\n    return;\n\n  const Expr\
+  \ *RHS = BO->getRHS();\n  if (!RHS)\n    return;\n\n  // Look for sizeof(array)\
+  \ in RHS; if found, associate the array with this LHS length variable\n  if (const\
+  \ auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(RHS)) {\n    if\
+  \ (UE->getKind() == UETT_SizeOf) {\n      if (const Expr *Arg = UE->getArgumentExpr())\
+  \ {\n        // Confirm it's an array decl ref\n        llvm::APInt DummySize;\n\
+  \        if (getArraySizeFromExpr(DummySize, Arg)) {\n          const MemRegion\
+  \ *ArrMR = getMemRegionFromExpr(Arg, C);\n          if (ArrMR) {\n            ArrMR\
+  \ = ArrMR->getBaseRegion();\n            if (ArrMR) {\n              State = State->set<ArraySafeLenMap>(ArrMR,\
+  \ LHSReg);\n            }\n          }\n        }\n      }\n    }\n  } else {\n\
+  \    // Weak heuristic: if RHS contains both min and sizeof, consider LHS symbol\
+  \ bounded\n    if (ExprHasName(RHS, \"min\", C) && ExprHasName(RHS, \"sizeof\",\
+  \ C)) {\n      if (SymbolRef Sym = Val.getAsSymbol())\n        State = State->add<BoundedLenSyms>(Sym);\n\
+  \    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isCopyFromUser(Call, C))\n\
+  \    return;\n\n  if (Call.getNumArgs() < 3)\n    return;\n\n  const Expr *DstArg\
+  \ = Call.getArgExpr(0);\n  const Expr *LenArg = Call.getArgExpr(2);\n  if (!DstArg\
+  \ || !LenArg)\n    return;\n\n  // Identify destination as a fixed-size array\n\
+  \  llvm::APInt ArraySizeAP;\n  const MemRegion *ArrReg = nullptr;\n  std::string\
+  \ ArrName;\n  if (!getDestArrayInfo(DstArg, C, ArraySizeAP, ArrReg, ArrName))\n\
+  \    return; // Only warn when destination is a provable fixed-size array\n\n  uint64_t\
+  \ ArraySize = ArraySizeAP.getZExtValue();\n  uint64_t SafeCopyLimit = (ArraySize\
+  \ > 0) ? (ArraySize - 1) : 0;\n\n  // 1) Len directly contains sizeof(array)\n \
+  \ if (exprContainsSizeofOfArray(LenArg, ArrReg, ArrName, C))\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  // 2) Len is a variable that we already recorded as\
+  \ safe for this array\n  const MemRegion *const *BoundRegForArrayPtr = State->get<ArraySafeLenMap>(ArrReg);\n\
+  \  const MemRegion *BoundRegForArray = BoundRegForArrayPtr ? *BoundRegForArrayPtr\
+  \ : nullptr;\n  const MemRegion *LenReg = nullptr;\n  SymbolRef LenSym = nullptr;\n\
+  \  getLenArgRegionOrSymbol(LenArg, C, LenReg, LenSym);\n  if (BoundRegForArray &&\
+  \ LenReg && (BoundRegForArray == LenReg))\n    return;\n\n  // 3) Try to infer if\
+  \ Len is constant and exceeds the array size\n  llvm::APSInt ConstLen;\n  if (EvaluateExprToInt(ConstLen,\
+  \ LenArg, C)) {\n    // If definitely larger than the array, report.\n    if (ConstLen.isSigned()\
+  \ ? ConstLen.getSExtValue() > (int64_t)ArraySize\n                            :\
+  \ ConstLen.getZExtValue() > ArraySize) {\n      reportUnbounded(Call, DstArg, LenArg,\
+  \ C);\n      return;\n    }\n    // If definitely <= SafeCopyLimit, consider safe.\n\
+  \    if (ConstLen.isSigned() ? ConstLen.getSExtValue() <= (int64_t)SafeCopyLimit\n\
+  \                            : ConstLen.getZExtValue() <= SafeCopyLimit) {\n   \
+  \   return;\n    }\n    // Otherwise, do not early report here; continue checks.\n\
+  \  }\n\n  // 4) Infer maximal value for symbolic Len\n  if (LenSym) {\n    if (const\
+  \ llvm::APSInt *MaxV = inferSymbolMaxVal(LenSym, C)) {\n      uint64_t MaxVal =\
+  \ MaxV->isSigned() ? (uint64_t)MaxV->getSExtValue() : MaxV->getZExtValue();\n  \
+  \    if (MaxVal <= SafeCopyLimit)\n        return; // safely bounded\n      if (MaxVal\
+  \ > ArraySize) {\n        // Definitely can exceed buffer size.\n        reportUnbounded(Call,\
+  \ DstArg, LenArg, C);\n        return;\n      }\n    }\n    // Weak heuristic: if\
+  \ we heuristically said the symbol is bounded, accept it.\n    if (State->contains<BoundedLenSyms>(LenSym))\n\
+  \      return;\n  }\n\n  // 5) If none of the above proved it's safe, warn.\n  reportUnbounded(Call,\
+  \ DstArg, LenArg, C);\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unbounded copy_from_user into fixed-size buffers\",\n      \"\
+  \");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

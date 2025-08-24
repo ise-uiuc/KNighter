@@ -1,0 +1,316 @@
+--- attempt_1_original.cpp+++ attempt_1.cpp@@ -21,15 +21,16 @@ using namespace ento;
+ using namespace taint;
+
+-// No custom program states are necessary for this AST-only checker.
+-
+ namespace {
+
+ // Forward declarations of helpers
+ static bool evalInt(const ASTContext &Ctx, const Expr *E, llvm::APSInt &Res);
+ static bool containsDeclRefToVar(const Expr *E, const VarDecl *V);
++// Replaced by a more general extractor that recognizes simple derived indices.
+ static bool getArrayConstSizeFromBase(const ASTContext &Ctx, const Expr *Base, uint64_t &CapOut);
+ static bool stmtContains(const Stmt *Root, const Stmt *Target);
++static bool parseGuardCondition(const ASTContext &Ctx, const Expr *Cond, const VarDecl *IVar,
++                                uint64_t Cap, bool &IsLTorLE, bool &IsGEorGT);
+ static bool isGuardedByEnclosingIfLtCap(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+                                         const VarDecl *IVar, uint64_t Cap);
+ static bool isGuardedByPrevIfGeBreak(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+@@ -37,6 +38,147 @@ static bool isGuardedBeforeUse(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+                                const VarDecl *IVar, uint64_t Cap);
+
++// New helpers to eliminate macro-originated false positives
++static bool isFromMacro(const SourceRange &SR) {
++  if (SR.isInvalid())
++    return false;
++  SourceLocation B = SR.getBegin();
++  SourceLocation E = SR.getEnd();
++  return (B.isMacroID() || E.isMacroID());
++}
++
++static bool isFromMacro(const Expr *E) {
++  if (!E) return false;
++  return isFromMacro(E->getSourceRange()) || E->getExprLoc().isMacroID();
++}
++
++// A single place to decide whether this ASE is a known false positive.
++static bool isFalsePositive(const ArraySubscriptExpr *ASE) {
++  if (!ASE) return false;
++  // If either the subscript expression itself, its base, or its index come from
++  // a macro expansion, skip. Macros often hide bitset/packing tricks that the
++  // AST-only checker cannot reason about safely.
++  if (isFromMacro(ASE) || isFromMacro(ASE->getBase()) || isFromMacro(ASE->getIdx()))
++    return true;
++  return false;
++}
++
++// Strip no-op nodes for matching.
++static const Expr *stripNoOps(const Expr *E) {
++  if (!E) return nullptr;
++  return E->IgnoreParenImpCasts();
++}
++
++// Try to evaluate an expression to an unsigned 64-bit constant.
++// Returns true on success and sets Out.
++static bool evalUInt64(const ASTContext &Ctx, const Expr *E, uint64_t &Out) {
++  llvm::APSInt V;
++  if (!evalInt(Ctx, E, V))
++    return false;
++  // Treat negative as unsupported.
++  if (V.isSigned() && V.isNegative())
++    return false;
++  Out = V.getLimitedValue();
++  return true;
++}
++
++// Recognize subscript index forms that are simple linear transforms of the loop variable.
++// Supported forms:
++//   - i
++//   - i / K   (K > 0)
++//   - i >> n  (n >= 0)
++// Optionally allow addition/subtraction by 0 (no-op).
++// Returns true if recognized and sets DivOut (>=1) and OffsetOut (currently only 0 supported).
++static bool extractIndexDivAndOffset(const ASTContext &Ctx, const Expr *Idx,
++                                     const VarDecl *IVar, uint64_t &DivOut,
++                                     int64_t &OffsetOut) {
++  DivOut = 0;
++  OffsetOut = 0;
++  if (!Idx || !IVar) return false;
++
++  const Expr *E = stripNoOps(Idx);
++
++  auto IsDirectLoopVar = [&](const Expr *X) -> bool {
++    X = stripNoOps(X);
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(X))
++      return DRE->getDecl() == IVar;
++    return false;
++  };
++
++  // Direct variable: arr[i]
++  if (IsDirectLoopVar(E)) {
++    DivOut = 1;
++    OffsetOut = 0;
++    return true;
++  }
++
++  // Allow no-op +0 or -0 around recognized forms
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++    BinaryOperator::Opcode Op = BO->getOpcode();
++
++    // i / K
++    if (Op == BO_Div) {
++      if (IsDirectLoopVar(BO->getLHS())) {
++        uint64_t K = 0;
++        if (evalUInt64(Ctx, BO->getRHS(), K) && K > 0) {
++          DivOut = K;
++          OffsetOut = 0;
++          return true;
++        }
++      }
++    }
++
++    // i >> n  => division by 2^n
++    if (Op == BO_Shr) {
++      if (IsDirectLoopVar(BO->getLHS())) {
++        uint64_t N = 0;
++        if (evalUInt64(Ctx, BO->getRHS(), N)) {
++          if (N < 63) {
++            DivOut = (1ULL << N);
++            OffsetOut = 0;
++            return true;
++          }
++        }
++      }
++    }
++
++    // Handle +0 or -0 around a recognized form
++    if (Op == BO_Add || Op == BO_Sub) {
++      const Expr *L = BO->getLHS();
++      const Expr *R = BO->getRHS();
++      uint64_t CVal = 0;
++
++      // Try left op as core form and right as constant 0
++      uint64_t InnerDiv = 0;
++      int64_t InnerOff = 0;
++      if (evalUInt64(Ctx, R, CVal)) {
++        if (CVal == 0 && extractIndexDivAndOffset(Ctx, L, IVar, InnerDiv, InnerOff)) {
++          DivOut = InnerDiv;
++          OffsetOut = InnerOff;
++          return true;
++        }
++      }
++
++      // Try right op as core form and left as constant 0, for commutative '+'
++      if (Op == BO_Add && evalUInt64(Ctx, L, CVal)) {
++        if (CVal == 0 && extractIndexDivAndOffset(Ctx, R, IVar, InnerDiv, InnerOff)) {
++          DivOut = InnerDiv;
++          OffsetOut = InnerOff;
++          return true;
++        }
++      }
++    }
++  }
++
++  return false;
++}
++
++// Safe ceil division for positive integers: ceil(A / B) with B >= 1.
++static uint64_t ceilDivU64(uint64_t A, uint64_t B) {
++  if (B == 0) return UINT64_MAX;
++  return (A + B - 1) / B;
++}
++
+ class SAGenTestChecker : public Checker<check::ASTCodeBody> {
+    mutable std::unique_ptr<BugType> BT;
+
+@@ -48,10 +190,12 @@
+ private:
+   // Extract loop index variable and bounds from a ForStmt.
+-  // Returns true on success and sets IVar, LB, UBExclusive.
++  // Returns true on success and sets IVar, LB, UBExclusive, CondOp, RHSValue.
+   static bool getLoopIndexAndBounds(const ForStmt *FS, const ASTContext &Ctx,
+                                     const VarDecl *&IVar, llvm::APSInt &LB,
+-                                    llvm::APSInt &UBExclusive);
++                                    llvm::APSInt &UBExclusive,
++                                    BinaryOperator::Opcode &CondOpOut,
++                                    llvm::APSInt &RHSValueOut);
+
+   // Process a single ForStmt: find array subscripts using IVar and check against Cap.
+   void processForStmt(const ForStmt *FS, const ASTContext &Ctx, BugReporter &BR) const;
+@@ -240,7 +384,7 @@   }
+   if (!ContainerChild) return false;
+
+-  // Scan previous statements for if (i >= Cap) { break; } or return;
++  // Scan previous statements for if (i >= Cap) { break; } or return; or continue;
+   Index = 0;
+   for (const Stmt *Child : CS->body()) {
+     if (Index >= FoundIndex) break;
+@@ -259,17 +403,16 @@     const Stmt *Then = IS->getThen();
+     if (!Then) continue;
+
+-    // Look for a BreakStmt or ReturnStmt inside the then-branch.
+-    bool HasBreakOrReturn = false;
++    // Look for a BreakStmt, ContinueStmt or ReturnStmt inside the then-branch.
+     struct FindTerminator : public RecursiveASTVisitor<FindTerminator> {
+       bool Found = false;
+       bool VisitBreakStmt(BreakStmt *) { Found = true; return false; }
++      bool VisitContinueStmt(ContinueStmt *) { Found = true; return false; }
+       bool VisitReturnStmt(ReturnStmt *) { Found = true; return false; }
+     } Finder;
+     Finder.TraverseStmt(const_cast<Stmt*>(Then));
+-    HasBreakOrReturn = Finder.Found;
+-
+-    if (HasBreakOrReturn)
++
++    if (Finder.Found)
+       return true;
+   }
+
+@@ -283,7 +426,7 @@   if (isGuardedByEnclosingIfLtCap(Ctx, ASE, IVar, Cap))
+     return true;
+
+-  // 2) Just before ASE in the same block, there is if (i >= Cap) { break; } or return;
++  // 2) Just before ASE in the same block, there is if (i >= Cap) { break; } or return; or continue;
+   if (isGuardedByPrevIfGeBreak(Ctx, ASE, IVar, Cap))
+     return true;
+
+@@ -292,8 +435,11 @@
+ bool SAGenTestChecker::getLoopIndexAndBounds(const ForStmt *FS, const ASTContext &Ctx,
+                                              const VarDecl *&IVar, llvm::APSInt &LB,
+-                                             llvm::APSInt &UBExclusive) {
++                                             llvm::APSInt &UBExclusive,
++                                             BinaryOperator::Opcode &CondOpOut,
++                                             llvm::APSInt &RHSValueOut) {
+   IVar = nullptr;
++  CondOpOut = BO_Comma; // sentinel
+
+   // Parse init: either "int i = 0" or "i = 0"
+   const Stmt *Init = FS->getInit();
+@@ -350,6 +496,8 @@
+   LB = InitVal;
+   IVar = IdxVar;
++  CondOpOut = Op;
++  RHSValueOut = RHSVal;
+   return true;
+ }
+
+@@ -372,40 +520,65 @@
+ void SAGenTestChecker::processForStmt(const ForStmt *FS, const ASTContext &Ctx, BugReporter &BR) const {
+   const VarDecl *IVar = nullptr;
+-  llvm::APSInt LB, UBEx;
+-  if (!getLoopIndexAndBounds(FS, Ctx, IVar, LB, UBEx))
++  llvm::APSInt LB, UBEx, RHSVal;
++  BinaryOperator::Opcode CondOp;
++  if (!getLoopIndexAndBounds(FS, Ctx, IVar, LB, UBEx, CondOp, RHSVal))
+     return;
+
+   // Only consider LB == 0 (already filtered)
+   uint64_t UBExclusive = UBEx.getLimitedValue();
++  uint64_t RHSNumeric = RHSVal.getLimitedValue();
+
+   // Traverse the loop body to find array subscripts using IVar.
+   struct ASEVisitor : public RecursiveASTVisitor<ASEVisitor> {
+     const ASTContext &Ctx;
+     const VarDecl *IVar;
+     uint64_t UBExclusive;
++    uint64_t RHSNumeric;
++    BinaryOperator::Opcode CondOp;
+     BugReporter &BR;
+     const SAGenTestChecker *Checker;
+
+-    ASEVisitor(const ASTContext &C, const VarDecl *V, uint64_t UB, BugReporter &B,
+-               const SAGenTestChecker *Ch)
+-      : Ctx(C), IVar(V), UBExclusive(UB), BR(B), Checker(Ch) {}
++    ASEVisitor(const ASTContext &C, const VarDecl *V, uint64_t UB, uint64_t RHSN,
++               BinaryOperator::Opcode Op, BugReporter &B, const SAGenTestChecker *Ch)
++      : Ctx(C), IVar(V), UBExclusive(UB), RHSNumeric(RHSN), CondOp(Op), BR(B), Checker(Ch) {}
+
+     bool VisitArraySubscriptExpr(ArraySubscriptExpr *ASE) {
+       const Expr *Idx = ASE->getIdx();
+       if (!Idx) return true;
+-      if (!containsDeclRefToVar(Idx, IVar))
++
++      // Filter out known false positives early.
++      if (isFalsePositive(ASE))
+         return true;
+
+       uint64_t Cap = 0;
+       if (!getArrayConstSizeFromBase(Ctx, ASE->getBase(), Cap))
+         return true;
+
++      // Only consider subscripts where the index is directly the loop variable
++      // or a supported derived form (i, i/const, i>>const). Skip unknown forms to avoid FPs.
++      uint64_t Div = 0;
++      int64_t Offset = 0;
++      if (!extractIndexDivAndOffset(Ctx, Idx, IVar, Div, Offset))
++        return true;
++
+       // If guarded appropriately, skip.
+       if (isGuardedBeforeUse(Ctx, ASE, IVar, Cap))
+         return true;
+
+-      if (UBExclusive > Cap) {
++      // Preserve the existing conservative suppression for "<=" when RHS equals the capacity
++      // on the direct-indexing path (Div == 1). This avoids regressions unrelated to the target bug.
++      if (Div == 1 && CondOp == BO_LE && RHSNumeric == Cap)
++        return true;
++
++      // Currently handle only zero offset to avoid accidental FPs.
++      if (Offset != 0)
++        return true;
++
++      // For index forms of i/Div (Div>=1), the max subscript is floor((UBExclusive-1)/Div).
++      // This is safe iff ceil(UBExclusive / Div) <= Cap.
++      const uint64_t NeededSlots = ceilDivU64(UBExclusive, Div);
++      if (NeededSlots > Cap) {
+         Checker->reportIssue(ASE, IVar, UBExclusive, Cap, BR, Ctx);
+       }
+
+@@ -414,7 +587,7 @@   };
+
+   if (const Stmt *Body = FS->getBody()) {
+-    ASEVisitor V(Ctx, IVar, UBExclusive, BR, this);
++    ASEVisitor V(Ctx, IVar, UBExclusive, RHSNumeric, CondOp, BR, this);
+     V.TraverseStmt(const_cast<Stmt*>(Body));
+   }
+ }

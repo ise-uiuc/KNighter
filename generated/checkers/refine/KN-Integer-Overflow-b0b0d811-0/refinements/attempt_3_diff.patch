@@ -1,0 +1,433 @@
+--- attempt_3_original.cpp+++ attempt_3.cpp@@ -74,6 +74,10 @@   static bool getExprRange128(const Expr *E, CheckerContext &C,
+                               llvm::APInt &Min, llvm::APInt &Max,
+                               unsigned Depth = 0);
++
++  static bool tryGetUpperBoundFromState(const Expr *E, CheckerContext &C,
++                                        llvm::APInt &MaxOut, bool &Known);
++
+   static bool productDefinitelyFitsInType(const Expr *L, const Expr *R,
+                                           QualType MulType, CheckerContext &C);
+
+@@ -92,7 +96,7 @@   // Address/size-like LHS filter for intended bug surface.
+   static bool isAddressOrSizeLikeLHS(const Expr *LHS);
+
+-  // IRQ-like and jiffies contexts suppression.
++  // IRQ-like context suppression.
+   static bool isIrqLikeContext(const Expr *Root, const Expr *LHS, CheckerContext &C);
+
+   // Kernel block/folio I/O math suppression helpers
+@@ -123,12 +127,33 @@   static bool isMulUnderArrayIndex(const BinaryOperator *MulBO,
+                                    CheckerContext &C);
+
++  // CFI-style erase region math: ((X >> k) & ~((1<<K)-1)) * interleave
++  static bool isConstMaskClearingLowBits(const Expr *E, unsigned &ClearedBits,
++                                         CheckerContext &C);
++  static bool matchMaskedShiftExpr(const Expr *E, unsigned &ShiftAmt,
++                                   unsigned &ClearedBits, CheckerContext &C);
++  static bool isBenignCFIMaskedShiftInterleaveCase(const BinaryOperator *MulBO,
++                                                   CheckerContext &C);
++
++  // Radeon-specific benign DMA packet math suppression:
++  static bool isBenignNdwDiv2TimesIncrAddrPattern(const BinaryOperator *MulBO,
++                                                  const Expr *LHSExpr,
++                                                  CheckerContext &C);
++
++  // New: Memory unit scaling suppression (e.g., size = gb * 1024).
++  static bool isMemoryUnitScaleConversion(const BinaryOperator *MulBO,
++                                          const Expr *LHSExpr,
++                                          CheckerContext &C);
++
+   // Aggregated FP gate.
+   static bool isFalsePositive(const Expr *Root,
+                               const BinaryOperator *MulBO,
+                               const Expr *LHSExpr,
+                               CheckerContext &C);
+
++  static void clampByNameHints(const Expr *E, llvm::APInt &Min, llvm::APInt &Max,
++                               CheckerContext &C);
++
+   void emitReport(const BinaryOperator *MulBO, QualType LHSType,
+                   CheckerContext &C) const;
+ };
+@@ -145,7 +170,6 @@ }
+
+ // Wide target: unsigned integer-like and width >= 64 bits (covers u64, dma_addr_t on 64-bit).
+-// Narrowing to unsigned eliminates benign signed long "size" temporaries like ALSA's private_size.
+ bool SAGenTestChecker::isWideTargetType(QualType QT, CheckerContext &C) {
+   if (!isIntegerLike(QT))
+     return false;
+@@ -183,9 +207,50 @@   }
+ }
+
++// Attempt to obtain an upper bound from the current program state for E.
++// Returns true if a bound was found. MaxOut is 128-bit extended.
++bool SAGenTestChecker::tryGetUpperBoundFromState(const Expr *E, CheckerContext &C,
++                                                 llvm::APInt &MaxOut, bool &Known) {
++  Known = false;
++  if (!E) return false;
++
++  // If E folds to a constant, its "max" is itself.
++  llvm::APSInt Folded;
++  if (EvaluateExprToInt(Folded, E->IgnoreParenImpCasts(), C)) {
++    MaxOut = Folded.extOrTrunc(128);
++    Known = true;
++    return true;
++  }
++
++  // Try symbol-based bound via constraint manager.
++  SVal V = C.getSVal(E);
++  SymbolRef Sym = V.getAsSymbol();
++  if (!Sym)
++    return false;
++
++  if (const llvm::APSInt *Max = inferSymbolMaxVal(Sym, C)) {
++    MaxOut = Max->extOrTrunc(128);
++    Known = true;
++    return true;
++  }
++
++  return false;
++}
++
++// Clamp ranges based on identifier hints (heuristics for kernel).
++void SAGenTestChecker::clampByNameHints(const Expr *E, llvm::APInt &Min, llvm::APInt &Max,
++                                        CheckerContext &C) {
++  // Small interleave factors in flash CFI stacks are common (1,2,4,8,...).
++  if (exprNameContains(E, {"interleave"}, C)) {
++    llvm::APInt One = llvm::APInt(128, 1, /*isSigned*/false);
++    llvm::APInt Up = llvm::APInt(128, 64, /*isSigned*/false);
++    if (Min.slt(One)) Min = One;
++    if (Max.sgt(Up))  Max = Up;
++  }
++}
++
+ // Lightweight interval analysis for expressions. Always returns true,
+ // providing a conservative range, falling back to type-based ranges.
+-// Depth-limited to avoid pathological recursion.
+ bool SAGenTestChecker::getExprRange128(const Expr *E, CheckerContext &C,
+                                        llvm::APInt &Min, llvm::APInt &Max,
+                                        unsigned Depth) {
+@@ -256,6 +321,11 @@       Max = -SMin;
+       return true;
+     }
++    // Bitwise not may be folded above; otherwise fallback.
++    if (K == UO_Not) {
++      getTypeRange128(UO->getType(), C, Min, Max);
++      return true;
++    }
+     // Address/deref or other: fallback to type range
+     getTypeRange128(UO->getType(), C, Min, Max);
+     return true;
+@@ -301,9 +371,75 @@       }
+       return true;
+     }
+-    case BO_Shl:
+-    case BO_Shr:
+-    case BO_And:
++    case BO_Div: {
++      // If RHS is a positive constant, derive tighter bounds for non-negative LHS.
++      llvm::APSInt AmtAPS;
++      if (EvaluateExprToInt(AmtAPS, BO->getRHS()->IgnoreParenImpCasts(), C)) {
++        if (AmtAPS.isSigned() ? AmtAPS.isStrictlyPositive() : AmtAPS.isStrictlyPositive()) {
++          uint64_t D = (uint64_t)AmtAPS.getExtValue();
++          // Handle common unsigned or nonnegative LHS case.
++          if (!LMin.isNegative() && !LMax.isNegative() && D != 0) {
++            Min = LMin.udiv(D);
++            Max = LMax.udiv(D);
++            return true;
++          }
++        }
++      }
++      // Fallback
++      getTypeRange128(BO->getType(), C, Min, Max);
++      return true;
++    }
++    case BO_Shr: {
++      // If RHS is a constant, tighten by shifting bounds; valid for nonnegative ranges.
++      llvm::APSInt AmtAPS;
++      if (EvaluateExprToInt(AmtAPS, BO->getRHS()->IgnoreParenImpCasts(), C)) {
++        unsigned Amt = (unsigned)AmtAPS.getExtValue();
++        if (!LMin.isNegative() && !LMax.isNegative()) {
++          Min = LMin.lshr(Amt);
++          Max = LMax.lshr(Amt);
++          return true;
++        }
++      }
++      getTypeRange128(BO->getType(), C, Min, Max);
++      return true;
++    }
++    case BO_Shl: {
++      llvm::APSInt AmtAPS;
++      if (EvaluateExprToInt(AmtAPS, BO->getRHS()->IgnoreParenImpCasts(), C)) {
++        unsigned Amt = (unsigned)AmtAPS.getExtValue();
++        if (!LMin.isNegative() && !LMax.isNegative()) {
++          Min = LMin.shl(Amt);
++          Max = LMax.shl(Amt);
++          return true;
++        }
++      }
++      getTypeRange128(BO->getType(), C, Min, Max);
++      return true;
++    }
++    case BO_And: {
++      // If one side is a constant mask M, result is within [0, min(OtherMax, M)].
++      llvm::APSInt ConstAPS;
++      bool LConst = EvaluateExprToInt(ConstAPS, BO->getLHS()->IgnoreParenImpCasts(), C);
++      if (LConst) {
++        llvm::APInt M = ConstAPS.extOrTrunc(128);
++        llvm::APInt Zero(128, 0, false);
++        Min = Zero;
++        Max = (LMax.slt(M)) ? LMax : M;
++        clampByNameHints(BO->getRHS(), Min, Max, C);
++        return true;
++      }
++      bool RConst = EvaluateExprToInt(ConstAPS, BO->getRHS()->IgnoreParenImpCasts(), C);
++      if (RConst) {
++        llvm::APInt M = ConstAPS.extOrTrunc(128);
++        llvm::APInt Zero(128, 0, false);
++        Min = Zero;
++        Max = (RMax.slt(M)) ? RMax : M;
++        clampByNameHints(BO->getLHS(), Min, Max, C);
++        return true;
++      }
++      getTypeRange128(BO->getType(), C, Min, Max);
++      return true;
++    }
+     case BO_Or:
+     case BO_Xor:
+     default:
+@@ -329,9 +465,17 @@     return true;
+   }
+
+-  // Member access / decl ref: use their type ranges.
++  // Member access / decl ref: use their type ranges, then clamp by state-based upper bound and hints.
+   if (isa<MemberExpr>(E) || isa<DeclRefExpr>(E)) {
+     getTypeRange128(E->getType(), C, Min, Max);
++    // Try to refine upper bound from the state (e.g., ndw <= 0xFFFFE).
++    llvm::APInt UB(128, 0, false);
++    bool Known = false;
++    if (tryGetUpperBoundFromState(E, C, UB, Known) && Known) {
++      if (Max.sgt(UB))
++        Max = UB;
++    }
++    clampByNameHints(E, Min, Max, C);
+     return true;
+   }
+
+@@ -700,6 +844,199 @@   return ASE != nullptr;
+ }
+
++// Detect E is a constant mask that clears at least K low bits: e.g., ~0xff or 0xffff0000.
++bool SAGenTestChecker::isConstMaskClearingLowBits(const Expr *E, unsigned &ClearedBits,
++                                                  CheckerContext &C) {
++  llvm::APSInt APS;
++  if (!EvaluateExprToInt(APS, E->IgnoreParenImpCasts(), C))
++    return false;
++  llvm::APInt V = APS.extOrTrunc(128);
++  // Number of trailing zero bits gives cleared low bits by this mask.
++  unsigned TZ = V.countTrailingZeros();
++  if (TZ == 0)
++    return false;
++  ClearedBits = TZ;
++  return true;
++}
++
++// Detect ((X >> ShiftAmt) & mask-clearing low bits)
++bool SAGenTestChecker::matchMaskedShiftExpr(const Expr *E, unsigned &ShiftAmt,
++                                            unsigned &ClearedBits, CheckerContext &C) {
++  E = E ? E->IgnoreParenImpCasts() : nullptr;
++  const auto *AndBO = dyn_cast_or_null<BinaryOperator>(E);
++  if (!AndBO || AndBO->getOpcode() != BO_And)
++    return false;
++
++  // AND is commutative: check both sides for the mask and the shift.
++  auto TryMatch = [&](const Expr *Left, const Expr *Right) -> bool {
++    Left = Left ? Left->IgnoreParenImpCasts() : nullptr;
++    Right = Right ? Right->IgnoreParenImpCasts() : nullptr;
++    unsigned K = 0;
++    if (!isConstMaskClearingLowBits(Right, K, C))
++      return false;
++    const auto *ShrBO = dyn_cast<BinaryOperator>(Left);
++    if (!ShrBO || ShrBO->getOpcode() != BO_Shr)
++      return false;
++    llvm::APSInt AmtAPS;
++    if (!EvaluateExprToInt(AmtAPS, ShrBO->getRHS()->IgnoreParenImpCasts(), C))
++      return false;
++    int64_t SA = AmtAPS.getExtValue();
++    if (SA < 0)
++      return false;
++    ShiftAmt = (unsigned)SA;
++    ClearedBits = K;
++    return true;
++  };
++
++  if (TryMatch(AndBO->getLHS(), AndBO->getRHS()))
++    return true;
++  if (TryMatch(AndBO->getRHS(), AndBO->getLHS()))
++    return true;
++  return false;
++}
++
++// Specific benign CFI case: ((X >> k) & mask-clearing >=8 low bits) * <interleave>
++bool SAGenTestChecker::isBenignCFIMaskedShiftInterleaveCase(const BinaryOperator *MulBO,
++                                                            CheckerContext &C) {
++  if (!MulBO || MulBO->getOpcode() != BO_Mul)
++    return false;
++  const Expr *L = MulBO->getLHS()->IgnoreParenImpCasts();
++  const Expr *R = MulBO->getRHS()->IgnoreParenImpCasts();
++
++  unsigned ShiftAmt = 0, Cleared = 0;
++  // One side must be masked-shift; the other named "interleave".
++  bool LMasked = matchMaskedShiftExpr(L, ShiftAmt, Cleared, C);
++  bool RMasked = matchMaskedShiftExpr(R, ShiftAmt, Cleared, C);
++  if (!LMasked && !RMasked)
++    return false;
++
++  const Expr *Other = LMasked ? R : L;
++  if (!exprNameContains(Other, {"interleave"}, C))
++    return false;
++
++  // Require that at least 8 low bits are cleared, as in (~0xff) pattern.
++  if (Cleared < 8)
++    return false;
++
++  return true;
++}
++
++// Detect benign Radeon DMA PTE math: addr += (ndw / 2) * incr;
++// Returns true if matched.
++bool SAGenTestChecker::isBenignNdwDiv2TimesIncrAddrPattern(const BinaryOperator *MulBO,
++                                                           const Expr *LHSExpr,
++                                                           CheckerContext &C) {
++  if (!MulBO || MulBO->getOpcode() != BO_Mul || !LHSExpr)
++    return false;
++
++  // Require LHS name to be 'addr'-like to narrow to address accumulators.
++  std::string LHSName = extractIdentifierLikeName(LHSExpr);
++  std::string LLower = LHSName;
++  std::transform(LLower.begin(), LLower.end(), LLower.begin(), ::tolower);
++  if (LLower.empty() || !nameContains(LLower, {"addr"}))
++    return false;
++
++  auto IsNdwDiv2 = [&](const Expr *E) -> bool {
++    E = E ? E->IgnoreParenImpCasts() : nullptr;
++    if (!E) return false;
++    // Either 'ndw / 2' or 'ndw >> 1'
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      if (BO->getOpcode() == BO_Div || BO->getOpcode() == BO_Shr) {
++        // RHS must be 2 (for Div) or 1 (for Shr)
++        llvm::APSInt APS;
++        if (!EvaluateExprToInt(APS, BO->getRHS()->IgnoreParenImpCasts(), C))
++          return false;
++        uint64_t V = APS.getExtValue();
++        if ((BO->getOpcode() == BO_Div && V != 2) ||
++            (BO->getOpcode() == BO_Shr && V != 1))
++          return false;
++        // LHS must be a variable named 'ndw'
++        std::string Name = extractIdentifierLikeName(BO->getLHS());
++        std::string Lower = Name;
++        std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++        if (Lower == "ndw")
++          return true;
++      }
++    }
++    return false;
++  };
++
++  auto IsIncr = [&](const Expr *E) -> bool {
++    std::string Name = extractIdentifierLikeName(E);
++    std::string Lower = Name;
++    std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++    return Lower == "incr";
++  };
++
++  const Expr *ML = MulBO->getLHS()->IgnoreParenImpCasts();
++  const Expr *MR = MulBO->getRHS()->IgnoreParenImpCasts();
++
++  // Match (ndw/2) * incr or incr * (ndw/2).
++  if ((IsNdwDiv2(ML) && IsIncr(MR)) || (IsNdwDiv2(MR) && IsIncr(ML)))
++    return true;
++
++  return false;
++}
++
++// Identify var * constant unit scaling for memory units, e.g.:
++//   size = gb * 1024;   // GB -> MB
++// Suppress only when:
++// - one side is a small constant typical for unit conversion (1000, 1024, 1e6, 2^20, 1e9, 2^30)
++// - the other side name suggests a larger memory unit (gb/gib/gig)
++// - LHS name is size/capacity/bytes-like (address-size sinks)
++bool SAGenTestChecker::isMemoryUnitScaleConversion(const BinaryOperator *MulBO,
++                                                   const Expr *LHSExpr,
++                                                   CheckerContext &C) {
++  if (!MulBO || MulBO->getOpcode() != BO_Mul || !LHSExpr)
++    return false;
++
++  auto ConstValOf = [&](const Expr *E, uint64_t &Out) -> bool {
++    llvm::APSInt APS;
++    if (!EvaluateExprToInt(APS, E->IgnoreParenImpCasts(), C))
++      return false;
++    // Only accept non-negative smallish constants.
++    if (APS.isSigned() && APS.isNegative())
++      return false;
++    Out = (uint64_t)APS.getExtValue();
++    return true;
++  };
++
++  uint64_t CVal = 0;
++  const Expr *Other = nullptr;
++
++  if (ConstValOf(MulBO->getLHS(), CVal)) {
++    Other = MulBO->getRHS();
++  } else if (ConstValOf(MulBO->getRHS(), CVal)) {
++    Other = MulBO->getLHS();
++  } else {
++    return false;
++  }
++
++  // Allowed constants for common memory unit scaling.
++  switch (CVal) {
++    case 1000ULL:         // decimal KB/MB/GB scaling
++    case 1024ULL:         // binary KiB/MiB/GiB scaling
++    case 1000000ULL:      // decimal MB scaling
++    case 1048576ULL:      // 1024*1024
++    case 1000000000ULL:   // decimal GB scaling
++    case 1073741824ULL:   // 1024*1024*1024
++      break;
++    default:
++      return false;
++  }
++
++  // Check names: RHS non-const side mentions GB/GiB/Gig, and LHS is size-like.
++  bool OtherHasGB = exprNameContains(Other, {"gb", "gib", "gig"}, C);
++  if (!OtherHasGB)
++    return false;
++
++  bool LHSIsSizeLike = exprNameContains(LHSExpr, {"size", "capacity", "bytes", "nbytes"}, C);
++  if (!LHSIsSizeLike)
++    return false;
++
++  return true;
++}
++
+ // Aggregated FP logic.
+ bool SAGenTestChecker::isFalsePositive(const Expr *Root,
+                                        const BinaryOperator *MulBO,
+@@ -720,6 +1057,18 @@   if (isMulUnderCallArg(MulBO, Root, C))
+     return true;
+   if (isMulUnderArrayIndex(MulBO, C))
++    return true;
++
++  // Targeted suppression: CFI erase-region product pattern.
++  if (isBenignCFIMaskedShiftInterleaveCase(MulBO, C))
++    return true;
++
++  // Targeted suppression: Radeon DMA PTE benign pattern addr += (ndw/2) * incr;
++  if (isBenignNdwDiv2TimesIncrAddrPattern(MulBO, LHSExpr, C))
++    return true;
++
++  // Targeted suppression: Memory unit scaling like size = gb * 1024.
++  if (isMemoryUnitScaleConversion(MulBO, LHSExpr, C))
+     return true;
+
+   return false;

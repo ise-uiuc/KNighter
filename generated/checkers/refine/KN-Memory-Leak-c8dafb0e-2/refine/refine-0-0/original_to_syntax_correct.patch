@@ -1,0 +1,257 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -24,14 +24,43 @@ REGISTER_MAP_WITH_PROGRAMSTATE(PendingInitMap, SymbolRef, const MemRegion *)
+ // Set: Acquired req MemRegion*s that require hwrm_req_drop() before exit
+ REGISTER_SET_WITH_PROGRAMSTATE(AcquiredReqs, const MemRegion *)
++// Map: rc variable region -> req MemRegion* (when rc = hwrm_req_init(...))
++REGISTER_MAP_WITH_PROGRAMSTATE(PendingInitByVar, const MemRegion *, const MemRegion *)
+
+ namespace {
+
+ static bool isCallTo(const CallEvent &Call, StringRef Name, CheckerContext &C) {
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    return ID->getName() == Name;
++  }
+   const Expr *Origin = Call.getOriginExpr();
+   if (!Origin)
+     return false;
++  // Fallback for macro/wrapper cases.
+   return ExprHasName(Origin, Name, C);
++}
++
++static const FunctionDecl *getOwningFunctionOfRegion(const MemRegion *MR) {
++  if (!MR)
++    return nullptr;
++  MR = MR->getBaseRegion();
++  if (!MR)
++    return nullptr;
++
++  if (const auto *VR = dyn_cast<VarRegion>(MR)) {
++    const VarDecl *VD = VR->getDecl();
++    if (!VD)
++      return nullptr;
++    const DeclContext *DC = VD->getDeclContext();
++    return dyn_cast_or_null<FunctionDecl>(const_cast<DeclContext *>(DC));
++  }
++  return nullptr;
++}
++
++static bool isOwnedByCurrentFunction(const MemRegion *MR, CheckerContext &C) {
++  const FunctionDecl *CurFD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());
++  const FunctionDecl *OwnerFD = getOwningFunctionOfRegion(MR);
++  return CurFD && OwnerFD && CurFD == OwnerFD;
+ }
+
+ /* The checker callbacks are to be decided. */
+@@ -39,6 +68,7 @@     check::PostCall,
+     check::PreStmt<ReturnStmt>,
+     check::EndFunction,
++    check::Bind,
+     eval::Assume> {
+    mutable std::unique_ptr<BugType> BT;
+
+@@ -53,6 +83,7 @@       void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+       void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;
+       void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;
++      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+       ProgramStateRef evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const;
+
+    private:
+@@ -65,7 +96,6 @@
+   // Track hwrm_req_init(bp, req, ...)
+   if (isCallTo(Call, "hwrm_req_init", C)) {
+-    // Ensure we have at least 2 args: 0: bp, 1: req
+     if (Call.getNumArgs() < 2)
+       return;
+
+@@ -84,7 +114,7 @@     if (!RetSym)
+       return;
+
+-    // Record pending init: we'll determine success in evalAssume
++    // Record pending init: we'll determine success in evalAssume or via rc var.
+     State = State->set<PendingInitMap>(RetSym, ReqMR);
+     C.addTransition(State);
+     return;
+@@ -116,45 +146,114 @@   }
+ }
+
++void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
++  ProgramStateRef State = C.getState();
++
++  // If a variable is being bound to the return symbol of hwrm_req_init(),
++  // remember the variable region -> req mapping, so that later 'if (rc)'
++  // conditions can be recognized in evalAssume.
++  SymbolRef RHSym = Val.getAsSymbol();
++  if (!RHSym)
++    return;
++
++  const MemRegion *const *PendingReq = State->get<PendingInitMap>(RHSym);
++  if (!PendingReq)
++    return;
++
++  const MemRegion *DstR = Loc.getAsRegion();
++  if (!DstR)
++    return;
++  DstR = DstR->getBaseRegion();
++  if (!DstR)
++    return;
++
++  // Map the destination variable region (e.g., rc) to the req region.
++  State = State->set<PendingInitByVar>(DstR, *PendingReq);
++  C.addTransition(State);
++}
++
+ ProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const {
+   if (!State)
+     return State;
+
+-  // Handle pattern: if (rc) or if (!rc) or if (rc == 0) / if (rc != 0)
++  auto markSuccessForReq = [&](const MemRegion *ReqMR) -> ProgramStateRef {
++    if (!ReqMR)
++      return State;
++    // Record the req as acquired (needs a drop).
++    if (!State->contains<AcquiredReqs>(ReqMR))
++      State = State->add<AcquiredReqs>(ReqMR);
++    return State;
++  };
++
++  // Handle conditions:
++  //  - 'if (rc)' or 'if (!rc)' where 'rc' is a SymbolRegionValue.
++  //  - 'if (rc == 0)' / 'if (rc != 0)' as SymIntExpr with RHS == 0.
+   if (std::optional<NonLoc> NL = Cond.getAs<NonLoc>()) {
+-    // Case 1: plain symbolic value 'rc'
+     if (SymbolRef Sym = NL->getAsSymbol()) {
+-      const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
+-      if (PendingReq) {
+-        // if (rc) with Assumption == false means rc == 0 (success)
++      // Case A: raw symbolic rc (SymbolRegionValue), condition 'if (rc)'
++      if (const auto *SRV = dyn_cast<SymbolRegionValue>(Sym)) {
++        const MemRegion *RCVarR = SRV->getRegion();
++        if (RCVarR) {
++          RCVarR = RCVarR->getBaseRegion();
++          if (const MemRegion *const *ReqMR = State->get<PendingInitByVar>(RCVarR)) {
++            // if (rc) with Assumption == false means rc == 0 (success)
++            if (!Assumption) {
++              State = markSuccessForReq(*ReqMR);
++            }
++            // Either way, we don't need the pending var mapping anymore.
++            State = State->remove<PendingInitByVar>(RCVarR);
++          }
++        }
++      }
++
++      // Case B: condition carries the original return symbol from init call
++      // 'if (hwrm_req_init(...))' or equivalent.
++      if (const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym)) {
+         if (!Assumption) {
+-          State = State->add<AcquiredReqs>(*PendingReq);
++          State = markSuccessForReq(*PendingReq);
+         }
+-        // Consume the pending mapping either way
+         State = State->remove<PendingInitMap>(Sym);
+       }
+-      return State;
+-    }
+-
+-    // Case 2: symbolic comparison with integer, usually rc == 0 or rc != 0
+-    if (SymbolRef SE = Cond.getAsSymbol()) {
+-      if (const auto *SIE = dyn_cast<SymIntExpr>(SE)) {
++
++      // Case C: SymIntExpr like 'rc == 0' / 'rc != 0'
++      if (const auto *SIE = dyn_cast<SymIntExpr>(Sym)) {
+         BinaryOperator::Opcode Op = SIE->getOpcode();
+-        SymbolRef Sym = SIE->getLHS();
+         const llvm::APSInt &RHS = SIE->getRHS();
+-        if (Sym) {
+-          const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
+-          if (PendingReq && RHS == 0) {
++        SymbolRef LHS = SIE->getLHS();
++        if (RHS == 0 && LHS) {
++          // lhs may be a variable symbol or a return symbol
++          // First try variable mapping (rc variable)
++          if (const auto *LSRV = dyn_cast<SymbolRegionValue>(LHS)) {
++            const MemRegion *RCVarR = LSRV->getRegion();
++            if (RCVarR) {
++              RCVarR = RCVarR->getBaseRegion();
++              if (const MemRegion *const *ReqMR = State->get<PendingInitByVar>(RCVarR)) {
++                bool SuccessBranch = false;
++                if (Op == BO_EQ && Assumption)
++                  SuccessBranch = true;        // (rc == 0) assumed true
++                else if (Op == BO_NE && !Assumption)
++                  SuccessBranch = true;        // (rc != 0) assumed false
++
++                if (SuccessBranch)
++                  State = markSuccessForReq(*ReqMR);
++
++                State = State->remove<PendingInitByVar>(RCVarR);
++              }
++            }
++          }
++
++          // Then try return-symbol mapping
++          if (const MemRegion *const *PendingReq = State->get<PendingInitMap>(LHS)) {
+             bool SuccessBranch = false;
+             if (Op == BO_EQ && Assumption)
+-              SuccessBranch = true;        // (rc == 0) assumed true
++              SuccessBranch = true;        // (ret == 0) assumed true
+             else if (Op == BO_NE && !Assumption)
+-              SuccessBranch = true;        // (rc != 0) assumed false
+-
+-            if (SuccessBranch) {
+-              State = State->add<AcquiredReqs>(*PendingReq);
+-            }
+-            State = State->remove<PendingInitMap>(Sym);
++              SuccessBranch = true;        // (ret != 0) assumed false
++
++            if (SuccessBranch)
++              State = markSuccessForReq(*PendingReq);
++
++            State = State->remove<PendingInitMap>(LHS);
+           }
+         }
+       }
+@@ -169,16 +268,45 @@     return;
+
+   ProgramStateRef State = C.getState();
+-  // If any acquired req is still live, report a leak.
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
++  auto Set = State->get<AcquiredReqs>();
++  if (Set.isEmpty())
++    return;
++
++  // Only report if the acquired req belongs to the same function being returned from.
++  llvm::SmallVector<const MemRegion *, 4> OwnedReqsInThisFn;
++  for (const MemRegion *ReqMR : Set) {
++    if (isOwnedByCurrentFunction(ReqMR, C))
++      OwnedReqsInThisFn.push_back(ReqMR);
++  }
++
++  if (!OwnedReqsInThisFn.empty()) {
++    // Report once for this return site.
+     reportLeak(C, RS);
++
++    // Clean up the reqs owned by this function to avoid duplicate reports on path exit.
++    for (const MemRegion *ReqMR : OwnedReqsInThisFn)
++      State = State->remove<AcquiredReqs>(ReqMR);
++    C.addTransition(State);
+   }
+ }
+
+ void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
++  auto Set = State->get<AcquiredReqs>();
++  if (Set.isEmpty())
++    return;
++
++  llvm::SmallVector<const MemRegion *, 4> OwnedReqsInThisFn;
++  for (const MemRegion *ReqMR : Set) {
++    if (isOwnedByCurrentFunction(ReqMR, C))
++      OwnedReqsInThisFn.push_back(ReqMR);
++  }
++
++  if (!OwnedReqsInThisFn.empty()) {
+     reportLeak(C, nullptr);
++    for (const MemRegion *ReqMR : OwnedReqsInThisFn)
++      State = State->remove<AcquiredReqs>(ReqMR);
++    C.addTransition(State);
+   }
+ }

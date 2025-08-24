@@ -1,0 +1,392 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: e61dd678601eac53d501dda1eb1bcffec7b11bd6
+commit_type: Double-Free
+index: 3
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"llvm/ADT/DenseMap.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include\
+  \ \"llvm/ADT/SmallSet.h\"\n#include \"llvm/ADT/FoldingSet.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state: remember\
+  \ members of a specific base object freed along this path.\nstruct MemberKey {\n\
+  \  const MemRegion *BaseObj;    // base region for the object, e.g., the region\
+  \ for 'ca'\n  const FieldDecl *Field;      // field decl for the member, e.g., buckets_nouse\n\
+  \n  MemberKey() : BaseObj(nullptr), Field(nullptr) {}\n  MemberKey(const MemRegion\
+  \ *B, const FieldDecl *F)\n      : BaseObj(B), Field(F) {}\n\n  bool operator==(const\
+  \ MemberKey &O) const {\n    return BaseObj == O.BaseObj && Field == O.Field;\n\
+  \  }\n\n  void Profile(llvm::FoldingSetNodeID &ID) const {\n    ID.AddPointer(BaseObj);\n\
+  \    ID.AddPointer(Field);\n  }\n};\n\nREGISTER_SET_WITH_PROGRAMSTATE(FreedMemberSet,\
+  \ MemberKey)\n\nnamespace {\n\n// Summary entry: which parameter index and which\
+  \ field is freed by a callee.\nstruct FreedField {\n  unsigned ParamIndex;\n  const\
+  \ FieldDecl *Field; // canonical\n\n  FreedField() : ParamIndex(0), Field(nullptr)\
+  \ {}\n  FreedField(unsigned I, const FieldDecl *F) : ParamIndex(I), Field(F) {}\n\
+  \n  bool operator==(const FreedField &O) const {\n    return ParamIndex == O.ParamIndex\
+  \ && Field == O.Field;\n  }\n};\n\nclass SAGenTestChecker\n  : public Checker<\n\
+  \        check::PreCall,\n        check::ASTCodeBody\n      > {\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\n  // Checker-internal summary: For each function, which (param, field)\
+  \ pairs it frees.\n  mutable llvm::DenseMap<const FunctionDecl*, llvm::SmallVector<FreedField,\
+  \ 4>> CalleeFreeSummary;\n\npublic:\n  SAGenTestChecker() : BT(new BugType(this,\
+  \ \"Double free of struct member\", \"Memory Error\")) {}\n\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  void checkASTCodeBody(const Decl\
+  \ *D, AnalysisManager &Mgr, BugReporter &BR) const;\n\nprivate:\n  // Helpers\n\
+  \  static bool isFreeLike(const CallEvent &Call, CheckerContext &C);\n  static bool\
+  \ isFreeLikeCallee(const FunctionDecl *FD);\n  static bool extractMemberOnParam(const\
+  \ Expr *E, const FunctionDecl *FD,\n                                   unsigned\
+  \ &OutParamIdx, const FieldDecl *&OutFD);\n  static bool extractBaseAndFieldFromMember(const\
+  \ Expr *E, CheckerContext &C,\n                                            const\
+  \ MemRegion *&OutBaseRegion, const FieldDecl *&OutFD);\n  static MemberKey makeKey(const\
+  \ MemRegion *BaseRegion, const FieldDecl *FD);\n\n  void reportDoubleFree(const\
+  \ CallEvent &Call, const FieldDecl *FD, CheckerContext &C) const;\n\n  void buildSummaryForFunction(const\
+  \ FunctionDecl *FD) const;\n  const llvm::SmallVector<FreedField, 4> *getOrBuildSummary(const\
+  \ FunctionDecl *FD) const;\n};\n\n// Implementation\n\nbool SAGenTestChecker::isFreeLike(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  // Per suggestion, use ExprHasName() for name\
+  \ checking.\n  if (ExprHasName(Origin, \"kfree\", C)) return true;\n  if (ExprHasName(Origin,\
+  \ \"kvfree\", C)) return true;\n  if (ExprHasName(Origin, \"vfree\", C)) return\
+  \ true;\n  return false;\n}\n\nbool SAGenTestChecker::isFreeLikeCallee(const FunctionDecl\
+  \ *FD) {\n  if (!FD) return false;\n  const IdentifierInfo *ID = FD->getIdentifier();\n\
+  \  if (!ID) return false;\n  StringRef Name = ID->getName();\n  return Name == \"\
+  kfree\" || Name == \"kvfree\" || Name == \"vfree\";\n}\n\n// E is expected to be\
+  \ a MemberExpr like P->field or P.field where P is a ParmVarDecl of FD.\nbool SAGenTestChecker::extractMemberOnParam(const\
+  \ Expr *E, const FunctionDecl *FD,\n                                           \
+  \ unsigned &OutParamIdx, const FieldDecl *&OutFD) {\n  if (!E || !FD)\n    return\
+  \ false;\n\n  const Expr *IE = E->IgnoreParenImpCasts();\n  const auto *ME = dyn_cast<MemberExpr>(IE);\n\
+  \  if (!ME)\n    return false;\n\n  const ValueDecl *VD = ME->getMemberDecl();\n\
+  \  const FieldDecl *FDDecl = dyn_cast<FieldDecl>(VD);\n  if (!FDDecl)\n    return\
+  \ false;\n\n  const FieldDecl *CanonFD = cast<FieldDecl>(FDDecl->getCanonicalDecl());\n\
+  \n  const Expr *Base = ME->getBase();\n  if (!Base)\n    return false;\n\n  const\
+  \ Expr *BaseIE = Base->IgnoreParenImpCasts();\n  const auto *BaseDRE = dyn_cast<DeclRefExpr>(BaseIE);\n\
+  \  if (!BaseDRE)\n    return false;\n\n  const auto *PVD = dyn_cast<ParmVarDecl>(BaseDRE->getDecl());\n\
+  \  if (!PVD)\n    return false;\n\n  // Find parameter index\n  unsigned Index =\
+  \ 0;\n  bool Found = false;\n  for (const ParmVarDecl *Param : FD->parameters())\
+  \ {\n    if (Param == PVD) {\n      Found = true;\n      break;\n    }\n    ++Index;\n\
+  \  }\n  if (!Found)\n    return false;\n\n  OutParamIdx = Index;\n  OutFD = CanonFD;\n\
+  \  return true;\n}\n\n// For direct frees in the current function, extract base\
+  \ region and member field from an expression like 'obj->field'.\nbool SAGenTestChecker::extractBaseAndFieldFromMember(const\
+  \ Expr *E, CheckerContext &C,\n                                                \
+  \     const MemRegion *&OutBaseRegion, const FieldDecl *&OutFD) {\n  OutBaseRegion\
+  \ = nullptr;\n  OutFD = nullptr;\n  if (!E)\n    return false;\n\n  const Expr *IE\
+  \ = E->IgnoreParenImpCasts();\n  const auto *ME = dyn_cast<MemberExpr>(IE);\n  if\
+  \ (!ME)\n    return false;\n\n  const ValueDecl *VD = ME->getMemberDecl();\n  const\
+  \ FieldDecl *FDDecl = dyn_cast<FieldDecl>(VD);\n  if (!FDDecl)\n    return false;\n\
+  \n  const FieldDecl *CanonFD = cast<FieldDecl>(FDDecl->getCanonicalDecl());\n  const\
+  \ Expr *Base = ME->getBase();\n  if (!Base)\n    return false;\n\n  // Use the utility\
+  \ to get the region of the base expression.\n  const MemRegion *MR = getMemRegionFromExpr(Base,\
+  \ C);\n  if (!MR)\n    return false;\n\n  MR = MR->getBaseRegion();\n  if (!MR)\n\
+  \    return false;\n\n  OutBaseRegion = MR;\n  OutFD = CanonFD;\n  return true;\n\
+  }\n\nMemberKey SAGenTestChecker::makeKey(const MemRegion *BaseRegion, const FieldDecl\
+  \ *FD) {\n  if (const auto *CanonFD = FD ? cast<FieldDecl>(FD->getCanonicalDecl())\
+  \ : nullptr) {\n    return MemberKey(BaseRegion, CanonFD);\n  }\n  return MemberKey(BaseRegion,\
+  \ FD);\n}\n\nvoid SAGenTestChecker::reportDoubleFree(const CallEvent &Call, const\
+  \ FieldDecl *FD, CheckerContext &C) const {\n  if (!FD)\n    return;\n\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  SmallString<128>\
+  \ Msg;\n  Msg += \"Double free of member '\";\n  Msg += FD->getName();\n  Msg +=\
+  \ \"'\";\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);\n\
+  \  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n// Build\
+  \ summary for one function: which (param, field) pairs are freed via kfree/kvfree/vfree.\n\
+  void SAGenTestChecker::buildSummaryForFunction(const FunctionDecl *FD) const {\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  const FunctionDecl *CanonFD = FD->getCanonicalDecl();\n\
+  \  if (CalleeFreeSummary.find(CanonFD) != CalleeFreeSummary.end())\n    return;\
+  \ // already built\n\n  llvm::SmallVector<FreedField, 4> Summary;\n  llvm::SmallSet<std::pair<unsigned,\
+  \ const FieldDecl *>, 8> Seen;\n\n  const Stmt *Body = FD->getBody();\n  if (!Body)\
+  \ {\n    CalleeFreeSummary[CanonFD] = std::move(Summary);\n    return;\n  }\n\n\
+  \  class LocalVisitor : public RecursiveASTVisitor<LocalVisitor> {\n    const FunctionDecl\
+  \ *FD;\n    llvm::SmallVectorImpl<FreedField> &Summary;\n    llvm::SmallSet<std::pair<unsigned,\
+  \ const FieldDecl *>, 8> &Seen;\n\n  public:\n    LocalVisitor(const FunctionDecl\
+  \ *F,\n                 llvm::SmallVectorImpl<FreedField> &S,\n                \
+  \ llvm::SmallSet<std::pair<unsigned, const FieldDecl *>, 8> &Se)\n        : FD(F),\
+  \ Summary(S), Seen(Se) {}\n\n    bool VisitCallExpr(CallExpr *CE) {\n      if (!CE)\n\
+  \        return true;\n      const FunctionDecl *Callee = CE->getDirectCallee();\n\
+  \      if (!SAGenTestChecker::isFreeLikeCallee(Callee))\n        return true;\n\n\
+  \      if (CE->getNumArgs() < 1)\n        return true;\n\n      unsigned ParamIdx\
+  \ = 0;\n      const FieldDecl *Field = nullptr;\n      if (SAGenTestChecker::extractMemberOnParam(CE->getArg(0),\
+  \ FD, ParamIdx, Field)) {\n        const FieldDecl *CanonF = Field ? cast<FieldDecl>(Field->getCanonicalDecl())\
+  \ : nullptr;\n        std::pair<unsigned, const FieldDecl *> Key(ParamIdx, CanonF);\n\
+  \        if (!Seen.contains(Key)) {\n          Seen.insert(Key);\n          Summary.emplace_back(ParamIdx,\
+  \ CanonF);\n        }\n      }\n      return true;\n    }\n  };\n\n  LocalVisitor\
+  \ V(FD, Summary, Seen);\n  V.TraverseStmt(const_cast<Stmt *>(Body));\n\n  CalleeFreeSummary[CanonFD]\
+  \ = std::move(Summary);\n}\n\nconst llvm::SmallVector<FreedField, 4> *SAGenTestChecker::getOrBuildSummary(const\
+  \ FunctionDecl *FD) const {\n  if (!FD)\n    return nullptr;\n  const FunctionDecl\
+  \ *CanonFD = FD->getCanonicalDecl();\n  auto It = CalleeFreeSummary.find(CanonFD);\n\
+  \  if (It != CalleeFreeSummary.end())\n    return &It->second;\n\n  // Build on\
+  \ demand if not already built\n  if (FD->hasBody())\n    buildSummaryForFunction(FD);\n\
+  \n  It = CalleeFreeSummary.find(CanonFD);\n  if (It != CalleeFreeSummary.end())\n\
+  \    return &It->second;\n  return nullptr;\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD)\n    return;\n  if (!FD->hasBody())\n    return;\n\n  buildSummaryForFunction(FD);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  ProgramStateRef State = C.getState();\n\n  // Case A: Direct free-like\
+  \ calls\n  if (isFreeLike(Call, C) && Call.getNumArgs() >= 1) {\n    const Expr\
+  \ *Arg0 = Call.getArgExpr(0);\n    const MemRegion *BaseReg = nullptr;\n    const\
+  \ FieldDecl *FD = nullptr;\n    if (extractBaseAndFieldFromMember(Arg0, C, BaseReg,\
+  \ FD)) {\n      if (BaseReg) BaseReg = BaseReg->getBaseRegion();\n      if (BaseReg\
+  \ && FD) {\n        MemberKey K = makeKey(BaseReg, FD);\n        if (State->contains<FreedMemberSet>(K))\
+  \ {\n          reportDoubleFree(Call, FD, C);\n        }\n        State = State->add<FreedMemberSet>(K);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return; // Even if not a member,\
+  \ we only focus on member frees for this checker\n  }\n\n  // Case B: Calls to cleanup\
+  \ functions summarized to free certain members\n  const FunctionDecl *CalleeFD =\
+  \ dyn_cast_or_null<FunctionDecl>(Call.getDecl());\n  if (!CalleeFD)\n    return;\n\
+  \n  const auto *Summary = getOrBuildSummary(CalleeFD);\n  if (!Summary)\n    return;\n\
+  \n  for (const FreedField &FF : *Summary) {\n    if (FF.ParamIndex >= Call.getNumArgs())\n\
+  \      continue;\n\n    const Expr *ArgE = Call.getArgExpr(FF.ParamIndex);\n   \
+  \ if (!ArgE)\n      continue;\n\n    const MemRegion *ArgReg = getMemRegionFromExpr(ArgE,\
+  \ C);\n    if (!ArgReg)\n      continue;\n\n    ArgReg = ArgReg->getBaseRegion();\n\
+  \    if (!ArgReg)\n      continue;\n\n    MemberKey K = makeKey(ArgReg, FF.Field);\n\
+  \    if (State->contains<FreedMemberSet>(K)) {\n      reportDoubleFree(Call, FF.Field,\
+  \ C);\n    }\n    State = State->add<FreedMemberSet>(K);\n  }\n\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects double free of struct members across overlapping cleanup routines\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbcachefs: Fix double free of ca->buckets_nouse\n\n\
+  Reported-by: Dan Carpenter <dan.carpenter@linaro.org>\nFixes: ffcbec6076 (\"bcachefs:\
+  \ Kill opts.buckets_nouse\")\nSigned-off-by: Kent Overstreet <kent.overstreet@linux.dev>\n\
+  \n## Buggy Code\n\n```c\n// Function: bch2_dev_free in fs/bcachefs/super.c\nstatic\
+  \ void bch2_dev_free(struct bch_dev *ca)\n{\n\tcancel_work_sync(&ca->io_error_work);\n\
+  \n\tif (ca->kobj.state_in_sysfs &&\n\t    ca->disk_sb.bdev)\n\t\tsysfs_remove_link(bdev_kobj(ca->disk_sb.bdev),\
+  \ \"bcachefs\");\n\n\tif (ca->kobj.state_in_sysfs)\n\t\tkobject_del(&ca->kobj);\n\
+  \n\tkfree(ca->buckets_nouse);\n\tbch2_free_super(&ca->disk_sb);\n\tbch2_dev_allocator_background_exit(ca);\n\
+  \tbch2_dev_journal_exit(ca);\n\n\tfree_percpu(ca->io_done);\n\tbch2_dev_buckets_free(ca);\n\
+  \tfree_page((unsigned long) ca->sb_read_scratch);\n\n\tbch2_time_stats_quantiles_exit(&ca->io_latency[WRITE]);\n\
+  \tbch2_time_stats_quantiles_exit(&ca->io_latency[READ]);\n\n\tpercpu_ref_exit(&ca->io_ref);\n\
+  #ifndef CONFIG_BCACHEFS_DEBUG\n\tpercpu_ref_exit(&ca->ref);\n#endif\n\tkobject_put(&ca->kobj);\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/bcachefs/super.c b/fs/bcachefs/super.c\n\
+  index 0455a1001fec..e7fa2de35014 100644\n--- a/fs/bcachefs/super.c\n+++ b/fs/bcachefs/super.c\n\
+  @@ -1193,7 +1193,6 @@ static void bch2_dev_free(struct bch_dev *ca)\n \tif (ca->kobj.state_in_sysfs)\n\
+  \ \t\tkobject_del(&ca->kobj);\n \n-\tkfree(ca->buckets_nouse);\n \tbch2_free_super(&ca->disk_sb);\n\
+  \ \tbch2_dev_allocator_background_exit(ca);\n \tbch2_dev_journal_exit(ca);\n```\n"
+pattern: "## Bug Pattern\n\nFreeing a struct member directly in a top-level teardown\
+  \ path while also invoking a component-specific cleanup function that frees the\
+  \ same member, causing a double free. Concretely, calling kfree(ca->buckets_nouse)\
+  \ in bch2_dev_free() and later calling bch2_dev_buckets_free(ca) which also frees\
+  \ ca->buckets_nouse. This pattern is \u201Cduplicate ownership/free of a pointer\
+  \ across overlapping cleanup routines.\u201D"
+plan: "Plan\n\n1) Program state and checker-owned caches\n- Add a per-path set to\
+  \ remember which struct members of a specific base object have been freed in the\
+  \ current function:\n  - REGISTER_SET_WITH_PROGRAMSTATE(FreedMemberSet, MemberKey)\n\
+  \  - MemberKey = { const MemRegion *BaseObj, const FieldDecl *Field } with a profile()\
+  \ method so it can be used in ProgramState. BaseObj is the MemRegion of the base\
+  \ pointer (e.g., the region for variable \u201Cca\u201D). Field is the FieldDecl\
+  \ of the freed member (e.g., buckets_nouse).\n- Add a checker-internal summary cache\
+  \ (not in ProgramState) that records, for each cleanup function, which members of\
+  \ which parameter it frees:\n  - DenseMap<const FunctionDecl*, SmallVector<FreedField,\
+  \ 4>> CalleeFreeSummary\n  - FreedField = { unsigned ParamIndex; const FieldDecl\
+  \ *Field }\n  - Key functions by their canonical decl to avoid duplicates.\n\n2)\
+  \ Helper utilities (small static helpers inside the checker)\n- bool isFreeLike(const\
+  \ CallEvent &Call):\n  - Return true if callee name is one of: \"kfree\", \"kvfree\"\
+  , \"vfree\" (keep minimal, at least \"kfree\" to hit the target).\n- bool extractMemberOnParam(const\
+  \ Expr *E, const FunctionDecl *FD, unsigned &OutParamIdx, const FieldDecl *&OutFD):\n\
+  \  - E = E->IgnoreParenImpCasts(); expect MemberExpr ME (e.g., P->field or P.field).\n\
+  \  - From ME, take FieldDecl via ME->getMemberDecl()->getCanonicalDecl().\n  - For\
+  \ ME->getBase()->IgnoreParenImpCasts():\n    - If it is DeclRefExpr to ParmVarDecl\
+  \ of FD\u2019s parameter list, set OutParamIdx to that parameter\u2019s index.\n\
+  \    - Otherwise return false.\n- bool extractBaseAndFieldFromMember(const Expr\
+  \ *E, CheckerContext &C, const MemRegion *&OutBaseRegion, const FieldDecl *&OutFD):\n\
+  \  - E = E->IgnoreParenImpCasts(); if not MemberExpr, return false.\n  - OutFD =\
+  \ ME->getMemberDecl()->getCanonicalDecl().\n  - Get base expression: Base = ME->getBase()->IgnoreParenImpCasts();\
+  \ OutBaseRegion = getMemRegionFromExpr(Base, C). Return true if both available.\n\
+  - MemberKey makeKey(const MemRegion *BaseRegion, const FieldDecl *FD):\n  - Create\
+  \ a MemberKey from arguments; FD is canonical decl.\n- const SmallVector<FreedField,\
+  \ 4> *getOrBuildSummary(const FunctionDecl *CalleeFD):\n  - If CalleeFD not in CalleeFreeSummary\
+  \ and has body, scan once to build summary (see step 3).\n  - Return pointer to\
+  \ summary vector (possibly empty) or nullptr if no body.\n\n3) Build summaries of\
+  \ cleanup functions (who frees what) \u2014 checkASTCodeBody\n- Implement checkASTCodeBody(const\
+  \ Decl *D, ...) to precompute summaries for all function bodies in the TU.\n- For\
+  \ each FunctionDecl FD with a body:\n  - Walk the function body (simple recursive\
+  \ walk or stack-based traversal) to locate CallExpr to free-like functions (kfree/kvfree/vfree).\n\
+  \  - For each free-like call, take its first argument A0. If extractMemberOnParam(A0,\
+  \ FD, ParamIdx, FieldDecl) is true, record FreedField{ParamIdx, FieldDecl} in CalleeFreeSummary[FD].\n\
+  \  - De-duplicate (e.g., by a small set keyed on (ParamIdx, FieldDecl)).\n- This\
+  \ makes bch2_dev_buckets_free() summarized as \u201Cfrees param0->buckets_nouse\u201D\
+  .\n\n4) Track direct frees and check for conflicts \u2014 checkPreCall\n- Implement\
+  \ checkPreCall(const CallEvent &Call, CheckerContext &C):\n  - Case A: Direct free\
+  \ in the current function\n    - If isFreeLike(Call):\n      - Get Arg0 = Call.getArgExpr(0);\
+  \ if extractBaseAndFieldFromMember(Arg0, C, BaseRegion, FD):\n        - MemberKey\
+  \ K = makeKey(BaseRegion, FD).\n        - If K already in FreedMemberSet: report\
+  \ bug (double free).\n        - Else: add K to FreedMemberSet in ProgramState.\n\
+  \  - Case B: Calling a cleanup function that frees members of its parameter(s)\n\
+  \    - If const FunctionDecl *CalleeFD = dyn_cast_or_null<FunctionDecl>(Call.getDecl()):\n\
+  \      - const auto *Summary = getOrBuildSummary(CalleeFD).\n      - If Summary\
+  \ is non-null:\n        - For each FreedField {ParamIdx, FieldDecl} in *Summary:\n\
+  \          - If ParamIdx >= Call.getNumArgs(), continue.\n          - Let Arg =\
+  \ Call.getArgExpr(ParamIdx).\n          - Compute the base region of Arg: BaseRegion\
+  \ = getMemRegionFromExpr(Arg, C).\n            - If BaseRegion is null, skip this\
+  \ entry.\n          - MemberKey K = makeKey(BaseRegion, FieldDecl).\n          -\
+  \ If K already in FreedMemberSet: report bug (double free due to earlier direct\
+  \ kfree or earlier cleanup that freed the same member).\n          - Add K to FreedMemberSet\
+  \ (to prevent later duplicate frees after this call).\n\n5) Optional: clear state\
+  \ per function \u2014 checkBeginFunction\n- In checkBeginFunction, ensure the FreedMemberSet\
+  \ is empty at function entry (ProgramState starts clean by default; explicitly clearing\
+  \ is fine).\n\n6) Reporting\n- When detecting a double free, create a non-fatal\
+  \ error node and emit a PathSensitiveBugReport with a short message:\n  - \u201C\
+  Double free of member '<field_name>'\u201D\n- Attach the source range to the current\
+  \ call expression (the later free). If available, add an event note at the earlier\
+  \ free program point (optional).\n\n7) Scope and simplifications\n- This checker\
+  \ intentionally focuses on the most common, simple pattern:\n  - Direct free arg\
+  \ is a MemberExpr (e.g., ca->buckets_nouse).\n  - Cleanup frees direct members of\
+  \ its pointer parameter via kfree-like calls.\n- It does not try to resolve aliasing\
+  \ (e.g., tmp = ca->buckets_nouse; kfree(tmp)), nested field chains beyond one level,\
+  \ or frees hidden behind additional helper layers (unless the helper itself is summarized).\n\
+  - That simplicity is enough to detect the target bcachefs pattern: kfree(ca->buckets_nouse)\
+  \ followed by calling bch2_dev_buckets_free(ca), which frees ca->buckets_nouse again.\n\
+  \n8) Utility functions usage\n- getMemRegionFromExpr is used to obtain BaseRegion\
+  \ for MemberKey and for call arguments when composing cleanup frees.\n- ExprHasName\
+  \ is not required but can help debugging or fallback checks when extracting fields.\n\
+  - findSpecificTypeInChildren can be used in the AST walk in checkASTCodeBody to\
+  \ find CallExpr nodes, though a simple recursive traversal is sufficient."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"llvm/ADT/DenseMap.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include\
+  \ \"llvm/ADT/SmallSet.h\"\n#include \"llvm/ADT/FoldingSet.h\"\n#include \"llvm/ADT/SmallString.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state: remember members of a specific base object freed along this path.\n\
+  struct MemberKey {\n  const MemRegion *BaseObj;    // base region for the object,\
+  \ e.g., the region for 'ca'\n  const FieldDecl *Field;      // field decl for the\
+  \ member, e.g., buckets_nouse\n\n  MemberKey() : BaseObj(nullptr), Field(nullptr)\
+  \ {}\n  MemberKey(const MemRegion *B, const FieldDecl *F)\n      : BaseObj(B), Field(F)\
+  \ {}\n\n  bool operator==(const MemberKey &O) const {\n    return BaseObj == O.BaseObj\
+  \ && Field == O.Field;\n  }\n\n  // Provide a strict weak ordering to satisfy potential\
+  \ std::set/smallset fallbacks.\n  bool operator<(const MemberKey &O) const {\n \
+  \   if (BaseObj != O.BaseObj)\n      return BaseObj < O.BaseObj;\n    return Field\
+  \ < O.Field;\n  }\n\n  void Profile(llvm::FoldingSetNodeID &ID) const {\n    ID.AddPointer(BaseObj);\n\
+  \    ID.AddPointer(Field);\n  }\n};\n\nREGISTER_SET_WITH_PROGRAMSTATE(FreedMemberSet,\
+  \ MemberKey)\n\nnamespace {\n\n// Summary entry: which parameter index and which\
+  \ field is freed by a callee.\nstruct FreedField {\n  unsigned ParamIndex;\n  const\
+  \ FieldDecl *Field; // canonical\n\n  FreedField() : ParamIndex(0), Field(nullptr)\
+  \ {}\n  FreedField(unsigned I, const FieldDecl *F) : ParamIndex(I), Field(F) {}\n\
+  \n  bool operator==(const FreedField &O) const {\n    return ParamIndex == O.ParamIndex\
+  \ && Field == O.Field;\n  }\n};\n\nclass SAGenTestChecker\n  : public Checker<\n\
+  \        check::PreCall,\n        check::ASTCodeBody\n      > {\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\n  // Checker-internal summary: For each function, which (param, field)\
+  \ pairs it frees.\n  mutable llvm::DenseMap<const FunctionDecl*, llvm::SmallVector<FreedField,\
+  \ 4>> CalleeFreeSummary;\n\npublic:\n  SAGenTestChecker() : BT(new BugType(this,\
+  \ \"Double free of struct member\", \"Memory Error\")) {}\n\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  void checkASTCodeBody(const Decl\
+  \ *D, AnalysisManager &Mgr, BugReporter &BR) const;\n\nprivate:\n  // Helpers\n\
+  \  static bool isFreeLike(const CallEvent &Call, CheckerContext &C);\n  static bool\
+  \ isFreeLikeCallee(const FunctionDecl *FD);\n  static bool extractMemberOnParam(const\
+  \ Expr *E, const FunctionDecl *FD,\n                                   unsigned\
+  \ &OutParamIdx, const FieldDecl *&OutFD);\n  static bool extractBaseAndFieldFromMember(const\
+  \ Expr *E, CheckerContext &C,\n                                            const\
+  \ MemRegion *&OutBaseRegion, const FieldDecl *&OutFD);\n  static MemberKey makeKey(const\
+  \ MemRegion *BaseRegion, const FieldDecl *FD);\n\n  void reportDoubleFree(const\
+  \ CallEvent &Call, const FieldDecl *FD, CheckerContext &C) const;\n\n  void buildSummaryForFunction(const\
+  \ FunctionDecl *FD) const;\n  const llvm::SmallVector<FreedField, 4> *getOrBuildSummary(const\
+  \ FunctionDecl *FD) const;\n};\n\n// Implementation\n\nbool SAGenTestChecker::isFreeLike(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  // Per suggestion, use ExprHasName() for name\
+  \ checking.\n  if (ExprHasName(Origin, \"kfree\", C)) return true;\n  if (ExprHasName(Origin,\
+  \ \"kvfree\", C)) return true;\n  if (ExprHasName(Origin, \"vfree\", C)) return\
+  \ true;\n  return false;\n}\n\nbool SAGenTestChecker::isFreeLikeCallee(const FunctionDecl\
+  \ *FD) {\n  if (!FD) return false;\n  const IdentifierInfo *ID = FD->getIdentifier();\n\
+  \  if (!ID) return false;\n  StringRef Name = ID->getName();\n  return Name == \"\
+  kfree\" || Name == \"kvfree\" || Name == \"vfree\";\n}\n\n// E is expected to be\
+  \ a MemberExpr like P->field or P.field where P is a ParmVarDecl of FD.\nbool SAGenTestChecker::extractMemberOnParam(const\
+  \ Expr *E, const FunctionDecl *FD,\n                                           \
+  \ unsigned &OutParamIdx, const FieldDecl *&OutFD) {\n  if (!E || !FD)\n    return\
+  \ false;\n\n  const Expr *IE = E->IgnoreParenImpCasts();\n  const auto *ME = dyn_cast<MemberExpr>(IE);\n\
+  \  if (!ME)\n    return false;\n\n  const ValueDecl *VD = ME->getMemberDecl();\n\
+  \  const FieldDecl *FDDecl = dyn_cast<FieldDecl>(VD);\n  if (!FDDecl)\n    return\
+  \ false;\n\n  const FieldDecl *CanonFD = cast<FieldDecl>(FDDecl->getCanonicalDecl());\n\
+  \n  const Expr *Base = ME->getBase();\n  if (!Base)\n    return false;\n\n  const\
+  \ Expr *BaseIE = Base->IgnoreParenImpCasts();\n  const auto *BaseDRE = dyn_cast<DeclRefExpr>(BaseIE);\n\
+  \  if (!BaseDRE)\n    return false;\n\n  const auto *PVD = dyn_cast<ParmVarDecl>(BaseDRE->getDecl());\n\
+  \  if (!PVD)\n    return false;\n\n  // Find parameter index\n  unsigned Index =\
+  \ 0;\n  bool Found = false;\n  for (const ParmVarDecl *Param : FD->parameters())\
+  \ {\n    if (Param == PVD) {\n      Found = true;\n      break;\n    }\n    ++Index;\n\
+  \  }\n  if (!Found)\n    return false;\n\n  OutParamIdx = Index;\n  OutFD = CanonFD;\n\
+  \  return true;\n}\n\n// For direct frees in the current function, extract base\
+  \ region and member field from an expression like 'obj->field'.\nbool SAGenTestChecker::extractBaseAndFieldFromMember(const\
+  \ Expr *E, CheckerContext &C,\n                                                \
+  \     const MemRegion *&OutBaseRegion, const FieldDecl *&OutFD) {\n  OutBaseRegion\
+  \ = nullptr;\n  OutFD = nullptr;\n  if (!E)\n    return false;\n\n  const Expr *IE\
+  \ = E->IgnoreParenImpCasts();\n  const auto *ME = dyn_cast<MemberExpr>(IE);\n  if\
+  \ (!ME)\n    return false;\n\n  const ValueDecl *VD = ME->getMemberDecl();\n  const\
+  \ FieldDecl *FDDecl = dyn_cast<FieldDecl>(VD);\n  if (!FDDecl)\n    return false;\n\
+  \n  const FieldDecl *CanonFD = cast<FieldDecl>(FDDecl->getCanonicalDecl());\n  const\
+  \ Expr *Base = ME->getBase();\n  if (!Base)\n    return false;\n\n  // Use the utility\
+  \ to get the region of the base expression.\n  const MemRegion *MR = getMemRegionFromExpr(Base,\
+  \ C);\n  if (!MR)\n    return false;\n\n  MR = MR->getBaseRegion();\n  if (!MR)\n\
+  \    return false;\n\n  OutBaseRegion = MR;\n  OutFD = CanonFD;\n  return true;\n\
+  }\n\nMemberKey SAGenTestChecker::makeKey(const MemRegion *BaseRegion, const FieldDecl\
+  \ *FD) {\n  if (const auto *CanonFD = FD ? cast<FieldDecl>(FD->getCanonicalDecl())\
+  \ : nullptr) {\n    return MemberKey(BaseRegion, CanonFD);\n  }\n  return MemberKey(BaseRegion,\
+  \ FD);\n}\n\nvoid SAGenTestChecker::reportDoubleFree(const CallEvent &Call, const\
+  \ FieldDecl *FD, CheckerContext &C) const {\n  if (!FD)\n    return;\n\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  llvm::SmallString<128>\
+  \ Msg;\n  Msg += \"Double free of member '\";\n  Msg += FD->getName();\n  Msg +=\
+  \ \"'\";\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);\n\
+  \  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n// Build\
+  \ summary for one function: which (param, field) pairs are freed via kfree/kvfree/vfree.\n\
+  void SAGenTestChecker::buildSummaryForFunction(const FunctionDecl *FD) const {\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  const FunctionDecl *CanonFD = FD->getCanonicalDecl();\n\
+  \  if (CalleeFreeSummary.find(CanonFD) != CalleeFreeSummary.end())\n    return;\
+  \ // already built\n\n  llvm::SmallVector<FreedField, 4> Summary;\n  llvm::SmallSet<std::pair<unsigned,\
+  \ const FieldDecl *>, 8> Seen;\n\n  const Stmt *Body = FD->getBody();\n  if (!Body)\
+  \ {\n    CalleeFreeSummary[CanonFD] = std::move(Summary);\n    return;\n  }\n\n\
+  \  class LocalVisitor : public RecursiveASTVisitor<LocalVisitor> {\n    const FunctionDecl\
+  \ *FD;\n    llvm::SmallVectorImpl<FreedField> &Summary;\n    llvm::SmallSet<std::pair<unsigned,\
+  \ const FieldDecl *>, 8> &Seen;\n\n  public:\n    LocalVisitor(const FunctionDecl\
+  \ *F,\n                 llvm::SmallVectorImpl<FreedField> &S,\n                \
+  \ llvm::SmallSet<std::pair<unsigned, const FieldDecl *>, 8> &Se)\n        : FD(F),\
+  \ Summary(S), Seen(Se) {}\n\n    bool VisitCallExpr(CallExpr *CE) {\n      if (!CE)\n\
+  \        return true;\n      const FunctionDecl *Callee = CE->getDirectCallee();\n\
+  \      if (!SAGenTestChecker::isFreeLikeCallee(Callee))\n        return true;\n\n\
+  \      if (CE->getNumArgs() < 1)\n        return true;\n\n      unsigned ParamIdx\
+  \ = 0;\n      const FieldDecl *Field = nullptr;\n      if (SAGenTestChecker::extractMemberOnParam(CE->getArg(0),\
+  \ FD, ParamIdx, Field)) {\n        const FieldDecl *CanonF = Field ? cast<FieldDecl>(Field->getCanonicalDecl())\
+  \ : nullptr;\n        std::pair<unsigned, const FieldDecl *> Key(ParamIdx, CanonF);\n\
+  \        if (!Seen.contains(Key)) {\n          Seen.insert(Key);\n          Summary.emplace_back(ParamIdx,\
+  \ CanonF);\n        }\n      }\n      return true;\n    }\n  };\n\n  LocalVisitor\
+  \ V(FD, Summary, Seen);\n  V.TraverseStmt(const_cast<Stmt *>(Body));\n\n  CalleeFreeSummary[CanonFD]\
+  \ = std::move(Summary);\n}\n\nconst llvm::SmallVector<FreedField, 4> *SAGenTestChecker::getOrBuildSummary(const\
+  \ FunctionDecl *FD) const {\n  if (!FD)\n    return nullptr;\n  const FunctionDecl\
+  \ *CanonFD = FD->getCanonicalDecl();\n  auto It = CalleeFreeSummary.find(CanonFD);\n\
+  \  if (It != CalleeFreeSummary.end())\n    return &It->second;\n\n  // Build on\
+  \ demand if not already built\n  if (FD->hasBody())\n    buildSummaryForFunction(FD);\n\
+  \n  It = CalleeFreeSummary.find(CanonFD);\n  if (It != CalleeFreeSummary.end())\n\
+  \    return &It->second;\n  return nullptr;\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD)\n    return;\n  if (!FD->hasBody())\n    return;\n\n  buildSummaryForFunction(FD);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  ProgramStateRef State = C.getState();\n\n  // Case A: Direct free-like\
+  \ calls\n  if (isFreeLike(Call, C) && Call.getNumArgs() >= 1) {\n    const Expr\
+  \ *Arg0 = Call.getArgExpr(0);\n    const MemRegion *BaseReg = nullptr;\n    const\
+  \ FieldDecl *FD = nullptr;\n    if (extractBaseAndFieldFromMember(Arg0, C, BaseReg,\
+  \ FD)) {\n      if (BaseReg) BaseReg = BaseReg->getBaseRegion();\n      if (BaseReg\
+  \ && FD) {\n        MemberKey K = makeKey(BaseReg, FD);\n        if (State->contains<FreedMemberSet>(K))\
+  \ {\n          reportDoubleFree(Call, FD, C);\n        }\n        State = State->add<FreedMemberSet>(K);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return; // Even if not a member,\
+  \ we only focus on member frees for this checker\n  }\n\n  // Case B: Calls to cleanup\
+  \ functions summarized to free certain members\n  const FunctionDecl *CalleeFD =\
+  \ dyn_cast_or_null<FunctionDecl>(Call.getDecl());\n  if (!CalleeFD)\n    return;\n\
+  \n  const auto *Summary = getOrBuildSummary(CalleeFD);\n  if (!Summary)\n    return;\n\
+  \n  for (const FreedField &FF : *Summary) {\n    if (FF.ParamIndex >= Call.getNumArgs())\n\
+  \      continue;\n\n    const Expr *ArgE = Call.getArgExpr(FF.ParamIndex);\n   \
+  \ if (!ArgE)\n      continue;\n\n    const MemRegion *ArgReg = getMemRegionFromExpr(ArgE,\
+  \ C);\n    if (!ArgReg)\n      continue;\n\n    ArgReg = ArgReg->getBaseRegion();\n\
+  \    if (!ArgReg)\n      continue;\n\n    MemberKey K = makeKey(ArgReg, FF.Field);\n\
+  \    if (State->contains<FreedMemberSet>(K)) {\n      reportDoubleFree(Call, FF.Field,\
+  \ C);\n    }\n    State = State->add<FreedMemberSet>(K);\n  }\n\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects double free of struct members across overlapping cleanup routines\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

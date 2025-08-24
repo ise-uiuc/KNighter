@@ -1,0 +1,233 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -39,8 +39,6 @@                           llvm::SmallVectorImpl<unsigned> &DerefParams);
+ bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
+
+-// No custom program state needed.
+-
+ namespace {
+
+ class SAGenTestChecker : public Checker<check::PostStmt<BinaryOperator>> {
+@@ -69,6 +67,27 @@
+   static bool isNoOpWrapper(const Stmt *S) {
+     return isa<ParenExpr>(S) || isa<ImplicitCastExpr>(S);
++  }
++
++  static bool isSizeTType(QualType T, CheckerContext &C) {
++    return C.getASTContext().hasSameType(T, C.getASTContext().getSizeType());
++  }
++
++  static bool exprReferencesVar(const Expr *E, const VarDecl *VD) {
++    if (!E || !VD) return false;
++    // Simple recursive traversal to find DeclRefExpr to VD.
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts())) {
++      if (DRE->getDecl() == VD)
++        return true;
++    }
++    for (const Stmt *Child : E->children()) {
++      if (!Child) continue;
++      if (const auto *CE = dyn_cast<Expr>(Child)) {
++        if (exprReferencesVar(CE, VD))
++          return true;
++      }
++    }
++    return false;
+   }
+
+   bool getImmediateNonTrivialParent(const Stmt *Child,
+@@ -103,6 +122,129 @@         return false;
+       }
+     }
++  }
++
++  // Is this call a known allocation-like function where the product can be a size argument?
++  static bool isAllocLikeCallee(const FunctionDecl *FD) {
++    if (!FD) return false;
++    StringRef Name = FD->getName();
++    // Common Linux allocators, both managed and unmanaged.
++    return Name == "kmalloc" || Name == "kzalloc" || Name == "kvmalloc" ||
++           Name == "kvzalloc" || Name == "vzalloc" || Name == "vmalloc" ||
++           Name == "__vmalloc" || Name == "__kmalloc" ||
++           Name == "devm_kmalloc" || Name == "devm_kzalloc" ||
++           Name == "krealloc" || Name == "kvrealloc" ||
++           // Arrays/calloc-like usually take (n, size), not a product, but include for completeness.
++           Name == "kmalloc_array" || Name == "kcalloc" || Name == "devm_kmalloc_array" ||
++           Name == "devm_kcalloc";
++  }
++
++  // Which argument index is the "size" for known allocators? Return true if known and fills out SizeArgIdx.
++  static bool getAllocLikeSizeArgIndex(const FunctionDecl *FD, unsigned &SizeArgIdx) {
++    if (!FD) return false;
++    StringRef Name = FD->getName();
++    // kmalloc/kzalloc/kvmalloc/kvzalloc/vmalloc take (size, flags)
++    if (Name == "kmalloc" || Name == "kzalloc" || Name == "kvmalloc" ||
++        Name == "kvzalloc" || Name == "vzalloc" || Name == "vmalloc" ||
++        Name == "__vmalloc" || Name == "__kmalloc" ||
++        Name == "devm_kmalloc" || Name == "devm_kzalloc") {
++      SizeArgIdx = 0;
++      return true;
++    }
++    // krealloc/kvrealloc take (ptr, size, flags)
++    if (Name == "krealloc" || Name == "kvrealloc") {
++      SizeArgIdx = 1;
++      return true;
++    }
++    // kcalloc/kmalloc_array/devm_kcalloc/devm_kmalloc_array use (n, size, flags). SizeArgIdx could be 0 or 1.
++    // We are not matching products here usually; treat them as non-product cases, but for completeness we can
++    // consider either 0 or 1 is a "size-like" operand position.
++    if (Name == "kmalloc_array" || Name == "kcalloc" ||
++        Name == "devm_kmalloc_array" || Name == "devm_kcalloc") {
++      // No single definitive "size" index; return false so we don't rely on it.
++      return false;
++    }
++    return false;
++  }
++
++  // Determine if the multiply expression is used directly as the "size" argument of an allocation call.
++  bool isDirectAllocSizeUse(const Stmt *UseSiteStmt, const BinaryOperator *Mul) const {
++    if (!UseSiteStmt || !Mul) return false;
++    const auto *Call = dyn_cast<CallExpr>(UseSiteStmt);
++    if (!Call) return false;
++    const FunctionDecl *FD = Call->getDirectCallee();
++    if (!isAllocLikeCallee(FD)) return false;
++
++    // Find argument that is exactly our multiply expression.
++    for (unsigned i = 0, n = Call->getNumArgs(); i < n; ++i) {
++      const Expr *Arg = Call->getArg(i)->IgnoreParenImpCasts();
++      if (Arg == Mul->IgnoreParenImpCasts()) {
++        // Is this arg the size arg for allocators we recognize?
++        unsigned SizeIdx = 0;
++        if (getAllocLikeSizeArgIndex(FD, SizeIdx)) {
++          if (i == SizeIdx)
++            return true;
++        } else {
++          // For allocators where we don't have a fixed size index (e.g., kcalloc), suppress anyway if any arg matches.
++          return true;
++        }
++      }
++    }
++    return false;
++  }
++
++  // If the multiply result is assigned to a size_t variable, and then that variable is used
++  // as the "size" argument of an allocation function in the next few statements, suppress.
++  bool isAssignedThenImmediatelyUsedAsAllocSize(const Stmt *UseSiteStmt,
++                                                CheckerContext &C) const {
++    const auto *BO = dyn_cast_or_null<BinaryOperator>(UseSiteStmt);
++    if (!BO || !BO->isAssignmentOp())
++      return false;
++
++    const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
++    const auto *LHSRef = dyn_cast<DeclRefExpr>(LHS);
++    if (!LHSRef) return false;
++    const auto *LHSVD = dyn_cast<VarDecl>(LHSRef->getDecl());
++    if (!LHSVD) return false;
++
++    // Only consider temporaries/locals of size_t type (common for alloc sizes).
++    if (!isSizeTType(LHSVD->getType(), C))
++      return false;
++
++    const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(UseSiteStmt, C);
++    if (!CS) return false;
++
++    // Search next few statements in this block for an allocator call that uses the LHS var as size.
++    bool FoundAssign = false;
++    unsigned Lookahead = 0;
++    for (const Stmt *S : CS->body()) {
++      if (!S) continue;
++      if (!FoundAssign) {
++        if (S == UseSiteStmt)
++          FoundAssign = true;
++        continue;
++      }
++      // Limit lookahead to avoid too-aggressive suppression.
++      if (Lookahead++ > 3)
++        break;
++
++      const auto *CE = dyn_cast<CallExpr>(S);
++      if (!CE) continue;
++      const FunctionDecl *FD = CE->getDirectCallee();
++      if (!isAllocLikeCallee(FD)) continue;
++
++      unsigned SizeIdx = 0;
++      bool HasFixedSizeIdx = getAllocLikeSizeArgIndex(FD, SizeIdx);
++      for (unsigned i = 0, n = CE->getNumArgs(); i < n; ++i) {
++        const Expr *Arg = CE->getArg(i)->IgnoreParenImpCasts();
++        if (exprReferencesVar(Arg, LHSVD)) {
++          if (!HasFixedSizeIdx || i == SizeIdx) {
++            return true;
++          }
++        }
++      }
++    }
++    return false;
+   }
+
+   bool isDirectWidenedUseTo64(const Expr *Mul,
+@@ -211,10 +353,8 @@       return false;
+
+     if (IsUnsigned) {
+-      // For unsigned, max is 2^W - 1
+       Out = llvm::APSInt::getMaxValue(W, /*isUnsigned=*/true);
+     } else {
+-      // For signed, max is 2^(W-1) - 1
+       Out = llvm::APSInt::getMaxValue(W, /*isUnsigned=*/false);
+     }
+     return true;
+@@ -234,7 +374,7 @@
+     // Compute conservatively using 128-bit.
+     uint64_t ML = MaxL.isSigned() ? (uint64_t)MaxL.getExtValue() : MaxL.getZExtValue();
+-    uint64_t MR = MaxR.isSigned() ? (uint64_t)MaxR.getExtValue() : MaxR.getZExtValue();
++    uint64_t MR = MaxR.isSigned() ? (uint64_t)MaxR.getZExtValue() : MaxR.getZExtValue();
+     __uint128_t Prod = ((__uint128_t)ML) * ((__uint128_t)MR);
+
+     // Determine limit for the arithmetic type of the multiply.
+@@ -242,7 +382,6 @@     bool IsUnsignedMul = B->getType()->isUnsignedIntegerType();
+
+     if (MulW >= 64) {
+-      // If multiply is already 64-bit or wider, it can't overflow at 32-bit width.
+       return true;
+     }
+
+@@ -250,7 +389,6 @@     if (IsUnsignedMul) {
+       Limit = (((__uint128_t)1) << MulW) - 1;
+     } else {
+-      // Signed max: 2^(W-1) - 1
+       Limit = (((__uint128_t)1) << (MulW - 1)) - 1;
+     }
+
+@@ -329,7 +467,6 @@   bool looksLikeNonSizeEncodingContext(const Stmt *UseSiteStmt,
+                                        const Decl *UseSiteDecl,
+                                        CheckerContext &C) const {
+-    // Suppress in contexts that look like inode/permission/class encodings etc.
+     static const std::initializer_list<StringRef> Negatives = {
+         "irq", "hwirq", "interrupt", "index", "idx", "id",
+         "ino", "inode", "perm", "class", "sid"
+@@ -367,12 +504,23 @@                        const Stmt *UseSiteStmt,
+                        const Decl *UseSiteDecl,
+                        CheckerContext &C) const {
++    // Allocation-size context suppression:
++    // a) Multiply passed directly as allocator size argument.
++    if (isDirectAllocSizeUse(UseSiteStmt, Mul))
++      return true;
++
++    // b) Multiply assigned to a size_t temporary and immediately used as allocator size.
++    if (isAssignedThenImmediatelyUsedAsAllocSize(UseSiteStmt, C))
++      return true;
++
+     // If it doesn't look like a size/count computation, suppress.
+     if (!looksLikeSizeContext(UseSiteStmt, UseSiteDecl, Mul, C))
+       return true;
++
+     // Or if it explicitly looks like a non-size encoding context, suppress.
+     if (looksLikeNonSizeEncodingContext(UseSiteStmt, UseSiteDecl, C))
+       return true;
++
+     return false;
+   }
+ };
+@@ -412,7 +560,7 @@   if (productDefinitelyFits(B, C))
+     return;
+
+-  // Semantic filter to avoid non-size/count encodings, e.g., inode/perm/class indices.
++  // Semantic filter and allocation-size suppressions.
+   if (isFalsePositive(B, UseSiteStmt, UseSiteDecl, C))
+     return;

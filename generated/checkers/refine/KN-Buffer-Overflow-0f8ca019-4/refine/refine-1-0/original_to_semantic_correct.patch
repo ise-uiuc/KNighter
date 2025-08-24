@@ -1,0 +1,218 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -36,7 +36,7 @@ static bool isGuardedByPrevIfGeBreak(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+                                      const VarDecl *IVar, uint64_t Cap);
+ static bool isGuardedBeforeUse(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+-                               const VarDecl *IVar, uint64_t Cap);
++                               const VarDecl *IVar, uint64_t Cap, uint64_t UBExclusive);
+
+ // New helpers to eliminate macro-originated false positives
+ static bool isFromMacro(const SourceRange &SR) {
+@@ -179,6 +179,167 @@   return (A + B - 1) / B;
+ }
+
++// Parse a comparator "IVar <op> Const" or "Const <op> IVar".
++// Returns true and fills ConstVal (unsigned) and OpOut if matches; otherwise false.
++static bool parseIVarVsConst(const ASTContext &Ctx, const Expr *Cond, const VarDecl *IVar,
++                             uint64_t &ConstVal, BinaryOperator::Opcode &OpOut) {
++  if (!Cond) return false;
++  Cond = Cond->IgnoreParenImpCasts();
++  const auto *BO = dyn_cast<BinaryOperator>(Cond);
++  if (!BO) return false;
++
++  BinaryOperator::Opcode Op = BO->getOpcode();
++  switch (Op) {
++  case BO_LT: case BO_LE:
++  case BO_GT: case BO_GE:
++  case BO_EQ: case BO_NE:
++    break;
++  default:
++    return false;
++  }
++
++  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
++  const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
++
++  // IVar on LHS, constant on RHS
++  if (const auto *DL = dyn_cast<DeclRefExpr>(LHS)) {
++    if (DL->getDecl() == IVar) {
++      llvm::APSInt Val;
++      if (!evalInt(Ctx, RHS, Val)) return false;
++      ConstVal = Val.getLimitedValue();
++      OpOut = Op;
++      return true;
++    }
++  }
++
++  // IVar on RHS, constant on LHS: reverse comparison
++  if (const auto *DR = dyn_cast<DeclRefExpr>(RHS)) {
++    if (DR->getDecl() == IVar) {
++      llvm::APSInt Val;
++      if (!evalInt(Ctx, LHS, Val)) return false;
++      ConstVal = Val.getLimitedValue();
++
++      // Reverse the operator
++      switch (Op) {
++      case BO_LT: OpOut = BO_GT; break;
++      case BO_LE: OpOut = BO_GE; break;
++      case BO_GT: OpOut = BO_LT; break;
++      case BO_GE: OpOut = BO_LE; break;
++      case BO_EQ: OpOut = BO_EQ; break;
++      case BO_NE: OpOut = BO_NE; break;
++      default: return false;
++      }
++      return true;
++    }
++  }
++
++  return false;
++}
++
++// Determine if ASE is guarded by an enclosing IfStmt using a comparator between IVar and Cap.
++// Additionally considers '==' and '!=' cases. For '!=' we require UBExclusive <= Cap + 1.
++static bool isGuardedByEnclosingIfComparator(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
++                                             const VarDecl *IVar, uint64_t Cap, uint64_t UBExclusive) {
++  if (!ASE) return false;
++
++  const Stmt *Curr = ASE;
++  while (true) {
++    const Stmt *ParentS = nullptr;
++    auto Parents = const_cast<ASTContext &>(Ctx).getParentMapContext().getParents(*Curr);
++    if (Parents.empty()) break;
++    ParentS = Parents[0].get<Stmt>();
++    if (!ParentS) break;
++
++    if (const auto *IS = dyn_cast<IfStmt>(ParentS)) {
++      uint64_t CVal = 0;
++      BinaryOperator::Opcode Op;
++      if (parseIVarVsConst(Ctx, IS->getCond(), IVar, CVal, Op)) {
++        if (CVal == Cap) {
++          const Stmt *Then = IS->getThen();
++          const Stmt *Else = IS->getElse();
++
++          auto InThen = Then && stmtContains(Then, ASE);
++          auto InElse = Else && stmtContains(Else, ASE);
++
++          switch (Op) {
++          case BO_LT:
++          case BO_LE:
++            if (InThen) return true;
++            break;
++          case BO_GT:
++          case BO_GE:
++            if (InElse) return true;
++            break;
++          case BO_EQ:
++            if (InElse) return true;
++            break;
++          case BO_NE:
++            if (InThen && UBExclusive <= Cap + 1) return true;
++            break;
++          default:
++            break;
++          }
++        }
++      }
++    }
++    Curr = ParentS;
++  }
++
++  return false;
++}
++
++// Determine if ASE is guarded by a ConditionalOperator (?:) that compares IVar against Cap,
++// and the branch containing ASE is safe. For '!=' we require UBExclusive <= Cap + 1.
++static bool isGuardedByConditionalOperator(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
++                                           const VarDecl *IVar, uint64_t Cap, uint64_t UBExclusive) {
++  if (!ASE) return false;
++
++  const Stmt *Curr = ASE;
++  while (true) {
++    const Stmt *ParentS = nullptr;
++    auto Parents = const_cast<ASTContext &>(Ctx).getParentMapContext().getParents(*Curr);
++    if (Parents.empty()) break;
++    ParentS = Parents[0].get<Stmt>();
++    if (!ParentS) break;
++
++    if (const auto *CO = dyn_cast<ConditionalOperator>(ParentS)) {
++      uint64_t CVal = 0;
++      BinaryOperator::Opcode Op;
++      if (parseIVarVsConst(Ctx, CO->getCond(), IVar, CVal, Op)) {
++        if (CVal == Cap) {
++          const Expr *TrueE = CO->getTrueExpr();
++          const Expr *FalseE = CO->getFalseExpr();
++          bool InTrue = TrueE && stmtContains(TrueE, ASE);
++          bool InFalse = FalseE && stmtContains(FalseE, ASE);
++
++          switch (Op) {
++          case BO_LT:
++          case BO_LE:
++            if (InTrue) return true;
++            break;
++          case BO_GT:
++          case BO_GE:
++            if (InFalse) return true;
++            break;
++          case BO_EQ:
++            if (InFalse) return true;
++            break;
++          case BO_NE:
++            if (InTrue && UBExclusive <= Cap + 1) return true;
++            break;
++          default:
++            break;
++          }
++        }
++      }
++    }
++
++    Curr = ParentS;
++  }
++
++  return false;
++}
++
+ class SAGenTestChecker : public Checker<check::ASTCodeBody> {
+    mutable std::unique_ptr<BugType> BT;
+
+@@ -420,18 +581,27 @@ }
+
+ static bool isGuardedBeforeUse(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+-                               const VarDecl *IVar, uint64_t Cap) {
+-  // Two heuristics:
+-  // 1) ASE is inside an enclosing if (i < Cap) { ... ASE ... }
++                               const VarDecl *IVar, uint64_t Cap, uint64_t UBExclusive) {
++  // Heuristic A: ASE is inside an enclosing if (i < Cap) { ... ASE ... }
+   if (isGuardedByEnclosingIfLtCap(Ctx, ASE, IVar, Cap))
+     return true;
+
+-  // 2) Just before ASE in the same block, there is if (i >= Cap) { break; } or return; or continue;
++  // Heuristic B: Just before ASE in the same block, there is if (i >= Cap) { break; } or return; or continue;
+   if (isGuardedByPrevIfGeBreak(Ctx, ASE, IVar, Cap))
+     return true;
+
+-  return false;
+-}
++  // Heuristic C: ASE is in a safe branch of a ConditionalOperator (?:) comparing i with Cap.
++  if (isGuardedByConditionalOperator(Ctx, ASE, IVar, Cap, UBExclusive))
++    return true;
++
++  // Heuristic D: ASE is in a safe branch of an enclosing IfStmt using a comparator (==, !=, <, <=, >, >=) with Cap.
++  if (isGuardedByEnclosingIfComparator(Ctx, ASE, IVar, Cap, UBExclusive))
++    return true;
++
++  return false;
++}
++
++//====================== Checker implementations ======================
+
+ bool SAGenTestChecker::getLoopIndexAndBounds(const ForStmt *FS, const ASTContext &Ctx,
+                                              const VarDecl *&IVar, llvm::APSInt &LB,
+@@ -562,8 +732,8 @@       if (!extractIndexDivAndOffset(Ctx, Idx, IVar, Div, Offset))
+         return true;
+
+-      // If guarded appropriately, skip.
+-      if (isGuardedBeforeUse(Ctx, ASE, IVar, Cap))
++      // If guarded appropriately (via if/?:), skip.
++      if (isGuardedBeforeUse(Ctx, ASE, IVar, Cap, UBExclusive))
+         return true;
+
+       // Preserve the existing conservative suppression for "<=" when RHS equals the capacity

@@ -1,0 +1,214 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -65,6 +65,12 @@   void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+
+ private:
++  // Helper to perform case-insensitive substring search using lowercase conversion.
++  static bool containsLower(StringRef Haystack, StringRef Needle) {
++    std::string Lower = Haystack.lower();
++    return StringRef(Lower).contains(Needle);
++  }
++
+   // Helper to collect labels, gotos, and fields locally assigned from allocators.
+   struct FuncInfoCollector : public RecursiveASTVisitor<FuncInfoCollector> {
+     CheckerContext &C;
+@@ -165,6 +171,15 @@   // Gating heuristic: return the ParmVarDecl if the base of a MemberExpr resolves directly to a function parameter.
+   const ParmVarDecl *getDirectBaseParam(const Expr *BaseE) const;
+
++  // Additional gating: check whether the target label has any error-like incoming goto.
++  bool labelHasErrorishIncoming(const FunctionDecl *FD, const LabelStmt *LS, CheckerContext &C) const;
++
++  // Helpers for "error-ish" classification.
++  bool labelNameLooksErrorish(const LabelStmt *LS) const;
++  bool gotoLooksErrorish(const GotoStmt *GS, CheckerContext &C) const;
++  bool condLooksErrorish(const Expr *Cond, CheckerContext &C) const;
++  const Expr *stripWrapperCalls(const Expr *E, CheckerContext &C) const;
++
+   void reportFreeUnownedInSharedLabel(const CallEvent &Call, CheckerContext &C) const;
+ };
+
+@@ -330,11 +345,159 @@   return nullptr;
+ }
+
++const Expr *SAGenTestChecker::stripWrapperCalls(const Expr *E, CheckerContext &C) const {
++  const Expr *Cur = E ? E->IgnoreParenImpCasts() : nullptr;
++  while (const auto *CE = dyn_cast_or_null<CallExpr>(Cur)) {
++    const FunctionDecl *FD = CE->getDirectCallee();
++    StringRef Name = FD ? FD->getName() : StringRef();
++    // Common kernel wrappers/macros lowered as calls we want to peel.
++    if (Name.equals("unlikely") || Name.equals("likely") ||
++        Name.equals("__builtin_expect")) {
++      if (CE->getNumArgs() > 0) {
++        Cur = CE->getArg(0)->IgnoreParenImpCasts();
++        continue;
++      }
++    }
++    break;
++  }
++  return Cur ? Cur->IgnoreParenImpCasts() : nullptr;
++}
++
++bool SAGenTestChecker::condLooksErrorish(const Expr *Cond, CheckerContext &C) const {
++  if (!Cond)
++    return false;
++
++  const Expr *E = stripWrapperCalls(Cond, C);
++  if (!E)
++    return false;
++
++  // if (ret) or if (!ret) patterns where 'ret' is a typical error code variable.
++  auto LooksLikeErrVar = [](StringRef N) {
++    return N.equals("ret") || N.equals("rc") || N.equals("err") || N.equals("error") || N.equals("status");
++  };
++
++  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++      if (LooksLikeErrVar(VD->getName()))
++        return true;
++    }
++  }
++
++  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    if (UO->getOpcode() == UO_LNot) {
++      if (const auto *D = dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParenImpCasts()))
++        if (const auto *VD = dyn_cast<VarDecl>(D->getDecl()))
++          if (LooksLikeErrVar(VD->getName()))
++            return true;
++    }
++  }
++
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++    if (BO->isComparisonOp() || BO->getOpcode() == BO_NE || BO->getOpcode() == BO_EQ) {
++      const Expr *L = BO->getLHS()->IgnoreParenImpCasts();
++      const Expr *R = BO->getRHS()->IgnoreParenImpCasts();
++      auto IsZeroOrNegConst = [](const Expr *X) -> bool {
++        if (const auto *IL = dyn_cast<IntegerLiteral>(X)) {
++          return IL->getValue().isZero(); // zero
++        }
++        // We do not easily get negative constants unless folded; conservative: also treat zero checks.
++        return false;
++      };
++      auto IsErrVar = [&](const Expr *X) -> bool {
++        if (const auto *DR = dyn_cast<DeclRefExpr>(X))
++          if (const auto *VD = dyn_cast<VarDecl>(DR->getDecl()))
++            return LooksLikeErrVar(VD->getName());
++        return false;
++      };
++      // ret != 0, ret < 0, 0 != ret, etc.
++      if ((IsErrVar(L) && IsZeroOrNegConst(R)) || (IsErrVar(R) && IsZeroOrNegConst(L)))
++        return true;
++    }
++  }
++
++  // if (IS_ERR(ptr)) or IS_ERR_OR_NULL(ptr)
++  if (const auto *CE = dyn_cast<CallExpr>(E)) {
++    if (const FunctionDecl *FD = CE->getDirectCallee()) {
++      StringRef N = FD->getName();
++      if (N.equals("IS_ERR") || N.equals("IS_ERR_OR_NULL") || N.equals("IS_ERR_VALUE"))
++        return true;
++    } else {
++      // Fallback: text search in the expression for kernel helpers.
++      if (ExprHasName(E, "IS_ERR", C) || ExprHasName(E, "IS_ERR_OR_NULL", C) || ExprHasName(E, "IS_ERR_VALUE", C))
++        return true;
++    }
++  }
++
++  return false;
++}
++
++bool SAGenTestChecker::labelNameLooksErrorish(const LabelStmt *LS) const {
++  if (!LS || !LS->getDecl())
++    return false;
++  StringRef N = LS->getDecl()->getName();
++  // Common error cleanup labels in kernel code.
++  return containsLower(N, "err") || containsLower(N, "error") ||
++         containsLower(N, "fail") || containsLower(N, "free") ||
++         containsLower(N, "cleanup") || containsLower(N, "out_err");
++}
++
++bool SAGenTestChecker::gotoLooksErrorish(const GotoStmt *GS, CheckerContext &C) const {
++  if (!GS)
++    return false;
++
++  // If there's an enclosing if-statement, examine its condition.
++  if (const IfStmt *IS = findSpecificTypeInParents<IfStmt>(GS, C)) {
++    if (const Expr *Cond = IS->getCond()) {
++      if (condLooksErrorish(Cond, C))
++        return true;
++    }
++  }
++
++  // Otherwise, fall back to label name being errorish.
++  const LabelDecl *LD = GS->getLabel();
++  if (LD) {
++    StringRef N = LD->getName();
++    if (containsLower(N, "err") || containsLower(N, "error") ||
++        containsLower(N, "fail") || containsLower(N, "free") ||
++        containsLower(N, "cleanup") || containsLower(N, "out_err"))
++      return true;
++  }
++  return false;
++}
++
++bool SAGenTestChecker::labelHasErrorishIncoming(const FunctionDecl *FD, const LabelStmt *LS, CheckerContext &C) const {
++  if (!FD || !LS)
++    return false;
++  auto ItF = FuncLabelGotos.find(FD);
++  if (ItF == FuncLabelGotos.end())
++    return false;
++  auto It = ItF->second.find(LS);
++  if (It == ItF->second.end())
++    return false;
++
++  // If label name looks errorish, that's sufficient.
++  if (labelNameLooksErrorish(LS))
++    return true;
++
++  const auto &Gotos = It->second;
++  for (const GotoStmt *GS : Gotos) {
++    if (gotoLooksErrorish(GS, C))
++      return true;
++  }
++  return false;
++}
++
+ bool SAGenTestChecker::isFalsePositive(const Expr *FreedArgE,
+                                        const MemberExpr *FreedME,
+                                        const CallEvent &Call,
+                                        const LabelStmt *EnclosingLabel,
+                                        CheckerContext &C) const {
++  // 0) If the label does not look like an error path for any of its incoming gotos,
++  //    this is very likely a normal cleanup label (e.g. "out") -> suppress.
++  const FunctionDecl *FD = getCurrentFunction(C);
++  if (FD && EnclosingLabel && !labelHasErrorishIncoming(FD, EnclosingLabel, C))
++    return true;
++
+   // 1) If the argument is definitely the literal NULL at this point, kfree(NULL) is a no-op.
+   if (FreedArgE) {
+     SVal ArgVal = C.getSVal(FreedArgE);
+@@ -357,7 +520,6 @@
+   // 3) If all incoming gotos to this label lexically occur after the earliest allocator
+   //    assignment to this field in the same function, then the shared label is safe.
+-  const FunctionDecl *FD = getCurrentFunction(C);
+   if (FD && FreedME) {
+     const FieldDecl *FreedFD = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
+     if (FreedFD) {
+@@ -433,8 +595,12 @@   auto Lit = IncomingMap.find(EnclosingLabel);
+   unsigned Count = (Lit == IncomingMap.end()) ? 0u : Lit->second;
+
+-  // Only warn for shared labels (2 or more incoming gotos).
++  // Only consider shared labels (2 or more incoming gotos).
+   if (Count < 2)
++    return;
++
++  // New gating: Only consider labels that look like error paths.
++  if (!labelHasErrorishIncoming(FD, EnclosingLabel, C))
+     return;
+
+   // Check each freed argument.
+@@ -449,7 +615,7 @@     if (!FreedME)
+       continue;
+
+-    // New gating: Only warn when the freed field belongs directly to a function parameter.
++    // Only warn when the freed field belongs directly to a function parameter.
+     // This matches the target buggy pattern (e.g., mt->fc) and suppresses cleanup of local/private state.
+     const Expr *BaseE = FreedME->getBase();
+     const ParmVarDecl *BaseParam = getDirectBaseParam(BaseE);

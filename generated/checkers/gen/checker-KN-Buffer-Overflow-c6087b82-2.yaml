@@ -1,0 +1,291 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: c6087b82a9146826564a55c5ca0164cac40348f5
+commit_type: Buffer-Overflow
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include <string>\n#include <algorithm>\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// No custom program states needed.\n\nnamespace\
+  \ {\n\nclass SAGenTestChecker : public Checker<check::PreCall> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Unbounded\
+  \ copy_from_user into fixed-size buffer\", \"Security\")) {}\n\n      void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n   private:\n\n      // Helper predicates/utilities\n\
+  \      bool isCopyFromUser(const CallEvent &Call, CheckerContext &C) const;\n  \
+  \    bool getDestArrayAndSize(const Expr *DestArg, std::string &BufName, llvm::APInt\
+  \ &ArraySize) const;\n      bool exprIsStaticallyBoundedByBufMinusOne(const Expr\
+  \ *LenExpr, StringRef BufName, unsigned BufSize, CheckerContext &C) const;\n   \
+  \   bool exprLooksLikeRawUserLen(const Expr *LenExpr) const;\n};\n\nbool SAGenTestChecker::isCopyFromUser(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *OriginExpr = Call.getOriginExpr();\n\
+  \  if (!OriginExpr)\n    return false;\n  return ExprHasName(OriginExpr, \"copy_from_user\"\
+  , C);\n}\n\nbool SAGenTestChecker::getDestArrayAndSize(const Expr *DestArg, std::string\
+  \ &BufName, llvm::APInt &ArraySize) const {\n  if (!DestArg)\n    return false;\n\
+  \n  // Try to retrieve constant array size directly (helper ignores implicit nodes).\n\
+  \  if (!getArraySizeFromExpr(ArraySize, DestArg))\n    return false;\n\n  // Extract\
+  \ variable name for heuristics.\n  const Expr *E = DestArg->IgnoreParenImpCasts();\n\
+  \  const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E);\n  if (!DRE)\n    DRE = findSpecificTypeInChildren<DeclRefExpr>(DestArg);\n\
+  \  if (!DRE)\n    return false;\n\n  if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\
+  \ {\n    BufName = VD->getNameAsString();\n    return true;\n  }\n  return false;\n\
+  }\n\nbool SAGenTestChecker::exprIsStaticallyBoundedByBufMinusOne(const Expr *LenExpr,\
+  \ StringRef BufName, unsigned BufSize, CheckerContext &C) const {\n  if (!LenExpr\
+  \ || BufSize == 0)\n    return false;\n\n  // 1) Constant evaluation\n  llvm::APSInt\
+  \ EvalRes;\n  if (EvaluateExprToInt(EvalRes, LenExpr, C)) {\n    uint64_t V = EvalRes.getLimitedValue();\n\
+  \    if (V <= (uint64_t)BufSize - 1)\n      return true;\n    else\n      return\
+  \ false;\n  }\n\n  // 2) Symbolic max bound\n  ProgramStateRef State = C.getState();\n\
+  \  SVal SV = State->getSVal(LenExpr, C.getLocationContext());\n  if (SymbolRef Sym\
+  \ = SV.getAsSymbol()) {\n    if (const llvm::APSInt *MaxVal = inferSymbolMaxVal(Sym,\
+  \ C)) {\n      if (MaxVal->getLimitedValue() <= (uint64_t)BufSize - 1)\n       \
+  \ return true;\n      else\n        return false;\n    }\n  }\n\n  // 3) Heuristics:\
+  \ look for min(sizeof(buf)-1, ...) patterns\n  // If min(...) is used and either\
+  \ sizeof or buffer name is referenced, assume bounded.\n  if (ExprHasName(LenExpr,\
+  \ \"min\", C) &&\n      (ExprHasName(LenExpr, \"sizeof\", C) || (!BufName.empty()\
+  \ && ExprHasName(LenExpr, BufName, C)))) {\n    return true;\n  }\n\n  // If sizeof(buffer)\
+  \ and \"-1\" present in the expression, assume bounded.\n  if ((!BufName.empty()\
+  \ && ExprHasName(LenExpr, BufName, C)) &&\n      ExprHasName(LenExpr, \"sizeof\"\
+  , C) &&\n      (ExprHasName(LenExpr, \"- 1\", C) || ExprHasName(LenExpr, \"-1\"\
+  , C))) {\n    return true;\n  }\n\n  return false;\n}\n\nbool SAGenTestChecker::exprLooksLikeRawUserLen(const\
+  \ Expr *LenExpr) const {\n  if (!LenExpr)\n    return false;\n  const Expr *E =\
+  \ LenExpr->IgnoreParenCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n      std::string\
+  \ Name = VD->getNameAsString();\n      std::string Lower = Name;\n      std::transform(Lower.begin(),\
+  \ Lower.end(), Lower.begin(), ::tolower);\n      static const char *Common[] = {\"\
+  nbytes\", \"len\", \"length\", \"count\", \"size\", \"n\", \"nr\", \"num\"};\n \
+  \     for (const char *S : Common) {\n        if (Lower == S)\n          return\
+  \ true;\n      }\n    }\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isCopyFromUser(Call, C))\n\
+  \    return;\n\n  if (Call.getNumArgs() < 3)\n    return;\n\n  const Expr *DestArg\
+  \ = Call.getArgExpr(0);\n  const Expr *LenExpr = Call.getArgExpr(2);\n  if (!DestArg\
+  \ || !LenExpr)\n    return;\n\n  // Destination must be a fixed-size array for our\
+  \ pattern.\n  std::string BufName;\n  llvm::APInt ArraySize;\n  if (!getDestArrayAndSize(DestArg,\
+  \ BufName, ArraySize))\n    return;\n\n  uint64_t BufSize = ArraySize.getLimitedValue();\n\
+  \  if (BufSize == 0)\n    return;\n\n  // If length is bounded by sizeof(buf)-1,\
+  \ consider safe.\n  if (exprIsStaticallyBoundedByBufMinusOne(LenExpr, BufName, (unsigned)BufSize,\
+  \ C))\n    return;\n\n  // If constant, check if it's > BufSize - 1 (unsafe).\n\
+  \  llvm::APSInt EvalRes;\n  if (EvaluateExprToInt(EvalRes, LenExpr, C)) {\n    uint64_t\
+  \ V = EvalRes.getLimitedValue();\n    if (V <= (uint64_t)BufSize - 1)\n      return;\
+  \ // safe\n    // else unsafe, report\n  } else {\n    // If symbolic and we can\
+  \ prove max <= BufSize - 1, safe.\n    ProgramStateRef State = C.getState();\n \
+  \   SVal SV = State->getSVal(LenExpr, C.getLocationContext());\n    if (SymbolRef\
+  \ Sym = SV.getAsSymbol()) {\n      if (const llvm::APSInt *MaxVal = inferSymbolMaxVal(Sym,\
+  \ C)) {\n        if (MaxVal->getLimitedValue() <= (uint64_t)BufSize - 1)\n     \
+  \     return; // safe\n      }\n    }\n    // Otherwise, only warn if it looks like\
+  \ a raw user length (e.g., nbytes)\n    if (!exprLooksLikeRawUserLen(LenExpr))\n\
+  \      return; // avoid noise\n  }\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"copy_from_user length not bounded by sizeof(buffer) - 1; possible\
+  \ overflow\", N);\n  R->addRange(DestArg->getSourceRange());\n  R->addRange(LenExpr->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\n} // end anonymous namespace\n\nextern \"C\"\
+  \ void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects unbounded copy_from_user into\
+  \ fixed-size buffers (missing sizeof(buf)-1 clamp)\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nscsi: lpfc: Prevent lpfc_debugfs_lockstat_write()\
+  \ buffer overflow\n\nA static code analysis tool flagged the possibility of buffer\
+  \ overflow when\nusing copy_from_user() for a debugfs entry.\n\nCurrently, it is\
+  \ possible that copy_from_user() copies more bytes than what\nwould fit in the mybuf\
+  \ char array.  Add a min() restriction check between\nsizeof(mybuf) - 1 and nbytes\
+  \ passed from the userspace buffer to protect\nagainst buffer overflow.\n\nLink:\
+  \ https://lore.kernel.org/r/20230301231626.9621-2-justintee8345@gmail.com\nSigned-off-by:\
+  \ Justin Tee <justin.tee@broadcom.com>\nSigned-off-by: Martin K. Petersen <martin.petersen@oracle.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: lpfc_debugfs_lockstat_write in drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  static ssize_t\nlpfc_debugfs_lockstat_write(struct file *file, const char __user\
+  \ *buf,\n\t\t\t    size_t nbytes, loff_t *ppos)\n{\n\tstruct lpfc_debug *debug =\
+  \ file->private_data;\n\tstruct lpfc_hba *phba = (struct lpfc_hba *)debug->i_private;\n\
+  \tstruct lpfc_sli4_hdw_queue *qp;\n\tchar mybuf[64];\n\tchar *pbuf;\n\tint i;\n\n\
+  \tmemset(mybuf, 0, sizeof(mybuf));\n\n\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  \t\treturn -EFAULT;\n\tpbuf = &mybuf[0];\n\n\tif ((strncmp(pbuf, \"reset\", strlen(\"\
+  reset\")) == 0) ||\n\t    (strncmp(pbuf, \"zero\", strlen(\"zero\")) == 0)) {\n\t\
+  \tfor (i = 0; i < phba->cfg_hdw_queue; i++) {\n\t\t\tqp = &phba->sli4_hba.hdwq[i];\n\
+  \t\t\tqp->lock_conflict.alloc_xri_get = 0;\n\t\t\tqp->lock_conflict.alloc_xri_put\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_xri = 0;\n\t\t\tqp->lock_conflict.wq_access\
+  \ = 0;\n\t\t\tqp->lock_conflict.alloc_pvt_pool = 0;\n\t\t\tqp->lock_conflict.mv_from_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.mv_to_pub_pool = 0;\n\t\t\tqp->lock_conflict.mv_to_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_pvt_pool = 0;\n\t\t\tqp->lock_conflict.free_pub_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.wq_access = 0;\n\t\t}\n\t}\n\treturn nbytes;\n}\n\
+  ```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/scsi/lpfc/lpfc_debugfs.c\
+  \ b/drivers/scsi/lpfc/lpfc_debugfs.c\nindex f5252e45a48a..3e365e5e194a 100644\n\
+  --- a/drivers/scsi/lpfc/lpfc_debugfs.c\n+++ b/drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  @@ -2157,10 +2157,13 @@ lpfc_debugfs_lockstat_write(struct file *file, const char\
+  \ __user *buf,\n \tchar mybuf[64];\n \tchar *pbuf;\n \tint i;\n+\tsize_t bsize;\n\
+  \ \n \tmemset(mybuf, 0, sizeof(mybuf));\n \n-\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  +\tbsize = min(nbytes, (sizeof(mybuf) - 1));\n+\n+\tif (copy_from_user(mybuf, buf,\
+  \ bsize))\n \t\treturn -EFAULT;\n \tpbuf = &mybuf[0];\n \n@@ -2181,7 +2184,7 @@\
+  \ lpfc_debugfs_lockstat_write(struct file *file, const char __user *buf,\n \t\t\t\
+  qp->lock_conflict.wq_access = 0;\n \t\t}\n \t}\n-\treturn nbytes;\n+\treturn bsize;\n\
+  \ }\n #endif\n \n```\n"
+pattern: '## Bug Pattern
+
+
+  Copying user-provided data into a fixed-size buffer using copy_from_user() with
+  the unvalidated user length (nbytes), i.e., not bounding the copy by sizeof(buffer)
+  - 1. This can overflow the stack/local buffer.
+
+
+  Pattern example:
+
+  - char buf[64];
+
+  - if (copy_from_user(buf, user_ptr, nbytes)) return -EFAULT;  // nbytes not clamped
+  to sizeof(buf)-1
+
+
+  Correct pattern:
+
+  - size_t len = min(nbytes, sizeof(buf) - 1);
+
+  - if (copy_from_user(buf, user_ptr, len)) return -EFAULT;
+
+  - return len;'
+plan: "```\nPlan: Detect unbounded copy_from_user() into fixed-size buffers\n\n1)\
+  \ Program state customization\n- Not necessary. This checker can be implemented\
+  \ without custom program states or traits.\n\n2) Callbacks to use\n- checkPreCall:\
+  \ Main detection of unsafe copy_from_user() usage.\n\n3) Detailed steps\n\nA. Helper\
+  \ predicates/utilities to implement (local in checker)\n- bool isCopyFromUser(const\
+  \ CallEvent &Call):\n  - Return true if Call.getCalleeIdentifier()->getName() ==\
+  \ \"copy_from_user\".\n\n- bool getDestArrayAndSize(const Expr *DestArg, std::string\
+  \ &BufName, llvm::APInt &ArraySize):\n  - Use getArraySizeFromExpr(ArraySize, DestArg)\
+  \ to obtain the constant array size.\n  - If success, also extract the variable\
+  \ name:\n    - If DestArg (after IgnoreImplicit/IgnoreParenImpCasts) is a DeclRefExpr\
+  \ to a VarDecl, set BufName = VD->getNameAsString().\n  - Return true if both array\
+  \ size and name were obtained.\n\n- bool exprIsStaticallyBoundedByBufMinusOne(const\
+  \ Expr *LenExpr, StringRef BufName, unsigned BufSize, CheckerContext &C):\n  - Try\
+  \ exact reasoning first:\n    - If EvaluateExprToInt(EvalRes, LenExpr, C) succeeds:\n\
+  \      - Return true if EvalRes <= (BufSize - 1), else false.\n    - Else try to\
+  \ obtain a max bound using the analyzer\u2019s symbolic reasoning:\n      - Get\
+  \ SVal of LenExpr via C.getState()->getSVal(LenExpr, C.getLocationContext()).\n\
+  \      - If it has a SymbolRef, call inferSymbolMaxVal(Sym, C).\n        - If maxVal\
+  \ exists, return true if maxVal <= (BufSize - 1); else false.\n  - If still unknown,\
+  \ apply simple structural/textual heuristics to avoid false positives:\n    - If\
+  \ ExprHasName(LenExpr, \"min\", C) and (ExprHasName(LenExpr, \"sizeof\", C) or ExprHasName(LenExpr,\
+  \ BufName, C)):\n      - Consider it bounded, return true.\n    - If ExprHasName(LenExpr,\
+  \ \"sizeof\", C) and ExprHasName(LenExpr, BufName, C):\n      - If the source text\
+  \ contains \"- 1\" as well, consider it bounded, return true.\n  - Otherwise, return\
+  \ false (not proven bounded).\n\n- Optional helper: bool exprLooksLikeRawUserLen(const\
+  \ Expr *LenExpr, CheckerContext &C):\n  - If LenExpr is a DeclRefExpr to a parameter\
+  \ or local named typically \"nbytes\", \"len\", \"count\", or \"size\", return true.\n\
+  \  - Else return false.\n  - This is only used to bias reporting when we cannot\
+  \ prove boundedness.\n\nB. Implementation in checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const\n- If not isCopyFromUser(Call), return.\n- Retrieve arguments:\n\
+  \  - const Expr *DestArg = Call.getArgExpr(0);\n  - const Expr *LenExpr = Call.getArgExpr(2);\n\
+  \  - If either is null, return.\n\n- Determine if destination is a fixed-size array:\n\
+  \  - std::string BufName; llvm::APInt ArraySize;\n  - If !getDestArrayAndSize(DestArg,\
+  \ BufName, ArraySize), return.\n  - If ArraySize == 0, return (defensive guard).\n\
+  \  - unsigned BufSize = ArraySize.getLimitedValue(); if BufSize == 0, return.\n\n\
+  - Check whether the length is safely bounded by sizeof(buf)-1:\n  - if (exprIsStaticallyBoundedByBufMinusOne(LenExpr,\
+  \ BufName, BufSize, C)) return; // safe, no report\n\n- If not proven safe, reduce\
+  \ false positives:\n  - If EvaluateExprToInt(LenExpr) succeeded and the constant\
+  \ is <= BufSize, still unsafe per our pattern if it\u2019s exactly BufSize (no room\
+  \ for terminator). Proceed to warn only if it\u2019s > BufSize - 1.\n  - If symbolic\
+  \ max is known and <= BufSize - 1, do not warn.\n  - Otherwise, if exprLooksLikeRawUserLen(LenExpr,\
+  \ C) is true, proceed to warn.\n  - If none of the above applies (completely unknown),\
+  \ do not warn to avoid noise.\n\n- Reporting:\n  - Create an error node via generateNonFatalErrorNode().\n\
+  \  - Emit a PathSensitiveBugReport with a short message like:\n    - \"copy_from_user\
+  \ length not bounded by sizeof(buffer) - 1; possible overflow\"\n  - Highlight DestArg\
+  \ and LenExpr ranges to aid the user.\n  - One report per call site.\n\n4) Notes\
+  \ to keep it simple and effective\n- We target the common kernel anti-pattern: passing\
+  \ unvalidated user length (e.g., nbytes) directly to copy_from_user for a fixed-size\
+  \ local buffer.\n- We only warn when the destination is a compile-time constant\
+  \ array and the length is not proven (symbolically or syntactically) to be bounded\
+  \ by sizeof(buf) - 1.\n- We leverage:\n  - getArraySizeFromExpr to obtain array\
+  \ size.\n  - EvaluateExprToInt and inferSymbolMaxVal to reason about length.\n \
+  \ - ExprHasName to heuristically detect min/sizeof(buf)-1 patterns and avoid false\
+  \ positives.\n- No alias/pointer tracking or additional program state is needed.\n\
+  \n5) Optional extension (can be skipped for minimal viable checker)\n- Detect the\
+  \ good pattern: len = min(nbytes, sizeof(buf) - 1); if copy_from_user(..., len)\
+  \ is used but the function returns the original nbytes instead of len, optionally\
+  \ warn about \"returned size not clamped,\" though this is beyond the core overflow\
+  \ detection.\n```"
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include <string>\n#include <algorithm>\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// No custom program states needed.\n\nnamespace\
+  \ {\n\nclass SAGenTestChecker : public Checker<check::PreCall> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Unbounded\
+  \ copy_from_user into fixed-size buffer\", \"Security\")) {}\n\n      void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n   private:\n\n      // Helper predicates/utilities\n\
+  \      bool isCopyFromUser(const CallEvent &Call, CheckerContext &C) const;\n  \
+  \    bool getDestArrayAndSize(const Expr *DestArg, std::string &BufName, llvm::APInt\
+  \ &ArraySize) const;\n      bool exprIsStaticallyBoundedByBufMinusOne(const Expr\
+  \ *LenExpr, StringRef BufName, unsigned BufSize, CheckerContext &C) const;\n   \
+  \   bool exprLooksLikeRawUserLen(const Expr *LenExpr) const;\n};\n\nbool SAGenTestChecker::isCopyFromUser(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *OriginExpr = Call.getOriginExpr();\n\
+  \  if (!OriginExpr)\n    return false;\n  return ExprHasName(OriginExpr, \"copy_from_user\"\
+  , C);\n}\n\nbool SAGenTestChecker::getDestArrayAndSize(const Expr *DestArg, std::string\
+  \ &BufName, llvm::APInt &ArraySize) const {\n  if (!DestArg)\n    return false;\n\
+  \n  // Try to retrieve constant array size directly (helper ignores implicit nodes).\n\
+  \  if (!getArraySizeFromExpr(ArraySize, DestArg))\n    return false;\n\n  // Extract\
+  \ variable name for heuristics.\n  const Expr *E = DestArg->IgnoreParenImpCasts();\n\
+  \  const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E);\n  if (!DRE)\n    DRE = findSpecificTypeInChildren<DeclRefExpr>(DestArg);\n\
+  \  if (!DRE)\n    return false;\n\n  if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\
+  \ {\n    BufName = VD->getNameAsString();\n    return true;\n  }\n  return false;\n\
+  }\n\nbool SAGenTestChecker::exprIsStaticallyBoundedByBufMinusOne(const Expr *LenExpr,\
+  \ StringRef BufName, unsigned BufSize, CheckerContext &C) const {\n  if (!LenExpr\
+  \ || BufSize == 0)\n    return false;\n\n  // 1) Constant evaluation\n  llvm::APSInt\
+  \ EvalRes;\n  if (EvaluateExprToInt(EvalRes, LenExpr, C)) {\n    uint64_t V = EvalRes.getLimitedValue();\n\
+  \    if (V <= (uint64_t)BufSize - 1)\n      return true;\n    else\n      return\
+  \ false;\n  }\n\n  // 2) Symbolic max bound\n  ProgramStateRef State = C.getState();\n\
+  \  SVal SV = State->getSVal(LenExpr, C.getLocationContext());\n  if (SymbolRef Sym\
+  \ = SV.getAsSymbol()) {\n    if (const llvm::APSInt *MaxVal = inferSymbolMaxVal(Sym,\
+  \ C)) {\n      if (MaxVal->getLimitedValue() <= (uint64_t)BufSize - 1)\n       \
+  \ return true;\n      else\n        return false;\n    }\n  }\n\n  // 3) Heuristics:\
+  \ look for min(sizeof(buf)-1, ...) patterns\n  // If min(...) is used and either\
+  \ sizeof or buffer name is referenced, assume bounded.\n  if (ExprHasName(LenExpr,\
+  \ \"min\", C) &&\n      (ExprHasName(LenExpr, \"sizeof\", C) || (!BufName.empty()\
+  \ && ExprHasName(LenExpr, BufName, C)))) {\n    return true;\n  }\n\n  // If sizeof(buffer)\
+  \ and \"-1\" present in the expression, assume bounded.\n  if ((!BufName.empty()\
+  \ && ExprHasName(LenExpr, BufName, C)) &&\n      ExprHasName(LenExpr, \"sizeof\"\
+  , C) &&\n      (ExprHasName(LenExpr, \"- 1\", C) || ExprHasName(LenExpr, \"-1\"\
+  , C))) {\n    return true;\n  }\n\n  return false;\n}\n\nbool SAGenTestChecker::exprLooksLikeRawUserLen(const\
+  \ Expr *LenExpr) const {\n  if (!LenExpr)\n    return false;\n  const Expr *E =\
+  \ LenExpr->IgnoreParenCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n      std::string\
+  \ Name = VD->getNameAsString();\n      std::string Lower = Name;\n      std::transform(Lower.begin(),\
+  \ Lower.end(), Lower.begin(), ::tolower);\n      static const char *Common[] = {\"\
+  nbytes\", \"len\", \"length\", \"count\", \"size\", \"n\", \"nr\", \"num\"};\n \
+  \     for (const char *S : Common) {\n        if (Lower == S)\n          return\
+  \ true;\n      }\n    }\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isCopyFromUser(Call, C))\n\
+  \    return;\n\n  if (Call.getNumArgs() < 3)\n    return;\n\n  const Expr *DestArg\
+  \ = Call.getArgExpr(0);\n  const Expr *LenExpr = Call.getArgExpr(2);\n  if (!DestArg\
+  \ || !LenExpr)\n    return;\n\n  // Destination must be a fixed-size array for our\
+  \ pattern.\n  std::string BufName;\n  llvm::APInt ArraySize;\n  if (!getDestArrayAndSize(DestArg,\
+  \ BufName, ArraySize))\n    return;\n\n  uint64_t BufSize = ArraySize.getLimitedValue();\n\
+  \  if (BufSize == 0)\n    return;\n\n  // If length is bounded by sizeof(buf)-1,\
+  \ consider safe.\n  if (exprIsStaticallyBoundedByBufMinusOne(LenExpr, BufName, (unsigned)BufSize,\
+  \ C))\n    return;\n\n  // If constant, check if it's > BufSize - 1 (unsafe).\n\
+  \  llvm::APSInt EvalRes;\n  if (EvaluateExprToInt(EvalRes, LenExpr, C)) {\n    uint64_t\
+  \ V = EvalRes.getLimitedValue();\n    if (V <= (uint64_t)BufSize - 1)\n      return;\
+  \ // safe\n    // else unsafe, report\n  } else {\n    // If symbolic and we can\
+  \ prove max <= BufSize - 1, safe.\n    ProgramStateRef State = C.getState();\n \
+  \   SVal SV = State->getSVal(LenExpr, C.getLocationContext());\n    if (SymbolRef\
+  \ Sym = SV.getAsSymbol()) {\n      if (const llvm::APSInt *MaxVal = inferSymbolMaxVal(Sym,\
+  \ C)) {\n        if (MaxVal->getLimitedValue() <= (uint64_t)BufSize - 1)\n     \
+  \     return; // safe\n      }\n    }\n    // Otherwise, only warn if it looks like\
+  \ a raw user length (e.g., nbytes)\n    if (!exprLooksLikeRawUserLen(LenExpr))\n\
+  \      return; // avoid noise\n  }\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"copy_from_user length not bounded by sizeof(buffer) - 1; possible\
+  \ overflow\", N);\n  R->addRange(DestArg->getSourceRange());\n  R->addRange(LenExpr->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\n} // end anonymous namespace\n\nextern \"C\"\
+  \ void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects unbounded copy_from_user into\
+  \ fixed-size buffers (missing sizeof(buf)-1 clamp)\",\n      \"\");\n}\n\nextern\
+  \ \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

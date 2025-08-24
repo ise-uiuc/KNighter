@@ -1,0 +1,451 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: c6087b82a9146826564a55c5ca0164cac40348f5
+commit_type: Buffer-Overflow
+index: 4
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/ASTContext.h\"\n#include \"\
+  clang/Lex/Lexer.h\"\n#include <cstdint>\n#include <string>\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\n// Program states\nREGISTER_MAP_WITH_PROGRAMSTATE(SizeBoundMap,\
+  \ const MemRegion*, uint64_t)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrToArraySizeMap,\
+  \ const MemRegion*, uint64_t)\n\nnamespace {\n\nclass SAGenTestChecker : public\
+  \ Checker<\n  check::PreCall,\n  check::PostStmt<DeclStmt>,\n  check::Bind\n> {\n\
+  \   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"copy_from_user length not capped by destination size\"\
+  , \"Memory Safety\")) {}\n\n      void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkPostStmt(const DeclStmt *DS, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C)\
+  \ const;\n\n   private:\n\n      // Helpers\n      static bool isIntegerLike(QualType\
+  \ QT);\n      static bool isPointerLike(QualType QT);\n      static bool containsMinusOne(const\
+  \ Expr *E, CheckerContext &C);\n      static const DeclRefExpr* findArrayDeclRef(const\
+  \ Expr *E);\n      static bool getArraySizeFromAny(const Expr *E, CheckerContext\
+  \ &C, uint64_t &OutSize, std::string &OutName);\n      static const MemRegion* getVarRegionForDecl(const\
+  \ VarDecl *VD, CheckerContext &C);\n\n      static bool computeBoundFromExpr(const\
+  \ Expr *E, CheckerContext &C, uint64_t &Bound);\n      static void tryRecordPtrToArrayAlias(ProgramStateRef\
+  \ &State, const MemRegion *LHSReg,\n                                           const\
+  \ Expr *RHS, CheckerContext &C);\n      static void tryRecordIntegerBound(ProgramStateRef\
+  \ &State, const MemRegion *LHSReg,\n                                        const\
+  \ Expr *RHS, CheckerContext &C);\n\n      void reportUnboundedCopy(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n};\n\n// ---------- Helper Implementations ----------\n\
+  \nbool SAGenTestChecker::isIntegerLike(QualType QT) {\n  return QT->isIntegerType();\n\
+  }\n\nbool SAGenTestChecker::isPointerLike(QualType QT) {\n  return QT->isPointerType();\n\
+  }\n\nbool SAGenTestChecker::containsMinusOne(const Expr *E, CheckerContext &C) {\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"- 1\", C) || ExprHasName(E,\
+  \ \"-1\", C);\n}\n\nconst DeclRefExpr* SAGenTestChecker::findArrayDeclRef(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  return findSpecificTypeInChildren<DeclRefExpr>(E);\n\
+  }\n\nbool SAGenTestChecker::getArraySizeFromAny(const Expr *E, CheckerContext &C,\n\
+  \                                           uint64_t &OutSize, std::string &OutName)\
+  \ {\n  if (!E) return false;\n\n  // Case 1: direct DeclRefExpr to an array (possibly\
+  \ after ignoring imp casts)\n  llvm::APInt Size;\n  const Expr *EI = E->IgnoreImpCasts();\n\
+  \  if (getArraySizeFromExpr(Size, EI)) {\n    OutSize = Size.getZExtValue();\n \
+  \   if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(EI)) {\n      if (const VarDecl\
+  \ *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n        OutName = VD->getName().str();\n\
+  \      }\n    }\n    return true;\n  }\n\n  // Case 2: find DeclRefExpr within complex\
+  \ expr, e.g., &arr[0]\n  if (const DeclRefExpr *DRE = findArrayDeclRef(E)) {\n \
+  \   llvm::APInt Size2;\n    if (getArraySizeFromExpr(Size2, DRE)) {\n      OutSize\
+  \ = Size2.getZExtValue();\n      if (const VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl()))\
+  \ {\n        OutName = VD->getName().str();\n      }\n      return true;\n    }\n\
+  \  }\n\n  // Case 3: RHS is a pointer variable that aliases an array recorded in\
+  \ state.\n  // Use getMemRegionFromExpr; do not ignore implicit before calling it.\n\
+  \  if (const MemRegion *MR = getMemRegionFromExpr(E, C)) {\n    MR = MR->getBaseRegion();\n\
+  \    ProgramStateRef State = C.getState();\n    if (const uint64_t *KnownSize =\
+  \ State->get<PtrToArraySizeMap>(MR)) {\n      OutSize = *KnownSize;\n      // Try\
+  \ to infer the array name (not strictly required).\n      if (const auto *VR = dyn_cast<VarRegion>(MR))\
+  \ {\n        OutName = VR->getDecl()->getName().str();\n      }\n      return true;\n\
+  \    }\n  }\n\n  return false;\n}\n\nconst MemRegion* SAGenTestChecker::getVarRegionForDecl(const\
+  \ VarDecl *VD, CheckerContext &C) {\n  if (!VD) return nullptr;\n  const LocationContext\
+  \ *LCtx = C.getLocationContext();\n  if (!LCtx) return nullptr;\n  MemRegionManager\
+  \ &MRM = C.getSValBuilder().getRegionManager();\n  const MemRegion *MR = MRM.getVarRegion(VD,\
+  \ LCtx);\n  if (!MR) return nullptr;\n  return MR->getBaseRegion();\n}\n\n// Attempt\
+  \ to compute a maximum bound from an expression that contains sizeof(array) or min(...,\
+  \ sizeof(array)[-1]).\nbool SAGenTestChecker::computeBoundFromExpr(const Expr *E,\
+  \ CheckerContext &C, uint64_t &Bound) {\n  if (!E) return false;\n\n  // Heuristic\
+  \ using source text: min( and sizeof(\n  if (ExprHasName(E, \"sizeof(\", C)) {\n\
+  \    uint64_t A = 0;\n    std::string ArrName;\n    if (getArraySizeFromAny(E, C,\
+  \ A, ArrName)) {\n      if (containsMinusOne(E, C)) {\n        if (A == 0) return\
+  \ false; // avoid underflow\n        Bound = A - 1;\n        return true;\n    \
+  \  }\n      Bound = A;\n      return true;\n    }\n  }\n\n  // If not matched, fail.\n\
+  \  return false;\n}\n\nvoid SAGenTestChecker::tryRecordPtrToArrayAlias(ProgramStateRef\
+  \ &State, const MemRegion *LHSReg,\n                                           \
+  \     const Expr *RHS, CheckerContext &C) {\n  if (!LHSReg || !RHS) return;\n  uint64_t\
+  \ A = 0;\n  std::string ArrName;\n  if (getArraySizeFromAny(RHS, C, A, ArrName))\
+  \ {\n    State = State->set<PtrToArraySizeMap>(LHSReg, A);\n    return;\n  }\n \
+  \ // If RHS is another pointer with known alias size, propagate.\n  if (const MemRegion\
+  \ *RHSReg = getMemRegionFromExpr(RHS, C)) {\n    RHSReg = RHSReg->getBaseRegion();\n\
+  \    if (const uint64_t *Known = State->get<PtrToArraySizeMap>(RHSReg)) {\n    \
+  \  State = State->set<PtrToArraySizeMap>(LHSReg, *Known);\n    }\n  }\n}\n\nvoid\
+  \ SAGenTestChecker::tryRecordIntegerBound(ProgramStateRef &State, const MemRegion\
+  \ *LHSReg,\n                                             const Expr *RHS, CheckerContext\
+  \ &C) {\n  if (!LHSReg || !RHS) return;\n\n  // Case 1: RHS contains sizeof or min\
+  \ with sizeof\n  uint64_t Bound = 0;\n  if (computeBoundFromExpr(RHS, C, Bound))\
+  \ {\n    State = State->set<SizeBoundMap>(LHSReg, Bound);\n    return;\n  }\n\n\
+  \  // Case 2: RHS is another variable with known bound\n  if (const MemRegion *RHSReg\
+  \ = getMemRegionFromExpr(RHS, C)) {\n    RHSReg = RHSReg->getBaseRegion();\n   \
+  \ if (const uint64_t *KnownB = State->get<SizeBoundMap>(RHSReg)) {\n      State\
+  \ = State->set<SizeBoundMap>(LHSReg, *KnownB);\n    }\n  }\n}\n\n// ---------- Core\
+  \ Checkers ----------\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if\
+  \ (!Origin)\n    return;\n\n  // Use source-text based matcher per suggestions\n\
+  \  if (!ExprHasName(Origin, \"copy_from_user\", C))\n    return;\n\n  if (Call.getNumArgs()\
+  \ < 3)\n    return;\n\n  const Expr *DestExpr = Call.getArgExpr(0);\n  const Expr\
+  \ *LenExpr  = Call.getArgExpr(2);\n  if (!DestExpr || !LenExpr)\n    return;\n\n\
+  \  // Determine destination array size A\n  uint64_t A = 0;\n  std::string DestName;\n\
+  \  if (!getArraySizeFromAny(DestExpr, C, A, DestName)) {\n    // Unknown destination\
+  \ size: avoid false positives\n    return;\n  }\n\n  // Try to prove the length\
+  \ is safe\n  bool Safe = false;\n\n  // Case 1: LenExpr is constant\n  llvm::APSInt\
+  \ EvalRes;\n  if (EvaluateExprToInt(EvalRes, LenExpr, C)) {\n    uint64_t V = EvalRes.getZExtValue();\n\
+  \    if (V <= A) {\n      Safe = true;\n    }\n  }\n\n  // Case 2: LenExpr contains\
+  \ sizeof(dest)\n  if (!Safe && !DestName.empty()) {\n    if (ExprHasName(LenExpr,\
+  \ \"sizeof(\", C) && ExprHasName(LenExpr, DestName, C)) {\n      // Heuristic: if\
+  \ it has sizeof(dest) we consider it bounded\n      Safe = true;\n    }\n  }\n\n\
+  \  // Case 3: LenExpr is an identifier with known bound\n  if (!Safe) {\n    const\
+  \ Expr *LenEI = LenExpr;\n    if (const DeclRefExpr *LenDRE = dyn_cast_or_null<DeclRefExpr>(LenEI->IgnoreImplicit()))\
+  \ {\n      // Use getMemRegionFromExpr without stripping implicit as per suggestion\n\
+  \      if (const MemRegion *LenReg = getMemRegionFromExpr(LenExpr, C)) {\n     \
+  \   LenReg = LenReg->getBaseRegion();\n        ProgramStateRef State = C.getState();\n\
+  \        if (const uint64_t *Bound = State->get<SizeBoundMap>(LenReg)) {\n     \
+  \     if (*Bound <= A)\n            Safe = true;\n        }\n      }\n    }\n  }\n\
+  \n  // Case 4: Use constraint manager inferred max\n  if (!Safe) {\n    SVal LenVal\
+  \ = C.getState()->getSVal(LenExpr, C.getLocationContext());\n    if (SymbolRef Sym\
+  \ = LenVal.getAsSymbol()) {\n      if (const llvm::APSInt *MaxV = inferSymbolMaxVal(Sym,\
+  \ C)) {\n        uint64_t MV = MaxV->getZExtValue();\n        if (MV <= A)\n   \
+  \       Safe = true;\n      }\n    }\n  }\n\n  if (!Safe) {\n    reportUnboundedCopy(Call,\
+  \ C);\n  }\n}\n\nvoid SAGenTestChecker::checkPostStmt(const DeclStmt *DS, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  const LocationContext\
+  \ *LCtx = C.getLocationContext();\n  if (!LCtx) return;\n\n  for (const Decl *D\
+  \ : DS->decls()) {\n    const auto *VD = dyn_cast<VarDecl>(D);\n    if (!VD)\n \
+  \     continue;\n\n    const Expr *Init = VD->getInit();\n    if (!Init)\n     \
+  \ continue;\n\n    const MemRegion *VarReg = getVarRegionForDecl(VD, C);\n    if\
+  \ (!VarReg) continue;\n\n    // Integer-like variables: record bounds\n    if (isIntegerLike(VD->getType()))\
+  \ {\n      uint64_t Bound = 0;\n      if (computeBoundFromExpr(Init, C, Bound))\
+  \ {\n        State = State->set<SizeBoundMap>(VarReg, Bound);\n      } else {\n\
+  \        // If initializer is a reference to another bounded integer, propagate.\n\
+  \        if (const MemRegion *InitReg = getMemRegionFromExpr(Init, C)) {\n     \
+  \     InitReg = InitReg->getBaseRegion();\n          if (const uint64_t *Known =\
+  \ State->get<SizeBoundMap>(InitReg)) {\n            State = State->set<SizeBoundMap>(VarReg,\
+  \ *Known);\n          }\n        }\n      }\n    }\n\n    // Pointer-like variables:\
+  \ record pointer-to-array alias if initializer refers to array\n    if (isPointerLike(VD->getType()))\
+  \ {\n      uint64_t A = 0;\n      std::string ArrName;\n      if (getArraySizeFromAny(Init,\
+  \ C, A, ArrName)) {\n        State = State->set<PtrToArraySizeMap>(VarReg, A);\n\
+  \      }\n    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if\
+  \ (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  // We prefer\
+  \ to only process clear assignment statements\n  const auto *BO = dyn_cast_or_null<BinaryOperator>(StoreE);\n\
+  \  if (!BO || !BO->isAssignmentOp()) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  const Expr *LHS = BO->getLHS();\n  const Expr *RHS = BO->getRHS();\n \
+  \ if (!LHS || !RHS) {\n    C.addTransition(State);\n    return;\n  }\n\n  QualType\
+  \ LHSTy = LHS->getType();\n\n  if (isIntegerLike(LHSTy)) {\n    tryRecordIntegerBound(State,\
+  \ LHSReg, RHS, C);\n  } else if (isPointerLike(LHSTy)) {\n    tryRecordPtrToArrayAlias(State,\
+  \ LHSReg, RHS, C);\n  }\n\n  C.addTransition(State);\n}\n\n// ---------- Reporting\
+  \ ----------\n\nvoid SAGenTestChecker::reportUnboundedCopy(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \   *BT, \"copy_from_user length not capped by destination size\", N);\n  if (const\
+  \ Expr *E = Call.getOriginExpr())\n    R->addRange(E->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unbounded copy_from_user into fixed-size stack buffers\",\n \
+  \     \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nscsi: lpfc: Prevent lpfc_debugfs_lockstat_write()\
+  \ buffer overflow\n\nA static code analysis tool flagged the possibility of buffer\
+  \ overflow when\nusing copy_from_user() for a debugfs entry.\n\nCurrently, it is\
+  \ possible that copy_from_user() copies more bytes than what\nwould fit in the mybuf\
+  \ char array.  Add a min() restriction check between\nsizeof(mybuf) - 1 and nbytes\
+  \ passed from the userspace buffer to protect\nagainst buffer overflow.\n\nLink:\
+  \ https://lore.kernel.org/r/20230301231626.9621-2-justintee8345@gmail.com\nSigned-off-by:\
+  \ Justin Tee <justin.tee@broadcom.com>\nSigned-off-by: Martin K. Petersen <martin.petersen@oracle.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: lpfc_debugfs_lockstat_write in drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  static ssize_t\nlpfc_debugfs_lockstat_write(struct file *file, const char __user\
+  \ *buf,\n\t\t\t    size_t nbytes, loff_t *ppos)\n{\n\tstruct lpfc_debug *debug =\
+  \ file->private_data;\n\tstruct lpfc_hba *phba = (struct lpfc_hba *)debug->i_private;\n\
+  \tstruct lpfc_sli4_hdw_queue *qp;\n\tchar mybuf[64];\n\tchar *pbuf;\n\tint i;\n\n\
+  \tmemset(mybuf, 0, sizeof(mybuf));\n\n\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  \t\treturn -EFAULT;\n\tpbuf = &mybuf[0];\n\n\tif ((strncmp(pbuf, \"reset\", strlen(\"\
+  reset\")) == 0) ||\n\t    (strncmp(pbuf, \"zero\", strlen(\"zero\")) == 0)) {\n\t\
+  \tfor (i = 0; i < phba->cfg_hdw_queue; i++) {\n\t\t\tqp = &phba->sli4_hba.hdwq[i];\n\
+  \t\t\tqp->lock_conflict.alloc_xri_get = 0;\n\t\t\tqp->lock_conflict.alloc_xri_put\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_xri = 0;\n\t\t\tqp->lock_conflict.wq_access\
+  \ = 0;\n\t\t\tqp->lock_conflict.alloc_pvt_pool = 0;\n\t\t\tqp->lock_conflict.mv_from_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.mv_to_pub_pool = 0;\n\t\t\tqp->lock_conflict.mv_to_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_pvt_pool = 0;\n\t\t\tqp->lock_conflict.free_pub_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.wq_access = 0;\n\t\t}\n\t}\n\treturn nbytes;\n}\n\
+  ```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/scsi/lpfc/lpfc_debugfs.c\
+  \ b/drivers/scsi/lpfc/lpfc_debugfs.c\nindex f5252e45a48a..3e365e5e194a 100644\n\
+  --- a/drivers/scsi/lpfc/lpfc_debugfs.c\n+++ b/drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  @@ -2157,10 +2157,13 @@ lpfc_debugfs_lockstat_write(struct file *file, const char\
+  \ __user *buf,\n \tchar mybuf[64];\n \tchar *pbuf;\n \tint i;\n+\tsize_t bsize;\n\
+  \ \n \tmemset(mybuf, 0, sizeof(mybuf));\n \n-\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  +\tbsize = min(nbytes, (sizeof(mybuf) - 1));\n+\n+\tif (copy_from_user(mybuf, buf,\
+  \ bsize))\n \t\treturn -EFAULT;\n \tpbuf = &mybuf[0];\n \n@@ -2181,7 +2184,7 @@\
+  \ lpfc_debugfs_lockstat_write(struct file *file, const char __user *buf,\n \t\t\t\
+  qp->lock_conflict.wq_access = 0;\n \t\t}\n \t}\n-\treturn nbytes;\n+\treturn bsize;\n\
+  \ }\n #endif\n \n```\n"
+pattern: '## Bug Pattern
+
+
+  Copying user-provided data into a fixed-size stack buffer using copy_from_user()
+  without bounding the length by the buffer size (e.g., using nbytes directly). This
+  allows nbytes (controlled by userspace) to exceed sizeof(buffer), causing a stack
+  buffer overflow. The safe pattern is to cap the length to min(nbytes, sizeof(buffer)
+  - 1) before copying, especially when the buffer is later treated as a string.'
+plan: "1) Program state customizations\n- REGISTER_MAP_WITH_PROGRAMSTATE(SizeBoundMap,\
+  \ const MemRegion*, uint64_t)\n  - Tracks integer variables that hold a bounded\
+  \ length (upper bound) derived from sizeof(array) (optionally minus a small constant)\
+  \ or a min(...) with such sizeof bound.\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrToArraySizeMap,\
+  \ const MemRegion*, uint64_t)\n  - Tracks pointer variables that alias a fixed-size\
+  \ array (e.g., p = mybuf; or p = &mybuf[0];), recording the array\u2019s size.\n\
+  - No other traits needed.\n\n2) Callback selection and implementation steps\n\n\
+  A) checkPreCall (detect unsafe copy_from_user invocations)\n- Goal: Warn when copy_from_user(dst,\
+  \ src, len) copies into a fixed-size stack array without capping len by the array\
+  \ size.\n- Steps:\n  1) Identify target calls:\n     - If Call.getCalleeIdentifier()->getName()\
+  \ != \"copy_from_user\", return.\n  2) Extract arguments:\n     - DestExpr = Call.getArgExpr(0)->IgnoreImpCasts()\n\
+  \     - LenExpr  = Call.getArgExpr(2)->IgnoreImpCasts()\n  3) Determine destination\
+  \ buffer size A (in bytes):\n     - Try getArraySizeFromExpr(ArraySize, DestExpr).\
+  \ This works if DestExpr is a DeclRefExpr (array decays to pointer).\n     - Else\
+  \ if DestExpr is UnaryOperator (\u2018&\u2019) of an ArraySubscriptExpr (e.g., &mybuf[0]):\n\
+  \       - Get base of ArraySubscriptExpr, find DeclRefExpr and call getArraySizeFromExpr\
+  \ on that.\n       - You can use findSpecificTypeInChildren<DeclRefExpr>(DestExpr)\
+  \ and then getArraySizeFromExpr on it.\n     - Else if DestExpr is a pointer variable:\n\
+  \       - Get its MemRegion via getMemRegionFromExpr; lookup in PtrToArraySizeMap.\
+  \ If found, use that size.\n     - If A is still unknown, bail out (to avoid false\
+  \ positives).\n  4) Decide if len is safely bounded:\n     - Case 1: LenExpr is\
+  \ a compile-time constant:\n       - If EvaluateExprToInt succeeds and value <=\
+  \ A, safe; else report.\n     - Case 2: LenExpr syntactically expresses a bound\
+  \ using sizeof of the destination:\n       - Use ExprHasName(LenExpr, \"sizeof(\"\
+  ) and also ensure it contains the array name if available (from the DeclRefExpr\
+  \ found for the destination). If true, mark safe.\n     - Case 3: LenExpr is an\
+  \ identifier (DeclRefExpr) to a variable with a known bound:\n       - Get MemRegion\
+  \ of LenExpr. If SizeBoundMap has an entry (Bound) and Bound <= A, safe; else not\
+  \ proven safe.\n     - Case 4: Use constraint manager upper bound:\n       - Extract\
+  \ symbol for LenExpr (C.getSVal(LenExpr,...).getAsSymbol()); call inferSymbolMaxVal.\
+  \ If present and <= A, safe; else not proven safe.\n     - If none of the above\
+  \ prove safety, emit a report.\n  5) Reporting:\n     - Create a non-fatal error\
+  \ node and emit a PathSensitiveBugReport with a short message:\n       - \"copy_from_user\
+  \ length not capped by destination size\"\n     - Highlight the call expression.\n\
+  \nB) checkPostStmt (DeclStmt) (record bounded sizes during variable initialization)\n\
+  - Goal: Populate SizeBoundMap for variables initialized from min(...) with sizeof\
+  \ array, or directly from sizeof(array) +/- c.\n- Steps:\n  1) For each VarDecl\
+  \ V with initializer Init:\n     - Only consider integer/size_t-like variables (e.g.,\
+  \ V->getType()->isIntegerType()).\n  2) Analyze Init to detect bound patterns:\n\
+  \     - If source text contains \"min(\" AND \"sizeof(\":\n       - We treat this\
+  \ as a capped bound. Attempt to compute the maximum cap:\n         - Find a DeclRefExpr\
+  \ inside Init referring to an array variable (use findSpecificTypeInChildren<DeclRefExpr>(Init)).\n\
+  \         - Call getArraySizeFromExpr to obtain array size A if that DeclRefExpr\u2019\
+  s type is ConstantArrayType.\n         - Determine if source contains \"- 1\" (ExprHasName(Init,\
+  \ \"- 1\") or \"-1\"); if yes, Bound = A - 1; else Bound = A.\n       - If A is\
+  \ found, store: SizeBoundMap[Region(V)] = Bound.\n     - Else if Init contains \"\
+  sizeof(\" (no min):\n       - Similarly, detect an array DeclRefExpr; compute A;\
+  \ detect optional \"- 1\"; Bound = (A - 1) or A; store in SizeBoundMap.\n     -\
+  \ Else if Init is a DeclRefExpr to another variable W:\n       - If W has a bound\
+  \ in SizeBoundMap, copy it: SizeBoundMap[Region(V)] = SizeBoundMap[Region(W)].\n\
+  \  3) Do not emit reports here.\n\nC) checkBind (propagate bounds on assignments\
+  \ and track pointer-to-array aliases)\n- Goal: Keep SizeBoundMap and PtrToArraySizeMap\
+  \ updated when variables are assigned.\n- Steps:\n  1) If S is a BinaryOperator\
+  \ that\u2019s an assignment (opKind is =, += not needed):\n     - Let LHS be the\
+  \ assigned variable; get its MemRegion (only if it\u2019s a variable region).\n\
+  \     - Let RHS be the assigned expression (binop->getRHS()).\n  2) Propagate integer\
+  \ size bounds:\n     - If LHS type is integer/size_t-like:\n       - If RHS source\
+  \ contains \"min(\" and \"sizeof(\":\n         - Find DeclRefExpr for an array inside\
+  \ RHS; compute A with getArraySizeFromExpr.\n         - Determine optional \"- 1\"\
+  \ as above; Bound = (A - 1) or A.\n         - Record: SizeBoundMap[Region(LHS)]\
+  \ = Bound.\n       - Else if RHS contains \"sizeof(\":\n         - Compute A similarly;\
+  \ detect \"- 1\"; record Bound.\n       - Else if RHS is a DeclRefExpr to another\
+  \ integer variable with a known bound:\n         - Copy bound: SizeBoundMap[Region(LHS)]\
+  \ = SizeBoundMap[Region(RHS)].\n       - Else: do nothing (don\u2019t clear previous\
+  \ info; allow later overwrites to replace).\n  3) Track pointer-to-array alias for\
+  \ destination resolution:\n     - If LHS type is a pointer (char*, void*, etc.):\n\
+  \       - If RHS refers to an array (DeclRefExpr of ConstantArrayType) or is &ArraySubscriptExpr\
+  \ based on an array:\n         - Compute A using getArraySizeFromExpr (on array\
+  \ DeclRefExpr found in RHS).\n         - Record: PtrToArraySizeMap[Region(LHS)]\
+  \ = A.\n\nD) Optional: checkEndFunction / checkRegionChanges\n- Not needed. Rely\
+  \ on the analyzer to drop maps at function boundaries automatically.\n\n3) Heuristics\
+  \ and notes\n- Destination array detection:\n  - Prefer direct getArraySizeFromExpr\
+  \ on DeclRefExpr or on the DeclRefExpr found inside &arr[0] forms via findSpecificTypeInChildren.\n\
+  \  - Only report when destination size A is known (ConstantArrayType) and the destination\
+  \ originates from a local stack array (VarDecl->hasLocalStorage()) to reduce false\
+  \ positives.\n- Len safety checks:\n  - If the argument text contains \"sizeof(\"\
+  \ and contains the destination array\u2019s name, consider it safe even without\
+  \ \"- 1\".\n  - When using SizeBoundMap, accept as safe if Bound <= A.\n  - When\
+  \ using constraint manager, accept as safe if inferred max <= A.\n- Macros:\n  -\
+  \ Use ExprHasName to detect \"min(\" and \"sizeof(\" from the source text, which\
+  \ stays intact before macro expansion. This handles kernel min() macro usage.\n\
+  - Report message:\n  - Keep it short and clear: \"copy_from_user length not capped\
+  \ by destination size\".\n\n4) Summary of utility functions used\n- getArraySizeFromExpr\
+  \ to get constant array sizes from DeclRefExprs.\n- findSpecificTypeInChildren to\
+  \ locate DeclRefExpr or sizeof (UnaryExprOrTypeTraitExpr) deep inside complex expressions\
+  \ like &arr[0] or min macro expansions.\n- EvaluateExprToInt to quickly accept constant\
+  \ length arguments.\n- inferSymbolMaxVal to leverage constraint information when\
+  \ available.\n- getMemRegionFromExpr to map expressions to regions for SizeBoundMap/PtrToArraySizeMap.\n\
+  - ExprHasName to detect \"min(\" / \"sizeof(\" / \"- 1\" patterns in source text.\n\
+  \n5) Minimal end-to-end flow\n- As variables get initialized/assigned, record bounds\
+  \ (SizeBoundMap) or pointer-to-array aliases (PtrToArraySizeMap).\n- On each copy_from_user\
+  \ call, derive the destination array size A; then verify the third argument is provably\
+  \ <= A via one of: constant evaluation, direct \"sizeof(dest)\" text, recorded bound,\
+  \ or inferred max; otherwise, emit a bug report."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/ASTContext.h\"\n#include \"\
+  clang/Lex/Lexer.h\"\n#include <cstdint>\n#include <string>\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\n// Program states\nREGISTER_MAP_WITH_PROGRAMSTATE(SizeBoundMap,\
+  \ const MemRegion*, uint64_t)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrToArraySizeMap,\
+  \ const MemRegion*, uint64_t)\n\nnamespace {\n\nclass SAGenTestChecker : public\
+  \ Checker<\n  check::PreCall,\n  check::PostStmt<DeclStmt>,\n  check::Bind\n> {\n\
+  \   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"copy_from_user length not capped by destination size\"\
+  , \"Memory Safety\")) {}\n\n      void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkPostStmt(const DeclStmt *DS, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C)\
+  \ const;\n\n   private:\n\n      // Helpers\n      static bool isIntegerLike(QualType\
+  \ QT);\n      static bool isPointerLike(QualType QT);\n      static bool containsMinusOne(const\
+  \ Expr *E, CheckerContext &C);\n      static const DeclRefExpr* findArrayDeclRef(const\
+  \ Expr *E);\n      static bool getArraySizeFromAny(const Expr *E, CheckerContext\
+  \ &C, uint64_t &OutSize, std::string &OutName);\n      static const MemRegion* getVarRegionForDecl(const\
+  \ VarDecl *VD, CheckerContext &C);\n\n      static bool computeBoundFromExpr(const\
+  \ Expr *E, CheckerContext &C, uint64_t &Bound);\n      static void tryRecordPtrToArrayAlias(ProgramStateRef\
+  \ &State, const MemRegion *LHSReg,\n                                           const\
+  \ Expr *RHS, CheckerContext &C);\n      static void tryRecordIntegerBound(ProgramStateRef\
+  \ &State, const MemRegion *LHSReg,\n                                        const\
+  \ Expr *RHS, CheckerContext &C);\n\n      void reportUnboundedCopy(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n};\n\n// ---------- Helper Implementations ----------\n\
+  \nbool SAGenTestChecker::isIntegerLike(QualType QT) {\n  return QT->isIntegerType();\n\
+  }\n\nbool SAGenTestChecker::isPointerLike(QualType QT) {\n  return QT->isPointerType();\n\
+  }\n\nbool SAGenTestChecker::containsMinusOne(const Expr *E, CheckerContext &C) {\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"- 1\", C) || ExprHasName(E,\
+  \ \"-1\", C);\n}\n\nconst DeclRefExpr* SAGenTestChecker::findArrayDeclRef(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  return findSpecificTypeInChildren<DeclRefExpr>(E);\n\
+  }\n\nbool SAGenTestChecker::getArraySizeFromAny(const Expr *E, CheckerContext &C,\n\
+  \                                           uint64_t &OutSize, std::string &OutName)\
+  \ {\n  if (!E) return false;\n\n  // Case 1: direct DeclRefExpr to an array (possibly\
+  \ after ignoring imp casts)\n  llvm::APInt Size;\n  const Expr *EI = E->IgnoreImpCasts();\n\
+  \  if (getArraySizeFromExpr(Size, EI)) {\n    OutSize = Size.getZExtValue();\n \
+  \   if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(EI)) {\n      if (const VarDecl\
+  \ *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n        OutName = VD->getName().str();\n\
+  \      }\n    }\n    return true;\n  }\n\n  // Case 2: find DeclRefExpr within complex\
+  \ expr, e.g., &arr[0]\n  if (const DeclRefExpr *DRE = findArrayDeclRef(E)) {\n \
+  \   llvm::APInt Size2;\n    if (getArraySizeFromExpr(Size2, DRE)) {\n      OutSize\
+  \ = Size2.getZExtValue();\n      if (const VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl()))\
+  \ {\n        OutName = VD->getName().str();\n      }\n      return true;\n    }\n\
+  \  }\n\n  // Case 3: RHS is a pointer variable that aliases an array recorded in\
+  \ state.\n  // Use getMemRegionFromExpr; do not ignore implicit before calling it.\n\
+  \  if (const MemRegion *MR = getMemRegionFromExpr(E, C)) {\n    MR = MR->getBaseRegion();\n\
+  \    ProgramStateRef State = C.getState();\n    if (const uint64_t *KnownSize =\
+  \ State->get<PtrToArraySizeMap>(MR)) {\n      OutSize = *KnownSize;\n      // Try\
+  \ to infer the array name (not strictly required).\n      if (const auto *VR = dyn_cast<VarRegion>(MR))\
+  \ {\n        OutName = VR->getDecl()->getName().str();\n      }\n      return true;\n\
+  \    }\n  }\n\n  return false;\n}\n\nconst MemRegion* SAGenTestChecker::getVarRegionForDecl(const\
+  \ VarDecl *VD, CheckerContext &C) {\n  if (!VD) return nullptr;\n  const LocationContext\
+  \ *LCtx = C.getLocationContext();\n  if (!LCtx) return nullptr;\n  MemRegionManager\
+  \ &MRM = C.getSValBuilder().getRegionManager();\n  const MemRegion *MR = MRM.getVarRegion(VD,\
+  \ LCtx);\n  if (!MR) return nullptr;\n  return MR->getBaseRegion();\n}\n\n// Attempt\
+  \ to compute a maximum bound from an expression that contains sizeof(array) or min(...,\
+  \ sizeof(array)[-1]).\nbool SAGenTestChecker::computeBoundFromExpr(const Expr *E,\
+  \ CheckerContext &C, uint64_t &Bound) {\n  if (!E) return false;\n\n  // Heuristic\
+  \ using source text: min( and sizeof(\n  if (ExprHasName(E, \"sizeof(\", C)) {\n\
+  \    uint64_t A = 0;\n    std::string ArrName;\n    if (getArraySizeFromAny(E, C,\
+  \ A, ArrName)) {\n      if (containsMinusOne(E, C)) {\n        if (A == 0) return\
+  \ false; // avoid underflow\n        Bound = A - 1;\n        return true;\n    \
+  \  }\n      Bound = A;\n      return true;\n    }\n  }\n\n  // If not matched, fail.\n\
+  \  return false;\n}\n\nvoid SAGenTestChecker::tryRecordPtrToArrayAlias(ProgramStateRef\
+  \ &State, const MemRegion *LHSReg,\n                                           \
+  \     const Expr *RHS, CheckerContext &C) {\n  if (!LHSReg || !RHS) return;\n  uint64_t\
+  \ A = 0;\n  std::string ArrName;\n  if (getArraySizeFromAny(RHS, C, A, ArrName))\
+  \ {\n    State = State->set<PtrToArraySizeMap>(LHSReg, A);\n    return;\n  }\n \
+  \ // If RHS is another pointer with known alias size, propagate.\n  if (const MemRegion\
+  \ *RHSReg = getMemRegionFromExpr(RHS, C)) {\n    RHSReg = RHSReg->getBaseRegion();\n\
+  \    if (const uint64_t *Known = State->get<PtrToArraySizeMap>(RHSReg)) {\n    \
+  \  State = State->set<PtrToArraySizeMap>(LHSReg, *Known);\n    }\n  }\n}\n\nvoid\
+  \ SAGenTestChecker::tryRecordIntegerBound(ProgramStateRef &State, const MemRegion\
+  \ *LHSReg,\n                                             const Expr *RHS, CheckerContext\
+  \ &C) {\n  if (!LHSReg || !RHS) return;\n\n  // Case 1: RHS contains sizeof or min\
+  \ with sizeof\n  uint64_t Bound = 0;\n  if (computeBoundFromExpr(RHS, C, Bound))\
+  \ {\n    State = State->set<SizeBoundMap>(LHSReg, Bound);\n    return;\n  }\n\n\
+  \  // Case 2: RHS is another variable with known bound\n  if (const MemRegion *RHSReg\
+  \ = getMemRegionFromExpr(RHS, C)) {\n    RHSReg = RHSReg->getBaseRegion();\n   \
+  \ if (const uint64_t *KnownB = State->get<SizeBoundMap>(RHSReg)) {\n      State\
+  \ = State->set<SizeBoundMap>(LHSReg, *KnownB);\n    }\n  }\n}\n\n// ---------- Core\
+  \ Checkers ----------\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if\
+  \ (!Origin)\n    return;\n\n  // Use source-text based matcher per suggestions\n\
+  \  if (!ExprHasName(Origin, \"copy_from_user\", C))\n    return;\n\n  if (Call.getNumArgs()\
+  \ < 3)\n    return;\n\n  const Expr *DestExpr = Call.getArgExpr(0);\n  const Expr\
+  \ *LenExpr  = Call.getArgExpr(2);\n  if (!DestExpr || !LenExpr)\n    return;\n\n\
+  \  // Determine destination array size A\n  uint64_t A = 0;\n  std::string DestName;\n\
+  \  if (!getArraySizeFromAny(DestExpr, C, A, DestName)) {\n    // Unknown destination\
+  \ size: avoid false positives\n    return;\n  }\n\n  // Try to prove the length\
+  \ is safe\n  bool Safe = false;\n\n  // Case 1: LenExpr is constant\n  llvm::APSInt\
+  \ EvalRes;\n  if (EvaluateExprToInt(EvalRes, LenExpr, C)) {\n    uint64_t V = EvalRes.getZExtValue();\n\
+  \    if (V <= A) {\n      Safe = true;\n    }\n  }\n\n  // Case 2: LenExpr contains\
+  \ sizeof(dest)\n  if (!Safe && !DestName.empty()) {\n    if (ExprHasName(LenExpr,\
+  \ \"sizeof(\", C) && ExprHasName(LenExpr, DestName, C)) {\n      // Heuristic: if\
+  \ it has sizeof(dest) we consider it bounded\n      Safe = true;\n    }\n  }\n\n\
+  \  // Case 3: LenExpr is an identifier with known bound\n  if (!Safe) {\n    const\
+  \ Expr *LenEI = LenExpr;\n    if (const DeclRefExpr *LenDRE = dyn_cast_or_null<DeclRefExpr>(LenEI->IgnoreImplicit()))\
+  \ {\n      // Use getMemRegionFromExpr without stripping implicit as per suggestion\n\
+  \      if (const MemRegion *LenReg = getMemRegionFromExpr(LenExpr, C)) {\n     \
+  \   LenReg = LenReg->getBaseRegion();\n        ProgramStateRef State = C.getState();\n\
+  \        if (const uint64_t *Bound = State->get<SizeBoundMap>(LenReg)) {\n     \
+  \     if (*Bound <= A)\n            Safe = true;\n        }\n      }\n    }\n  }\n\
+  \n  // Case 4: Use constraint manager inferred max\n  if (!Safe) {\n    SVal LenVal\
+  \ = C.getState()->getSVal(LenExpr, C.getLocationContext());\n    if (SymbolRef Sym\
+  \ = LenVal.getAsSymbol()) {\n      if (const llvm::APSInt *MaxV = inferSymbolMaxVal(Sym,\
+  \ C)) {\n        uint64_t MV = MaxV->getZExtValue();\n        if (MV <= A)\n   \
+  \       Safe = true;\n      }\n    }\n  }\n\n  if (!Safe) {\n    reportUnboundedCopy(Call,\
+  \ C);\n  }\n}\n\nvoid SAGenTestChecker::checkPostStmt(const DeclStmt *DS, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  const LocationContext\
+  \ *LCtx = C.getLocationContext();\n  if (!LCtx) return;\n\n  for (const Decl *D\
+  \ : DS->decls()) {\n    const auto *VD = dyn_cast<VarDecl>(D);\n    if (!VD)\n \
+  \     continue;\n\n    const Expr *Init = VD->getInit();\n    if (!Init)\n     \
+  \ continue;\n\n    const MemRegion *VarReg = getVarRegionForDecl(VD, C);\n    if\
+  \ (!VarReg) continue;\n\n    // Integer-like variables: record bounds\n    if (isIntegerLike(VD->getType()))\
+  \ {\n      uint64_t Bound = 0;\n      if (computeBoundFromExpr(Init, C, Bound))\
+  \ {\n        State = State->set<SizeBoundMap>(VarReg, Bound);\n      } else {\n\
+  \        // If initializer is a reference to another bounded integer, propagate.\n\
+  \        if (const MemRegion *InitReg = getMemRegionFromExpr(Init, C)) {\n     \
+  \     InitReg = InitReg->getBaseRegion();\n          if (const uint64_t *Known =\
+  \ State->get<SizeBoundMap>(InitReg)) {\n            State = State->set<SizeBoundMap>(VarReg,\
+  \ *Known);\n          }\n        }\n      }\n    }\n\n    // Pointer-like variables:\
+  \ record pointer-to-array alias if initializer refers to array\n    if (isPointerLike(VD->getType()))\
+  \ {\n      uint64_t A = 0;\n      std::string ArrName;\n      if (getArraySizeFromAny(Init,\
+  \ C, A, ArrName)) {\n        State = State->set<PtrToArraySizeMap>(VarReg, A);\n\
+  \      }\n    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if\
+  \ (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  // We prefer\
+  \ to only process clear assignment statements\n  const auto *BO = dyn_cast_or_null<BinaryOperator>(StoreE);\n\
+  \  if (!BO || !BO->isAssignmentOp()) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  const Expr *LHS = BO->getLHS();\n  const Expr *RHS = BO->getRHS();\n \
+  \ if (!LHS || !RHS) {\n    C.addTransition(State);\n    return;\n  }\n\n  QualType\
+  \ LHSTy = LHS->getType();\n\n  if (isIntegerLike(LHSTy)) {\n    tryRecordIntegerBound(State,\
+  \ LHSReg, RHS, C);\n  } else if (isPointerLike(LHSTy)) {\n    tryRecordPtrToArrayAlias(State,\
+  \ LHSReg, RHS, C);\n  }\n\n  C.addTransition(State);\n}\n\n// ---------- Reporting\
+  \ ----------\n\nvoid SAGenTestChecker::reportUnboundedCopy(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \   *BT, \"copy_from_user length not capped by destination size\", N);\n  if (const\
+  \ Expr *E = Call.getOriginExpr())\n    R->addRange(E->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unbounded copy_from_user into fixed-size stack buffers\",\n \
+  \     \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

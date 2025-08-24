@@ -1,0 +1,5 @@
+- Decision: NotABug
+- Reason: The target bug pattern requires using netdev’s private data (priv = netdev_priv(netdev)) after calling free_netdev(), typically via canceling/flushing work/timers/IRQs that reference priv. In the reported path in lan78xx_probe(), the code does:
+  - out2: free_netdev(netdev);
+  - out1: usb_put_dev(udev);
+  The flagged statement usb_put_dev(udev) does not access netdev_priv or any member of priv; it operates on the local udev variable obtained from usb_get_dev(), which is independent of net_device and its private area. There is no dereference of dev = netdev_priv(netdev) after free_netdev in this path. Additionally, in this early error path (failure right after lan78xx_urb_config_init), deferred work/timers/NAPI have not yet been set up, so there is nothing to cancel before freeing the netdev. In later failure paths where such items are initialized, the code calls lan78xx_unbind(dev, intf) prior to free_netdev(), which is where cancellations typically occur. Therefore, the report neither matches the specified bug pattern nor indicates a real use-after-free.

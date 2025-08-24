@@ -1,0 +1,252 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -23,6 +23,152 @@
+ namespace {
+
++// Utility: check if two types are the same ignoring qualifiers.
++static bool typesEqualIgnoreQual(ASTContext &ACtx, QualType A, QualType B) {
++  return ACtx.getCanonicalType(A.getUnqualifiedType()) ==
++         ACtx.getCanonicalType(B.getUnqualifiedType());
++}
++
++// Utility: get the element type referenced inside a sizeof(...) expression.
++// Returns true and sets ElemTy if E is a sizeof(...) and we can deduce the type.
++static bool getElemTypeFromSizeof(const Expr *E, QualType &ElemTy) {
++  if (!E)
++    return false;
++  E = E->IgnoreParenImpCasts();
++  const auto *U = dyn_cast<UnaryExprOrTypeTraitExpr>(E);
++  if (!U || U->getKind() != UETT_SizeOf)
++    return false;
++
++  if (U->isArgumentType())
++    ElemTy = U->getArgumentType();
++  else if (const Expr *Arg = U->getArgumentExpr())
++    ElemTy = Arg->getType();
++  else
++    return false;
++
++  return true;
++}
++
++// Utility: determine if a type is an integer-like builtin type (e.g., u32, u16).
++static bool isIntegerLikeBuiltin(QualType T) {
++  T = T.getCanonicalType().getUnqualifiedType();
++  return T->isIntegerType() || T->isAnyCharacterType() || T->isEnumeralType();
++}
++
++// Return the BinaryOperator if E is exactly a multiplication where one side
++// is a sizeof(...) expression. Also return which side is the sizeof and the
++// other side as CountExpr.
++static const BinaryOperator *getMulWithSizeof(const Expr *E,
++                                              const UnaryExprOrTypeTraitExpr *&SizeofUE,
++                                              const Expr *&CountExpr) {
++  SizeofUE = nullptr;
++  CountExpr = nullptr;
++  if (!E)
++    return nullptr;
++  E = E->IgnoreParenImpCasts();
++  const auto *BO = dyn_cast<BinaryOperator>(E);
++  if (!BO || BO->getOpcode() != BO_Mul)
++    return nullptr;
++
++  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
++  const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
++
++  if (const auto *UL = dyn_cast<UnaryExprOrTypeTraitExpr>(LHS)) {
++    if (UL->getKind() == UETT_SizeOf) {
++      SizeofUE = UL;
++      CountExpr = RHS;
++      return BO;
++    }
++  }
++  if (const auto *UR = dyn_cast<UnaryExprOrTypeTraitExpr>(RHS)) {
++    if (UR->getKind() == UETT_SizeOf) {
++      SizeofUE = UR;
++      CountExpr = LHS;
++      return BO;
++    }
++  }
++  return nullptr;
++}
++
++// Determine whether the pointer argument is a "simple" base pointer:
++// - a DeclRefExpr or a chain of simple C-style casts wrapping a DeclRefExpr.
++// - not pointer arithmetic, not a member access, not an address-of member.
++// If simple, also return the pointee type in OutElemTy (if deducible and not void).
++static bool isSimpleBasePointer(const Expr *PtrArg, QualType &OutElemTy) {
++  if (!PtrArg)
++    return false;
++
++  const Expr *Cur = PtrArg;
++  // Peel off parens and casts but stop on non-trivial constructs.
++  while (true) {
++    Cur = Cur->IgnoreParenImpCasts();
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(Cur)) {
++      QualType T = DRE->getType();
++      if (const auto *PT = T->getAs<PointerType>()) {
++        QualType Pointee = PT->getPointeeType();
++        if (Pointee->isVoidType())
++          return false; // Unknown element type, avoid FP/over-report.
++        OutElemTy = Pointee;
++        return true;
++      }
++      return false;
++    }
++    if (isa<MemberExpr>(Cur))
++      return false; // likely interior pointer or struct member reference
++    if (isa<ArraySubscriptExpr>(Cur))
++      return false; // pointer arithmetic/indexing
++    if (const auto *BO = dyn_cast<BinaryOperator>(Cur)) {
++      if (BO->isAdditiveOp())
++        return false; // pointer arithmetic, e.g., base + offset
++      return false;
++    }
++    if (const auto *UO = dyn_cast<UnaryOperator>(Cur)) {
++      if (UO->getOpcode() == UO_AddrOf)
++        return false; // address of a member/element
++      return false;
++    }
++    if (const auto *CE = dyn_cast<CStyleCastExpr>(Cur)) {
++      Cur = CE->getSubExpr();
++      continue;
++    }
++    // Unknown/complex expression, be conservative.
++    return false;
++  }
++}
++
++// Filter out known benign or out-of-scope cases.
++static bool isFalsePositiveSizeOnly(const Expr *SizeArg) {
++  // Plain sizeof(...) is not an array copy with count.
++  if (!SizeArg)
++    return true;
++  SizeArg = SizeArg->IgnoreParenImpCasts();
++  if (const auto *U = dyn_cast<UnaryExprOrTypeTraitExpr>(SizeArg))
++    return U->getKind() == UETT_SizeOf;
++  return false;
++}
++
++// Additional suppression: if pointer argument expression clearly shows
++// interior-pointer patterns (offsetof, entries, '+ header_size'), suppress.
++// This is a heuristic to avoid header+flexible-array cases.
++static bool looksLikeInteriorPointer(const Expr *PtrArg, CheckerContext &C) {
++  if (!PtrArg)
++    return false;
++  const Expr *E = PtrArg->IgnoreParenCasts();
++  // Pointer arithmetic
++  if (const auto *BO = dyn_cast<BinaryOperator>(E))
++    if (BO->isAdditiveOp())
++      return true;
++  // Member access to a flexible array (heuristic via name)
++  if (ExprHasName(E, "entries", C) || ExprHasName(E, "array", C))
++    return true;
++  // Offsets (macro use); best-effort via source text
++  if (ExprHasName(E, "offsetof", C) || ExprHasName(E, "offset", C))
++    return true;
++  if (isa<MemberExpr>(E))
++    return true;
++  return false;
++}
++
+ class SAGenTestChecker : public Checker<check::PreCall> {
+   mutable std::unique_ptr<BugType> BT;
+
+@@ -34,49 +180,8 @@   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+
+ private:
+-  static bool isSizeofExpr(const Expr *E);
+-  static const BinaryOperator *getMulWithSizeof(const Expr *E);
+-
+-  // Filter out known benign cases to avoid false positives.
+-  static bool isFalsePositive(const Expr *SizeArg);
+-
+   static bool isMemdupUser(const CallEvent &Call);
+ };
+-
+-bool SAGenTestChecker::isSizeofExpr(const Expr *E) {
+-  if (!E)
+-    return false;
+-  E = E->IgnoreParenImpCasts();
+-  if (const auto *U = dyn_cast<UnaryExprOrTypeTraitExpr>(E))
+-    return U->getKind() == UETT_SizeOf;
+-  return false;
+-}
+-
+-const BinaryOperator *SAGenTestChecker::getMulWithSizeof(const Expr *E) {
+-  if (!E)
+-    return nullptr;
+-  E = E->IgnoreParenImpCasts();
+-  const auto *BO = dyn_cast<BinaryOperator>(E);
+-  if (!BO)
+-    return nullptr;
+-  if (BO->getOpcode() != BO_Mul)
+-    return nullptr;
+-
+-  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
+-  const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
+-
+-  if (isSizeofExpr(LHS) || isSizeofExpr(RHS))
+-    return BO;
+-
+-  return nullptr;
+-}
+-
+-bool SAGenTestChecker::isFalsePositive(const Expr *SizeArg) {
+-  // The primary false positive we observed: sizeof(*ptr) (no multiplication).
+-  // If the size argument is a plain sizeof expression, it's not an array copy
+-  // and memdup_user is the correct API.
+-  return isSizeofExpr(SizeArg);
+-}
+
+ bool SAGenTestChecker::isMemdupUser(const CallEvent &Call) {
+   if (const IdentifierInfo *ID = Call.getCalleeIdentifier())
+@@ -93,19 +198,45 @@   if (Call.getNumArgs() < 2)
+     return;
+
++  const Expr *PtrArg = Call.getArgExpr(0);
+   const Expr *SizeArg = Call.getArgExpr(1);
+-  if (!SizeArg)
++  if (!PtrArg || !SizeArg)
+     return;
+
+   // Suppress plain sizeof(...) calls.
+-  if (isFalsePositive(SizeArg))
++  if (isFalsePositiveSizeOnly(SizeArg))
+     return;
+
+   // Detect size expressions of the form count * sizeof(...).
+-  const BinaryOperator *Mul = getMulWithSizeof(SizeArg);
+-  if (!Mul)
+-    return;
+-
++  const UnaryExprOrTypeTraitExpr *SizeofUE = nullptr;
++  const Expr *CountExpr = nullptr;
++  const BinaryOperator *Mul = getMulWithSizeof(SizeArg, SizeofUE, CountExpr);
++  if (!Mul || !SizeofUE)
++    return;
++
++  // Avoid header+FAM or interior-pointer patterns.
++  if (looksLikeInteriorPointer(PtrArg, C))
++    return;
++
++  // Extract the sizeof element type.
++  QualType SizeofElemTy;
++  if (!getElemTypeFromSizeof(SizeofUE, SizeofElemTy))
++    return;
++
++  // Focus on scalar integer-like element types to reduce false positives
++  // commonly seen with arrays of structs in ioctl paths.
++  if (!isIntegerLikeBuiltin(SizeofElemTy))
++    return;
++
++  // Ensure the pointer argument is a simple base pointer with a matched element type.
++  QualType PtrElemTy;
++  if (!isSimpleBasePointer(PtrArg, PtrElemTy))
++    return;
++
++  if (!typesEqualIgnoreQual(C.getASTContext(), PtrElemTy, SizeofElemTy))
++    return;
++
++  // All checks passed: this looks like a direct array copy from userspace.
+   ExplodedNode *N = C.generateNonFatalErrorNode();
+   if (!N)
+     return;

@@ -1,0 +1,198 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -26,7 +26,7 @@ // Forward declarations of helpers
+ static bool evalInt(const ASTContext &Ctx, const Expr *E, llvm::APSInt &Res);
+ static bool containsDeclRefToVar(const Expr *E, const VarDecl *V);
+-static bool indexIsDirectLoopVar(const Expr *Idx, const VarDecl *IVar);
++// Replaced by a more general extractor that recognizes simple derived indices.
+ static bool getArrayConstSizeFromBase(const ASTContext &Ctx, const Expr *Base, uint64_t &CapOut);
+ static bool stmtContains(const Stmt *Root, const Stmt *Target);
+ static bool parseGuardCondition(const ASTContext &Ctx, const Expr *Cond, const VarDecl *IVar,
+@@ -61,6 +61,122 @@   if (isFromMacro(ASE) || isFromMacro(ASE->getBase()) || isFromMacro(ASE->getIdx()))
+     return true;
+   return false;
++}
++
++// Strip no-op nodes for matching.
++static const Expr *stripNoOps(const Expr *E) {
++  if (!E) return nullptr;
++  return E->IgnoreParenImpCasts();
++}
++
++// Try to evaluate an expression to an unsigned 64-bit constant.
++// Returns true on success and sets Out.
++static bool evalUInt64(const ASTContext &Ctx, const Expr *E, uint64_t &Out) {
++  llvm::APSInt V;
++  if (!evalInt(Ctx, E, V))
++    return false;
++  // Treat negative as unsupported.
++  if (V.isSigned() && V.isNegative())
++    return false;
++  Out = V.getLimitedValue();
++  return true;
++}
++
++// Recognize subscript index forms that are simple linear transforms of the loop variable.
++// Supported forms:
++//   - i
++//   - i / K   (K > 0)
++//   - i >> n  (n >= 0)
++// Optionally allow addition/subtraction by 0 (no-op).
++// Returns true if recognized and sets DivOut (>=1) and OffsetOut (currently only 0 supported).
++static bool extractIndexDivAndOffset(const ASTContext &Ctx, const Expr *Idx,
++                                     const VarDecl *IVar, uint64_t &DivOut,
++                                     int64_t &OffsetOut) {
++  DivOut = 0;
++  OffsetOut = 0;
++  if (!Idx || !IVar) return false;
++
++  const Expr *E = stripNoOps(Idx);
++
++  auto IsDirectLoopVar = [&](const Expr *X) -> bool {
++    X = stripNoOps(X);
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(X))
++      return DRE->getDecl() == IVar;
++    return false;
++  };
++
++  // Direct variable: arr[i]
++  if (IsDirectLoopVar(E)) {
++    DivOut = 1;
++    OffsetOut = 0;
++    return true;
++  }
++
++  // Allow no-op +0 or -0 around recognized forms
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++    BinaryOperator::Opcode Op = BO->getOpcode();
++
++    // i / K
++    if (Op == BO_Div) {
++      if (IsDirectLoopVar(BO->getLHS())) {
++        uint64_t K = 0;
++        if (evalUInt64(Ctx, BO->getRHS(), K) && K > 0) {
++          DivOut = K;
++          OffsetOut = 0;
++          return true;
++        }
++      }
++    }
++
++    // i >> n  => division by 2^n
++    if (Op == BO_Shr) {
++      if (IsDirectLoopVar(BO->getLHS())) {
++        uint64_t N = 0;
++        if (evalUInt64(Ctx, BO->getRHS(), N)) {
++          if (N < 63) {
++            DivOut = (1ULL << N);
++            OffsetOut = 0;
++            return true;
++          }
++        }
++      }
++    }
++
++    // Handle +0 or -0 around a recognized form
++    if (Op == BO_Add || Op == BO_Sub) {
++      const Expr *L = BO->getLHS();
++      const Expr *R = BO->getRHS();
++      uint64_t CVal = 0;
++
++      // Try left op as core form and right as constant 0
++      uint64_t InnerDiv = 0;
++      int64_t InnerOff = 0;
++      if (evalUInt64(Ctx, R, CVal)) {
++        if (CVal == 0 && extractIndexDivAndOffset(Ctx, L, IVar, InnerDiv, InnerOff)) {
++          DivOut = InnerDiv;
++          OffsetOut = InnerOff;
++          return true;
++        }
++      }
++
++      // Try right op as core form and left as constant 0, for commutative '+'
++      if (Op == BO_Add && evalUInt64(Ctx, L, CVal)) {
++        if (CVal == 0 && extractIndexDivAndOffset(Ctx, R, IVar, InnerDiv, InnerOff)) {
++          DivOut = InnerDiv;
++          OffsetOut = InnerOff;
++          return true;
++        }
++      }
++    }
++  }
++
++  return false;
++}
++
++// Safe ceil division for positive integers: ceil(A / B) with B >= 1.
++static uint64_t ceilDivU64(uint64_t A, uint64_t B) {
++  if (B == 0) return UINT64_MAX;
++  return (A + B - 1) / B;
+ }
+
+ class SAGenTestChecker : public Checker<check::ASTCodeBody> {
+@@ -119,27 +235,6 @@   LocalVisitor Vst(V);
+   Vst.TraverseStmt(const_cast<Expr*>(E));
+   return Vst.Found;
+-}
+-
+-// Strict filter: Only accept index expressions that are directly the loop variable.
+-static bool indexIsDirectLoopVar(const Expr *Idx, const VarDecl *IVar) {
+-  if (!Idx || !IVar)
+-    return false;
+-  const Expr *E = Idx->IgnoreParenImpCasts();
+-  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
+-    return DRE->getDecl() == IVar;
+-
+-  // Allow trivial unary plus on the variable (rare in C, but harmless).
+-  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+-    if (UO->getOpcode() == UO_Plus) {
+-      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
+-      if (const auto *SDRE = dyn_cast<DeclRefExpr>(Sub))
+-        return SDRE->getDecl() == IVar;
+-    }
+-  }
+-
+-  // Do not accept composite/mapped indices like arr[map[i].field] or arr[i + k].
+-  return false;
+ }
+
+ static bool getArrayConstSizeFromBase(const ASTContext &Ctx, const Expr *Base, uint64_t &CapOut) {
+@@ -456,24 +551,34 @@       if (isFalsePositive(ASE))
+         return true;
+
+-      // Only consider subscripts where the index is directly the loop variable.
+-      if (!indexIsDirectLoopVar(Idx, IVar))
+-        return true;
+-
+       uint64_t Cap = 0;
+       if (!getArrayConstSizeFromBase(Ctx, ASE->getBase(), Cap))
+         return true;
+
++      // Only consider subscripts where the index is directly the loop variable
++      // or a supported derived form (i, i/const, i>>const). Skip unknown forms to avoid FPs.
++      uint64_t Div = 0;
++      int64_t Offset = 0;
++      if (!extractIndexDivAndOffset(Ctx, Idx, IVar, Div, Offset))
++        return true;
++
+       // If guarded appropriately, skip.
+       if (isGuardedBeforeUse(Ctx, ASE, IVar, Cap))
+         return true;
+
+-      // Suppress off-by-one "<=" cases where RHS equals the array's capacity.
+-      // This is not the targeted "mismatched macro sizes" pattern.
+-      if (CondOp == BO_LE && RHSNumeric == Cap)
++      // Preserve the existing conservative suppression for "<=" when RHS equals the capacity
++      // on the direct-indexing path (Div == 1). This avoids regressions unrelated to the target bug.
++      if (Div == 1 && CondOp == BO_LE && RHSNumeric == Cap)
+         return true;
+
+-      if (UBExclusive > Cap) {
++      // Currently handle only zero offset to avoid accidental FPs.
++      if (Offset != 0)
++        return true;
++
++      // For index forms of i/Div (Div>=1), the max subscript is floor((UBExclusive-1)/Div).
++      // This is safe iff ceil(UBExclusive / Div) <= Cap.
++      const uint64_t NeededSlots = ceilDivU64(UBExclusive, Div);
++      if (NeededSlots > Cap) {
+         Checker->reportIssue(ASE, IVar, UBExclusive, Cap, BR, Ctx);
+       }

@@ -1,0 +1,382 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -27,7 +27,7 @@ // Program state maps
+ // 0 = Unknown/not tracked, 1 = Zeroed allocation (kzalloc/kcalloc), 2 = Possibly-uninitialized (kmalloc/*)
+ REGISTER_MAP_WITH_PROGRAMSTATE(AllocKindMap, const MemRegion*, unsigned)
+-// Records last known initialized byte size via memset/memzero_explicit for the base region.
++// Records last known initialized prefix size (in bytes) via memset/memzero_explicit or tracked stores.
+ REGISTER_MAP_WITH_PROGRAMSTATE(ZeroInitSizeMap, const MemRegion*, uint64_t)
+ // Tracks pointer aliases.
+ REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)
+@@ -35,6 +35,10 @@ REGISTER_MAP_WITH_PROGRAMSTATE(ProducerLenSymMap, const MemRegion*, SymbolRef)
+ // Tracks producer-initialized buffers: buffer -> symbol of status/return value of producer call.
+ REGISTER_MAP_WITH_PROGRAMSTATE(ProducerStatusSymMap, const MemRegion*, SymbolRef)
++// Tracks regions that were written through as arrays (element-wise initialization pattern seen).
++REGISTER_SET_WITH_PROGRAMSTATE(RegionElemWriteSet, const MemRegion*)
++// Tracks kmalloc/kzalloc/kmalloc_array constant allocation size (bytes), if constant.
++REGISTER_MAP_WITH_PROGRAMSTATE(AllocConstSizeMap, const MemRegion*, uint64_t)
+
+ // Utility Functions provided externally in the prompt:
+ // - findSpecificTypeInParents
+@@ -70,6 +74,15 @@       const MemRegion *getArgBaseRegion(const CallEvent &Call, unsigned Idx, CheckerContext &C) const;
+       void noteExplicitInitLen(const CallEvent &Call, CheckerContext &C, unsigned PtrArgIndex, unsigned LenArgIndex) const;
+       void reportLeak(const CallEvent &Call, CheckerContext &C, const MemRegion *SrcReg) const;
++
++      // Initialization tracking via element-wise stores and memcpy
++      void noteElemStoreToRegion(const MemRegion *DstElemReg, CheckerContext &C) const;
++      void maybeExtendInitializedPrefix(const MemRegion *DstReg, const MemRegion *StoreRegion, CheckerContext &C) const;
++
++      // Allocation size helpers
++      void maybeRecordAllocConstSize(const CallEvent &Call, CheckerContext &C, const MemRegion *RetBaseReg) const;
++      bool isCopyLenZero(const CallEvent &CopyToUserCall, CheckerContext &C) const;
++      bool isCopyLenBoundedByAlloc(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
+
+       // Producer modeling helpers
+       bool functionKnownToInitBuffer(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx, unsigned &LenPtrParamIdx) const;
+@@ -114,6 +127,9 @@   // Also clear producer-derived initialization info to avoid stale mapping across re-allocations.
+   State = State->remove<ProducerLenSymMap>(Canon);
+   State = State->remove<ProducerStatusSymMap>(Canon);
++  // Clear element-write heuristic and known alloc size.
++  State = State->remove<RegionElemWriteSet>(Canon);
++  State = State->remove<AllocConstSizeMap>(Canon);
+   return State;
+ }
+
+@@ -179,8 +195,102 @@   C.emitReport(std::move(R));
+ }
+
+-// Recognize known producer that fills an output buffer up to length returned in len-pointer on success.
+-// For this false positive, we need to recognize efi.get_variable(name, guid, attr, data_size_ptr, data_ptr).
++// Mark that we observed element-wise store into a tracked region.
++void SAGenTestChecker::noteElemStoreToRegion(const MemRegion *DstElemReg, CheckerContext &C) const {
++  if (!DstElemReg)
++    return;
++
++  ProgramStateRef State = C.getState();
++  const MemRegion *Base = DstElemReg->getBaseRegion();
++  if (!Base)
++    return;
++
++  const MemRegion *Canon = canonical(State, Base);
++  if (!Canon)
++    return;
++
++  // Only consider kmalloc-kind buffers (possibly uninitialized).
++  if (const unsigned *Kind = State->get<AllocKindMap>(Canon)) {
++    if (*Kind == 2) {
++      State = State->add<RegionElemWriteSet>(Canon);
++      C.addTransition(State);
++    }
++  }
++}
++
++// Try to extend "initialized prefix" size for contiguous element stores.
++// We conservatively track only the largest contiguous prefix from offset 0.
++void SAGenTestChecker::maybeExtendInitializedPrefix(const MemRegion *DstReg,
++                                                    const MemRegion *StoreRegion,
++                                                    CheckerContext &C) const {
++  if (!DstReg || !StoreRegion)
++    return;
++
++  ProgramStateRef State = C.getState();
++  const MemRegion *Canon = canonical(State, DstReg->getBaseRegion());
++  if (!Canon)
++    return;
++
++  // Must be kmalloc-kind to be interesting.
++  if (const unsigned *Kind = State->get<AllocKindMap>(Canon)) {
++    if (*Kind != 2)
++      return;
++  } else {
++    return;
++  }
++
++  // Compute offset and store size.
++  RegionOffset RO = StoreRegion->getAsOffset();
++  if (!RO.isValid())
++    return;
++
++  const MemRegion *OffsetBase = RO.getRegion();
++  if (!OffsetBase)
++    return;
++
++  const MemRegion *OBBase = canonical(State, OffsetBase->getBaseRegion());
++  if (OBBase != Canon)
++    return;
++
++  int64_t Offset = RO.getOffset();
++  if (Offset < 0)
++    return;
++
++  // Determine the size of the value stored at StoreRegion.
++  uint64_t StoreSize = 0;
++  if (const TypedValueRegion *TVR = dyn_cast<TypedValueRegion>(StoreRegion)) {
++    QualType VT = TVR->getValueType();
++    if (!VT.isNull() && !VT->isVoidType()) {
++      StoreSize = C.getASTContext().getTypeSizeInChars(VT).getQuantity();
++    }
++  }
++  if (StoreSize == 0)
++    return;
++
++  const uint64_t *OldP = State->get<ZeroInitSizeMap>(Canon);
++  uint64_t Old = OldP ? *OldP : 0;
++  uint64_t NewVal = Old;
++
++  // Extend contiguous prefix: if this store overlaps the end of the current prefix.
++  uint64_t Begin = static_cast<uint64_t>(Offset);
++  uint64_t End = Begin + StoreSize;
++
++  if (Old == 0) {
++    if (Begin == 0)
++      NewVal = End;
++  } else {
++    if (Begin <= Old && End > Old)
++      NewVal = End;
++    else if (Begin == 0 && End > Old)
++      NewVal = End;
++  }
++
++  if (NewVal > Old) {
++    State = State->set<ZeroInitSizeMap>(Canon, NewVal);
++    C.addTransition(State);
++  }
++}
++
+ bool SAGenTestChecker::functionKnownToInitBuffer(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx, unsigned &LenPtrParamIdx) const {
+   if (const Expr *Origin = Call.getOriginExpr()) {
+     if (ExprHasName(Origin, "get_variable", C)) {
+@@ -194,7 +304,6 @@   return false;
+ }
+
+-// Recognize producers that return the number of bytes initialized in the buffer.
+ bool SAGenTestChecker::functionKnownToInitLenIsReturn(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const {
+   if (const Expr *Origin = Call.getOriginExpr()) {
+     // usb_control_msg(dev, pipe, req, reqtype, value, index, data, size, timeout)
+@@ -253,6 +362,85 @@   return true;
+ }
+
++void SAGenTestChecker::maybeRecordAllocConstSize(const CallEvent &Call, CheckerContext &C, const MemRegion *RetBaseReg) const {
++  if (!RetBaseReg)
++    return;
++
++  ProgramStateRef State = C.getState();
++  const Expr *Origin = Call.getOriginExpr();
++  if (!Origin)
++    return;
++
++  // Try kmalloc(size, ...)
++  if (ExprHasName(Origin, "kmalloc", C) || ExprHasName(Origin, "kzalloc", C) || ExprHasName(Origin, "kmalloc_node", C)) {
++    if (Call.getNumArgs() >= 1) {
++      llvm::APSInt Sz;
++      if (EvaluateExprToInt(Sz, Call.getArgExpr(0), C)) {
++        State = State->set<AllocConstSizeMap>(RetBaseReg, Sz.getZExtValue());
++        C.addTransition(State);
++      }
++    }
++    return;
++  }
++
++  // kmalloc_array(n, size, ...)
++  if (ExprHasName(Origin, "kmalloc_array", C)) {
++    if (Call.getNumArgs() >= 2) {
++      llvm::APSInt N, S;
++      bool OkN = EvaluateExprToInt(N, Call.getArgExpr(0), C);
++      bool OkS = EvaluateExprToInt(S, Call.getArgExpr(1), C);
++      if (OkN && OkS) {
++        uint64_t Prod = N.getZExtValue() * S.getZExtValue();
++        State = State->set<AllocConstSizeMap>(RetBaseReg, Prod);
++        C.addTransition(State);
++      }
++    }
++    return;
++  }
++}
++
++bool SAGenTestChecker::isCopyLenZero(const CallEvent &CopyToUserCall, CheckerContext &C) const {
++  const Expr *LenE = CopyToUserCall.getArgExpr(2);
++  if (!LenE)
++    return false;
++  llvm::APSInt EvalRes;
++  if (EvaluateExprToInt(EvalRes, LenE, C)) {
++    return EvalRes.isZero();
++  }
++  return false;
++}
++
++bool SAGenTestChecker::isCopyLenBoundedByAlloc(const CallEvent &CopyToUserCall, CheckerContext &C,
++                                               const MemRegion *FromReg) const {
++  ProgramStateRef State = C.getState();
++  const uint64_t *AllocConst = State->get<AllocConstSizeMap>(FromReg);
++  if (!AllocConst)
++    return false;
++
++  const Expr *LenE = CopyToUserCall.getArgExpr(2);
++  if (!LenE)
++    return false;
++
++  // If len is a constant, compare directly.
++  llvm::APSInt EvalRes;
++  if (EvaluateExprToInt(EvalRes, LenE, C)) {
++    uint64_t L = EvalRes.getZExtValue();
++    return L <= *AllocConst;
++  }
++
++  // Otherwise, if len is symbolic, try to get its inferred max and compare.
++  SVal LenV = CopyToUserCall.getArgSVal(2);
++  if (SymbolRef LenSym = LenV.getAsSymbol()) {
++    if (const llvm::APSInt *Max = inferSymbolMaxVal(LenSym, C)) {
++      if (Max->isSigned())
++        return Max->getSExtValue() <= static_cast<int64_t>(*AllocConst);
++      return Max->getZExtValue() <= *AllocConst;
++    }
++  }
++
++  return false;
++}
++
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+
+@@ -266,7 +454,9 @@     if (RetReg) {
+       RetReg = RetReg->getBaseRegion();
+       if (RetReg) {
+-        State = setAllocKind(State, canonical(State, RetReg), 1);
++        const MemRegion *Canon = canonical(State, RetReg);
++        State = setAllocKind(State, Canon, 1);
++        maybeRecordAllocConstSize(Call, C, Canon);
+         C.addTransition(State);
+       }
+     }
+@@ -282,9 +472,26 @@     if (RetReg) {
+       RetReg = RetReg->getBaseRegion();
+       if (RetReg) {
+-        State = setAllocKind(State, canonical(State, RetReg), 2);
++        const MemRegion *Canon = canonical(State, RetReg);
++        State = setAllocKind(State, Canon, 2);
++        maybeRecordAllocConstSize(Call, C, Canon);
+         C.addTransition(State);
+       }
++    }
++    return;
++  }
++
++  // Free modeling: clear state for the region.
++  if (callNamed(Call, C, "kfree")) {
++    const MemRegion *ArgR = getArgBaseRegion(Call, 0, C);
++    if (ArgR) {
++      State = State->remove<AllocKindMap>(ArgR);
++      State = State->remove<ZeroInitSizeMap>(ArgR);
++      State = State->remove<ProducerLenSymMap>(ArgR);
++      State = State->remove<ProducerStatusSymMap>(ArgR);
++      State = State->remove<RegionElemWriteSet>(ArgR);
++      State = State->remove<AllocConstSizeMap>(ArgR);
++      C.addTransition(State);
+     }
+     return;
+   }
+@@ -299,6 +506,12 @@   if (callNamed(Call, C, "memzero_explicit")) {
+     // memzero_explicit(ptr, len)
+     noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/1);
++    return;
++  }
++
++  // memcpy(dst, src, len) also initializes bytes in dst
++  if (callNamed(Call, C, "memcpy")) {
++    noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/2);
+     return;
+   }
+
+@@ -358,6 +571,10 @@   if (*Kind != 2)
+     return;
+
++  // Zero-length copies are safe.
++  if (isCopyLenZero(Call, C))
++    return;
++
+   // Recognize and suppress false positives when a known producer initialized exactly the copied bytes.
+   if (isFalsePositiveDueToProducer(Call, C, FromReg))
+     return;
+@@ -374,18 +591,20 @@     }
+   }
+
+-  const uint64_t *ZeroedBytes = State->get<ZeroInitSizeMap>(FromReg);
++  const uint64_t *InitPrefixBytes = State->get<ZeroInitSizeMap>(FromReg);
+   if (LenKnown) {
+-    if (ZeroedBytes && *ZeroedBytes >= CopyLen)
+-      return; // Fully initialized by memset/memzero_explicit
+-    reportLeak(Call, C, FromReg);
+-    return;
+-  } else {
+-    if (!ZeroedBytes) {
+-      reportLeak(Call, C, FromReg);
+-    }
+-    return;
+-  }
++    if (InitPrefixBytes && *InitPrefixBytes >= CopyLen)
++      return; // Fully initialized (by memset/memzero_explicit/memcpy or contiguous element stores)
++  }
++
++  // Heuristic suppression: if we have seen element-wise writes into this buffer
++  // (typical "event[i] = ..." loops) and the copy length is provably bounded by
++  // the allocation size, suppress as non-buggy.
++  if (State->contains<RegionElemWriteSet>(FromReg) && isCopyLenBoundedByAlloc(Call, C, FromReg))
++    return;
++
++  // Otherwise, report.
++  reportLeak(Call, C, FromReg);
+ }
+
+ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {
+@@ -394,25 +613,36 @@   const MemRegion *LHS = Loc.getAsRegion();
+   if (!LHS)
+     return;
+-  LHS = LHS->getBaseRegion();
+-  if (!LHS)
+-    return;
+-
++
++  // Track pointer aliases (RHS region assigned to LHS pointer variable).
+   const MemRegion *RHS = Val.getAsRegion();
+-  if (!RHS)
+-    return;
+-  RHS = RHS->getBaseRegion();
+-  if (!RHS)
+-    return;
+-
+-  const MemRegion *LC = canonical(State, LHS);
+-  const MemRegion *RC = canonical(State, RHS);
+-  if (!LC || !RC)
+-    return;
+-
+-  State = State->set<PtrAliasMap>(LC, RC);
+-  State = State->set<PtrAliasMap>(RC, LC);
+-  C.addTransition(State);
++  if (RHS) {
++    const MemRegion *LBase = LHS->getBaseRegion();
++    const MemRegion *RBase = RHS->getBaseRegion();
++    if (LBase && RBase) {
++      const MemRegion *LC = canonical(State, LBase);
++      const MemRegion *RC = canonical(State, RBase);
++      if (LC && RC) {
++        State = State->set<PtrAliasMap>(LC, RC);
++        State = State->set<PtrAliasMap>(RC, LC);
++        C.addTransition(State);
++      }
++    }
++  }
++
++  // If the store goes into an element of a kmalloc buffer, record the pattern.
++  if (isa<ElementRegion>(LHS)) {
++    noteElemStoreToRegion(LHS, C);
++  }
++
++  // Also try extending the initialized prefix size for contiguous stores.
++  const MemRegion *LBase = LHS->getBaseRegion();
++  if (LBase) {
++    const MemRegion *Canon = canonical(State, LBase);
++    if (Canon) {
++      maybeExtendInitializedPrefix(Canon, LHS, C);
++    }
++  }
+ }
+
+ } // end anonymous namespace

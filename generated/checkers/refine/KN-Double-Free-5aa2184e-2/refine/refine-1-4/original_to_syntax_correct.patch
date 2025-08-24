@@ -1,0 +1,120 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -34,6 +34,34 @@
+ namespace {
+
++// Utility functions (as provided in the prompt)
++template <typename T>
++const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
++
++template <typename T>
++const T* findSpecificTypeInChildren(const Stmt *S);
++
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C);
++
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C);
++
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E);
++
++bool getStringSize(llvm::APInt &StringSize, const Expr *E);
++
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C);
++
++struct KnownDerefFunction {
++  const char *Name;
++  llvm::SmallVector<unsigned, 4> Params;
++};
++
++bool functionKnownToDeref(const CallEvent &Call,
++                          llvm::SmallVectorImpl<unsigned> &DerefParams);
++
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
++
++
+ class SAGenTestChecker : public Checker<
+                              check::BeginFunction,
+                              check::EndFunction,
+@@ -62,7 +90,7 @@   mutable llvm::DenseMap<const FunctionDecl*, FieldParmLocsMap> FuncFieldFreeLocs;
+   // Locations of param-field = NULL (or 0).
+   mutable llvm::DenseMap<const FunctionDecl*, FieldParmLocsMap> FuncFieldNullSetLocs;
+-  // Locations where param-field is assigned from allocator-like calls.
++  // Locations where param-field is assigned from allocator-like calls (directly or propagated via local var).
+   mutable llvm::DenseMap<const FunctionDecl*, FieldParmLocsMap> FuncFieldAllocAssignLocs;
+
+ public:
+@@ -98,6 +126,9 @@     FieldParmLocsMap FreeLocs;
+     FieldParmLocsMap NullSetLocs;
+     FieldParmLocsMap AllocAssignLocs;
++
++    // New: variables assigned from allocator calls: VarDecl -> allocator assignment locations.
++    llvm::DenseMap<const VarDecl*, llvm::SmallVector<SourceLocation, 4>> VarAllocAssignLocs;
+
+     FuncInfoCollector(CheckerContext &Ctx) : C(Ctx) {}
+
+@@ -219,7 +250,18 @@       const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
+       const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
+
+-      // Track fields assigned from call expressions (potential allocators).
++      // 1) Track variables assigned from allocator calls: var = Alloc(...)
++      if (const auto *LHS_DRE = dyn_cast<DeclRefExpr>(LHS)) {
++        if (const auto *VD = dyn_cast<VarDecl>(LHS_DRE->getDecl())) {
++          if (const auto *RHS_CE = dyn_cast<CallExpr>(RHS)) {
++            if (callExprLooksLikeAllocator(RHS_CE, C)) {
++              VarAllocAssignLocs[VD->getCanonicalDecl()].push_back(BO->getBeginLoc());
++            }
++          }
++        }
++      }
++
++      // 2) Track fields assigned from call expressions (potential allocators) and NULL sets.
+       if (const auto *ME = dyn_cast<MemberExpr>(LHS)) {
+         const ValueDecl *VD = ME->getMemberDecl();
+         if (const auto *FD = dyn_cast_or_null<FieldDecl>(VD)) {
+@@ -229,12 +271,34 @@             if (isExplicitNullExpr(RHS)) {
+               NullSetLocs[FD->getCanonicalDecl()][BaseP].push_back(BO->getBeginLoc());
+             }
+-            // Allocator-assignment tracking.
++            // Direct Allocator-assignment tracking: param->field = Alloc(...)
+             if (const auto *CE = dyn_cast<CallExpr>(RHS)) {
+               if (callExprLooksLikeAllocator(CE, C)) {
+                 AllocAssignLocs[FD->getCanonicalDecl()][BaseP].push_back(BO->getBeginLoc());
+               }
+             }
++            // New: Indirect allocator propagation via local variable:
++            // param->field = var; where earlier var = Alloc(...).
++            if (const auto *RHS_DRE = dyn_cast<DeclRefExpr>(RHS)) {
++              if (const auto *Var = dyn_cast<VarDecl>(RHS_DRE->getDecl())) {
++                auto ItVar = VarAllocAssignLocs.find(Var->getCanonicalDecl());
++                if (ItVar != VarAllocAssignLocs.end() && !ItVar->second.empty()) {
++                  // Only consider if the var's alloc assignment(s) precede this field assignment.
++                  const SourceManager &SM = C.getSourceManager();
++                  SourceLocation CurAssignLoc = BO->getBeginLoc();
++                  bool HasAllocBefore = false;
++                  for (SourceLocation LallocVar : ItVar->second) {
++                    if (SM.isBeforeInTranslationUnit(LallocVar, CurAssignLoc)) {
++                      HasAllocBefore = true;
++                      break;
++                    }
++                  }
++                  if (HasAllocBefore) {
++                    AllocAssignLocs[FD->getCanonicalDecl()][BaseP].push_back(CurAssignLoc);
++                  }
++                }
++              }
++            }
+           }
+         }
+       }
+@@ -250,7 +314,7 @@       if (!VD)
+         return true;
+       QualType LT = VD->getType();
+-      if (!isPointerType(LT))
++      if (!LT->isPointerType())
+         return true;
+
+       if (const auto *FD = dyn_cast<FieldDecl>(VD)) {
+@@ -828,7 +892,6 @@       continue;
+
+     // Only warn when the freed field belongs directly to a function parameter.
+-    // This matches the target buggy pattern (e.g., mt->fc) and suppresses cleanup of local/private state.
+     const Expr *BaseE = FreedME->getBase();
+     const ParmVarDecl *BaseParam = getDirectBaseParam(BaseE);
+     if (!BaseParam)

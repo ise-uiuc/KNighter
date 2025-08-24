@@ -1,0 +1,2 @@
+- Decision: NotABug
+- Reason: The code is validating an index where the valid values are 0 and 1 (two inputs). Using "if (i->index > 1) return -EINVAL;" correctly rejects any index >= 2, since "> 1" is equivalent to ">= 2". This matches the intended valid range [0..1]. The target bug pattern concerns checks of the form "if (idx > MAX)" where MAX is the array size (count), which would erroneously allow idx == MAX. Here, "1" is the last valid index, not the count, so the check is correct and there is no off-by-one error nor any subsequent out-of-bounds access.

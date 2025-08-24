@@ -1,0 +1,389 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: c6087b82a9146826564a55c5ca0164cac40348f5
+commit_type: Buffer-Overflow
+index: 7
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Type.h\"\n#include \"llvm/ADT/APSInt.h\"\
+  \n#include \"llvm/ADT/APInt.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Program state maps:\n// - PtrAliasMap: map a pointer\
+  \ variable region to the base region it ultimately aliases.\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n// - UnboundedCopyMap: mark base array regions\
+  \ that had an unsafe/unbounded copy_from_user into them.\nREGISTER_MAP_WITH_PROGRAMSTATE(UnboundedCopyMap,\
+  \ const MemRegion*, bool)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Unbounded user copy into fixed buffer\", \"Security\"\
+  )) {}\n\n      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \n   private:\n      // Helpers\n      bool isCopyFromUser(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      bool isStringOp(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n\n      const MemRegion *getBaseRegionFromExpr(const Expr *E, CheckerContext\
+  \ &C) const;\n\n      bool getArraySizeForDestExpr(const Expr *DestE, llvm::APInt\
+  \ &ArrSz,\n                                   CheckerContext &C) const;\n\n    \
+  \  bool getUpperBoundOfSizeArg(const Expr *SizeE, CheckerContext &C,\n         \
+  \                         llvm::APSInt &UB, bool &Known) const;\n\n      const MemRegion\
+  \ *getArrayBaseForArg(const Expr *ArgE, CheckerContext &C) const;\n\n      void\
+  \ reportCopyIssue(const CallEvent &Call, CheckerContext &C) const;\n      void reportStringUseIssue(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n};\n\n// Return true if the call is\
+  \ to copy_from_user.\nbool SAGenTestChecker::isCopyFromUser(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if\
+  \ (!Origin)\n    return false;\n  return ExprHasName(Origin, \"copy_from_user\"\
+  , C);\n}\n\n// Return true if the call is one of common string operations that expect\
+  \ NUL-terminated strings.\nbool SAGenTestChecker::isStringOp(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if\
+  \ (!Origin)\n    return false;\n\n  // String ops to consider.\n  static const char\
+  \ *Names[] = {\n    \"strcmp\", \"strncmp\", \"strcasecmp\", \"strncasecmp\", \"\
+  strlen\"\n  };\n  for (const char *N : Names) {\n    if (ExprHasName(Origin, N,\
+  \ C))\n      return true;\n  }\n  return false;\n}\n\n// Get the base region from\
+  \ an expression using the analyzer's SVal machinery.\n// Do not IgnoreImplicit()\
+  \ before calling getMemRegionFromExpr, and always normalize to base region.\nconst\
+  \ MemRegion *SAGenTestChecker::getBaseRegionFromExpr(const Expr *E, CheckerContext\
+  \ &C) const {\n  if (!E)\n    return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(E,\
+  \ C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n}\n\n// Try\
+  \ to infer the constant array size for a destination expression.\n// Returns true\
+  \ on success and stores the size into ArrSz.\nbool SAGenTestChecker::getArraySizeForDestExpr(const\
+  \ Expr *DestE, llvm::APInt &ArrSz,\n                                           \
+  \    CheckerContext &C) const {\n  if (!DestE)\n    return false;\n\n  // First,\
+  \ if the expression itself is a DeclRefExpr, try directly.\n  if (const auto *DREself\
+  \ = dyn_cast<DeclRefExpr>(DestE->IgnoreParenCasts())) {\n    if (getArraySizeFromExpr(ArrSz,\
+  \ DREself))\n      return true;\n  }\n\n  // Otherwise, try to find a DeclRefExpr\
+  \ in the children (works for array-to-pointer decay or &buf[0], etc).\n  if (const\
+  \ auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(DestE)) {\n    if (getArraySizeFromExpr(ArrSz,\
+  \ DRE))\n      return true;\n  }\n\n  return false;\n}\n\n// Infer an upper bound\
+  \ for the size argument.\n// Known is set to true if UB is a known constant/upper\
+  \ bound. Otherwise, Known is false.\nbool SAGenTestChecker::getUpperBoundOfSizeArg(const\
+  \ Expr *SizeE, CheckerContext &C,\n                                            \
+  \  llvm::APSInt &UB, bool &Known) const {\n  Known = false;\n  if (!SizeE)\n   \
+  \ return false;\n\n  // Try to evaluate as integer constant\n  if (EvaluateExprToInt(UB,\
+  \ SizeE, C)) {\n    Known = true;\n    return true;\n  }\n\n  // Otherwise, try\
+  \ to infer max value via symbol constraints.\n  ProgramStateRef State = C.getState();\n\
+  \  SVal SV = State->getSVal(SizeE, C.getLocationContext());\n  SymbolRef Sym = SV.getAsSymbol();\n\
+  \  if (!Sym)\n    return false;\n\n  if (const llvm::APSInt *MaxV = inferSymbolMaxVal(Sym,\
+  \ C)) {\n    UB = *MaxV;\n    Known = true;\n    return true;\n  }\n\n  return false;\n\
+  }\n\n// Given an argument expression to a string function, get the base array region\
+  \ it refers to.\n// This consults alias map to resolve pointer variables.\nconst\
+  \ MemRegion *SAGenTestChecker::getArrayBaseForArg(const Expr *ArgE, CheckerContext\
+  \ &C) const {\n  if (!ArgE)\n    return nullptr;\n\n  ProgramStateRef State = C.getState();\n\
+  \  const MemRegion *MR = getBaseRegionFromExpr(ArgE, C);\n  if (!MR)\n    return\
+  \ nullptr;\n\n  // If the expression is a pointer variable that aliases an array,\
+  \ resolve it through PtrAliasMap.\n  if (const MemRegion *AliasedBase = State->get<PtrAliasMap>(MR))\
+  \ {\n    return AliasedBase;\n  }\n\n  // Otherwise, return the base we got. This\
+  \ may already be the array's VarRegion.\n  return MR;\n}\n\n// Report at copy_from_user\
+  \ callsite: potential overflow and missing min(..., sizeof-1).\nvoid SAGenTestChecker::reportCopyIssue(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"copy_from_user size may exceed destination; cap to min(n, sizeof(buf)-1).\"\
+  , N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\
+  \n// Report at string operation callsite after an unsafe copy.\nvoid SAGenTestChecker::reportStringUseIssue(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"String function on buffer after unbounded copy_from_user; missing\
+  \ NUL and overflow risk.\", N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// Handle calls: detect unsafe copy_from_user and later string ops.\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Case 1: copy_from_user(dst, src, nbytes)\n  if (isCopyFromUser(Call, C))\
+  \ {\n    const Expr *DestE = Call.getArgExpr(0);\n    const Expr *SizeE = Call.getArgExpr(2);\n\
+  \    if (!DestE || !SizeE)\n      return;\n\n    // We only warn when destination\
+  \ is a fixed-size array known at compile time.\n    llvm::APInt ArrSz;\n    if (!getArraySizeForDestExpr(DestE,\
+  \ ArrSz, C))\n      return;\n\n    const MemRegion *BaseR = getBaseRegionFromExpr(DestE,\
+  \ C);\n    if (!BaseR)\n      return;\n\n    // Compute limit = sizeof(array) -\
+  \ 1\n    if (ArrSz == 0)\n      return; // degenerate\n    llvm::APInt LimitAP =\
+  \ ArrSz;\n    LimitAP -= 1;\n\n    llvm::APSInt UB;\n    bool Known = false;\n \
+  \   getUpperBoundOfSizeArg(SizeE, C, UB, Known);\n\n    bool Safe = false;\n   \
+  \ if (Known) {\n      uint64_t ubVal = UB.getLimitedValue(UINT64_MAX);\n      uint64_t\
+  \ limitVal = LimitAP.getLimitedValue(UINT64_MAX);\n      Safe = (ubVal <= limitVal);\n\
+  \    }\n\n    if (Safe) {\n      // Clear any previous unsafe mark for this base\
+  \ region.\n      State = State->remove<UnboundedCopyMap>(BaseR);\n      C.addTransition(State);\n\
+  \    } else {\n      // Mark as unsafe and report.\n      State = State->set<UnboundedCopyMap>(BaseR,\
+  \ true);\n      C.addTransition(State);\n      reportCopyIssue(Call, C);\n    }\n\
+  \    return;\n  }\n\n  // Case 2: string operations: strcmp/strncmp/strcasecmp/strncasecmp/strlen\n\
+  \  if (isStringOp(Call, C)) {\n    if (Call.getNumArgs() == 0)\n      return;\n\n\
+  \    const Expr *Arg0 = Call.getArgExpr(0);\n    const MemRegion *BaseR = getArrayBaseForArg(Arg0,\
+  \ C);\n    if (!BaseR)\n      return;\n\n    const bool *Flag = State->get<UnboundedCopyMap>(BaseR);\n\
+  \    if (Flag && *Flag) {\n      reportStringUseIssue(Call, C);\n    }\n    return;\n\
+  \  }\n}\n\n// Track pointer aliases so that p = &buf[0]; and later string ops on\
+  \ p can be recognized.\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n  if (!LHSReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Only track pointer-like values mapping to an underlying\
+  \ base region.\n  const MemRegion *RHSReg = Val.getAsRegion();\n  const MemRegion\
+  \ *BaseToStore = nullptr;\n\n  if (RHSReg) {\n    RHSReg = RHSReg->getBaseRegion();\n\
+  \    if (RHSReg) {\n      // If RHS is a pointer variable with an existing mapping,\
+  \ reuse it.\n      if (const MemRegion *Aliased = State->get<PtrAliasMap>(RHSReg))\
+  \ {\n        BaseToStore = Aliased;\n      } else {\n        // Otherwise, store\
+  \ its own base region (might be an array's VarRegion or similar).\n        BaseToStore\
+  \ = RHSReg;\n      }\n    }\n  }\n\n  if (BaseToStore) {\n    State = State->set<PtrAliasMap>(LHSReg,\
+  \ BaseToStore);\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects unbounded copy_from_user into\
+  \ fixed-size buffers and subsequent string use without guaranteed NUL\",\n     \
+  \ \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nscsi: lpfc: Prevent lpfc_debugfs_lockstat_write()\
+  \ buffer overflow\n\nA static code analysis tool flagged the possibility of buffer\
+  \ overflow when\nusing copy_from_user() for a debugfs entry.\n\nCurrently, it is\
+  \ possible that copy_from_user() copies more bytes than what\nwould fit in the mybuf\
+  \ char array.  Add a min() restriction check between\nsizeof(mybuf) - 1 and nbytes\
+  \ passed from the userspace buffer to protect\nagainst buffer overflow.\n\nLink:\
+  \ https://lore.kernel.org/r/20230301231626.9621-2-justintee8345@gmail.com\nSigned-off-by:\
+  \ Justin Tee <justin.tee@broadcom.com>\nSigned-off-by: Martin K. Petersen <martin.petersen@oracle.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: lpfc_debugfs_lockstat_write in drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  static ssize_t\nlpfc_debugfs_lockstat_write(struct file *file, const char __user\
+  \ *buf,\n\t\t\t    size_t nbytes, loff_t *ppos)\n{\n\tstruct lpfc_debug *debug =\
+  \ file->private_data;\n\tstruct lpfc_hba *phba = (struct lpfc_hba *)debug->i_private;\n\
+  \tstruct lpfc_sli4_hdw_queue *qp;\n\tchar mybuf[64];\n\tchar *pbuf;\n\tint i;\n\n\
+  \tmemset(mybuf, 0, sizeof(mybuf));\n\n\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  \t\treturn -EFAULT;\n\tpbuf = &mybuf[0];\n\n\tif ((strncmp(pbuf, \"reset\", strlen(\"\
+  reset\")) == 0) ||\n\t    (strncmp(pbuf, \"zero\", strlen(\"zero\")) == 0)) {\n\t\
+  \tfor (i = 0; i < phba->cfg_hdw_queue; i++) {\n\t\t\tqp = &phba->sli4_hba.hdwq[i];\n\
+  \t\t\tqp->lock_conflict.alloc_xri_get = 0;\n\t\t\tqp->lock_conflict.alloc_xri_put\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_xri = 0;\n\t\t\tqp->lock_conflict.wq_access\
+  \ = 0;\n\t\t\tqp->lock_conflict.alloc_pvt_pool = 0;\n\t\t\tqp->lock_conflict.mv_from_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.mv_to_pub_pool = 0;\n\t\t\tqp->lock_conflict.mv_to_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_pvt_pool = 0;\n\t\t\tqp->lock_conflict.free_pub_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.wq_access = 0;\n\t\t}\n\t}\n\treturn nbytes;\n}\n\
+  ```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/scsi/lpfc/lpfc_debugfs.c\
+  \ b/drivers/scsi/lpfc/lpfc_debugfs.c\nindex f5252e45a48a..3e365e5e194a 100644\n\
+  --- a/drivers/scsi/lpfc/lpfc_debugfs.c\n+++ b/drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  @@ -2157,10 +2157,13 @@ lpfc_debugfs_lockstat_write(struct file *file, const char\
+  \ __user *buf,\n \tchar mybuf[64];\n \tchar *pbuf;\n \tint i;\n+\tsize_t bsize;\n\
+  \ \n \tmemset(mybuf, 0, sizeof(mybuf));\n \n-\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  +\tbsize = min(nbytes, (sizeof(mybuf) - 1));\n+\n+\tif (copy_from_user(mybuf, buf,\
+  \ bsize))\n \t\treturn -EFAULT;\n \tpbuf = &mybuf[0];\n \n@@ -2181,7 +2184,7 @@\
+  \ lpfc_debugfs_lockstat_write(struct file *file, const char __user *buf,\n \t\t\t\
+  qp->lock_conflict.wq_access = 0;\n \t\t}\n \t}\n-\treturn nbytes;\n+\treturn bsize;\n\
+  \ }\n #endif\n \n```\n"
+pattern: '## Bug Pattern
+
+
+  Copying user-provided data into a fixed-size buffer without bounding the copy size
+  to the buffer capacity and without guaranteeing NUL-termination before string parsing.
+  Concretely:
+
+
+  char buf[64];
+
+  ...
+
+  /* nbytes is user-controlled and may exceed sizeof(buf) */
+
+  copy_from_user(buf, user_ptr, nbytes);   // potential stack buffer overflow
+
+  ...
+
+  strncmp(buf, "reset", strlen("reset"));  // treats buf as a string without ensured
+  NUL
+
+
+  The correct pattern is to cap the copy to min(nbytes, sizeof(buf) - 1) and preserve
+  a trailing NUL.'
+plan: "Plan\n\n1. Program state\n- No custom traits are necessary beyond two simple\
+  \ maps for aliasing and for marking suspicious buffers:\n  - REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n    - Key: pointer variable region.\n   \
+  \ - Value: the ultimate base MemRegion of the underlying fixed-size array it aliases.\n\
+  \  - REGISTER_MAP_WITH_PROGRAMSTATE(UnboundedCopyMap, const MemRegion*, bool)\n\
+  \    - Key: base MemRegion of a fixed-size array.\n    - Value: true indicates that\
+  \ the most recent copy_from_user() into this array was not proven bounded by sizeof(array)-1\
+  \ (thus possible overflow and no guaranteed trailing NUL). Removing the key (or\
+  \ setting false) means safe/clean.\n\n2. Helpers\n- isCopyFromUser(const CallEvent\
+  \ &Call): return true if callee identifier name is \"copy_from_user\".\n- isStringOp(const\
+  \ CallEvent &Call): return true for any of:\n  - \"strcmp\", \"strncmp\", \"strcasecmp\"\
+  , \"strncasecmp\", \"strlen\"\n- getBaseRegionFromExpr(const Expr *E, CheckerContext\
+  \ &C):\n  - Using getMemRegionFromExpr(E, C), then normalize with Region->getBaseRegion().\n\
+  - getArraySizeForDestExpr(const Expr *DestE, llvm::APInt &ArrSz):\n  - Try to find\
+  \ DeclRefExpr of the array via findSpecificTypeInChildren<DeclRefExpr>(DestE). If\
+  \ found, call getArraySizeFromExpr(ArrSz, DRE).\n  - If DestE is an implicit array-to-pointer\
+  \ decay, still find DRE via the child traversal utility.\n  - If Dest is an expression\
+  \ like &buf[0] or buf + 0, use the same approach; the child DeclRefExpr gives you\
+  \ the array VarDecl.\n- getUpperBoundOfSizeArg(const Expr *SizeE, CheckerContext\
+  \ &C, llvm::APSInt &UB, bool &Known):\n  - If EvaluateExprToInt(UB, SizeE, C) succeeds,\
+  \ Known = true.\n  - Else, get SVal SV = State->getSVal(SizeE, C.getLocationContext()).\
+  \ If SV is a SymbolVal, query inferSymbolMaxVal(SymbolRef, C). If it returns non-null,\
+  \ set UB = *maxVal, Known = true. Otherwise Known = false.\n- getArrayBaseForArg(const\
+  \ Expr *ArgE, CheckerContext &C):\n  - 1) Try getBaseRegionFromExpr(ArgE, C), call\
+  \ it R.\n  - 2) Look up PtrAliasMap[R] to see if it maps to a base array region;\
+  \ if so, return that base. Otherwise, just return R.\n\n3. checkPreCall\n3.1. Handle\
+  \ copy_from_user\n- If !isCopyFromUser(Call): return.\n- Extract:\n  - DestE = Call.getArgExpr(0)\n\
+  \  - SizeE = Call.getArgExpr(2)\n- Determine the array base and size:\n  - If getArraySizeForDestExpr(DestE,\
+  \ ArrSz) fails, bail out (we only warn on fixed-size arrays).\n  - BaseR = getBaseRegionFromExpr(DestE,\
+  \ C)->getBaseRegion().\n- Compute the upper bound of SizeE:\n  - UB, Known = getUpperBoundOfSizeArg(SizeE,\
+  \ C).\n- Decide safety:\n  - Required safety: SizeE \u2264 sizeof(array) - 1.\n\
+  \  - Let Limit = ArrSz - 1 (as unsigned APInt).\n  - If Known and UB \u2264 Limit:\
+  \ safe. Update state: UnboundedCopyMap = UnboundedCopyMap.remove(BaseR) (or set\
+  \ to false).\n  - Else (Unknown UB or UB > Limit): unsafe. Update state: UnboundedCopyMap[BaseR]\
+  \ = true. Also, immediately emit a bug:\n    - Message: copy_from_user size may\
+  \ exceed destination; cap to min(n, sizeof(buf)-1).\n    - Create a non-fatal error\
+  \ node and PathSensitiveBugReport pointing at the call site.\n- Note: Even if safe,\
+  \ do not attempt to infer or enforce NUL termination beyond the bound check; the\
+  \ min(size, sizeof-1) check adequately preserves space for NUL.\n\n3.2. Handle string\
+  \ operations\n- If isStringOp(Call) is false: return.\n- Identify the buffer argument\
+  \ (first argument for these functions): E = Call.getArgExpr(0).\n- Resolve to base\
+  \ array region: BaseR = getArrayBaseForArg(E, C).\n- Query UnboundedCopyMap[BaseR]:\n\
+  \  - If present and true, emit a bug:\n    - Message: String function on buffer\
+  \ after unbounded copy_from_user; missing NUL and overflow risk.\n    - Non-fatal\
+  \ error node and PathSensitiveBugReport at the string call.\n  - Else: no report.\n\
+  \n4. checkBind\n- Purpose: track aliases so string functions invoked on pointer\
+  \ variables pointing into fixed-size arrays are recognized.\n- When binding a pointer\
+  \ target:\n  - If the destination (LHS) is a pointer variable region (call it LHSR).\n\
+  \  - Try to discover if RHS aliases a fixed-size array:\n    - If RHS is an Expr,\
+  \ get R = getBaseRegionFromExpr(RHSExpr, C).\n      - If R refers to a DeclRefExpr\
+  \ of an array (use findSpecificTypeInChildren<DeclRefExpr> on RHSExpr and getArraySizeFromExpr\
+  \ to confirm), set PtrAliasMap[LHSR] = R->getBaseRegion().\n    - Else if RHS is\
+  \ another pointer variable region Rptr and PtrAliasMap[Rptr] exists mapping to BaseR,\
+  \ then set PtrAliasMap[LHSR] = BaseR (alias propagation).\n- This tracking enables\
+  \ recognizing p = &buf[0]; followed by strncmp(p, ...).\n\n5. Optional cleanups\
+  \ and scope\n- No explicit cleanup is required; maps are per-path and per-function\
+  \ naturally managed by the analyzer.\n- You may optionally remove entries from UnboundedCopyMap\
+  \ when you see a subsequent bounded copy_from_user into the same BaseR (as described\
+  \ in 3.1), or when you detect a clear NUL write (e.g., explicit write of \u2018\
+  0\u2019 to the last byte). For simplicity, the above plan doesn\u2019t require handling\
+  \ explicit NUL writes.\n\n6. Reporting details\n- Use std::make_unique<PathSensitiveBugReport>\
+  \ with short, clear messages:\n  - For copy_from_user: \"copy_from_user size may\
+  \ exceed destination; cap to min(n, sizeof(buf)-1).\"\n  - For string ops: \"String\
+  \ function on buffer after unbounded copy_from_user; missing NUL and overflow risk.\"\
+  \n- Use generateNonFatalErrorNode(State) to create the error node for reports.\n\
+  - Attach the relevant argument expressions as the report range where possible (DestE\
+  \ or the string-argument E).\n\n7. Notes on conservatism and false positives\n-\
+  \ We only warn on copy_from_user when the destination is a compile-time constant-sized\
+  \ array and the size upper bound is unknown or greater than sizeof(array)-1.\n-\
+  \ We avoid warning when we can prove UB \u2264 sizeof(array)-1 using EvaluateExprToInt\
+  \ or inferSymbolMaxVal.\n- The string-op warning is secondary and only triggers\
+  \ if an unbounded copy was previously recorded for the same base array region. This\
+  \ keeps the signal focused on the actual bug pattern highlighted by the patch."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Type.h\"\n#include \"llvm/ADT/APSInt.h\"\
+  \n#include \"llvm/ADT/APInt.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Program state maps:\n// - PtrAliasMap: map a pointer\
+  \ variable region to the base region it ultimately aliases.\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n// - UnboundedCopyMap: mark base array regions\
+  \ that had an unsafe/unbounded copy_from_user into them.\nREGISTER_MAP_WITH_PROGRAMSTATE(UnboundedCopyMap,\
+  \ const MemRegion*, bool)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Unbounded user copy into fixed buffer\", \"Security\"\
+  )) {}\n\n      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \n   private:\n      // Helpers\n      bool isCopyFromUser(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      bool isStringOp(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n\n      const MemRegion *getBaseRegionFromExpr(const Expr *E, CheckerContext\
+  \ &C) const;\n\n      bool getArraySizeForDestExpr(const Expr *DestE, llvm::APInt\
+  \ &ArrSz,\n                                   CheckerContext &C) const;\n\n    \
+  \  bool getUpperBoundOfSizeArg(const Expr *SizeE, CheckerContext &C,\n         \
+  \                         llvm::APSInt &UB, bool &Known) const;\n\n      const MemRegion\
+  \ *getArrayBaseForArg(const Expr *ArgE, CheckerContext &C) const;\n\n      void\
+  \ reportCopyIssue(const CallEvent &Call, CheckerContext &C) const;\n      void reportStringUseIssue(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n};\n\n// Return true if the call is\
+  \ to copy_from_user.\nbool SAGenTestChecker::isCopyFromUser(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if\
+  \ (!Origin)\n    return false;\n  return ExprHasName(Origin, \"copy_from_user\"\
+  , C);\n}\n\n// Return true if the call is one of common string operations that expect\
+  \ NUL-terminated strings.\nbool SAGenTestChecker::isStringOp(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if\
+  \ (!Origin)\n    return false;\n\n  // String ops to consider.\n  static const char\
+  \ *Names[] = {\n    \"strcmp\", \"strncmp\", \"strcasecmp\", \"strncasecmp\", \"\
+  strlen\"\n  };\n  for (const char *N : Names) {\n    if (ExprHasName(Origin, N,\
+  \ C))\n      return true;\n  }\n  return false;\n}\n\n// Get the base region from\
+  \ an expression using the analyzer's SVal machinery.\n// Do not IgnoreImplicit()\
+  \ before calling getMemRegionFromExpr, and always normalize to base region.\nconst\
+  \ MemRegion *SAGenTestChecker::getBaseRegionFromExpr(const Expr *E, CheckerContext\
+  \ &C) const {\n  if (!E)\n    return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(E,\
+  \ C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n}\n\n// Try\
+  \ to infer the constant array size for a destination expression.\n// Returns true\
+  \ on success and stores the size into ArrSz.\nbool SAGenTestChecker::getArraySizeForDestExpr(const\
+  \ Expr *DestE, llvm::APInt &ArrSz,\n                                           \
+  \    CheckerContext &C) const {\n  if (!DestE)\n    return false;\n\n  // First,\
+  \ if the expression itself is a DeclRefExpr, try directly.\n  if (const auto *DREself\
+  \ = dyn_cast<DeclRefExpr>(DestE->IgnoreParenCasts())) {\n    if (getArraySizeFromExpr(ArrSz,\
+  \ DREself))\n      return true;\n  }\n\n  // Otherwise, try to find a DeclRefExpr\
+  \ in the children (works for array-to-pointer decay or &buf[0], etc).\n  if (const\
+  \ auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(DestE)) {\n    if (getArraySizeFromExpr(ArrSz,\
+  \ DRE))\n      return true;\n  }\n\n  return false;\n}\n\n// Infer an upper bound\
+  \ for the size argument.\n// Known is set to true if UB is a known constant/upper\
+  \ bound. Otherwise, Known is false.\nbool SAGenTestChecker::getUpperBoundOfSizeArg(const\
+  \ Expr *SizeE, CheckerContext &C,\n                                            \
+  \  llvm::APSInt &UB, bool &Known) const {\n  Known = false;\n  if (!SizeE)\n   \
+  \ return false;\n\n  // Try to evaluate as integer constant\n  if (EvaluateExprToInt(UB,\
+  \ SizeE, C)) {\n    Known = true;\n    return true;\n  }\n\n  // Otherwise, try\
+  \ to infer max value via symbol constraints.\n  ProgramStateRef State = C.getState();\n\
+  \  SVal SV = State->getSVal(SizeE, C.getLocationContext());\n  SymbolRef Sym = SV.getAsSymbol();\n\
+  \  if (!Sym)\n    return false;\n\n  if (const llvm::APSInt *MaxV = inferSymbolMaxVal(Sym,\
+  \ C)) {\n    UB = *MaxV;\n    Known = true;\n    return true;\n  }\n\n  return false;\n\
+  }\n\n// Given an argument expression to a string function, get the base array region\
+  \ it refers to.\n// This consults alias map to resolve pointer variables.\nconst\
+  \ MemRegion *SAGenTestChecker::getArrayBaseForArg(const Expr *ArgE, CheckerContext\
+  \ &C) const {\n  if (!ArgE)\n    return nullptr;\n\n  ProgramStateRef State = C.getState();\n\
+  \  const MemRegion *MR = getBaseRegionFromExpr(ArgE, C);\n  if (!MR)\n    return\
+  \ nullptr;\n\n  // If the expression is a pointer variable that aliases an array,\
+  \ resolve it through PtrAliasMap.\n  if (const MemRegion * const *AliasedBase =\
+  \ State->get<PtrAliasMap>(MR)) {\n    return *AliasedBase;\n  }\n\n  // Otherwise,\
+  \ return the base we got. This may already be the array's VarRegion.\n  return MR;\n\
+  }\n\n// Report at copy_from_user callsite: potential overflow and missing min(...,\
+  \ sizeof-1).\nvoid SAGenTestChecker::reportCopyIssue(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n \
+  \   return;\n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"\
+  copy_from_user size may exceed destination; cap to min(n, sizeof(buf)-1).\", N);\n\
+  \  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n// Report\
+  \ at string operation callsite after an unsafe copy.\nvoid SAGenTestChecker::reportStringUseIssue(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"String function on buffer after unbounded copy_from_user; missing\
+  \ NUL and overflow risk.\", N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// Handle calls: detect unsafe copy_from_user and later string ops.\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Case 1: copy_from_user(dst, src, nbytes)\n  if (isCopyFromUser(Call, C))\
+  \ {\n    const Expr *DestE = Call.getArgExpr(0);\n    const Expr *SizeE = Call.getArgExpr(2);\n\
+  \    if (!DestE || !SizeE)\n      return;\n\n    // We only warn when destination\
+  \ is a fixed-size array known at compile time.\n    llvm::APInt ArrSz;\n    if (!getArraySizeForDestExpr(DestE,\
+  \ ArrSz, C))\n      return;\n\n    const MemRegion *BaseR = getBaseRegionFromExpr(DestE,\
+  \ C);\n    if (!BaseR)\n      return;\n\n    // Compute limit = sizeof(array) -\
+  \ 1\n    if (ArrSz == 0)\n      return; // degenerate\n    llvm::APInt LimitAP =\
+  \ ArrSz;\n    LimitAP -= 1;\n\n    llvm::APSInt UB;\n    bool Known = false;\n \
+  \   getUpperBoundOfSizeArg(SizeE, C, UB, Known);\n\n    bool Safe = false;\n   \
+  \ if (Known) {\n      uint64_t ubVal = UB.getLimitedValue(UINT64_MAX);\n      uint64_t\
+  \ limitVal = LimitAP.getLimitedValue(UINT64_MAX);\n      Safe = (ubVal <= limitVal);\n\
+  \    }\n\n    if (Safe) {\n      // Clear any previous unsafe mark for this base\
+  \ region.\n      State = State->remove<UnboundedCopyMap>(BaseR);\n      C.addTransition(State);\n\
+  \    } else {\n      // Mark as unsafe and report.\n      State = State->set<UnboundedCopyMap>(BaseR,\
+  \ true);\n      C.addTransition(State);\n      reportCopyIssue(Call, C);\n    }\n\
+  \    return;\n  }\n\n  // Case 2: string operations: strcmp/strncmp/strcasecmp/strncasecmp/strlen\n\
+  \  if (isStringOp(Call, C)) {\n    if (Call.getNumArgs() == 0)\n      return;\n\n\
+  \    const Expr *Arg0 = Call.getArgExpr(0);\n    const MemRegion *BaseR = getArrayBaseForArg(Arg0,\
+  \ C);\n    if (!BaseR)\n      return;\n\n    const bool *Flag = State->get<UnboundedCopyMap>(BaseR);\n\
+  \    if (Flag && *Flag) {\n      reportStringUseIssue(Call, C);\n    }\n    return;\n\
+  \  }\n}\n\n// Track pointer aliases so that p = &buf[0]; and later string ops on\
+  \ p can be recognized.\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n  if (!LHSReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Only track pointer-like values mapping to an underlying\
+  \ base region.\n  const MemRegion *RHSReg = Val.getAsRegion();\n  const MemRegion\
+  \ *BaseToStore = nullptr;\n\n  if (RHSReg) {\n    RHSReg = RHSReg->getBaseRegion();\n\
+  \    if (RHSReg) {\n      // If RHS is a pointer variable with an existing mapping,\
+  \ reuse it.\n      if (const MemRegion * const *Aliased = State->get<PtrAliasMap>(RHSReg))\
+  \ {\n        BaseToStore = *Aliased;\n      } else {\n        // Otherwise, store\
+  \ its own base region (might be an array's VarRegion or similar).\n        BaseToStore\
+  \ = RHSReg;\n      }\n    }\n  }\n\n  if (BaseToStore) {\n    State = State->set<PtrAliasMap>(LHSReg,\
+  \ BaseToStore);\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects unbounded copy_from_user into\
+  \ fixed-size buffers and subsequent string use without guaranteed NUL\",\n     \
+  \ \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

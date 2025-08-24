@@ -1,0 +1,243 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -278,6 +278,18 @@              L.find("bound") != std::string::npos));
+   }
+
++  static bool rhsTextLooksMinLike(const Expr *RHS, CheckerContext &C) {
++    StringRef Txt = getExprText(RHS, C);
++    std::string L = toLowerCopy(Txt);
++    return (!L.empty() &&
++            (L.find("min") != std::string::npos ||
++             L.find("start") != std::string::npos ||
++             L.find("lower") != std::string::npos ||
++             L.find("lo") != std::string::npos ||
++             L.find("begin") != std::string::npos ||
++             L.find("first") != std::string::npos));
++  }
++
+   static bool isPlainMaxLikeBound(const Expr *Bound, CheckerContext &C) {
+     if (!Bound)
+       return false;
+@@ -299,6 +311,29 @@       return nameLooksLikeCapacityOrMax(Name); // Do not treat *_count/*_num as MAX-like.
+
+     return rhsTextLooksMaxLike(Bound, C);
++  }
++
++  static bool isPlainMinLikeBound(const Expr *Bound, CheckerContext &C) {
++    if (!Bound)
++      return false;
++
++    Bound = Bound->IgnoreParenCasts();
++
++    if (isa<IntegerLiteral>(Bound)) {
++      return rhsTextLooksMinLike(Bound, C);
++    }
++
++    if (isUnarySizeOf(Bound))
++      return false;
++
++    if (isCompositeBoundExpr(Bound))
++      return false;
++
++    StringRef Name = getIdentNameFromExpr(Bound);
++    if (!Name.empty())
++      return rhsTextLooksMinLike(Bound, C);
++
++    return rhsTextLooksMinLike(Bound, C);
+   }
+
+   // Range endpoint detection helpers.
+@@ -351,7 +386,6 @@       if (L.size() >= S.size() && L.compare(L.size() - S.size(), S.size(), S) == 0)
+         L.erase(L.size() - S.size());
+     };
+-    // Handle both min-side and max-side tokens.
+     const char *MinToks[] = {"min","start","begin","first","lo","low","lower"};
+     const char *MaxToks[] = {"max","end","last","hi","high","upper"};
+
+@@ -566,6 +600,32 @@     }
+   }
+
++  static void collectLtLeComparisons(const Expr *E,
++                                     llvm::SmallVectorImpl<const BinaryOperator*> &Out) {
++    if (!E)
++      return;
++    E = E->IgnoreParenImpCasts();
++
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      if (BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr) {
++        collectLtLeComparisons(BO->getLHS(), Out);
++        collectLtLeComparisons(BO->getRHS(), Out);
++        return;
++      }
++      if (BO->getOpcode() == BO_LT || BO->getOpcode() == BO_LE) {
++        Out.push_back(BO);
++        return;
++      }
++    }
++
++    if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
++      collectLtLeComparisons(CO->getCond(), Out);
++      collectLtLeComparisons(CO->getTrueExpr(), Out);
++      collectLtLeComparisons(CO->getFalseExpr(), Out);
++      return;
++    }
++  }
++
+   static const Decl* getReferencedDecl(const Expr *E) {
+     if (!E) return nullptr;
+     E = E->IgnoreParenCasts();
+@@ -588,6 +648,102 @@     if (const auto *IL = dyn_cast<IntegerLiteral>(E))
+       return IL->getValue() == V;
+     return false;
++  }
++
++  // Structural equality for expressions used to compare if two LHS expressions are the "same".
++  static bool areEquivalentExprs(const Expr *A, const Expr *B, CheckerContext &C) {
++    if (!A || !B) return false;
++    A = A->IgnoreParenCasts();
++    B = B->IgnoreParenCasts();
++
++    if (A == B) return true;
++
++    if (const auto *DA = dyn_cast<DeclRefExpr>(A)) {
++      if (const auto *DB = dyn_cast<DeclRefExpr>(B))
++        return DA->getDecl()->getCanonicalDecl() == DB->getDecl()->getCanonicalDecl();
++    }
++
++    if (const auto *MA = dyn_cast<MemberExpr>(A)) {
++      if (const auto *MB = dyn_cast<MemberExpr>(B)) {
++        if (MA->getMemberDecl()->getCanonicalDecl() != MB->getMemberDecl()->getCanonicalDecl())
++          return false;
++        return areEquivalentExprs(MA->getBase(), MB->getBase(), C);
++      }
++    }
++
++    if (const auto *AA = dyn_cast<ArraySubscriptExpr>(A)) {
++      if (const auto *AB = dyn_cast<ArraySubscriptExpr>(B)) {
++        return areEquivalentExprs(AA->getBase(), AB->getBase(), C) &&
++               areEquivalentExprs(AA->getIdx(), AB->getIdx(), C);
++      }
++    }
++
++    if (const auto *UA = dyn_cast<UnaryOperator>(A)) {
++      if (const auto *UB = dyn_cast<UnaryOperator>(B)) {
++        if (UA->getOpcode() != UB->getOpcode())
++          return false;
++        return areEquivalentExprs(UA->getSubExpr(), UB->getSubExpr(), C);
++      }
++    }
++
++    // Fallback to textual match for common simple cases (macros, etc.).
++    StringRef TA = getExprText(A, C);
++    StringRef TB = getExprText(B, C);
++    return !TA.empty() && TA == TB;
++  }
++
++  // Detect if the current '>' comparison on an ArraySubscriptExpr LHS is paired with a lower-bound guard (x < MIN).
++  static bool hasPairedLowerBoundGuardForArrayLHS(const Expr *FullCond, const Expr *LHSCand, CheckerContext &C) {
++    const auto *ASE = dyn_cast_or_null<ArraySubscriptExpr>(LHSCand ? LHSCand->IgnoreParenCasts() : nullptr);
++    if (!ASE || !FullCond)
++      return false;
++
++    llvm::SmallVector<const BinaryOperator*, 8> LtComps;
++    collectLtLeComparisons(FullCond, LtComps);
++
++    for (const BinaryOperator *BO : LtComps) {
++      const Expr *L = BO->getLHS()->IgnoreParenCasts();
++      const Expr *R = BO->getRHS()->IgnoreParenCasts();
++
++      if (!areEquivalentExprs(L, ASE, C))
++        continue;
++
++      // RHS named MIN-like, or small integer literal (0/1)
++      bool MinLike = isPlainMinLikeBound(R, C);
++      if (!MinLike) {
++        if (const auto *IL = dyn_cast<IntegerLiteral>(R)) {
++          uint64_t V = IL->getValue().getLimitedValue();
++          if (V <= 1)
++            MinLike = true;
++        }
++      }
++      if (MinLike)
++        return true;
++    }
++    return false;
++  }
++
++  // Recognize scalar-control-style one-element array access (e.g., ucontrol->value.integer.value[0]).
++  static bool isControlValueArrayAccess(const ArraySubscriptExpr *ASE, CheckerContext &C) {
++    if (!ASE) return false;
++    const Expr *Idx = ASE->getIdx()->IgnoreParenCasts();
++    if (!isa<IntegerLiteral>(Idx))
++      return false;
++
++    uint64_t V = cast<IntegerLiteral>(Idx)->getValue().getLimitedValue();
++    if (V != 0)
++      return false;
++
++    // Heuristic: base expression text contains tokens like 'ucontrol'/'control' and 'value'.
++    StringRef BaseTxt = getExprText(ASE->getBase(), C);
++    std::string L = toLowerCopy(BaseTxt);
++    bool HasControlTok = (L.find("ucontrol") != std::string::npos) ||
++                         (L.find("kcontrol") != std::string::npos) ||
++                         (L.find("control") != std::string::npos) ||
++                         (L.find("ctl") != std::string::npos);
++    bool HasValueTok = (L.find("value") != std::string::npos) ||
++                        (L.find("val") != std::string::npos);
++    return HasControlTok && HasValueTok;
+   }
+
+   // Detect the 1-based ordinal guard pattern for the same LHS symbol:
+@@ -652,9 +808,24 @@     if (isa<IntegerLiteral>(E))
+       return false;
+
+-    // Array indexing is always index-like.
+-    if (isa<ArraySubscriptExpr>(E))
+-      return true;
++    // Array indexing is typically index-like, but exclude scalar-control idioms.
++    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
++      // Exclude constant-subscript forms like arr[0].
++      const Expr *Idx = ASE->getIdx()->IgnoreParenCasts();
++      if (isa<IntegerLiteral>(Idx))
++        return false;
++
++      // Exclude "ucontrol/kcontrol/...->value[0]" style scalar control arrays.
++      if (isControlValueArrayAccess(ASE, *PCtx))
++        return false;
++
++      // If base's terminal name is 'value' or 'val', likely not an index.
++      StringRef BaseName = getIdentNameFromExpr(ASE->getBase());
++      if (BaseName.equals_insensitive("value") || BaseName.equals_insensitive("val"))
++        return false;
++
++      return true;
++    }
+
+     StringRef Name = getIdentNameFromExpr(E);
+     if (!Name.empty()) {
+@@ -771,7 +942,7 @@     return false;
+   }
+
+-  bool isCandidateGtComparison(const BinaryOperator *BO, const IfStmt *EnclosingIf, CheckerContext &C) const {
++  bool isCandidateGtComparison(const BinaryOperator *BO, const IfStmt *EnclosingIf, const Expr *FullCond, CheckerContext &C) const {
+     if (!BO || BO->getOpcode() != BO_GT)
+       return false;
+
+@@ -783,6 +954,12 @@
+     // LHS should look like an index. Exclude size/len fields and min/max range endpoints.
+     if (!isLikelyIndexExpr(LHS, RHS, &C))
++      return false;
++
++    // Special suppression: if LHS is an ArraySubscriptExpr and the full condition also
++    // contains a paired lower-bound check on the same LHS (x < MIN), this is likely a
++    // scalar parameter range validation, not index validation.
++    if (hasPairedLowerBoundGuardForArrayLHS(FullCond, LHS, C))
+       return false;
+
+     // RHS should be a named MAX-like bound (including macros that expand to integers).
+@@ -849,7 +1026,7 @@     return;
+
+   for (const BinaryOperator *BO : GtComps) {
+-    if (!isCandidateGtComparison(BO, IS, C))
++    if (!isCandidateGtComparison(BO, IS, CondE, C))
+       continue;
+
+     // Suppress the common 1-based ordinal check: (!x || x == 0/<=0/<1) || (x > Bound)

@@ -1,0 +1,4 @@
+- Decision: NotABug
+- Reason: The reported path is in the error-unwind of internal_dev_create(). It frees resources in this order: free_percpu(dev->tstats); free_netdev(dev); ovs_vport_free(vport). The target bug pattern concerns freeing a net_device before canceling/flushing deferred work that later accesses netdev_priv, leading to UAF. Here, there is no deferred work/timer/IRQ involved, and no direct use of netdev_priv after free_netdev in this function.
+
+Moreover, ovs_vport_free(vport) is explicitly designed to be callable after the net_device has been freed: internal_dev_destructor (set as netdev->priv_destructor) calls ovs_vport_free(vport) during netdev teardown. Thus, ovs_vport_free() must not dereference the net_device’s private area, and its invocation after free_netdev is intentional and safe. Therefore, the report neither matches the specified bug pattern nor indicates a real bug.

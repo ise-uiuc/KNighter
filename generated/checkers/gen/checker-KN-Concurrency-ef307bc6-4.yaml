@@ -1,0 +1,530 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ef307bc6ef04e8c1ea843231db58e3afaafa9fa6
+commit_type: Concurrency
+index: 4
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/DenseMap.h\"\
+  \n#include \"llvm/ADT/SmallPtrSet.h\"\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\nnamespace {\n/* The checker callbacks are to\
+  \ be decided. */\nclass SAGenTestChecker : public Checker< check::ASTCodeBody, check::EndAnalysis\
+  \ > {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Unlocked NULL write races with under-lock use of pointer\
+  \ field\", \"Concurrency\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n      void checkEndAnalysis(ExplodedGraph &G, BugReporter\
+  \ &BR, ExprEngine &Eng) const;\n\n   private:\n\n      struct UnlockedWriteSite\
+  \ {\n        const FieldDecl *FD = nullptr;\n        const Stmt *AssignNode = nullptr;\n\
+  \        std::string FuncName;\n        bool AfterUnlock = false;\n      };\n  \
+  \    struct ProtectedUseSite {\n        const FieldDecl *FD = nullptr;\n       \
+  \ const Stmt *CheckNode = nullptr; // may be null if no explicit check found\n \
+  \       const Stmt *UseNode = nullptr;\n        std::string FuncName;\n      };\n\
+  \n      mutable std::vector<UnlockedWriteSite> UnlockedWrites;\n      mutable std::vector<ProtectedUseSite>\
+  \ ProtectedUses;\n\n      // Helpers for scanning\n      static const FunctionDecl\
+  \ *getDirectCallee(const CallExpr *CE) {\n        return CE ? CE->getDirectCallee()\
+  \ : nullptr;\n      }\n\n      static bool nameIs(const FunctionDecl *FD, StringRef\
+  \ N) {\n        if (!FD) return false;\n        if (const IdentifierInfo *II = FD->getIdentifier())\n\
+  \          return II->getName() == N;\n        return false;\n      }\n\n      static\
+  \ bool isSpinLockName(StringRef N) {\n        return N == \"spin_lock\" || N ==\
+  \ \"spin_lock_bh\" ||\n               N == \"spin_lock_irq\" || N == \"spin_lock_irqsave\"\
+  ;\n      }\n\n      static bool isSpinUnlockName(StringRef N) {\n        return\
+  \ N == \"spin_unlock\" || N == \"spin_unlock_bh\" ||\n               N == \"spin_unlock_irq\"\
+  \ || N == \"spin_unlock_irqrestore\";\n      }\n\n      static bool isSpinLockCall(const\
+  \ CallExpr *CE) {\n        const FunctionDecl *FD = getDirectCallee(CE);\n     \
+  \   if (!FD) return false;\n        if (const IdentifierInfo *II = FD->getIdentifier())\n\
+  \          return isSpinLockName(II->getName());\n        return false;\n      }\n\
+  \n      static bool isSpinUnlockCall(const CallExpr *CE) {\n        const FunctionDecl\
+  \ *FD = getDirectCallee(CE);\n        if (!FD) return false;\n        if (const\
+  \ IdentifierInfo *II = FD->getIdentifier())\n          return isSpinUnlockName(II->getName());\n\
+  \        return false;\n      }\n\n      static const FieldDecl* getArrowField(const\
+  \ Expr *E) {\n        if (!E) return nullptr;\n        E = E->IgnoreParenCasts();\n\
+  \        const auto *ME = dyn_cast<MemberExpr>(E);\n        if (!ME || !ME->isArrow())\n\
+  \          return nullptr;\n        const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \        if (!FD) return nullptr;\n        if (!FD->getType()->isPointerType())\n\
+  \          return nullptr;\n        return FD;\n      }\n\n      static const FieldDecl*\
+  \ findFieldInSubtree(const Expr *E) {\n        if (!E) return nullptr;\n       \
+  \ E = E->IgnoreParenCasts();\n        if (const FieldDecl *FD = getArrowField(E))\n\
+  \          return FD;\n        for (const Stmt *Child : E->children()) {\n     \
+  \     const Expr *CE = dyn_cast_or_null<Expr>(Child);\n          if (!CE) continue;\n\
+  \          if (const FieldDecl *FD = findFieldInSubtree(CE))\n            return\
+  \ FD;\n        }\n        return nullptr;\n      }\n\n      static bool isNullExpr(const\
+  \ Expr *E, ASTContext &ACtx) {\n        if (!E) return false;\n        E = E->IgnoreParenCasts();\n\
+  \        // Cover most null pointer constants\n        if (E->isNullPointerConstant(ACtx,\
+  \ Expr::NPC_ValueDependentIsNull))\n          return true;\n        if (const auto\
+  \ *IL = dyn_cast<IntegerLiteral>(E))\n          return IL->getValue() == 0;\n  \
+  \      return false;\n      }\n\n      void addUnlockedWrite(const FieldDecl *FD,\
+  \ const Stmt *AssignNode,\n                            StringRef FuncName, bool\
+  \ AfterUnlock) const {\n        UnlockedWriteSite S;\n        S.FD = FD;\n     \
+  \   S.AssignNode = AssignNode;\n        S.FuncName = FuncName.str();\n        S.AfterUnlock\
+  \ = AfterUnlock;\n        UnlockedWrites.push_back(S);\n      }\n\n      void addProtectedUse(const\
+  \ FieldDecl *FD, const Stmt *CheckNode,\n                           const Stmt *UseNode,\
+  \ StringRef FuncName) const {\n        ProtectedUseSite S;\n        S.FD = FD;\n\
+  \        S.CheckNode = CheckNode;\n        S.UseNode = UseNode;\n        S.FuncName\
+  \ = FuncName.str();\n        ProtectedUses.push_back(S);\n      }\n\n      // Per-function\
+  \ scanner\n      class FuncBodyScanner : public RecursiveASTVisitor<FuncBodyScanner>\
+  \ {\n        ASTContext &ACtx;\n        const FunctionDecl *FD;\n        const SAGenTestChecker\
+  \ *Checker;\n        int LockDepth = 0;\n        bool AfterUnlock = false;\n\n \
+  \       llvm::DenseMap<const FieldDecl*, const Stmt*> CheckedMap;\n        llvm::DenseMap<const\
+  \ FieldDecl*, const Stmt*> UseMap;\n\n        void recordUse(const FieldDecl *F,\
+  \ const Stmt *UseNode) {\n          if (!F) return;\n          if (!UseMap.count(F))\n\
+  \            UseMap[F] = UseNode;\n        }\n\n        void flushProtectedUses()\
+  \ {\n          if (UseMap.empty()) return;\n          for (auto &P : UseMap) {\n\
+  \            const FieldDecl *F = P.first;\n            const Stmt *UseN = P.second;\n\
+  \            const Stmt *CheckN = nullptr;\n            auto It = CheckedMap.find(F);\n\
+  \            if (It != CheckedMap.end())\n              CheckN = It->second;\n \
+  \           Checker->addProtectedUse(F, CheckN, UseN, FD->getName());\n        \
+  \  }\n          CheckedMap.clear();\n          UseMap.clear();\n        }\n\n  \
+  \     public:\n        FuncBodyScanner(ASTContext &ACtx, const FunctionDecl *FD,\
+  \ const SAGenTestChecker *C)\n          : ACtx(ACtx), FD(FD), Checker(C) {}\n\n\
+  \        bool VisitCallExpr(CallExpr *CE) {\n          if (!CE) return true;\n \
+  \         const FunctionDecl *Callee = CE->getDirectCallee();\n          StringRef\
+  \ Name;\n          if (Callee) {\n            if (const IdentifierInfo *II = Callee->getIdentifier())\n\
+  \              Name = II->getName();\n          }\n\n          if (isSpinLockName(Name))\
+  \ {\n            if (LockDepth == 0) {\n              CheckedMap.clear();\n    \
+  \          UseMap.clear();\n            }\n            ++LockDepth;\n          \
+  \  AfterUnlock = false;\n            return true;\n          }\n\n          if (isSpinUnlockName(Name))\
+  \ {\n            if (LockDepth > 0)\n              --LockDepth;\n            if\
+  \ (LockDepth == 0) {\n              flushProtectedUses();\n              AfterUnlock\
+  \ = true;\n            }\n            return true;\n          }\n\n          if\
+  \ (LockDepth > 0) {\n            // Record uses in call arguments while holding\
+  \ lock.\n            for (unsigned i = 0; i < CE->getNumArgs(); ++i) {\n       \
+  \       const Expr *Arg = CE->getArg(i);\n              const FieldDecl *F = SAGenTestChecker::findFieldInSubtree(Arg);\n\
+  \              if (F && F->getType()->isPointerType())\n                recordUse(F,\
+  \ CE);\n            }\n          }\n          return true;\n        }\n\n      \
+  \  bool VisitBinaryOperator(BinaryOperator *BO) {\n          if (!BO) return true;\n\
+  \          if (BO->getOpcode() == BO_Assign) {\n            const FieldDecl *F =\
+  \ SAGenTestChecker::getArrowField(BO->getLHS());\n            if (F && F->getType()->isPointerType())\
+  \ {\n              if (SAGenTestChecker::isNullExpr(BO->getRHS(), ACtx)) {\n   \
+  \             if (LockDepth == 0) {\n                  Checker->addUnlockedWrite(F,\
+  \ BO, FD->getName(), AfterUnlock);\n                }\n              }\n       \
+  \     }\n          }\n          return true;\n        }\n\n        bool VisitIfStmt(IfStmt\
+  \ *IS) {\n          if (!IS) return true;\n          if (LockDepth <= 0) return\
+  \ true;\n          const Expr *Cond = IS->getCond();\n          if (!Cond) return\
+  \ true;\n          Cond = Cond->IgnoreParenCasts();\n\n          const FieldDecl\
+  \ *F = nullptr;\n          if (const auto *UO = dyn_cast<UnaryOperator>(Cond)) {\n\
+  \            if (UO->getOpcode() == UO_LNot) {\n              F = SAGenTestChecker::findFieldInSubtree(UO->getSubExpr());\n\
+  \            }\n          } else if (const auto *BO = dyn_cast<BinaryOperator>(Cond))\
+  \ {\n            if (BO->isEqualityOp()) {\n              const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n\
+  \              const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n           \
+  \   bool LIsNull = SAGenTestChecker::isNullExpr(LHS, ACtx);\n              bool\
+  \ RIsNull = SAGenTestChecker::isNullExpr(RHS, ACtx);\n              if (LIsNull\
+  \ && !RIsNull)\n                F = SAGenTestChecker::findFieldInSubtree(RHS);\n\
+  \              else if (RIsNull && !LIsNull)\n                F = SAGenTestChecker::findFieldInSubtree(LHS);\n\
+  \            }\n          }\n          if (F && !CheckedMap.count(F))\n        \
+  \    CheckedMap[F] = IS;\n          return true;\n        }\n\n        bool VisitMemberExpr(MemberExpr\
+  \ *ME) {\n          if (!ME) return true;\n          if (LockDepth <= 0) return\
+  \ true;\n          if (!ME->isArrow()) return true;\n          const Expr *Base\
+  \ = ME->getBase();\n          if (!Base) return true;\n          Base = Base->IgnoreParenCasts();\n\
+  \          if (const auto *BME = dyn_cast<MemberExpr>(Base)) {\n            if (BME->isArrow())\
+  \ {\n              if (const auto *FD = dyn_cast<FieldDecl>(BME->getMemberDecl()))\
+  \ {\n                if (FD->getType()->isPointerType()) {\n                  recordUse(FD,\
+  \ ME);\n                }\n              }\n            }\n          }\n       \
+  \   return true;\n        }\n\n        bool VisitUnaryOperator(UnaryOperator *UO)\
+  \ {\n          if (!UO) return true;\n          if (LockDepth <= 0) return true;\n\
+  \          if (UO->getOpcode() == UO_Deref) {\n            const FieldDecl *F =\
+  \ SAGenTestChecker::findFieldInSubtree(UO->getSubExpr());\n            if (F &&\
+  \ F->getType()->isPointerType())\n              recordUse(F, UO);\n          }\n\
+  \          return true;\n        }\n\n        void finalize() {\n          // In\
+  \ case function ends while still under lock, flush what we have.\n          if (!UseMap.empty())\
+  \ {\n            flushProtectedUses();\n          }\n        }\n      };\n};\n\n\
+  void SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD)\n    return;\n\
+  \  const Stmt *Body = FD->getBody();\n  if (!Body)\n    return;\n\n  ASTContext\
+  \ &ACtx = Mgr.getASTContext();\n  FuncBodyScanner Scanner(ACtx, FD, this);\n  const_cast<FuncBodyScanner&>(Scanner).TraverseStmt(const_cast<Stmt*>(Body));\n\
+  \  Scanner.finalize();\n}\n\nvoid SAGenTestChecker::checkEndAnalysis(ExplodedGraph\
+  \ &G, BugReporter &BR, ExprEngine &Eng) const {\n  if (UnlockedWrites.empty() ||\
+  \ ProtectedUses.empty())\n    return;\n\n  ASTContext &ACtx = Eng.getContext();\n\
+  \  const SourceManager &SM = ACtx.getSourceManager();\n\n  llvm::SmallPtrSet<const\
+  \ Stmt*, 8> ReportedAssigns;\n\n  for (const auto &UW : UnlockedWrites) {\n    if\
+  \ (!UW.FD || !UW.AssignNode)\n      continue;\n\n    bool HasMatchingUse = false;\n\
+  \    const ProtectedUseSite *Match = nullptr;\n    for (const auto &PU : ProtectedUses)\
+  \ {\n      if (PU.FD == UW.FD) {\n        HasMatchingUse = true;\n        Match\
+  \ = &PU;\n        break;\n      }\n    }\n    if (!HasMatchingUse)\n      continue;\n\
+  \n    if (ReportedAssigns.count(UW.AssignNode))\n      continue;\n\n    PathDiagnosticLocation\
+  \ Loc = PathDiagnosticLocation::createBegin(UW.AssignNode, SM);\n    auto R = std::make_unique<BasicBugReport>(\n\
+  \      *BT,\n      \"Field is set to NULL without holding the spinlock, but is checked/used\
+  \ under spinlock in another path; possible race and NULL dereference.\",\n     \
+  \ Loc);\n\n    BR.emitReport(std::move(R));\n    ReportedAssigns.insert(UW.AssignNode);\n\
+  \  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect concurrent unlocked NULL write racing with under-lock check/use\
+  \ of a pointer field (possible NULL dereference)\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nusb: dwc2: fix possible NULL pointer dereference caused\
+  \ by driver concurrency\n\nIn _dwc2_hcd_urb_enqueue(), \"urb->hcpriv = NULL\" is\
+  \ executed without\nholding the lock \"hsotg->lock\". In _dwc2_hcd_urb_dequeue():\n\
+  \n    spin_lock_irqsave(&hsotg->lock, flags);\n    ...\n\tif (!urb->hcpriv) {\n\t\
+  \tdev_dbg(hsotg->dev, \"## urb->hcpriv is NULL ##\\n\");\n\t\tgoto out;\n\t}\n \
+  \   rc = dwc2_hcd_urb_dequeue(hsotg, urb->hcpriv); // Use urb->hcpriv\n    ...\n\
+  out:\n    spin_unlock_irqrestore(&hsotg->lock, flags);\n\nWhen _dwc2_hcd_urb_enqueue()\
+  \ and _dwc2_hcd_urb_dequeue() are\nconcurrently executed, the NULL check of \"urb->hcpriv\"\
+  \ can be executed\nbefore \"urb->hcpriv = NULL\". After urb->hcpriv is NULL, it\
+  \ can be used\nin the function call to dwc2_hcd_urb_dequeue(), which can cause a\
+  \ NULL\npointer dereference.\n\nThis possible bug is found by an experimental static\
+  \ analysis tool\ndeveloped by myself. This tool analyzes the locking APIs to extract\n\
+  function pairs that can be concurrently executed, and then analyzes the\ninstructions\
+  \ in the paired functions to identify possible concurrency\nbugs including data\
+  \ races and atomicity violations. The above possible\nbug is reported, when my tool\
+  \ analyzes the source code of Linux 6.5.\n\nTo fix this possible bug, \"urb->hcpriv\
+  \ = NULL\" should be executed with\nholding the lock \"hsotg->lock\". After using\
+  \ this patch, my tool never\nreports the possible bug, with the kernelconfiguration\
+  \ allyesconfig for\nx86_64. Because I have no associated hardware, I cannot test\
+  \ the patch\nin runtime testing, and just verify it according to the code logic.\n\
+  \nFixes: 33ad261aa62b (\"usb: dwc2: host: spinlock urb_enqueue\")\nSigned-off-by:\
+  \ Jia-Ju Bai <baijiaju@buaa.edu.cn>\nLink: https://lore.kernel.org/r/20230926024404.832096-1-baijiaju@buaa.edu.cn\n\
+  Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>\n\n## Buggy Code\n\
+  \n```c\n// Function: _dwc2_hcd_urb_enqueue in drivers/usb/dwc2/hcd.c\nstatic int\
+  \ _dwc2_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,\n\t\t\t\t gfp_t mem_flags)\n\
+  {\n\tstruct dwc2_hsotg *hsotg = dwc2_hcd_to_hsotg(hcd);\n\tstruct usb_host_endpoint\
+  \ *ep = urb->ep;\n\tstruct dwc2_hcd_urb *dwc2_urb;\n\tint i;\n\tint retval;\n\t\
+  int alloc_bandwidth = 0;\n\tu8 ep_type = 0;\n\tu32 tflags = 0;\n\tvoid *buf;\n\t\
+  unsigned long flags;\n\tstruct dwc2_qh *qh;\n\tbool qh_allocated = false;\n\tstruct\
+  \ dwc2_qtd *qtd;\n\tstruct dwc2_gregs_backup *gr;\n\n\tgr = &hsotg->gr_backup;\n\
+  \n\tif (dbg_urb(urb)) {\n\t\tdev_vdbg(hsotg->dev, \"DWC OTG HCD URB Enqueue\\n\"\
+  );\n\t\tdwc2_dump_urb_info(hcd, urb, \"urb_enqueue\");\n\t}\n\n\tif (hsotg->hibernated)\
+  \ {\n\t\tif (gr->gotgctl & GOTGCTL_CURMODE_HOST)\n\t\t\tretval = dwc2_exit_hibernation(hsotg,\
+  \ 0, 0, 1);\n\t\telse\n\t\t\tretval = dwc2_exit_hibernation(hsotg, 0, 0, 0);\n\n\
+  \t\tif (retval)\n\t\t\tdev_err(hsotg->dev,\n\t\t\t\t\"exit hibernation failed.\\\
+  n\");\n\t}\n\n\tif (hsotg->in_ppd) {\n\t\tretval = dwc2_exit_partial_power_down(hsotg,\
+  \ 0, true);\n\t\tif (retval)\n\t\t\tdev_err(hsotg->dev,\n\t\t\t\t\"exit partial_power_down\
+  \ failed\\n\");\n\t}\n\n\tif (hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE\
+  \ &&\n\t    hsotg->bus_suspended) {\n\t\tif (dwc2_is_device_mode(hsotg))\n\t\t\t\
+  dwc2_gadget_exit_clock_gating(hsotg, 0);\n\t\telse\n\t\t\tdwc2_host_exit_clock_gating(hsotg,\
+  \ 0);\n\t}\n\n\tif (!ep)\n\t\treturn -EINVAL;\n\n\tif (usb_pipetype(urb->pipe) ==\
+  \ PIPE_ISOCHRONOUS ||\n\t    usb_pipetype(urb->pipe) == PIPE_INTERRUPT) {\n\t\t\
+  spin_lock_irqsave(&hsotg->lock, flags);\n\t\tif (!dwc2_hcd_is_bandwidth_allocated(hsotg,\
+  \ ep))\n\t\t\talloc_bandwidth = 1;\n\t\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\
+  \t}\n\n\tswitch (usb_pipetype(urb->pipe)) {\n\tcase PIPE_CONTROL:\n\t\tep_type =\
+  \ USB_ENDPOINT_XFER_CONTROL;\n\t\tbreak;\n\tcase PIPE_ISOCHRONOUS:\n\t\tep_type\
+  \ = USB_ENDPOINT_XFER_ISOC;\n\t\tbreak;\n\tcase PIPE_BULK:\n\t\tep_type = USB_ENDPOINT_XFER_BULK;\n\
+  \t\tbreak;\n\tcase PIPE_INTERRUPT:\n\t\tep_type = USB_ENDPOINT_XFER_INT;\n\t\tbreak;\n\
+  \t}\n\n\tdwc2_urb = dwc2_hcd_urb_alloc(hsotg, urb->number_of_packets,\n\t\t\t\t\
+  \      mem_flags);\n\tif (!dwc2_urb)\n\t\treturn -ENOMEM;\n\n\tdwc2_hcd_urb_set_pipeinfo(hsotg,\
+  \ dwc2_urb, usb_pipedevice(urb->pipe),\n\t\t\t\t  usb_pipeendpoint(urb->pipe), ep_type,\n\
+  \t\t\t\t  usb_pipein(urb->pipe),\n\t\t\t\t  usb_endpoint_maxp(&ep->desc),\n\t\t\t\
+  \t  usb_endpoint_maxp_mult(&ep->desc));\n\n\tbuf = urb->transfer_buffer;\n\n\tif\
+  \ (hcd_uses_dma(hcd)) {\n\t\tif (!buf && (urb->transfer_dma & 3)) {\n\t\t\tdev_err(hsotg->dev,\n\
+  \t\t\t\t\"%s: unaligned transfer with no transfer_buffer\",\n\t\t\t\t__func__);\n\
+  \t\t\tretval = -EINVAL;\n\t\t\tgoto fail0;\n\t\t}\n\t}\n\n\tif (!(urb->transfer_flags\
+  \ & URB_NO_INTERRUPT))\n\t\ttflags |= URB_GIVEBACK_ASAP;\n\tif (urb->transfer_flags\
+  \ & URB_ZERO_PACKET)\n\t\ttflags |= URB_SEND_ZERO_PACKET;\n\n\tdwc2_urb->priv =\
+  \ urb;\n\tdwc2_urb->buf = buf;\n\tdwc2_urb->dma = urb->transfer_dma;\n\tdwc2_urb->length\
+  \ = urb->transfer_buffer_length;\n\tdwc2_urb->setup_packet = urb->setup_packet;\n\
+  \tdwc2_urb->setup_dma = urb->setup_dma;\n\tdwc2_urb->flags = tflags;\n\tdwc2_urb->interval\
+  \ = urb->interval;\n\tdwc2_urb->status = -EINPROGRESS;\n\n\tfor (i = 0; i < urb->number_of_packets;\
+  \ ++i)\n\t\tdwc2_hcd_urb_set_iso_desc_params(dwc2_urb, i,\n\t\t\t\t\t\t urb->iso_frame_desc[i].offset,\n\
+  \t\t\t\t\t\t urb->iso_frame_desc[i].length);\n\n\turb->hcpriv = dwc2_urb;\n\tqh\
+  \ = (struct dwc2_qh *)ep->hcpriv;\n\t/* Create QH for the endpoint if it doesn't\
+  \ exist */\n\tif (!qh) {\n\t\tqh = dwc2_hcd_qh_create(hsotg, dwc2_urb, mem_flags);\n\
+  \t\tif (!qh) {\n\t\t\tretval = -ENOMEM;\n\t\t\tgoto fail0;\n\t\t}\n\t\tep->hcpriv\
+  \ = qh;\n\t\tqh_allocated = true;\n\t}\n\n\tqtd = kzalloc(sizeof(*qtd), mem_flags);\n\
+  \tif (!qtd) {\n\t\tretval = -ENOMEM;\n\t\tgoto fail1;\n\t}\n\n\tspin_lock_irqsave(&hsotg->lock,\
+  \ flags);\n\tretval = usb_hcd_link_urb_to_ep(hcd, urb);\n\tif (retval)\n\t\tgoto\
+  \ fail2;\n\n\tretval = dwc2_hcd_urb_enqueue(hsotg, dwc2_urb, qh, qtd);\n\tif (retval)\n\
+  \t\tgoto fail3;\n\n\tif (alloc_bandwidth) {\n\t\tdwc2_allocate_bus_bandwidth(hcd,\n\
+  \t\t\t\tdwc2_hcd_get_ep_bandwidth(hsotg, ep),\n\t\t\t\turb);\n\t}\n\n\tspin_unlock_irqrestore(&hsotg->lock,\
+  \ flags);\n\n\treturn 0;\n\nfail3:\n\tdwc2_urb->priv = NULL;\n\tusb_hcd_unlink_urb_from_ep(hcd,\
+  \ urb);\n\tif (qh_allocated && qh->channel && qh->channel->qh == qh)\n\t\tqh->channel->qh\
+  \ = NULL;\nfail2:\n\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\turb->hcpriv\
+  \ = NULL;\n\tkfree(qtd);\nfail1:\n\tif (qh_allocated) {\n\t\tstruct dwc2_qtd *qtd2,\
+  \ *qtd2_tmp;\n\n\t\tep->hcpriv = NULL;\n\t\tdwc2_hcd_qh_unlink(hsotg, qh);\n\t\t\
+  /* Free each QTD in the QH's QTD list */\n\t\tlist_for_each_entry_safe(qtd2, qtd2_tmp,\
+  \ &qh->qtd_list,\n\t\t\t\t\t qtd_list_entry)\n\t\t\tdwc2_hcd_qtd_unlink_and_free(hsotg,\
+  \ qtd2, qh);\n\t\tdwc2_hcd_qh_free(hsotg, qh);\n\t}\nfail0:\n\tkfree(dwc2_urb);\n\
+  \n\treturn retval;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/usb/dwc2/hcd.c\
+  \ b/drivers/usb/dwc2/hcd.c\nindex 657f1f659ffa..35c7a4df8e71 100644\n--- a/drivers/usb/dwc2/hcd.c\n\
+  +++ b/drivers/usb/dwc2/hcd.c\n@@ -4769,8 +4769,8 @@ static int _dwc2_hcd_urb_enqueue(struct\
+  \ usb_hcd *hcd, struct urb *urb,\n \tif (qh_allocated && qh->channel && qh->channel->qh\
+  \ == qh)\n \t\tqh->channel->qh = NULL;\n fail2:\n-\tspin_unlock_irqrestore(&hsotg->lock,\
+  \ flags);\n \turb->hcpriv = NULL;\n+\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\
+  \ \tkfree(qtd);\n fail1:\n \tif (qh_allocated) {\n```\n"
+pattern: "## Bug Pattern\n\nConcurrent access to a shared pointer field with inconsistent\
+  \ locking:\n- One path reads and check-then-uses a pointer under spinlock L:\n \
+  \ spin_lock(L);\n  if (!obj->ptr) goto out;\n  use(obj->ptr);\n  spin_unlock(L);\n\
+  - Another path writes to the same pointer (e.g., sets it to NULL) without holding\
+  \ L:\n  obj->ptr = NULL;  // no lock\n\nThis violates the locking discipline for\
+  \ the shared field, creating a TOCTOU race where the pointer can change between\
+  \ the check and use, leading to a possible NULL pointer dereference."
+plan: "Plan\n\n1. Program state\n- No custom ProgramState is needed. This checker\
+  \ works as an AST-level, whole-TU correlation checker. It stores per-function facts\
+  \ in the checker instance (ordinary C++ containers), then correlates them at the\
+  \ end of analysis.\n\n2. Data recorded in the checker object (global to the checker,\
+  \ not ProgramState)\n- For each function body scanned, we collect facts and append\
+  \ to global containers:\n  - UnlockedWriteSites: vector of {FD, AssignLoc, FuncName,\
+  \ AfterUnlockFlag}\n    - FD: const FieldDecl* of the pointer field written (e.g.,\
+  \ urb->hcpriv).\n    - AssignLoc: SourceLocation of the assignment to NULL.\n  \
+  \  - AfterUnlockFlag: true if immediately after a spin_unlock call before any next\
+  \ spin_lock.\n  - ProtectedUseSites: vector of {FD, CheckLocOpt, UseLoc, FuncName}\n\
+  \    - FD: the same pointer field decl.\n    - CheckLocOpt: optional SourceLocation\
+  \ of a NULL-check of this FD under lock (if found).\n    - UseLoc: SourceLocation\
+  \ of a \u201Cuse\u201D of this FD under lock (call arg/deref).\n- Internal, per-function,\
+  \ transient tracking while scanning:\n  - lockDepth: integer tracking current lock\
+  \ nesting. Any lockDepth > 0 means \u201Cunder lock\u201D.\n  - afterUnlock: boolean\
+  \ that is set true at spin_unlock* and reset to false at any later statement (or\
+  \ next lock).\n  - currentLockedContext:\n    - CheckedFields: SmallSet<const FieldDecl*,\
+  \ N>\n    - UsedFields: SmallSet<const FieldDecl*, N>\n  - When lockDepth transitions\
+  \ 0 -> 1, start a new currentLockedContext (clear both sets).\n  - When lockDepth\
+  \ transitions 1 -> 0 (at unlock), flush the currentLockedContext to ProtectedUseSites:\
+  \ for each FD in UsedFields, emit a ProtectedUseSite with CheckLocOpt set if FD\
+  \ also appears in CheckedFields.\n\n3. Lock/unlock recognition\n- Recognize these\
+  \ function names as lock acquisition:\n  - \"spin_lock\", \"spin_lock_bh\", \"spin_lock_irq\"\
+  , \"spin_lock_irqsave\"\n- Recognize these as lock release:\n  - \"spin_unlock\"\
+  , \"spin_unlock_bh\", \"spin_unlock_irq\", \"spin_unlock_irqrestore\"\n- Implement\
+  \ helpers:\n  - bool isSpinLockCall(const CallExpr*): check callee identifier name\
+  \ against the list above.\n  - bool isSpinUnlockCall(const CallExpr*): same for\
+  \ unlock names.\n\n4. Field key and \u201CNULL\u201D recognition\n- Field key: For\
+  \ member expressions with \"->\" (MemberExpr with isArrow()), use the member\u2019\
+  s FieldDecl* (ME->getMemberDecl()) as the stable key (FD). This robustly unifies\
+  \ \u201Cobj->hcpriv\u201D across functions.\n- Pointer-only filter: Only consider\
+  \ fields whose type is a pointer (FD->getType()->isPointerType()).\n- Recognize\
+  \ NULL RHS: Implement isNullExpr(const Expr*):\n  - Return true if expr is a null\
+  \ pointer constant:\n    - expr->isNullPointerConstant(Ctx, Expr::NPC_ValueDependentIsNotNull)\n\
+  \    - Or EvaluateExprToInt yields 0\n    - Or ExprHasName(expr, \"NULL\", C) is\
+  \ true.\n  - This covers 0, NULL, nullptr.\n\n5. \u201CChecked under lock\u201D\
+  \ recognition (NULL check pattern)\n- While lockDepth > 0, analyze If conditions\
+  \ and record the pointer field FD if it is being compared to/against NULL:\n  -\
+  \ If the IfStmt condition is:\n    - UnaryOperator \u2018!\u2019 applied to an expression\
+  \ whose subtree contains a MemberExpr with isArrow() to a pointer FD.\n    - BinaryOperator\
+  \ (== or !=) where one side is a MemberExpr (->) to pointer FD and the other side\
+  \ is NULL/0/nullptr (via isNullExpr).\n  - Extract the involved MemberExpr; get\
+  \ its FD; record FD into currentLockedContext.CheckedFields with CheckLoc set to\
+  \ the IfStmt condition location (first time seen).\n\n6. \u201CUsed under lock\u201D\
+  \ recognition (deref or passed to calls)\n- While lockDepth > 0, record \u201Cuse\u201D\
+  \ of FD if either is observed:\n  - Call arg use:\n    - For every CallExpr, for\
+  \ each argument:\n      - Search for a MemberExpr with isArrow() in the argument\u2019\
+  s subtree; if found, take its FD.\n      - Record FD in currentLockedContext.UsedFields.\
+  \ If functionKnownToDeref(Call, derefParams) returns true, and this argument index\
+  \ is in derefParams, this is a strong \u201Cuse\u201D. If not known, still record\
+  \ as a weak \u201Cuse\u201D.\n  - Direct deref use:\n    - Detect MemberExpr chain\
+  \ like obj->field->...:\n      - If you see a MemberExpr ME2 with isArrow() whose\
+  \ base (ignoring casts) is another MemberExpr ME1 with isArrow(), then ME1\u2019\
+  s FD is a used pointer (ME1 is dereferenced to access ME2). Record FD in UsedFields.\n\
+  \    - Or detect a UnaryOperator \u2018*\u2019 whose subexpression subtree contains\
+  \ a MemberExpr with isArrow() to FD; record FD in UsedFields.\n\n7. Detect unlocked\
+  \ writes to NULL\n- For every BinaryOperator assignment under the function body\
+  \ traversal:\n  - If it is BO_Assign and LHS is a MemberExpr with isArrow() and\
+  \ FD is pointer-typed:\n    - If RHS isNullExpr(RHS) is true and lockDepth == 0:\n\
+  \      - Append an UnlockedWriteSites entry {FD, AssignLoc = LHS->getExprLoc(),\
+  \ FuncName, AfterUnlockFlag = afterUnlock}.\n- Maintain afterUnlock:\n  - Set afterUnlock\
+  \ = true when encountering a spin_unlock* call.\n  - Reset afterUnlock = false when\
+  \ encountering the next statement that is not another unlock (e.g., any non-unlock\
+  \ statement), or upon any subsequent spin_lock* call.\n\n8. Callback implementation\
+  \ details\n- checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR)\
+  \ const\n  - Only process if D has a body and it is a FunctionDecl.\n  - Implement\
+  \ a lightweight RecursiveASTVisitor (or manual recursive walk) to traverse the function\
+  \ body statements in source order.\n  - Maintain lockDepth, afterUnlock, and currentLockedContext\
+  \ as described.\n  - On entering a lock (isSpinLockCall), increment lockDepth; if\
+  \ lockDepth was 0, clear currentLockedContext.\n  - On unlocking (isSpinUnlockCall),\
+  \ decrement lockDepth (not below 0). If lockDepth reaches 0:\n    - For each FD\
+  \ in currentLockedContext.UsedFields, add a ProtectedUseSite entry:\n      - CheckLocOpt\
+  \ is set if FD is also present in CheckedFields (use the recorded first CheckLoc);\
+  \ otherwise leave it empty (we still keep this as a protected use but with weaker\
+  \ confidence).\n      - UseLoc is the CallExpr or MemberExpr location used most\
+  \ recently for this FD; recording the first seen \u201Cuse\u201D location is sufficient.\n\
+  \    - Clear currentLockedContext.\n    - Set afterUnlock = true.\n  - On any non-unlock\
+  \ statement, if afterUnlock is true, set afterUnlock = false.\n\n- checkEndAnalysis(ExplodedGraph\
+  \ &G, BugReporter &BR, ExprEngine &Eng) const\n  - Correlate facts across the TU:\n\
+  \    - For each UnlockedWriteSites entry UW with FD = f:\n      - If there exists\
+  \ at least one ProtectedUseSites entry PU with the same FD:\n        - Prefer reporting\
+  \ when either:\n          - UW.AfterUnlockFlag is true, or\n          - PU has a\
+  \ CheckLocOpt present (indicating an under-lock NULL-check-and-use pair).\n    \
+  \    - Emit a BasicBugReport:\n          - BugType: \u201CConcurrent NULL write\
+  \ without lock to field checked/used under spinlock\u201D\n          - Location:\
+  \ UW.AssignLoc\n          - Message: \u201CField is set to NULL without holding\
+  \ spinlock, but is checked/used under spinlock in another path; possible race and\
+  \ NULL dereference.\u201D\n        - Optionally, add an extra note location (if\
+  \ supported) pointing to PU.UseLoc (or CheckLocOpt) with a brief note \u201Cuse\
+  \ under lock here\u201D.\n    - Deduplicate: only one report per unique (UW.AssignLoc)\
+  \ or per (FD, AssignLoc).\n\n9. Helper routines to implement\n- bool isSpinLockCall(const\
+  \ CallExpr *CE)\n- bool isSpinUnlockCall(const CallExpr *CE)\n- const FieldDecl*\
+  \ getArrowField(const Expr *E)\n  - Return the FieldDecl* if E (ignoring casts)\
+  \ is a MemberExpr with isArrow() and its member is a FieldDecl with pointer type;\
+  \ else nullptr.\n- bool isNullExpr(const Expr *E)\n  - Use isNullPointerConstant\
+  \ or EvaluateExprToInt (from Utility Functions) or ExprHasName(E, \"NULL\", C).\n\
+  - const FieldDecl* findFieldInSubtree(const Expr *E)\n  - Walk children to find\
+  \ first MemberExpr with isArrow(); return its FieldDecl*.\n\n10. Reporting policy\
+  \ to keep false positives low\n- Only report if both:\n  - We saw at least one write\
+  \ of FD to NULL outside any lock, and\n  - We saw at least one use of FD under a\
+  \ lock that looks meaningful:\n    - Preferably a call to a function known to dereference\
+  \ this argument (functionKnownToDeref), or\n    - A dereference chain obj->field->...\
+  \ inside the lock, or\n    - A call with the same field argument and a preceding\
+  \ NULL-check of that field under the same locked region.\n- This \u201Cchecked-and-used\
+  \ under lock\u201D evidence significantly reduces noise and matches the target pattern.\n\
+  \n11. Where to use provided utilities\n- EvaluateExprToInt: in isNullExpr to detect\
+  \ literal 0.\n- functionKnownToDeref: to mark strong \u201Cuse\u201D when passing\
+  \ the field to known-deref functions.\n- ExprHasName: as a fallback for identifying\
+  \ NULL token and, if needed, to compare source substrings, though FieldDecl* matching\
+  \ should suffice.\n- findSpecificTypeInChildren: can be used to quickly locate MemberExpr\
+  \ nodes within arguments/conditions.\n\n12. Message format\n- Short and clear:\n\
+  \  - Title: \u201CUnlocked NULL write races with under-lock use of pointer field\u201D\
+  \n  - Description: \u201CField is set to NULL without holding the spinlock, but\
+  \ is checked/used under spinlock in another path; possible race and NULL dereference.\u201D\
+  \n\nThis plan keeps the implementation simple and robust:\n- One AST-body scan per\
+  \ function to collect reads/writes and lock context.\n- One cross-function correlation\
+  \ pass at end to emit concise, actionable reports for the exact bug pattern in the\
+  \ target patch."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/DenseMap.h\"\
+  \n#include \"llvm/ADT/SmallPtrSet.h\"\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\nnamespace {\n/* The checker callbacks are to\
+  \ be decided. */\nclass SAGenTestChecker : public Checker< check::ASTCodeBody, check::EndAnalysis\
+  \ > {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Unlocked NULL write races with under-lock use of pointer\
+  \ field\", \"Concurrency\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n      void checkEndAnalysis(ExplodedGraph &G, BugReporter\
+  \ &BR, ExprEngine &Eng) const;\n\n   private:\n\n      struct UnlockedWriteSite\
+  \ {\n        const FieldDecl *FD = nullptr;\n        const Stmt *AssignNode = nullptr;\n\
+  \        std::string FuncName;\n        bool AfterUnlock = false;\n      };\n  \
+  \    struct ProtectedUseSite {\n        const FieldDecl *FD = nullptr;\n       \
+  \ const Stmt *CheckNode = nullptr; // may be null if no explicit check found\n \
+  \       const Stmt *UseNode = nullptr;\n        std::string FuncName;\n      };\n\
+  \n      mutable std::vector<UnlockedWriteSite> UnlockedWrites;\n      mutable std::vector<ProtectedUseSite>\
+  \ ProtectedUses;\n\n      // Helpers for scanning\n      static const FunctionDecl\
+  \ *getDirectCallee(const CallExpr *CE) {\n        return CE ? CE->getDirectCallee()\
+  \ : nullptr;\n      }\n\n      static bool nameIs(const FunctionDecl *FD, StringRef\
+  \ N) {\n        if (!FD) return false;\n        if (const IdentifierInfo *II = FD->getIdentifier())\n\
+  \          return II->getName() == N;\n        return false;\n      }\n\n      static\
+  \ bool isSpinLockName(StringRef N) {\n        return N == \"spin_lock\" || N ==\
+  \ \"spin_lock_bh\" ||\n               N == \"spin_lock_irq\" || N == \"spin_lock_irqsave\"\
+  ;\n      }\n\n      static bool isSpinUnlockName(StringRef N) {\n        return\
+  \ N == \"spin_unlock\" || N == \"spin_unlock_bh\" ||\n               N == \"spin_unlock_irq\"\
+  \ || N == \"spin_unlock_irqrestore\";\n      }\n\n      static bool isSpinLockCall(const\
+  \ CallExpr *CE) {\n        const FunctionDecl *FD = getDirectCallee(CE);\n     \
+  \   if (!FD) return false;\n        if (const IdentifierInfo *II = FD->getIdentifier())\n\
+  \          return isSpinLockName(II->getName());\n        return false;\n      }\n\
+  \n      static bool isSpinUnlockCall(const CallExpr *CE) {\n        const FunctionDecl\
+  \ *FD = getDirectCallee(CE);\n        if (!FD) return false;\n        if (const\
+  \ IdentifierInfo *II = FD->getIdentifier())\n          return isSpinUnlockName(II->getName());\n\
+  \        return false;\n      }\n\n      static const FieldDecl* getArrowField(const\
+  \ Expr *E) {\n        if (!E) return nullptr;\n        E = E->IgnoreParenCasts();\n\
+  \        const auto *ME = dyn_cast<MemberExpr>(E);\n        if (!ME || !ME->isArrow())\n\
+  \          return nullptr;\n        const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \        if (!FD) return nullptr;\n        if (!FD->getType()->isPointerType())\n\
+  \          return nullptr;\n        return FD;\n      }\n\n      static const FieldDecl*\
+  \ findFieldInSubtree(const Expr *E) {\n        if (!E) return nullptr;\n       \
+  \ E = E->IgnoreParenCasts();\n        if (const FieldDecl *FD = getArrowField(E))\n\
+  \          return FD;\n        for (const Stmt *Child : E->children()) {\n     \
+  \     const Expr *CE = dyn_cast_or_null<Expr>(Child);\n          if (!CE) continue;\n\
+  \          if (const FieldDecl *FD = findFieldInSubtree(CE))\n            return\
+  \ FD;\n        }\n        return nullptr;\n      }\n\n      static bool isNullExpr(const\
+  \ Expr *E, ASTContext &ACtx) {\n        if (!E) return false;\n        E = E->IgnoreParenCasts();\n\
+  \        // Cover most null pointer constants\n        if (E->isNullPointerConstant(ACtx,\
+  \ Expr::NPC_ValueDependentIsNull))\n          return true;\n        if (const auto\
+  \ *IL = dyn_cast<IntegerLiteral>(E))\n          return IL->getValue() == 0;\n  \
+  \      return false;\n      }\n\n      void addUnlockedWrite(const FieldDecl *FD,\
+  \ const Stmt *AssignNode,\n                            StringRef FuncName, bool\
+  \ AfterUnlock) const {\n        UnlockedWriteSite S;\n        S.FD = FD;\n     \
+  \   S.AssignNode = AssignNode;\n        S.FuncName = FuncName.str();\n        S.AfterUnlock\
+  \ = AfterUnlock;\n        UnlockedWrites.push_back(S);\n      }\n\n      void addProtectedUse(const\
+  \ FieldDecl *FD, const Stmt *CheckNode,\n                           const Stmt *UseNode,\
+  \ StringRef FuncName) const {\n        ProtectedUseSite S;\n        S.FD = FD;\n\
+  \        S.CheckNode = CheckNode;\n        S.UseNode = UseNode;\n        S.FuncName\
+  \ = FuncName.str();\n        ProtectedUses.push_back(S);\n      }\n\n      // Per-function\
+  \ scanner\n      class FuncBodyScanner : public RecursiveASTVisitor<FuncBodyScanner>\
+  \ {\n        ASTContext &ACtx;\n        const FunctionDecl *FD;\n        const SAGenTestChecker\
+  \ *Checker;\n        int LockDepth = 0;\n        bool AfterUnlock = false;\n\n \
+  \       llvm::DenseMap<const FieldDecl*, const Stmt*> CheckedMap;\n        llvm::DenseMap<const\
+  \ FieldDecl*, const Stmt*> UseMap;\n\n        void recordUse(const FieldDecl *F,\
+  \ const Stmt *UseNode) {\n          if (!F) return;\n          if (!UseMap.count(F))\n\
+  \            UseMap[F] = UseNode;\n        }\n\n        void flushProtectedUses()\
+  \ {\n          if (UseMap.empty()) return;\n          for (auto &P : UseMap) {\n\
+  \            const FieldDecl *F = P.first;\n            const Stmt *UseN = P.second;\n\
+  \            const Stmt *CheckN = nullptr;\n            auto It = CheckedMap.find(F);\n\
+  \            if (It != CheckedMap.end())\n              CheckN = It->second;\n \
+  \           Checker->addProtectedUse(F, CheckN, UseN, FD->getName());\n        \
+  \  }\n          CheckedMap.clear();\n          UseMap.clear();\n        }\n\n  \
+  \     public:\n        FuncBodyScanner(ASTContext &ACtx, const FunctionDecl *FD,\
+  \ const SAGenTestChecker *C)\n          : ACtx(ACtx), FD(FD), Checker(C) {}\n\n\
+  \        bool VisitCallExpr(CallExpr *CE) {\n          if (!CE) return true;\n \
+  \         const FunctionDecl *Callee = CE->getDirectCallee();\n          StringRef\
+  \ Name;\n          if (Callee) {\n            if (const IdentifierInfo *II = Callee->getIdentifier())\n\
+  \              Name = II->getName();\n          }\n\n          if (isSpinLockName(Name))\
+  \ {\n            if (LockDepth == 0) {\n              CheckedMap.clear();\n    \
+  \          UseMap.clear();\n            }\n            ++LockDepth;\n          \
+  \  AfterUnlock = false;\n            return true;\n          }\n\n          if (isSpinUnlockName(Name))\
+  \ {\n            if (LockDepth > 0)\n              --LockDepth;\n            if\
+  \ (LockDepth == 0) {\n              flushProtectedUses();\n              AfterUnlock\
+  \ = true;\n            }\n            return true;\n          }\n\n          if\
+  \ (LockDepth > 0) {\n            // Record uses in call arguments while holding\
+  \ lock.\n            for (unsigned i = 0; i < CE->getNumArgs(); ++i) {\n       \
+  \       const Expr *Arg = CE->getArg(i);\n              const FieldDecl *F = SAGenTestChecker::findFieldInSubtree(Arg);\n\
+  \              if (F && F->getType()->isPointerType())\n                recordUse(F,\
+  \ CE);\n            }\n          }\n          return true;\n        }\n\n      \
+  \  bool VisitBinaryOperator(BinaryOperator *BO) {\n          if (!BO) return true;\n\
+  \          if (BO->getOpcode() == BO_Assign) {\n            const FieldDecl *F =\
+  \ SAGenTestChecker::getArrowField(BO->getLHS());\n            if (F && F->getType()->isPointerType())\
+  \ {\n              if (SAGenTestChecker::isNullExpr(BO->getRHS(), ACtx)) {\n   \
+  \             if (LockDepth == 0) {\n                  Checker->addUnlockedWrite(F,\
+  \ BO, FD->getName(), AfterUnlock);\n                }\n              }\n       \
+  \     }\n          }\n          return true;\n        }\n\n        bool VisitIfStmt(IfStmt\
+  \ *IS) {\n          if (!IS) return true;\n          if (LockDepth <= 0) return\
+  \ true;\n          const Expr *Cond = IS->getCond();\n          if (!Cond) return\
+  \ true;\n          Cond = Cond->IgnoreParenCasts();\n\n          const FieldDecl\
+  \ *F = nullptr;\n          if (const auto *UO = dyn_cast<UnaryOperator>(Cond)) {\n\
+  \            if (UO->getOpcode() == UO_LNot) {\n              F = SAGenTestChecker::findFieldInSubtree(UO->getSubExpr());\n\
+  \            }\n          } else if (const auto *BO = dyn_cast<BinaryOperator>(Cond))\
+  \ {\n            if (BO->isEqualityOp()) {\n              const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n\
+  \              const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n           \
+  \   bool LIsNull = SAGenTestChecker::isNullExpr(LHS, ACtx);\n              bool\
+  \ RIsNull = SAGenTestChecker::isNullExpr(RHS, ACtx);\n              if (LIsNull\
+  \ && !RIsNull)\n                F = SAGenTestChecker::findFieldInSubtree(RHS);\n\
+  \              else if (RIsNull && !LIsNull)\n                F = SAGenTestChecker::findFieldInSubtree(LHS);\n\
+  \            }\n          }\n          if (F && !CheckedMap.count(F))\n        \
+  \    CheckedMap[F] = IS;\n          return true;\n        }\n\n        bool VisitMemberExpr(MemberExpr\
+  \ *ME) {\n          if (!ME) return true;\n          if (LockDepth <= 0) return\
+  \ true;\n          if (!ME->isArrow()) return true;\n          const Expr *Base\
+  \ = ME->getBase();\n          if (!Base) return true;\n          Base = Base->IgnoreParenCasts();\n\
+  \          if (const auto *BME = dyn_cast<MemberExpr>(Base)) {\n            if (BME->isArrow())\
+  \ {\n              if (const auto *FD = dyn_cast<FieldDecl>(BME->getMemberDecl()))\
+  \ {\n                if (FD->getType()->isPointerType()) {\n                  recordUse(FD,\
+  \ ME);\n                }\n              }\n            }\n          }\n       \
+  \   return true;\n        }\n\n        bool VisitUnaryOperator(UnaryOperator *UO)\
+  \ {\n          if (!UO) return true;\n          if (LockDepth <= 0) return true;\n\
+  \          if (UO->getOpcode() == UO_Deref) {\n            const FieldDecl *F =\
+  \ SAGenTestChecker::findFieldInSubtree(UO->getSubExpr());\n            if (F &&\
+  \ F->getType()->isPointerType())\n              recordUse(F, UO);\n          }\n\
+  \          return true;\n        }\n\n        void finalize() {\n          // In\
+  \ case function ends while still under lock, flush what we have.\n          if (!UseMap.empty())\
+  \ {\n            flushProtectedUses();\n          }\n        }\n      };\n};\n\n\
+  void SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD)\n    return;\n\
+  \  const Stmt *Body = FD->getBody();\n  if (!Body)\n    return;\n\n  ASTContext\
+  \ &ACtx = Mgr.getASTContext();\n  FuncBodyScanner Scanner(ACtx, FD, this);\n  const_cast<FuncBodyScanner&>(Scanner).TraverseStmt(const_cast<Stmt*>(Body));\n\
+  \  Scanner.finalize();\n}\n\nvoid SAGenTestChecker::checkEndAnalysis(ExplodedGraph\
+  \ &G, BugReporter &BR, ExprEngine &Eng) const {\n  if (UnlockedWrites.empty() ||\
+  \ ProtectedUses.empty())\n    return;\n\n  ASTContext &ACtx = Eng.getContext();\n\
+  \  const SourceManager &SM = ACtx.getSourceManager();\n\n  llvm::SmallPtrSet<const\
+  \ Stmt*, 8> ReportedAssigns;\n\n  for (const auto &UW : UnlockedWrites) {\n    if\
+  \ (!UW.FD || !UW.AssignNode)\n      continue;\n\n    bool HasMatchingUse = false;\n\
+  \    const ProtectedUseSite *Match = nullptr;\n    for (const auto &PU : ProtectedUses)\
+  \ {\n      if (PU.FD == UW.FD) {\n        HasMatchingUse = true;\n        Match\
+  \ = &PU;\n        break;\n      }\n    }\n    if (!HasMatchingUse)\n      continue;\n\
+  \n    if (ReportedAssigns.count(UW.AssignNode))\n      continue;\n\n    PathDiagnosticLocation\
+  \ Loc(UW.AssignNode->getBeginLoc(), SM);\n    auto R = std::make_unique<BasicBugReport>(\n\
+  \      *BT,\n      \"Field is set to NULL without holding the spinlock, but is checked/used\
+  \ under spinlock in another path; possible race and NULL dereference.\",\n     \
+  \ Loc);\n\n    BR.emitReport(std::move(R));\n    ReportedAssigns.insert(UW.AssignNode);\n\
+  \  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect concurrent unlocked NULL write racing with under-lock check/use\
+  \ of a pointer field (possible NULL dereference)\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

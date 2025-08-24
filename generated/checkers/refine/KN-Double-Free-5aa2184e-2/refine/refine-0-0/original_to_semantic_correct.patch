@@ -1,0 +1,253 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -43,6 +43,9 @@   // Per-function: how many gotos target each label.
+   mutable llvm::DenseMap<const FunctionDecl*, llvm::DenseMap<const LabelStmt*, unsigned>> FuncLabelIncoming;
+
++  // Per-function: fields directly assigned from allocator calls within this function.
++  mutable llvm::DenseMap<const FunctionDecl*, llvm::SmallPtrSet<const FieldDecl*, 16>> FuncLocallyAllocFields;
++
+ public:
+   SAGenTestChecker()
+       : BT(new BugType(this, "Double free in shared error label", "Memory Management")) {}
+@@ -54,10 +57,14 @@   void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+
+ private:
+-  // Helper to collect labels and gotos from a function body.
+-  struct LabelGotoCollector : public RecursiveASTVisitor<LabelGotoCollector> {
++  // Helper to collect labels and gotos from a function body, and fields locally assigned from allocators.
++  struct FuncInfoCollector : public RecursiveASTVisitor<FuncInfoCollector> {
++    CheckerContext &C;
+     llvm::DenseMap<const LabelDecl *, const LabelStmt *> LabelMap;
+     llvm::SmallVector<const GotoStmt *, 16> Gotos;
++    llvm::SmallPtrSet<const FieldDecl*, 16> LocallyAllocFields;
++
++    FuncInfoCollector(CheckerContext &Ctx) : C(Ctx) {}
+
+     bool VisitLabelStmt(const LabelStmt *LS) {
+       if (const LabelDecl *LD = LS->getDecl())
+@@ -69,6 +76,54 @@       Gotos.push_back(GS);
+       return true;
+     }
++
++    bool VisitBinaryOperator(const BinaryOperator *BO) {
++      if (!BO || !BO->isAssignmentOp())
++        return true;
++
++      const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
++      const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
++
++      const auto *ME = dyn_cast<MemberExpr>(LHS);
++      const auto *CE = dyn_cast<CallExpr>(RHS);
++      if (!ME || !CE)
++        return true;
++
++      // If RHS call looks like an allocator, record the assigned field.
++      if (callExprLooksLikeAllocator(CE, C)) {
++        if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {
++          LocallyAllocFields.insert(FD->getCanonicalDecl());
++        }
++      }
++      return true;
++    }
++
++    // Heuristic allocator detection for CallExpr using source text/Callee name.
++    static bool callExprLooksLikeAllocator(const CallExpr *CE, CheckerContext &C) {
++      if (!CE)
++        return false;
++
++      static const char *AllocNames[] = {
++          "kmalloc", "kzalloc", "kcalloc", "kvzalloc", "kvmalloc", "krealloc",
++          "kmalloc_node", "kzalloc_node", "kcalloc_node", "kmalloc_array",
++          "devm_kmalloc", "devm_kzalloc", "devm_kcalloc", "__kmalloc"
++      };
++
++      // Prefer direct callee name if available.
++      if (const FunctionDecl *FD = CE->getDirectCallee()) {
++        StringRef Name = FD->getName();
++        for (const char *N : AllocNames)
++          if (Name.equals(N))
++            return true;
++      }
++
++      // Fallback to source text substring match.
++      for (const char *N : AllocNames) {
++        if (ExprHasName(CE, N, C))
++          return true;
++      }
++      return false;
++    }
+   };
+
+   const FunctionDecl *getCurrentFunction(const CheckerContext &C) const {
+@@ -76,24 +131,28 @@     return D;
+   }
+
+-  void buildLabelIncomingMapForFunction(const FunctionDecl *FD) const;
++  void buildPerFunctionInfo(const FunctionDecl *FD, CheckerContext &C) const;
+
+   bool isAllocatorCall(const CallEvent &Call, CheckerContext &C) const;
+   bool isFreeLikeCall(const CallEvent &Call, CheckerContext &C) const;
+
++  bool isFalsePositive(const MemberExpr *FreedME, const CallEvent &Call,
++                       const LabelStmt *EnclosingLabel, CheckerContext &C) const;
++
+   void reportFreeUnownedInSharedLabel(const CallEvent &Call, CheckerContext &C) const;
+ };
+
+-void SAGenTestChecker::buildLabelIncomingMapForFunction(const FunctionDecl *FD) const {
++void SAGenTestChecker::buildPerFunctionInfo(const FunctionDecl *FD, CheckerContext &C) const {
+   if (!FD)
+     return;
+   const Stmt *Body = FD->getBody();
+   if (!Body)
+     return;
+
+-  LabelGotoCollector Collector;
++  FuncInfoCollector Collector(C);
+   Collector.TraverseStmt(const_cast<Stmt *>(Body));
+
++  // Build incoming goto counts.
+   llvm::DenseMap<const LabelStmt*, unsigned> IncomingCount;
+   for (const GotoStmt *GS : Collector.Gotos) {
+     const LabelDecl *LD = GS->getLabel();
+@@ -107,6 +166,7 @@   }
+
+   FuncLabelIncoming[FD] = std::move(IncomingCount);
++  FuncLocallyAllocFields[FD] = std::move(Collector.LocallyAllocFields);
+ }
+
+ bool SAGenTestChecker::isAllocatorCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -114,10 +174,11 @@   if (!E)
+     return false;
+
+-  // Typical Linux allocators.
++  // Typical Linux allocators (expanded to include _node and array variants).
+   static const char *Names[] = {
+       "kmalloc", "kzalloc", "kcalloc", "kvzalloc", "kvmalloc", "krealloc",
+-      "devm_kmalloc", "devm_kzalloc", "devm_kcalloc"
++      "kmalloc_node", "kzalloc_node", "kcalloc_node", "kmalloc_array",
++      "devm_kmalloc", "devm_kzalloc", "devm_kcalloc", "__kmalloc"
+   };
+   for (const char *N : Names) {
+     if (ExprHasName(E, N, C))
+@@ -143,8 +204,8 @@   const FunctionDecl *FD = getCurrentFunction(C);
+   if (!FD)
+     return;
+-  // Rebuild (or build) label incoming counts for this function.
+-  buildLabelIncomingMapForFunction(FD);
++  // Build per-function metadata (labels and locally-allocated fields).
++  buildPerFunctionInfo(FD, C);
+ }
+
+ void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+@@ -153,6 +214,7 @@     return;
+   // Clean per-function metadata.
+   FuncLabelIncoming.erase(FD);
++  FuncLocallyAllocFields.erase(FD);
+ }
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -177,20 +239,58 @@   const MemRegion *DstReg = Loc.getAsRegion();
+   if (!DstReg)
+     return;
+-  DstReg = DstReg->getBaseRegion();
+-  if (!DstReg)
+-    return;
+
+   SymbolRef RHSym = Val.getAsSymbol();
+   if (!RHSym)
+     return;
+
+   if (State->contains<AllocSymSet>(RHSym)) {
++    // Mark the precise region as owned.
+     if (!State->contains<OwnedRegionSet>(DstReg)) {
+       State = State->add<OwnedRegionSet>(DstReg);
+-      C.addTransition(State);
+-    }
+-  }
++    }
++    // Also mark the base region to be robust against field/base conversions.
++    const MemRegion *Base = DstReg->getBaseRegion();
++    if (Base && !State->contains<OwnedRegionSet>(Base)) {
++      State = State->add<OwnedRegionSet>(Base);
++    }
++    C.addTransition(State);
++  }
++}
++
++bool SAGenTestChecker::isFalsePositive(const MemberExpr *FreedME,
++                                       const CallEvent &Call,
++                                       const LabelStmt *EnclosingLabel,
++                                       CheckerContext &C) const {
++  // 1) If the argument is definitely NULL at this point, kfree(NULL) is a no-op.
++  SVal ArgVal = C.getSVal(Call.getArgExpr(0));
++  if (ArgVal.isZeroConstant())
++    return true;
++
++  // 2) If this function path-sensitively owns the region (or its base), don't warn.
++  const MemRegion *FreedReg = getMemRegionFromExpr(Call.getArgExpr(0), C);
++  if (FreedReg) {
++    const MemRegion *Base = FreedReg->getBaseRegion();
++    ProgramStateRef State = C.getState();
++    if (State->contains<OwnedRegionSet>(FreedReg) ||
++        (Base && State->contains<OwnedRegionSet>(Base))) {
++      return true;
++    }
++  }
++
++  // 3) If this function (path-insensitive) directly assigns an allocator to this field anywhere,
++  //    treat it as locally managed and suppress.
++  const FunctionDecl *FD = getCurrentFunction(C);
++  if (FD && FreedME) {
++    auto It = FuncLocallyAllocFields.find(FD);
++    if (It != FuncLocallyAllocFields.end()) {
++      const FieldDecl *FDField = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
++      if (FDField && It->second.count(FDField->getCanonicalDecl()))
++        return true;
++    }
++  }
++
++  return false;
+ }
+
+ void SAGenTestChecker::reportFreeUnownedInSharedLabel(const CallEvent &Call, CheckerContext &C) const {
+@@ -215,22 +315,10 @@   if (!ArgE)
+     return;
+
+-  // Reduce FPs: only warn when freeing a struct/union field like mt->fc.
++  // Only consider freeing a struct/union field like mt->fc.
+   const Expr *Stripped = ArgE->IgnoreParenImpCasts();
+-  if (!isa<MemberExpr>(Stripped))
+-    return;
+-
+-  // Get region of the freed expression (do not strip casts before calling).
+-  const MemRegion *FreedReg = getMemRegionFromExpr(ArgE, C);
+-  if (!FreedReg)
+-    return;
+-  FreedReg = FreedReg->getBaseRegion();
+-  if (!FreedReg)
+-    return;
+-
+-  ProgramStateRef State = C.getState();
+-  // If this function has taken ownership of this region (or its base), do not warn.
+-  if (State->contains<OwnedRegionSet>(FreedReg))
++  const auto *FreedME = dyn_cast<MemberExpr>(Stripped);
++  if (!FreedME)
+     return;
+
+   // Determine if the call is under a label with multiple incoming gotos.
+@@ -255,9 +343,14 @@   unsigned Count = (Lit == IncomingMap.end()) ? 0u : Lit->second;
+
+   // Only warn for shared labels (2 or more incoming gotos).
+-  if (Count >= 2) {
+-    reportFreeUnownedInSharedLabel(Call, C);
+-  }
++  if (Count < 2)
++    return;
++
++  // Suppress known false positives.
++  if (isFalsePositive(FreedME, Call, EnclosingLabel, C))
++    return;
++
++  reportFreeUnownedInSharedLabel(Call, C);
+ }
+
+ } // end anonymous namespace

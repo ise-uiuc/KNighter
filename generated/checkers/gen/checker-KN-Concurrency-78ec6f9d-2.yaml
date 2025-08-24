@@ -1,0 +1,384 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 78ec6f9df6642418411c534683da6133e0962ec7
+commit_type: Concurrency
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/SValBuilder.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state: mark pointer regions that are known to point to per-CPU storage.\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrMap, const MemRegion *, bool)\n\nnamespace\
+  \ {\n// The checker callbacks are to be decided.\nclass SAGenTestChecker : public\
+  \ Checker<check::Bind, check::Location> {\n   mutable std::unique_ptr<BugType> BT;\n\
+  \n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Non-atomic per-CPU\
+  \ field access\", \"Concurrency\")) {}\n\n      void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n      void checkLocation(SVal Loc, bool\
+  \ IsLoad, const Stmt *S, CheckerContext &C) const;\n\n   private:\n\n      // Helper\
+  \ functions\n      static bool isPerCpuGetterName(StringRef N);\n      static StringRef\
+  \ getCallName(const CallExpr *CE);\n      static bool rhsContainsPerCpuGetter(const\
+  \ Stmt *S, CheckerContext &C);\n      static bool isStatsUpdatesME(const MemberExpr\
+  \ *ME);\n      static const MemRegion *getBaseRegionOfMember(const MemberExpr *ME,\
+  \ CheckerContext &C);\n      static bool inOnceMacroContext(const Stmt *S, CheckerContext\
+  \ &C, bool IsStore);\n      static bool isPerCpuBase(const Expr *Base, CheckerContext\
+  \ &C);\n      void reportNonAtomicStore(const Stmt *S, const MemberExpr *ME, CheckerContext\
+  \ &C) const;\n};\n\nbool SAGenTestChecker::isPerCpuGetterName(StringRef N) {\n \
+  \ return N.equals(\"this_cpu_ptr\") || N.equals(\"per_cpu_ptr\");\n}\n\nStringRef\
+  \ SAGenTestChecker::getCallName(const CallExpr *CE) {\n  if (!CE) return StringRef();\n\
+  \  if (const FunctionDecl *FD = CE->getDirectCallee()) {\n    if (const IdentifierInfo\
+  \ *II = FD->getIdentifier())\n      return II->getName();\n  }\n  return StringRef();\n\
+  }\n\nbool SAGenTestChecker::rhsContainsPerCpuGetter(const Stmt *S, CheckerContext\
+  \ &C) {\n  if (!S) return false;\n  const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S);\n\
+  \  if (!CE) return false;\n\n  StringRef N = getCallName(CE);\n  if (isPerCpuGetterName(N))\n\
+  \    return true;\n\n  // Also check source text to cover macro/wrapper cases\n\
+  \  if (ExprHasName(CE, \"this_cpu_ptr\", C) || ExprHasName(CE, \"per_cpu_ptr\",\
+  \ C))\n    return true;\n\n  return false;\n}\n\nbool SAGenTestChecker::isStatsUpdatesME(const\
+  \ MemberExpr *ME) {\n  if (!ME) return false;\n  return ME->getMemberNameInfo().getAsString()\
+  \ == \"stats_updates\";\n}\n\nconst MemRegion *SAGenTestChecker::getBaseRegionOfMember(const\
+  \ MemberExpr *ME, CheckerContext &C) {\n  if (!ME) return nullptr;\n  const Expr\
+  \ *BaseE = ME->getBase();\n  if (!BaseE) return nullptr;\n  BaseE = BaseE->IgnoreParenImpCasts();\n\
+  \  const MemRegion *R = getMemRegionFromExpr(BaseE, C);\n  if (!R) return nullptr;\n\
+  \  return R->getBaseRegion();\n}\n\nbool SAGenTestChecker::inOnceMacroContext(const\
+  \ Stmt *S, CheckerContext &C, bool IsStore) {\n  if (!S) return false;\n  // Check\
+  \ if inside a call expression that contains READ_ONCE/WRITE_ONCE.\n  const CallExpr\
+  \ *ParentCall = findSpecificTypeInParents<CallExpr>(S, C);\n  if (ParentCall) {\n\
+  \    if (IsStore && ExprHasName(ParentCall, \"WRITE_ONCE\", C))\n      return true;\n\
+  \    if (!IsStore && ExprHasName(ParentCall, \"READ_ONCE\", C))\n      return true;\n\
+  \  }\n  // Fallback: check the statement text itself (best effort).\n  if (const\
+  \ Expr *E = dyn_cast<Expr>(S)) {\n    if (IsStore && ExprHasName(E, \"WRITE_ONCE\"\
+  , C))\n      return true;\n    if (!IsStore && ExprHasName(E, \"READ_ONCE\", C))\n\
+  \      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isPerCpuBase(const\
+  \ Expr *Base, CheckerContext &C) {\n  if (!Base) return false;\n  const MemRegion\
+  \ *R = getMemRegionFromExpr(const_cast<Expr *>(Base), C);\n  if (!R) return false;\n\
+  \  R = R->getBaseRegion();\n  if (!R) return false;\n\n  ProgramStateRef State =\
+  \ C.getState();\n  const bool *Tag = State->get<PerCpuPtrMap>(R);\n  return Tag\
+  \ && *Tag;\n}\n\nvoid SAGenTestChecker::reportNonAtomicStore(const Stmt *S, const\
+  \ MemberExpr *ME, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \   *BT, \"Non-atomic write to per-CPU 'stats_updates'; use WRITE_ONCE.\", N);\n\
+  \n  if (ME)\n    R->addRange(ME->getSourceRange());\n  else\n    R->addRange(S->getSourceRange());\n\
+  \n  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc,\
+  \ SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State =\
+  \ C.getState();\n\n  const MemRegion *Dst = Loc.getAsRegion();\n  if (!Dst) return;\n\
+  \  Dst = Dst->getBaseRegion();\n  if (!Dst) return;\n\n  // Ensure destination is\
+  \ a pointer-typed region.\n  if (const auto *TVR = dyn_cast<TypedValueRegion>(Dst))\
+  \ {\n    QualType T = TVR->getValueType();\n    if (!T.isNull() && T->isPointerType())\
+  \ {\n      bool Changed = false;\n\n      // Case A: RHS explicitly calls per-CPU\
+  \ getters.\n      if (rhsContainsPerCpuGetter(S, C)) {\n        State = State->set<PerCpuPtrMap>(Dst,\
+  \ true);\n        Changed = true;\n      } else {\n        // Case B: Propagate\
+  \ from another per-CPU pointer region on simple aliasing.\n        if (const MemRegion\
+  \ *Src = Val.getAsRegion()) {\n          Src = Src->getBaseRegion();\n         \
+  \ if (Src) {\n            if (const bool *Tag = State->get<PerCpuPtrMap>(Src)) {\n\
+  \              if (*Tag) {\n                State = State->set<PerCpuPtrMap>(Dst,\
+  \ true);\n                Changed = true;\n              }\n            } else {\n\
+  \              // Heuristic: if RHS is a member access whose base is per-CPU, propagate.\n\
+  \              // E.g., statc = statc->parent;\n              if (S) {\n       \
+  \         if (const auto *ME = findSpecificTypeInChildren<MemberExpr>(S)) {\n  \
+  \                const Expr *BaseE = ME->getBase();\n                  if (BaseE\
+  \ && isPerCpuBase(BaseE->IgnoreParenImpCasts(), C)) {\n                    State\
+  \ = State->set<PerCpuPtrMap>(Dst, true);\n                    Changed = true;\n\
+  \                  }\n                }\n              }\n            }\n      \
+  \    }\n        }\n      }\n\n      if (Changed)\n        C.addTransition(State);\n\
+  \    }\n  }\n}\n\nvoid SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const\
+  \ Stmt *S, CheckerContext &C) const {\n  // We focus on non-atomic stores to per-CPU\
+  \ statc->stats_updates.\n  if (IsLoad)\n    return;\n\n  const MemRegion *R = Loc.getAsRegion();\n\
+  \  if (!R) return;\n\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(S);\n\
+  \  if (!ME) return;\n  if (!isStatsUpdatesME(ME))\n    return;\n\n  const Expr *BaseE\
+  \ = ME->getBase();\n  if (!BaseE) return;\n  BaseE = BaseE->IgnoreParenImpCasts();\n\
+  \n  if (!isPerCpuBase(BaseE, C))\n    return;\n\n  if (inOnceMacroContext(S, C,\
+  \ /*IsStore=*/true))\n    return;\n\n  reportNonAtomicStore(S, ME, C);\n}\n\n} //\
+  \ end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect plain stores/updates to per-CPU stats_updates without WRITE_ONCE/READ_ONCE\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nmemcg: fix data-race KCSAN bug in rstats\n\nA data-race\
+  \ issue in memcg rstat occurs when two distinct code paths\naccess the same 4-byte\
+  \ region concurrently.  KCSAN detection triggers the\nfollowing BUG as a result.\n\
+  \n\tBUG: KCSAN: data-race in __count_memcg_events / mem_cgroup_css_rstat_flush\n\
+  \n\twrite to 0xffffe8ffff98e300 of 4 bytes by task 5274 on cpu 17:\n\tmem_cgroup_css_rstat_flush\
+  \ (mm/memcontrol.c:5850)\n\tcgroup_rstat_flush_locked (kernel/cgroup/rstat.c:243\
+  \ (discriminator 7))\n\tcgroup_rstat_flush (./include/linux/spinlock.h:401 kernel/cgroup/rstat.c:278)\n\
+  \tmem_cgroup_flush_stats.part.0 (mm/memcontrol.c:767)\n\tmemory_numa_stat_show (mm/memcontrol.c:6911)\n\
+  <snip>\n\n\tread to 0xffffe8ffff98e300 of 4 bytes by task 410848 on cpu 27:\n\t\
+  __count_memcg_events (mm/memcontrol.c:725 mm/memcontrol.c:962)\n\tcount_memcg_event_mm.part.0\
+  \ (./include/linux/memcontrol.h:1097 ./include/linux/memcontrol.h:1120)\n\thandle_mm_fault\
+  \ (mm/memory.c:5483 mm/memory.c:5622)\n<snip>\n\n\tvalue changed: 0x00000029 ->\
+  \ 0x00000000\n\nThe race occurs because two code paths access the same \"stats_updates\"\
+  \nlocation.  Although \"stats_updates\" is a per-CPU variable, it is remotely\n\
+  accessed by another CPU at\ncgroup_rstat_flush_locked()->mem_cgroup_css_rstat_flush(),\
+  \ leading to the\ndata race mentioned.\n\nConsidering that memcg_rstat_updated()\
+  \ is in the hot code path, adding a\nlock to protect it may not be desirable, especially\
+  \ since this variable\npertains solely to statistics.\n\nTherefore, annotating accesses\
+  \ to stats_updates with READ/WRITE_ONCE() can\nprevent KCSAN splats and potential\
+  \ partial reads/writes.\n\nLink: https://lkml.kernel.org/r/20240424125940.2410718-1-leitao@debian.org\n\
+  Fixes: 9cee7e8ef3e3 (\"mm: memcg: optimize parent iteration in memcg_rstat_updated()\"\
+  )\nSigned-off-by: Breno Leitao <leitao@debian.org>\nSuggested-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Acked-by: Johannes Weiner <hannes@cmpxchg.org>\nAcked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Reviewed-by: Yosry Ahmed <yosryahmed@google.com>\nCc: Michal Hocko <mhocko@suse.com>\n\
+  Cc: Roman Gushchin <roman.gushchin@linux.dev>\nCc: Muchun Song <songmuchun@bytedance.com>\n\
+  Signed-off-by: Andrew Morton <akpm@linux-foundation.org>\n\n## Buggy Code\n\n```c\n\
+  // Function: memcg_rstat_updated in mm/memcontrol.c\nstatic inline void memcg_rstat_updated(struct\
+  \ mem_cgroup *memcg, int val)\n{\n\tstruct memcg_vmstats_percpu *statc;\n\tint cpu\
+  \ = smp_processor_id();\n\n\tif (!val)\n\t\treturn;\n\n\tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n\tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n\tfor (; statc; statc =\
+  \ statc->parent) {\n\t\tstatc->stats_updates += abs(val);\n\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n\t\t\tcontinue;\n\n\t\t/*\n\t\t * If @memcg is already\
+  \ flush-able, increasing stats_updates is\n\t\t * redundant. Avoid the overhead\
+  \ of the atomic update.\n\t\t */\n\t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  \t\t\tatomic64_add(statc->stats_updates,\n\t\t\t\t     &statc->vmstats->stats_updates);\n\
+  \t\tstatc->stats_updates = 0;\n\t}\n}\n```\n\n```c\n// Function: mem_cgroup_css_rstat_flush\
+  \ in mm/memcontrol.c\nstatic void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state\
+  \ *css, int cpu)\n{\n\tstruct mem_cgroup *memcg = mem_cgroup_from_css(css);\n\t\
+  struct mem_cgroup *parent = parent_mem_cgroup(memcg);\n\tstruct memcg_vmstats_percpu\
+  \ *statc;\n\tlong delta, delta_cpu, v;\n\tint i, nid;\n\n\tstatc = per_cpu_ptr(memcg->vmstats_percpu,\
+  \ cpu);\n\n\tfor (i = 0; i < MEMCG_NR_STAT; i++) {\n\t\t/*\n\t\t * Collect the aggregated\
+  \ propagation counts of groups\n\t\t * below us. We're in a per-cpu loop here and\
+  \ this is\n\t\t * a global counter, so the first cycle will get them.\n\t\t */\n\
+  \t\tdelta = memcg->vmstats->state_pending[i];\n\t\tif (delta)\n\t\t\tmemcg->vmstats->state_pending[i]\
+  \ = 0;\n\n\t\t/* Add CPU changes on this level since the last flush */\n\t\tdelta_cpu\
+  \ = 0;\n\t\tv = READ_ONCE(statc->state[i]);\n\t\tif (v != statc->state_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->state_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\t\
+  \tstatc->state_prev[i] = v;\n\t\t}\n\n\t\t/* Aggregate counts on this level and\
+  \ propagate upwards */\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->state_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->state[i] += delta;\n\t\
+  \t\tif (parent)\n\t\t\t\tparent->vmstats->state_pending[i] += delta;\n\t\t}\n\t\
+  }\n\n\tfor (i = 0; i < NR_MEMCG_EVENTS; i++) {\n\t\tdelta = memcg->vmstats->events_pending[i];\n\
+  \t\tif (delta)\n\t\t\tmemcg->vmstats->events_pending[i] = 0;\n\n\t\tdelta_cpu =\
+  \ 0;\n\t\tv = READ_ONCE(statc->events[i]);\n\t\tif (v != statc->events_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->events_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\
+  \t\tstatc->events_prev[i] = v;\n\t\t}\n\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->events_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->events[i] += delta;\n\
+  \t\t\tif (parent)\n\t\t\t\tparent->vmstats->events_pending[i] += delta;\n\t\t}\n\
+  \t}\n\n\tfor_each_node_state(nid, N_MEMORY) {\n\t\tstruct mem_cgroup_per_node *pn\
+  \ = memcg->nodeinfo[nid];\n\t\tstruct mem_cgroup_per_node *ppn = NULL;\n\t\tstruct\
+  \ lruvec_stats_percpu *lstatc;\n\n\t\tif (parent)\n\t\t\tppn = parent->nodeinfo[nid];\n\
+  \n\t\tlstatc = per_cpu_ptr(pn->lruvec_stats_percpu, cpu);\n\n\t\tfor (i = 0; i <\
+  \ NR_VM_NODE_STAT_ITEMS; i++) {\n\t\t\tdelta = pn->lruvec_stats.state_pending[i];\n\
+  \t\t\tif (delta)\n\t\t\t\tpn->lruvec_stats.state_pending[i] = 0;\n\n\t\t\tdelta_cpu\
+  \ = 0;\n\t\t\tv = READ_ONCE(lstatc->state[i]);\n\t\t\tif (v != lstatc->state_prev[i])\
+  \ {\n\t\t\t\tdelta_cpu = v - lstatc->state_prev[i];\n\t\t\t\tdelta += delta_cpu;\n\
+  \t\t\t\tlstatc->state_prev[i] = v;\n\t\t\t}\n\n\t\t\tif (delta_cpu)\n\t\t\t\tpn->lruvec_stats.state_local[i]\
+  \ += delta_cpu;\n\n\t\t\tif (delta) {\n\t\t\t\tpn->lruvec_stats.state[i] += delta;\n\
+  \t\t\t\tif (ppn)\n\t\t\t\t\tppn->lruvec_stats.state_pending[i] += delta;\n\t\t\t\
+  }\n\t\t}\n\t}\n\tstatc->stats_updates = 0;\n\t/* We are in a per-cpu loop here,\
+  \ only do the atomic write once */\n\tif (atomic64_read(&memcg->vmstats->stats_updates))\n\
+  \t\tatomic64_set(&memcg->vmstats->stats_updates, 0);\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 9095ab05d47a..a111e0d981ba\
+  \ 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -715,6 +715,7 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n {\n \tstruct\
+  \ memcg_vmstats_percpu *statc;\n \tint cpu = smp_processor_id();\n+\tunsigned int\
+  \ stats_updates;\n \n \tif (!val)\n \t\treturn;\n@@ -722,8 +723,9 @@ static inline\
+  \ void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n \tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n \tfor (; statc; statc\
+  \ = statc->parent) {\n-\t\tstatc->stats_updates += abs(val);\n-\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n+\t\tstats_updates = READ_ONCE(statc->stats_updates) +\
+  \ abs(val);\n+\t\tWRITE_ONCE(statc->stats_updates, stats_updates);\n+\t\tif (stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n \t\t\tcontinue;\n \n \t\t/*\n@@ -731,9 +733,9 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \t\t * redundant.\
+  \ Avoid the overhead of the atomic update.\n \t\t */\n \t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  -\t\t\tatomic64_add(statc->stats_updates,\n+\t\t\tatomic64_add(stats_updates,\n\
+  \ \t\t\t\t     &statc->vmstats->stats_updates);\n-\t\tstatc->stats_updates = 0;\n\
+  +\t\tWRITE_ONCE(statc->stats_updates, 0);\n \t}\n }\n \n@@ -5887,7 +5889,7 @@ static\
+  \ void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)\n \t\
+  \t\t}\n \t\t}\n \t}\n-\tstatc->stats_updates = 0;\n+\tWRITE_ONCE(statc->stats_updates,\
+  \ 0);\n \t/* We are in a per-cpu loop here, only do the atomic write once */\n \t\
+  if (atomic64_read(&memcg->vmstats->stats_updates))\n \t\tatomic64_set(&memcg->vmstats->stats_updates,\
+  \ 0);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Plain (non-atomic) read-modify-write and stores on a per-CPU field that is also
+  accessed from other CPUs (remote per-CPU access during flush), i.e., assuming per-CPU
+  isolation where it does not hold. Specifically:
+
+  - Updating and resetting a per-CPU counter (statc->stats_updates) with ordinary
+  loads/stores (x += inc; x = 0) while another CPU may concurrently read/reset the
+  same 4-byte location.
+
+  - No READ_ONCE/WRITE_ONCE (or locking/atomics) around these accesses, causing data
+  races and possible torn/partial reads/writes.
+
+
+  The fix annotates all accesses with READ_ONCE/WRITE_ONCE and bases atomic updates
+  on a locally captured value to avoid races.'
+plan: "1) Program state\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrMap, const MemRegion\
+  \ *, bool)\n  - Tracks which pointer regions are known to point to per-CPU storage\
+  \ (true).\n  - We only need a boolean tag; no additional state is required.\n- No\
+  \ other traits/maps needed. We will propagate this tag through simple pointer assignments/binds.\n\
+  \n\n2) Helper logic\n\n- isPerCpuGetterName(StringRef N):\n  - Return true if N\
+  \ equals \"this_cpu_ptr\" or \"per_cpu_ptr\".\n- getCallName(const CallExpr *CE):\n\
+  \  - If CE->getDirectCallee() exists, return its Identifier name.\n  - Else empty\
+  \ string.\n- rhsContainsPerCpuGetter(const Stmt *S, CheckerContext &C):\n  - Use\
+  \ findSpecificTypeInChildren<CallExpr>(S).\n  - If found, return true if isPerCpuGetterName(getCallName(CE))\
+  \ is true OR ExprHasName(CE, \"this_cpu_ptr\", C) OR ExprHasName(CE, \"per_cpu_ptr\"\
+  , C) is true (covers inline/macro wrappers).\n- isStatsUpdatesME(const MemberExpr\
+  \ *ME):\n  - Return true if ME->getMemberNameInfo().getAsString() equals \"stats_updates\"\
+  .\n- getBaseRegionOfMember(const MemberExpr *ME, CheckerContext &C):\n  - BaseE\
+  \ = ME->getBase()->IgnoreParenImpCasts()\n  - return getMemRegionFromExpr(BaseE,\
+  \ C)\n- inOnceMacroContext(const Stmt *S, CheckerContext &C, bool IsStore):\n  -\
+  \ We want to suppress warnings if access is annotated.\n  - Walk up to a reasonable\
+  \ parent Stmt (e.g., the nearest CallExpr parent or the full statement containing\
+  \ S) using findSpecificTypeInParents<CallExpr>(S, C). If found, check:\n    - IsStore:\
+  \ ExprHasName(CallExpr, \"WRITE_ONCE\", C)\n    - !IsStore: ExprHasName(CallExpr,\
+  \ \"READ_ONCE\", C)\n  - If no CallExpr parent, also directly check the source text\
+  \ of S via ExprHasName(S, \"WRITE_ONCE\"/\"READ_ONCE\", C) as a best-effort fallback.\n\
+  \  - Return true if any of the checks match; false otherwise.\n- isPerCpuBase(const\
+  \ Expr *Base, CheckerContext &C):\n  - R = getMemRegionFromExpr(Base, C)\n  - Query\
+  \ PerCpuPtrMap for R. If found true, return true.\n\n\n3) Callback: checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const\n\nGoal: learn which pointers\
+  \ are per-CPU.\n\n- Identify destination region:\n  - If Loc is a loc::MemRegionVal,\
+  \ get DestR = Loc.getAsRegion().\n  - Only proceed if DestR is a VarRegion or a\
+  \ FieldRegion of pointer type.\n- Case A: RHS originates from per-CPU getter\n \
+  \ - If rhsContainsPerCpuGetter(S, C) is true:\n    - State' = State->set<PerCpuPtrMap>(DestR,\
+  \ true)\n    - C.addTransition(State')\n- Case B: Propagate tag from another pointer\n\
+  \  - If Val is loc::MemRegionVal and SrcR = Val.getAsRegion():\n    - If State says\
+  \ SrcR is in PerCpuPtrMap as true:\n      - State' = State->set<PerCpuPtrMap>(DestR,\
+  \ true)\n      - C.addTransition(State')\n- Otherwise do nothing.\nNotes:\n- This\
+  \ handles both declarations with initializers and assignments because CSA calls\
+  \ checkBind for both.\n- This also captures statc = this_cpu_ptr(...); and propagates\
+  \ through statc = statc->parent; if the RHS has a region (often MemberExpr yields\
+  \ a region for the field), we will mark the LHS when applicable.\n\n\n4) Callback:\
+  \ checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const\n\
+  \nGoal: detect plain reads/writes on per-CPU stats_updates without READ_ONCE/WRITE_ONCE.\n\
+  \n- Fast-fail if Loc has no region: return.\n- Find a MemberExpr that corresponds\
+  \ to the accessed location:\n  - ME = findSpecificTypeInChildren<MemberExpr>(S).\
+  \ If null, return.\n  - If !isStatsUpdatesME(ME), return.\n- Verify base is a per-CPU\
+  \ pointer:\n  - BaseE = ME->getBase()->IgnoreParenImpCasts()\n  - If !isPerCpuBase(BaseE,\
+  \ C), return.\n- Macro annotation check:\n  - If inOnceMacroContext(S, C, /*IsStore=*/!IsLoad)\
+  \ returns true, then annotated; return.\n- Decide whether to warn:\n  - We primarily\
+  \ flag writes (IsLoad == false). These include:\n    - Direct assignment: statc->stats_updates\
+  \ = 0;\n    - Compound updates: statc->stats_updates += abs(val);\n  - Optionally,\
+  \ you may also warn on loads (IsLoad == true) for the same field if desired; to\
+  \ keep it minimal and precise, restrict to stores.\n- If IsLoad == false and not\
+  \ annotated:\n  - Generate a non-fatal error node: auto N = C.generateNonFatalErrorNode();\n\
+  \  - If N is null, return.\n  - Create and emit a PathSensitiveBugReport with a\
+  \ short message:\n    - Title: \"Non-atomic per-CPU field write\"\n    - Message:\
+  \ \"Non-atomic write to per-CPU 'stats_updates'; use WRITE_ONCE (and READ_ONCE for\
+  \ paired reads).\"\n    - Add the source range of the MemberExpr as the primary\
+  \ range.\n    - C.emitReport(std::move(R)).\n\n\n5) Optional: checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const\n\n(Only if you also want to catch unsafe\
+  \ reads passed directly to atomics; otherwise skip for simplicity.)\n\n- Inspect\
+  \ each argument of Call:\n  - If an argument contains a MemberExpr to 'stats_updates'\
+  \ with a per-CPU base and inOnceMacroContext == false for read:\n    - Warn similarly\
+  \ but with load-specific message (\"Non-atomic read to per-CPU 'stats_updates';\
+  \ use READ_ONCE\").\n\n\n6) Callback selection rationale\n\n- checkBind: simplest\
+  \ and reliable way to identify and propagate \u201Cper-CPU pointer\u201D knowledge\
+  \ from this_cpu_ptr/per_cpu_ptr to local variables and their aliases.\n- checkLocation:\
+  \ directly tells us when a program reads or writes a memory location; we filter\
+  \ to stores to the specific member, and verify per-CPU provenance, and lack of READ/WRITE_ONCE\
+  \ annotation.\n- No need for additional callbacks (ASTDecl/ASTCodeBody) or custom\
+  \ evalCall/assume, keeping the checker small and focused.\n\n\n7) Bug report\n\n\
+  - Use std::make_unique<PathSensitiveBugReport>.\n- Category: \"Concurrency\"\n-\
+  \ Short message examples:\n  - For stores: \"Non-atomic write to per-CPU 'stats_updates';\
+  \ use WRITE_ONCE.\"\n  - If you also implement reads: \"Non-atomic read of per-CPU\
+  \ 'stats_updates'; use READ_ONCE.\"\n- One report per offending access; no path\
+  \ notes necessary beyond the location range of the MemberExpr or full assignment\
+  \ statement."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/SValBuilder.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state: mark pointer regions that are known to point to per-CPU storage.\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrMap, const MemRegion *, bool)\n\nnamespace\
+  \ {\n// The checker callbacks are to be decided.\nclass SAGenTestChecker : public\
+  \ Checker<check::Bind, check::Location> {\n   mutable std::unique_ptr<BugType> BT;\n\
+  \n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Non-atomic per-CPU\
+  \ field access\", \"Concurrency\")) {}\n\n      void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n      void checkLocation(SVal Loc, bool\
+  \ IsLoad, const Stmt *S, CheckerContext &C) const;\n\n   private:\n\n      // Helper\
+  \ functions\n      static bool isPerCpuGetterName(StringRef N);\n      static StringRef\
+  \ getCallName(const CallExpr *CE);\n      static bool rhsContainsPerCpuGetter(const\
+  \ Stmt *S, CheckerContext &C);\n      static bool isStatsUpdatesME(const MemberExpr\
+  \ *ME);\n      static const MemRegion *getBaseRegionOfMember(const MemberExpr *ME,\
+  \ CheckerContext &C);\n      static bool inOnceMacroContext(const Stmt *S, CheckerContext\
+  \ &C, bool IsStore);\n      static bool isPerCpuBase(const Expr *Base, CheckerContext\
+  \ &C);\n      void reportNonAtomicStore(const Stmt *S, const MemberExpr *ME, CheckerContext\
+  \ &C) const;\n};\n\nbool SAGenTestChecker::isPerCpuGetterName(StringRef N) {\n \
+  \ return N.equals(\"this_cpu_ptr\") || N.equals(\"per_cpu_ptr\");\n}\n\nStringRef\
+  \ SAGenTestChecker::getCallName(const CallExpr *CE) {\n  if (!CE) return StringRef();\n\
+  \  if (const FunctionDecl *FD = CE->getDirectCallee()) {\n    if (const IdentifierInfo\
+  \ *II = FD->getIdentifier())\n      return II->getName();\n  }\n  return StringRef();\n\
+  }\n\nbool SAGenTestChecker::rhsContainsPerCpuGetter(const Stmt *S, CheckerContext\
+  \ &C) {\n  if (!S) return false;\n  const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S);\n\
+  \  if (!CE) return false;\n\n  StringRef N = getCallName(CE);\n  if (isPerCpuGetterName(N))\n\
+  \    return true;\n\n  // Also check source text to cover macro/wrapper cases\n\
+  \  if (ExprHasName(CE, \"this_cpu_ptr\", C) || ExprHasName(CE, \"per_cpu_ptr\",\
+  \ C))\n    return true;\n\n  return false;\n}\n\nbool SAGenTestChecker::isStatsUpdatesME(const\
+  \ MemberExpr *ME) {\n  if (!ME) return false;\n  return ME->getMemberNameInfo().getAsString()\
+  \ == \"stats_updates\";\n}\n\nconst MemRegion *SAGenTestChecker::getBaseRegionOfMember(const\
+  \ MemberExpr *ME, CheckerContext &C) {\n  if (!ME) return nullptr;\n  const Expr\
+  \ *BaseE = ME->getBase();\n  if (!BaseE) return nullptr;\n  BaseE = BaseE->IgnoreParenImpCasts();\n\
+  \  const MemRegion *R = getMemRegionFromExpr(BaseE, C);\n  if (!R) return nullptr;\n\
+  \  return R->getBaseRegion();\n}\n\nbool SAGenTestChecker::inOnceMacroContext(const\
+  \ Stmt *S, CheckerContext &C, bool IsStore) {\n  if (!S) return false;\n  // Check\
+  \ if inside a call expression that contains READ_ONCE/WRITE_ONCE.\n  const CallExpr\
+  \ *ParentCall = findSpecificTypeInParents<CallExpr>(S, C);\n  if (ParentCall) {\n\
+  \    if (IsStore && ExprHasName(ParentCall, \"WRITE_ONCE\", C))\n      return true;\n\
+  \    if (!IsStore && ExprHasName(ParentCall, \"READ_ONCE\", C))\n      return true;\n\
+  \  }\n  // Fallback: check the statement text itself (best effort).\n  if (const\
+  \ Expr *E = dyn_cast<Expr>(S)) {\n    if (IsStore && ExprHasName(E, \"WRITE_ONCE\"\
+  , C))\n      return true;\n    if (!IsStore && ExprHasName(E, \"READ_ONCE\", C))\n\
+  \      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isPerCpuBase(const\
+  \ Expr *Base, CheckerContext &C) {\n  if (!Base) return false;\n  const MemRegion\
+  \ *R = getMemRegionFromExpr(const_cast<Expr *>(Base), C);\n  if (!R) return false;\n\
+  \  R = R->getBaseRegion();\n  if (!R) return false;\n\n  ProgramStateRef State =\
+  \ C.getState();\n  const bool *Tag = State->get<PerCpuPtrMap>(R);\n  return Tag\
+  \ && *Tag;\n}\n\nvoid SAGenTestChecker::reportNonAtomicStore(const Stmt *S, const\
+  \ MemberExpr *ME, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n   \
+  \   *BT, \"Non-atomic write to per-CPU 'stats_updates'; use WRITE_ONCE.\", N);\n\
+  \n  if (ME)\n    R->addRange(ME->getSourceRange());\n  else\n    R->addRange(S->getSourceRange());\n\
+  \n  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc,\
+  \ SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State =\
+  \ C.getState();\n\n  const MemRegion *Dst = Loc.getAsRegion();\n  if (!Dst) return;\n\
+  \  Dst = Dst->getBaseRegion();\n  if (!Dst) return;\n\n  // Ensure destination is\
+  \ a pointer-typed region.\n  if (const auto *TVR = dyn_cast<TypedValueRegion>(Dst))\
+  \ {\n    QualType T = TVR->getValueType();\n    if (!T.isNull() && T->isPointerType())\
+  \ {\n      bool Changed = false;\n\n      // Case A: RHS explicitly calls per-CPU\
+  \ getters.\n      if (rhsContainsPerCpuGetter(S, C)) {\n        State = State->set<PerCpuPtrMap>(Dst,\
+  \ true);\n        Changed = true;\n      } else {\n        // Case B: Propagate\
+  \ from another per-CPU pointer region on simple aliasing.\n        if (const MemRegion\
+  \ *Src = Val.getAsRegion()) {\n          Src = Src->getBaseRegion();\n         \
+  \ if (Src) {\n            if (const bool *Tag = State->get<PerCpuPtrMap>(Src)) {\n\
+  \              if (*Tag) {\n                State = State->set<PerCpuPtrMap>(Dst,\
+  \ true);\n                Changed = true;\n              }\n            } else {\n\
+  \              // Heuristic: if RHS is a member access whose base is per-CPU, propagate.\n\
+  \              // E.g., statc = statc->parent;\n              if (S) {\n       \
+  \         if (const auto *ME = findSpecificTypeInChildren<MemberExpr>(S)) {\n  \
+  \                const Expr *BaseE = ME->getBase();\n                  if (BaseE\
+  \ && isPerCpuBase(BaseE->IgnoreParenImpCasts(), C)) {\n                    State\
+  \ = State->set<PerCpuPtrMap>(Dst, true);\n                    Changed = true;\n\
+  \                  }\n                }\n              }\n            }\n      \
+  \    }\n        }\n      }\n\n      if (Changed)\n        C.addTransition(State);\n\
+  \    }\n  }\n}\n\nvoid SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const\
+  \ Stmt *S, CheckerContext &C) const {\n  // We focus on non-atomic stores to per-CPU\
+  \ statc->stats_updates.\n  if (IsLoad)\n    return;\n\n  const MemRegion *R = Loc.getAsRegion();\n\
+  \  if (!R) return;\n\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(S);\n\
+  \  if (!ME) return;\n  if (!isStatsUpdatesME(ME))\n    return;\n\n  const Expr *BaseE\
+  \ = ME->getBase();\n  if (!BaseE) return;\n  BaseE = BaseE->IgnoreParenImpCasts();\n\
+  \n  if (!isPerCpuBase(BaseE, C))\n    return;\n\n  if (inOnceMacroContext(S, C,\
+  \ /*IsStore=*/true))\n    return;\n\n  reportNonAtomicStore(S, ME, C);\n}\n\n} //\
+  \ end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect plain stores/updates to per-CPU stats_updates without WRITE_ONCE/READ_ONCE\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

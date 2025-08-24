@@ -1,0 +1,429 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: aec8e6bf839101784f3ef037dcdb9432c3f32343
+commit_type: UAF
+index: 9
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Decl.h\"\n#include \"clang/AST/Type.h\"\n\nusing namespace clang;\nusing\
+  \ namespace ento;\nusing namespace taint;\n\n// Program state customizations\n//\
+  \ - ReleasedFieldMap: map base MemRegion* (owning-struct pointer variable) to bitmask\
+  \ of released fields.\nREGISTER_MAP_WITH_PROGRAMSTATE(ReleasedFieldMap, const MemRegion*,\
+  \ unsigned)\n// - PtrAliasMap: simple alias map for struct-pointer variables to\
+  \ a canonical base region (root).\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const\
+  \ MemRegion*, const MemRegion*)\n\nnamespace {\n\nstatic constexpr unsigned BDEV_FILE_BIT\
+  \ = 1u;\n\nstruct CloseHelperEntry {\n  const char *Name;\n  unsigned ParamIdx;\n\
+  \  unsigned FieldMask;\n};\n\nstatic const CloseHelperEntry CloseHelpers[] = {\n\
+  \  {\"btrfs_close_bdev\", 0u, BDEV_FILE_BIT},\n};\n\nstatic const char *SecondUseFuncs[]\
+  \ = {\n  \"fput\",\n  \"filp_close\",\n};\n\nclass SAGenTestChecker\n  : public\
+  \ Checker<\n      check::PostCall,\n      check::PreCall,\n      check::BranchCondition,\n\
+  \      check::Bind\n    > {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Stale struct file* field use\"\
+  , \"Resource Management\")) {}\n\n      void checkPostCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n\n   private:\n\n      // Helpers\n      const MemRegion *getBaseRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) const;\n      const MemRegion *canonicalizeBase(const\
+  \ MemRegion *R, ProgramStateRef State) const;\n\n      bool isCloseHelper(const\
+  \ CallEvent &Call, unsigned &ParamIdx, unsigned &FieldMask, CheckerContext &C) const;\n\
+  \      bool isSecondUseFunction(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n      bool getFieldAccessInfo(const Expr *E, CheckerContext &C,\n            \
+  \                  const MemRegion *&BaseR, unsigned &FieldBit) const;\n\n     \
+  \ ProgramStateRef setFieldReleased(ProgramStateRef State, const MemRegion *BaseR,\
+  \ unsigned FieldBit) const;\n      ProgramStateRef clearFieldReleased(ProgramStateRef\
+  \ State, const MemRegion *BaseR, unsigned FieldBit) const;\n\n      void reportAtCondition(const\
+  \ Stmt *S, CheckerContext &C, StringRef Msg) const;\n      void reportAtCall(const\
+  \ CallEvent &Call, CheckerContext &C, StringRef Msg) const;\n\n      bool isStructPointerVarRegion(const\
+  \ MemRegion *R, CheckerContext &C) const;\n};\n\nconst MemRegion *SAGenTestChecker::getBaseRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E) return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR) return nullptr;\n  MR = MR->getBaseRegion();\n\
+  \  return MR;\n}\n\nconst MemRegion *SAGenTestChecker::canonicalizeBase(const MemRegion\
+  \ *R, ProgramStateRef State) const {\n  if (!R) return nullptr;\n  // Follow alias\
+  \ chain to the root.\n  const MemRegion *Cur = R;\n  unsigned Steps = 0;\n  while\
+  \ (Cur) {\n    const MemRegion *Next = State->get<PtrAliasMap>(Cur);\n    if (!Next\
+  \ || Next == Cur)\n      break;\n    Cur = Next;\n    // Protective bound to avoid\
+  \ infinite loops due to cycles.\n    if (++Steps > 16)\n      break;\n  }\n  return\
+  \ Cur ? Cur->getBaseRegion() : nullptr;\n}\n\nbool SAGenTestChecker::isCloseHelper(const\
+  \ CallEvent &Call, unsigned &ParamIdx, unsigned &FieldMask, CheckerContext &C) const\
+  \ {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\
+  \  for (const auto &Entry : CloseHelpers) {\n    if (ExprHasName(Origin, Entry.Name,\
+  \ C)) {\n      ParamIdx = Entry.ParamIdx;\n      FieldMask = Entry.FieldMask;\n\
+  \      return true;\n    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isSecondUseFunction(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  for (const char *Name : SecondUseFuncs) {\n\
+  \    if (ExprHasName(Origin, Name, C))\n      return true;\n  }\n  return false;\n\
+  }\n\nbool SAGenTestChecker::getFieldAccessInfo(const Expr *E, CheckerContext &C,\n\
+  \                                          const MemRegion *&BaseR, unsigned &FieldBit)\
+  \ const {\n  BaseR = nullptr;\n  FieldBit = 0;\n\n  if (!E)\n    return false;\n\
+  \n  // We want to find a MemberExpr referencing a field like device->bdev_file.\n\
+  \  const MemberExpr *ME = nullptr;\n  if ((ME = dyn_cast<MemberExpr>(E->IgnoreParenCasts()))\
+  \ == nullptr) {\n    ME = findSpecificTypeInChildren<MemberExpr>(E);\n    if (!ME)\n\
+  \      return false;\n  }\n\n  const ValueDecl *VD = ME->getMemberDecl();\n  if\
+  \ (!VD)\n    return false;\n\n  StringRef FieldName = VD->getName();\n  if (FieldName\
+  \ == \"bdev_file\")\n    FieldBit = BDEV_FILE_BIT;\n\n  const Expr *BaseExpr = ME->getBase();\n\
+  \  if (!BaseExpr)\n    return false;\n\n  const MemRegion *Base = getBaseRegionFromExpr(BaseExpr,\
+  \ C);\n  if (!Base)\n    return false;\n\n  ProgramStateRef State = C.getState();\n\
+  \  BaseR = canonicalizeBase(Base, State);\n\n  return (FieldBit != 0) && (BaseR\
+  \ != nullptr);\n}\n\nProgramStateRef SAGenTestChecker::setFieldReleased(ProgramStateRef\
+  \ State, const MemRegion *BaseR, unsigned FieldBit) const {\n  if (!BaseR || FieldBit\
+  \ == 0)\n    return State;\n  unsigned Cur = 0;\n  if (const unsigned *P = State->get<ReleasedFieldMap>(BaseR))\n\
+  \    Cur = *P;\n  Cur |= FieldBit;\n  State = State->set<ReleasedFieldMap>(BaseR,\
+  \ Cur);\n  return State;\n}\n\nProgramStateRef SAGenTestChecker::clearFieldReleased(ProgramStateRef\
+  \ State, const MemRegion *BaseR, unsigned FieldBit) const {\n  if (!BaseR || FieldBit\
+  \ == 0)\n    return State;\n  unsigned Cur = 0;\n  if (const unsigned *P = State->get<ReleasedFieldMap>(BaseR))\n\
+  \    Cur = *P;\n\n  Cur &= ~FieldBit;\n  if (Cur == 0) {\n    State = State->remove<ReleasedFieldMap>(BaseR);\n\
+  \  } else {\n    State = State->set<ReleasedFieldMap>(BaseR, Cur);\n  }\n  return\
+  \ State;\n}\n\nvoid SAGenTestChecker::reportAtCondition(const Stmt *S, CheckerContext\
+  \ &C, StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::reportAtCall(const CallEvent &Call, CheckerContext &C,\
+  \ StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n \
+  \ if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nbool SAGenTestChecker::isStructPointerVarRegion(const MemRegion *R, CheckerContext\
+  \ &C) const {\n  if (!R)\n    return false;\n  const VarRegion *VR = dyn_cast<VarRegion>(R->getBaseRegion());\n\
+  \  if (!VR)\n    return false;\n  QualType T = VR->getValueType();\n  if (T.isNull())\n\
+  \    return false;\n  if (!T->isPointerType())\n    return false;\n  QualType Pointee\
+  \ = T->getPointeeType();\n  if (Pointee.isNull())\n    return false;\n  return Pointee->isRecordType();\n\
+  }\n\n// Callback implementations\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  unsigned ParamIdx = 0, FieldMask = 0;\n \
+  \ if (!isCloseHelper(Call, ParamIdx, FieldMask, C))\n    return;\n\n  if (ParamIdx\
+  \ >= Call.getNumArgs())\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(ParamIdx);\n\
+  \  if (!ArgE)\n    return;\n\n  const MemRegion *BaseR = getBaseRegionFromExpr(ArgE,\
+  \ C);\n  if (!BaseR)\n    return;\n\n  ProgramStateRef State = C.getState();\n \
+  \ BaseR = canonicalizeBase(BaseR, State);\n  if (!BaseR)\n    return;\n\n  State\
+  \ = setFieldReleased(State, BaseR, FieldMask);\n  C.addTransition(State);\n}\n\n\
+  void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *LHSReg\
+  \ = Loc.getAsRegion();\n  if (!LHSReg) {\n    return;\n  }\n\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg)\n    return;\n\n  // 1) Track aliasing for pointer variables: p2\
+  \ = p1;\n  if (const VarRegion *LHSVar = dyn_cast<VarRegion>(LHSReg)) {\n    //\
+  \ Ensure it's a pointer-to-struct variable.\n    if (isStructPointerVarRegion(LHSVar,\
+  \ C)) {\n      if (const MemRegion *RHSReg = Val.getAsRegion()) {\n        RHSReg\
+  \ = RHSReg->getBaseRegion();\n        if (RHSReg) {\n          const MemRegion *Root\
+  \ = canonicalizeBase(RHSReg, State);\n          if (!Root)\n            Root = RHSReg;\n\
+  \          // Map LHSVar to root\n          State = State->set<PtrAliasMap>(LHSVar,\
+  \ Root);\n          C.addTransition(State);\n          return;\n        }\n    \
+  \  }\n    }\n  }\n\n  // 2) If writing to a field like device->bdev_file = ...,\
+  \ clear the released bit.\n  if (const FieldRegion *FR = dyn_cast<FieldRegion>(LHSReg))\
+  \ {\n    const FieldDecl *FD = FR->getDecl();\n    if (FD && FD->getName() == \"\
+  bdev_file\") {\n      const MemRegion *Base = FR->getSuperRegion();\n      if (Base)\n\
+  \        Base = Base->getBaseRegion();\n      if (Base) {\n        Base = canonicalizeBase(Base,\
+  \ State);\n        if (Base) {\n          State = clearFieldReleased(State, Base,\
+  \ BDEV_FILE_BIT);\n          C.addTransition(State);\n          return;\n      \
+  \  }\n      }\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition)\n    return;\n\n\
+  \  const MemRegion *BaseR = nullptr;\n  unsigned FieldBit = 0;\n  if (!getFieldAccessInfo(dyn_cast<Expr>(Condition),\
+  \ C, BaseR, FieldBit))\n    return;\n\n  if (FieldBit != BDEV_FILE_BIT)\n    return;\n\
+  \n  ProgramStateRef State = C.getState();\n  const unsigned *Mask = State->get<ReleasedFieldMap>(BaseR);\n\
+  \  if (!Mask)\n    return;\n\n  if ((*Mask & BDEV_FILE_BIT) == 0)\n    return;\n\
+  \n  reportAtCondition(Condition, C, \"Stale file* checked after close; set field\
+  \ to NULL after close\");\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  if (!isSecondUseFunction(Call, C))\n    return;\n\
+  \n  if (Call.getNumArgs() == 0)\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(0);\n\
+  \  if (!ArgE)\n    return;\n\n  const MemRegion *BaseR = nullptr;\n  unsigned FieldBit\
+  \ = 0;\n  if (!getFieldAccessInfo(ArgE, C, BaseR, FieldBit))\n    return;\n\n  if\
+  \ (FieldBit != BDEV_FILE_BIT)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  const unsigned *Mask = State->get<ReleasedFieldMap>(BaseR);\n  if (!Mask)\n \
+  \   return;\n\n  if ((*Mask & BDEV_FILE_BIT) == 0)\n    return;\n\n  reportAtCall(Call,\
+  \ C, \"Double close/fput on freed struct file* field\");\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects stale struct file* field usage after close; suggests setting\
+  \ field to NULL\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbtrfs: fix use-after-free of block device file in\
+  \ __btrfs_free_extra_devids()\n\nMounting btrfs from two images (which have the\
+  \ same one fsid and two\ndifferent dev_uuids) in certain executing order may trigger\
+  \ an UAF for\nvariable 'device->bdev_file' in __btrfs_free_extra_devids(). And\n\
+  following are the details:\n\n1. Attach image_1 to loop0, attach image_2 to loop1,\
+  \ and scan btrfs\n   devices by ioctl(BTRFS_IOC_SCAN_DEV):\n\n             /  btrfs_device_1\
+  \ \u2192 loop0\n   fs_device\n             \\  btrfs_device_2 \u2192 loop1\n2. mount\
+  \ /dev/loop0 /mnt\n   btrfs_open_devices\n    btrfs_device_1->bdev_file = btrfs_get_bdev_and_sb(loop0)\n\
+  \    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n   btrfs_fill_super\n\
+  \    open_ctree\n     fail: btrfs_close_devices // -ENOMEM\n\t    btrfs_close_bdev(btrfs_device_1)\n\
+  \             fput(btrfs_device_1->bdev_file)\n\t      // btrfs_device_1->bdev_file\
+  \ is freed\n\t    btrfs_close_bdev(btrfs_device_2)\n             fput(btrfs_device_2->bdev_file)\n\
+  \n3. mount /dev/loop1 /mnt\n   btrfs_open_devices\n    btrfs_get_bdev_and_sb(&bdev_file)\n\
+  \     // EIO, btrfs_device_1->bdev_file is not assigned,\n     // which points to\
+  \ a freed memory area\n    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n\
+  \   btrfs_fill_super\n    open_ctree\n     btrfs_free_extra_devids\n      if (btrfs_device_1->bdev_file)\n\
+  \       fput(btrfs_device_1->bdev_file) // UAF !\n\nFix it by setting 'device->bdev_file'\
+  \ as 'NULL' after closing the\nbtrfs_device in btrfs_close_one_device().\n\nFixes:\
+  \ 142388194191 (\"btrfs: do not background blkdev_put()\")\nCC: stable@vger.kernel.org\
+  \ # 4.19+\nLink: https://bugzilla.kernel.org/show_bug.cgi?id=219408\nSigned-off-by:\
+  \ Zhihao Cheng <chengzhihao1@huawei.com>\nReviewed-by: David Sterba <dsterba@suse.com>\n\
+  Signed-off-by: David Sterba <dsterba@suse.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ btrfs_close_one_device in fs/btrfs/volumes.c\nstatic void btrfs_close_one_device(struct\
+  \ btrfs_device *device)\n{\n\tstruct btrfs_fs_devices *fs_devices = device->fs_devices;\n\
+  \n\tif (test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) &&\n\t    device->devid\
+  \ != BTRFS_DEV_REPLACE_DEVID) {\n\t\tlist_del_init(&device->dev_alloc_list);\n\t\
+  \tfs_devices->rw_devices--;\n\t}\n\n\tif (device->devid == BTRFS_DEV_REPLACE_DEVID)\n\
+  \t\tclear_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);\n\n\tif (test_bit(BTRFS_DEV_STATE_MISSING,\
+  \ &device->dev_state)) {\n\t\tclear_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state);\n\
+  \t\tfs_devices->missing_devices--;\n\t}\n\n\tbtrfs_close_bdev(device);\n\tif (device->bdev)\
+  \ {\n\t\tfs_devices->open_devices--;\n\t\tdevice->bdev = NULL;\n\t}\n\tclear_bit(BTRFS_DEV_STATE_WRITEABLE,\
+  \ &device->dev_state);\n\tbtrfs_destroy_dev_zone_info(device);\n\n\tdevice->fs_info\
+  \ = NULL;\n\tatomic_set(&device->dev_stats_ccnt, 0);\n\textent_io_tree_release(&device->alloc_state);\n\
+  \n\t/*\n\t * Reset the flush error record. We might have a transient flush error\n\
+  \t * in this mount, and if so we aborted the current transaction and set\n\t * the\
+  \ fs to an error state, guaranteeing no super blocks can be further\n\t * committed.\
+  \ However that error might be transient and if we unmount the\n\t * filesystem and\
+  \ mount it again, we should allow the mount to succeed\n\t * (btrfs_check_rw_degradable()\
+  \ should not fail) - if after mounting the\n\t * filesystem again we still get flush\
+  \ errors, then we will again abort\n\t * any transaction and set the error state,\
+  \ guaranteeing no commits of\n\t * unsafe super blocks.\n\t */\n\tdevice->last_flush_error\
+  \ = 0;\n\n\t/* Verify the device is back in a pristine state  */\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_FLUSH_SENT,\
+  \ &device->dev_state));\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state));\n\
+  \tWARN_ON(!list_empty(&device->dev_alloc_list));\n\tWARN_ON(!list_empty(&device->post_commit_list));\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c\n\
+  index 8f340ad1d938..eb51b609190f 100644\n--- a/fs/btrfs/volumes.c\n+++ b/fs/btrfs/volumes.c\n\
+  @@ -1105,6 +1105,7 @@ static void btrfs_close_one_device(struct btrfs_device *device)\n\
+  \ \tif (device->bdev) {\n \t\tfs_devices->open_devices--;\n \t\tdevice->bdev = NULL;\n\
+  +\t\tdevice->bdev_file = NULL;\n \t}\n \tclear_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state);\n\
+  \ \tbtrfs_destroy_dev_zone_info(device);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Leaving a stale struct file* pointer in a persistent structure after the resource
+  has been released (e.g., via fput()/close in a helper like btrfs_close_bdev()),
+  and later using a non-NULL check on that pointer to perform another put/close. In
+  short: a pointer field is freed by a callee but not set to NULL, so subsequent cleanup
+  paths treat the dangling non-NULL pointer as valid and dereference it, causing a
+  use-after-free/double fput.'
+plan: "1. Program State Customization\n\n- ReleasedFieldMap: map the owning-struct\
+  \ pointer region to which inner pointer fields are known to be released by a helper.\n\
+  \  - REGISTER_MAP_WITH_PROGRAMSTATE(ReleasedFieldMap, const MemRegion*, unsigned)\n\
+  \  - Use bit flags for fields we care about. Define BDEV_FILE_BIT = 1u.\n  - Meaning:\
+  \ State[R] has bit BDEV_FILE_BIT if the callee released R->bdev_file but the field\
+  \ was not reset to NULL in the current function.\n\n- PtrAliasMap: track simple\
+  \ aliases of struct-pointer variables to canonicalize the \u201Cowning object\u201D\
+  \ region across assignments.\n  - REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const\
+  \ MemRegion*, const MemRegion*)\n  - Map lhs pointer variable region \u2192 canonical\
+  \ base region. When new alias chains are introduced, always map to the root canonical\
+  \ region; maintain a small helper to resolve to root.\n\n2. Helper Tables and Utilities\n\
+  \n- Known close helpers (release inner field(s) of the passed struct):\n  - Table\
+  \ entry: \"btrfs_close_bdev\", ParamIdx = 0, FieldMask = BDEV_FILE_BIT\n\n- Known\
+  \ second-use calls (double-release/deref on struct file*):\n  - \"fput\", ParamIdx\
+  \ = 0\n  - \"filp_close\", ParamIdx = 0\n\n- AST/Region helpers:\n  - getBaseRegionFromExpr(const\
+  \ Expr* E, CheckerContext& C): returns the MemRegion of a struct-pointer variable\
+  \ for simple lvalues (DeclRefExpr) using getMemRegionFromExpr(E). If E is a MemberExpr\
+  \ base (e.g., device->...), pass the base expr into getMemRegionFromExpr.\n  - canonicalizeBase(const\
+  \ MemRegion* R, ProgramStateRef S): Follow PtrAliasMap to return the alias-root\
+  \ region (stop when no mapping).\n  - getFieldAccessInfo(const Expr* E): if E is\
+  \ a MemberExpr, return:\n    - FieldName = MemberExpr->getMemberDecl()->getName()\
+  \ (as StringRef)\n    - BaseRegion = canonicalizeBase(getMemRegionFromExpr(MemberExpr->getBase(),\
+  \ C), State)\n    - Also return the FieldBit if FieldName equals \"bdev_file\" (BDEV_FILE_BIT),\
+  \ else 0.\n  - setFieldReleased(State, BaseR, FieldBit): State = State->set<ReleasedFieldMap>(BaseR,\
+  \ State[BaseR] | FieldBit)\n  - clearFieldReleased(State, BaseR, FieldBit): State\
+  \ = State->set<ReleasedFieldMap>(BaseR, State[BaseR] & ~FieldBit); if value becomes\
+  \ 0, erase BaseR from map.\n\n3. Callback Selection and Implementation Details\n\
+  \n- checkPostCall(const CallEvent &Call, CheckerContext &C)\n  - Purpose: mark an\
+  \ inner pointer field as released by a known \u201Cclose\u201D helper that operates\
+  \ on a parent struct pointer argument.\n  - Steps:\n    1. Match Call against the\
+  \ Known close helpers table. If not matched, return.\n    2. Get the argument expression\
+  \ at the specified ParamIdx (e.g., 0 for btrfs_close_bdev).\n    3. BaseR = getBaseRegionFromExpr(ArgE,\
+  \ C); if null, return.\n    4. BaseR = canonicalizeBase(BaseR, State).\n    5. Set\
+  \ ReleasedFieldMap[BaseR] |= FieldMask (setFieldReleased).\n    6. C.addTransition(State).\n\
+  \n- checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C)\n  - Purpose:\n\
+  \    - Track aliases between struct-pointer variables: p2 = p1;\n    - Clear released\
+  \ bit when bdev_file field is written (e.g., device->bdev_file = NULL).\n  - Steps:\n\
+  \    1. If Loc is a MemRegionVal RLoc:\n       - If RLoc is a VarRegion whose type\
+  \ is a pointer to a struct (e.g., struct btrfs_device*), and Val is a loc::MemRegionVal\
+  \ RV:\n         - Update PtrAliasMap[RLoc] = canonicalizeBase(RV.getRegion(), State).\
+  \ This records p2 aliasing p1\u2019s base. If Val is unknown or non-region, skip.\n\
+  \       - Else if RLoc is a FieldRegion:\n         - If FieldRegion\u2019s FieldDecl\
+  \ name == \"bdev_file\":\n           - Get BaseR = canonicalizeBase(FieldRegion->getSuperRegion(),\
+  \ State).\n           - Clear the released bit for BDEV_FILE_BIT on BaseR (clearFieldReleased).\n\
+  \           - C.addTransition(State).\n    2. No other updates required here.\n\n\
+  - checkBranchCondition(const Stmt *Condition, CheckerContext &C)\n  - Purpose: flag\
+  \ the pattern if the condition is a non-NULL check on a field that was released\
+  \ by a helper (e.g., if (device->bdev_file) or if (device->bdev_file != NULL)).\n\
+  \  - Steps:\n    1. Find a MemberExpr inside Condition using findSpecificTypeInChildren<MemberExpr>(Condition).\
+  \ If none, return.\n    2. From the MemberExpr, get FieldName and BaseR via getFieldAccessInfo.\n\
+  \    3. If FieldBit == BDEV_FILE_BIT:\n       - Look up ReleasedFieldMap[BaseR];\
+  \ if BDEV_FILE_BIT is set, report a bug:\n         - Message: \"Stale file* checked\
+  \ after close; set field to NULL after close\".\n         - Emit report at Condition;\
+  \ create non-fatal error node and PathSensitiveBugReport.\n         - Do not clear\
+  \ the bit here (subsequent uses are still problematic).\n\n- checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C)\n  - Purpose: detect second use (double fput/close)\
+  \ of the already-released bdev_file field.\n  - Steps:\n    1. If callee is one\
+  \ of Known second-use functions (\"fput\", \"filp_close\"), get its pointer argument\
+  \ at index 0.\n    2. If the argument expression is a MemberExpr:\n       - Extract\
+  \ BaseR and FieldBit via getFieldAccessInfo.\n       - If FieldBit == BDEV_FILE_BIT\
+  \ and ReleasedFieldMap[BaseR] has BDEV_FILE_BIT:\n         - Report: \"Double close/fput\
+  \ on freed struct file* field\".\n         - Emit bug at the call site (PathSensitiveBugReport).\n\
+  \    3. Otherwise, no action.\n\n- checkRegionChanges(...)\n  - Purpose: hygiene.\
+  \ If regions get invalidated (e.g., scope end, unknown writes), drop related state.\n\
+  \  - Steps:\n    1. For every region in Regions (or ExplicitRegions), if it\u2019\
+  s a VarRegion or a super region that may be the base of our ReleasedFieldMap keys,\
+  \ remove ReleasedFieldMap entry keyed by that base or any alias whose root is that\
+  \ base.\n    2. For simplicity, it is acceptable to skip deep cleanup and rely on\
+  \ path sensitivity in this checker; optional.\n\n- checkEndFunction(...)\n  - Optional:\
+  \ No special handling required; the analyzer cleans up function-local states automatically.\
+  \ You can leave as no-op.\n\n4. Reporting\n\n- Create a single BugType, e.g., \"\
+  Stale struct file* field use\".\n- Reports:\n  - On branch condition: \"Stale file*\
+  \ checked after close; set field to NULL after close\"\n  - On second-use call:\
+  \ \"Double close/fput on freed struct file* field\"\n- Use std::make_unique<PathSensitiveBugReport>.\
+  \ Create a non-fatal error node via generateNonFatalErrorNode and emit the report.\n\
+  \n5. Notes and Scope\n\n- Field identification: This checker targets the specific\
+  \ field name \"bdev_file\". Extendable by adding more names and corresponding bits\
+  \ if needed.\n- Helper recognition: The core mark is from \"btrfs_close_bdev(device)\"\
+  ; add more helpers if they are known to release inner file* fields.\n- Alias tracking:\
+  \ Only simple pointer variable aliases are tracked (p2 = p1). Complex aliasing is\
+  \ intentionally out of scope to keep the checker simple and robust for the given\
+  \ pattern.\n- Field write clearing: Any assignment to device->bdev_file (including\
+  \ \"= NULL\") clears the released mark, which mirrors the intended fix of setting\
+  \ it to NULL after closing."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Decl.h\"\n#include \"clang/AST/Type.h\"\n#include <memory>\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state customizations\n\
+  // - ReleasedFieldMap: map base MemRegion* (owning-struct pointer variable) to bitmask\
+  \ of released fields.\nREGISTER_MAP_WITH_PROGRAMSTATE(ReleasedFieldMap, const MemRegion*,\
+  \ unsigned)\n// - PtrAliasMap: simple alias map for struct-pointer variables to\
+  \ a canonical base region (root).\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const\
+  \ MemRegion*, const MemRegion*)\n\nnamespace {\n\nstatic constexpr unsigned BDEV_FILE_BIT\
+  \ = 1u;\n\nstruct CloseHelperEntry {\n  const char *Name;\n  unsigned ParamIdx;\n\
+  \  unsigned FieldMask;\n};\n\nstatic const CloseHelperEntry CloseHelpers[] = {\n\
+  \  {\"btrfs_close_bdev\", 0u, BDEV_FILE_BIT},\n};\n\nstatic const char *SecondUseFuncs[]\
+  \ = {\n  \"fput\",\n  \"filp_close\",\n};\n\nclass SAGenTestChecker\n  : public\
+  \ Checker<\n      check::PostCall,\n      check::PreCall,\n      check::BranchCondition,\n\
+  \      check::Bind\n    > {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Stale struct file* field use\"\
+  , \"Resource Management\")) {}\n\n      void checkPostCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n\n   private:\n\n      // Helpers\n      const MemRegion *getBaseRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) const;\n      const MemRegion *canonicalizeBase(const\
+  \ MemRegion *R, ProgramStateRef State) const;\n\n      bool isCloseHelper(const\
+  \ CallEvent &Call, unsigned &ParamIdx, unsigned &FieldMask, CheckerContext &C) const;\n\
+  \      bool isSecondUseFunction(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n      bool getFieldAccessInfo(const Expr *E, CheckerContext &C,\n            \
+  \                  const MemRegion *&BaseR, unsigned &FieldBit) const;\n\n     \
+  \ ProgramStateRef setFieldReleased(ProgramStateRef State, const MemRegion *BaseR,\
+  \ unsigned FieldBit) const;\n      ProgramStateRef clearFieldReleased(ProgramStateRef\
+  \ State, const MemRegion *BaseR, unsigned FieldBit) const;\n\n      void reportAtCondition(const\
+  \ Stmt *S, CheckerContext &C, StringRef Msg) const;\n      void reportAtCall(const\
+  \ CallEvent &Call, CheckerContext &C, StringRef Msg) const;\n\n      bool isStructPointerVarRegion(const\
+  \ MemRegion *R, CheckerContext &C) const;\n};\n\nconst MemRegion *SAGenTestChecker::getBaseRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E) return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR) return nullptr;\n  MR = MR->getBaseRegion();\n\
+  \  return MR;\n}\n\nconst MemRegion *SAGenTestChecker::canonicalizeBase(const MemRegion\
+  \ *R, ProgramStateRef State) const {\n  if (!R) return nullptr;\n  // Follow alias\
+  \ chain to the root.\n  const MemRegion *Cur = R;\n  unsigned Steps = 0;\n  while\
+  \ (Cur) {\n    const MemRegion *Next = nullptr;\n    if (const MemRegion *const\
+  \ *P = State->get<PtrAliasMap>(Cur))\n      Next = *P;\n    if (!Next || Next ==\
+  \ Cur)\n      break;\n    Cur = Next;\n    // Protective bound to avoid infinite\
+  \ loops due to cycles.\n    if (++Steps > 16)\n      break;\n  }\n  return Cur ?\
+  \ Cur->getBaseRegion() : nullptr;\n}\n\nbool SAGenTestChecker::isCloseHelper(const\
+  \ CallEvent &Call, unsigned &ParamIdx, unsigned &FieldMask, CheckerContext &C) const\
+  \ {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\
+  \  for (const auto &Entry : CloseHelpers) {\n    if (ExprHasName(Origin, Entry.Name,\
+  \ C)) {\n      ParamIdx = Entry.ParamIdx;\n      FieldMask = Entry.FieldMask;\n\
+  \      return true;\n    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isSecondUseFunction(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  for (const char *Name : SecondUseFuncs) {\n\
+  \    if (ExprHasName(Origin, Name, C))\n      return true;\n  }\n  return false;\n\
+  }\n\nbool SAGenTestChecker::getFieldAccessInfo(const Expr *E, CheckerContext &C,\n\
+  \                                          const MemRegion *&BaseR, unsigned &FieldBit)\
+  \ const {\n  BaseR = nullptr;\n  FieldBit = 0;\n\n  if (!E)\n    return false;\n\
+  \n  // We want to find a MemberExpr referencing a field like device->bdev_file.\n\
+  \  const MemberExpr *ME = nullptr;\n  if ((ME = dyn_cast<MemberExpr>(E->IgnoreParenCasts()))\
+  \ == nullptr) {\n    ME = findSpecificTypeInChildren<MemberExpr>(E);\n    if (!ME)\n\
+  \      return false;\n  }\n\n  const ValueDecl *VD = ME->getMemberDecl();\n  if\
+  \ (!VD)\n    return false;\n\n  StringRef FieldName = VD->getName();\n  if (FieldName\
+  \ == \"bdev_file\")\n    FieldBit = BDEV_FILE_BIT;\n\n  const Expr *BaseExpr = ME->getBase();\n\
+  \  if (!BaseExpr)\n    return false;\n\n  const MemRegion *Base = getBaseRegionFromExpr(BaseExpr,\
+  \ C);\n  if (!Base)\n    return false;\n\n  ProgramStateRef State = C.getState();\n\
+  \  BaseR = canonicalizeBase(Base, State);\n\n  return (FieldBit != 0) && (BaseR\
+  \ != nullptr);\n}\n\nProgramStateRef SAGenTestChecker::setFieldReleased(ProgramStateRef\
+  \ State, const MemRegion *BaseR, unsigned FieldBit) const {\n  if (!BaseR || FieldBit\
+  \ == 0)\n    return State;\n  unsigned Cur = 0;\n  if (const unsigned *P = State->get<ReleasedFieldMap>(BaseR))\n\
+  \    Cur = *P;\n  Cur |= FieldBit;\n  State = State->set<ReleasedFieldMap>(BaseR,\
+  \ Cur);\n  return State;\n}\n\nProgramStateRef SAGenTestChecker::clearFieldReleased(ProgramStateRef\
+  \ State, const MemRegion *BaseR, unsigned FieldBit) const {\n  if (!BaseR || FieldBit\
+  \ == 0)\n    return State;\n  unsigned Cur = 0;\n  if (const unsigned *P = State->get<ReleasedFieldMap>(BaseR))\n\
+  \    Cur = *P;\n\n  Cur &= ~FieldBit;\n  if (Cur == 0) {\n    State = State->remove<ReleasedFieldMap>(BaseR);\n\
+  \  } else {\n    State = State->set<ReleasedFieldMap>(BaseR, Cur);\n  }\n  return\
+  \ State;\n}\n\nvoid SAGenTestChecker::reportAtCondition(const Stmt *S, CheckerContext\
+  \ &C, StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::reportAtCall(const CallEvent &Call, CheckerContext &C,\
+  \ StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n \
+  \ if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nbool SAGenTestChecker::isStructPointerVarRegion(const MemRegion *R, CheckerContext\
+  \ &C) const {\n  if (!R)\n    return false;\n  const VarRegion *VR = dyn_cast<VarRegion>(R->getBaseRegion());\n\
+  \  if (!VR)\n    return false;\n  QualType T = VR->getValueType();\n  if (T.isNull())\n\
+  \    return false;\n  if (!T->isPointerType())\n    return false;\n  QualType Pointee\
+  \ = T->getPointeeType();\n  if (Pointee.isNull())\n    return false;\n  return Pointee->isRecordType();\n\
+  }\n\n// Callback implementations\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  unsigned ParamIdx = 0, FieldMask = 0;\n \
+  \ if (!isCloseHelper(Call, ParamIdx, FieldMask, C))\n    return;\n\n  if (ParamIdx\
+  \ >= Call.getNumArgs())\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(ParamIdx);\n\
+  \  if (!ArgE)\n    return;\n\n  const MemRegion *BaseR = getBaseRegionFromExpr(ArgE,\
+  \ C);\n  if (!BaseR)\n    return;\n\n  ProgramStateRef State = C.getState();\n \
+  \ BaseR = canonicalizeBase(BaseR, State);\n  if (!BaseR)\n    return;\n\n  State\
+  \ = setFieldReleased(State, BaseR, FieldMask);\n  C.addTransition(State);\n}\n\n\
+  void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *LHSReg\
+  \ = Loc.getAsRegion();\n  if (!LHSReg) {\n    return;\n  }\n\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg)\n    return;\n\n  // 1) Track aliasing for pointer variables: p2\
+  \ = p1;\n  if (const VarRegion *LHSVar = dyn_cast<VarRegion>(LHSReg)) {\n    //\
+  \ Ensure it's a pointer-to-struct variable.\n    if (isStructPointerVarRegion(LHSVar,\
+  \ C)) {\n      if (const MemRegion *RHSReg = Val.getAsRegion()) {\n        RHSReg\
+  \ = RHSReg->getBaseRegion();\n        if (RHSReg) {\n          const MemRegion *Root\
+  \ = canonicalizeBase(RHSReg, State);\n          if (!Root)\n            Root = RHSReg;\n\
+  \          // Map LHSVar to root\n          State = State->set<PtrAliasMap>(LHSVar,\
+  \ Root);\n          C.addTransition(State);\n          return;\n        }\n    \
+  \  }\n    }\n  }\n\n  // 2) If writing to a field like device->bdev_file = ...,\
+  \ clear the released bit.\n  if (const FieldRegion *FR = dyn_cast<FieldRegion>(LHSReg))\
+  \ {\n    const FieldDecl *FD = FR->getDecl();\n    if (FD && FD->getName() == \"\
+  bdev_file\") {\n      const MemRegion *Base = FR->getSuperRegion();\n      if (Base)\n\
+  \        Base = Base->getBaseRegion();\n      if (Base) {\n        Base = canonicalizeBase(Base,\
+  \ State);\n        if (Base) {\n          State = clearFieldReleased(State, Base,\
+  \ BDEV_FILE_BIT);\n          C.addTransition(State);\n          return;\n      \
+  \  }\n      }\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition)\n    return;\n\n\
+  \  const MemRegion *BaseR = nullptr;\n  unsigned FieldBit = 0;\n  if (!getFieldAccessInfo(dyn_cast<Expr>(Condition),\
+  \ C, BaseR, FieldBit))\n    return;\n\n  if (FieldBit != BDEV_FILE_BIT)\n    return;\n\
+  \n  ProgramStateRef State = C.getState();\n  const unsigned *Mask = State->get<ReleasedFieldMap>(BaseR);\n\
+  \  if (!Mask)\n    return;\n\n  if ((*Mask & BDEV_FILE_BIT) == 0)\n    return;\n\
+  \n  reportAtCondition(Condition, C, \"Stale file* checked after close; set field\
+  \ to NULL after close\");\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  if (!isSecondUseFunction(Call, C))\n    return;\n\
+  \n  if (Call.getNumArgs() == 0)\n    return;\n\n  const Expr *ArgE = Call.getArgExpr(0);\n\
+  \  if (!ArgE)\n    return;\n\n  const MemRegion *BaseR = nullptr;\n  unsigned FieldBit\
+  \ = 0;\n  if (!getFieldAccessInfo(ArgE, C, BaseR, FieldBit))\n    return;\n\n  if\
+  \ (FieldBit != BDEV_FILE_BIT)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  const unsigned *Mask = State->get<ReleasedFieldMap>(BaseR);\n  if (!Mask)\n \
+  \   return;\n\n  if ((*Mask & BDEV_FILE_BIT) == 0)\n    return;\n\n  reportAtCall(Call,\
+  \ C, \"Double close/fput on freed struct file* field\");\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects stale struct file* field usage after close; suggests setting\
+  \ field to NULL\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

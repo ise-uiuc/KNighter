@@ -1,0 +1,143 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -46,6 +46,12 @@   // Per-function: fields directly assigned from allocator calls within this function.
+   mutable llvm::DenseMap<const FunctionDecl*, llvm::SmallPtrSet<const FieldDecl*, 16>> FuncLocallyAllocFields;
+
++  // Per-function: for each label, keep the list of concrete goto statements targeting it.
++  mutable llvm::DenseMap<const FunctionDecl*, llvm::DenseMap<const LabelStmt*, llvm::SmallVector<const GotoStmt*, 4>>> FuncLabelGotos;
++
++  // Per-function: earliest source location where a given FieldDecl is assigned from an allocator call.
++  mutable llvm::DenseMap<const FunctionDecl*, llvm::DenseMap<const FieldDecl*, SourceLocation>> FuncFieldFirstAllocLoc;
++
+ public:
+   SAGenTestChecker()
+       : BT(new BugType(this, "Double free in shared error label", "Memory Management")) {}
+@@ -57,12 +63,13 @@   void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+
+ private:
+-  // Helper to collect labels and gotos from a function body, and fields locally assigned from allocators.
++  // Helper to collect labels, gotos, and fields locally assigned from allocators.
+   struct FuncInfoCollector : public RecursiveASTVisitor<FuncInfoCollector> {
+     CheckerContext &C;
+     llvm::DenseMap<const LabelDecl *, const LabelStmt *> LabelMap;
+     llvm::SmallVector<const GotoStmt *, 16> Gotos;
+     llvm::SmallPtrSet<const FieldDecl*, 16> LocallyAllocFields;
++    llvm::DenseMap<const FieldDecl*, SourceLocation> FirstAllocLoc;
+
+     FuncInfoCollector(CheckerContext &Ctx) : C(Ctx) {}
+
+@@ -89,10 +96,21 @@       if (!ME || !CE)
+         return true;
+
+-      // If RHS call looks like an allocator, record the assigned field.
++      // If RHS call looks like an allocator, record the assigned field and earliest loc.
+       if (callExprLooksLikeAllocator(CE, C)) {
+         if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {
+-          LocallyAllocFields.insert(FD->getCanonicalDecl());
++          const FieldDecl *CanonFD = FD->getCanonicalDecl();
++          LocallyAllocFields.insert(CanonFD);
++          SourceLocation CurLoc = BO->getBeginLoc();
++          auto It = FirstAllocLoc.find(CanonFD);
++          if (It == FirstAllocLoc.end()) {
++            FirstAllocLoc[CanonFD] = CurLoc;
++          } else {
++            const SourceManager &SM = C.getSourceManager();
++            // Keep the earliest source location in TU order.
++            if (SM.isBeforeInTranslationUnit(CurLoc, It->second))
++              It->second = CurLoc;
++          }
+         }
+       }
+       return true;
+@@ -152,8 +170,9 @@   FuncInfoCollector Collector(C);
+   Collector.TraverseStmt(const_cast<Stmt *>(Body));
+
+-  // Build incoming goto counts.
++  // Build incoming goto counts and per-label goto lists.
+   llvm::DenseMap<const LabelStmt*, unsigned> IncomingCount;
++  llvm::DenseMap<const LabelStmt*, llvm::SmallVector<const GotoStmt*, 4>> LabelToGotos;
+   for (const GotoStmt *GS : Collector.Gotos) {
+     const LabelDecl *LD = GS->getLabel();
+     if (!LD)
+@@ -163,10 +182,18 @@       continue;
+     const LabelStmt *LS = It->second;
+     IncomingCount[LS] = IncomingCount.lookup(LS) + 1;
++    LabelToGotos[LS].push_back(GS);
+   }
+
+   FuncLabelIncoming[FD] = std::move(IncomingCount);
+   FuncLocallyAllocFields[FD] = std::move(Collector.LocallyAllocFields);
++  FuncLabelGotos[FD] = std::move(LabelToGotos);
++  // Store earliest allocator-assignment locations for fields.
++  llvm::DenseMap<const FieldDecl*, SourceLocation> Earliest;
++  for (const auto &P : Collector.FirstAllocLoc) {
++    Earliest[P.first->getCanonicalDecl()] = P.second;
++  }
++  FuncFieldFirstAllocLoc[FD] = std::move(Earliest);
+ }
+
+ bool SAGenTestChecker::isAllocatorCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -215,6 +242,8 @@   // Clean per-function metadata.
+   FuncLabelIncoming.erase(FD);
+   FuncLocallyAllocFields.erase(FD);
++  FuncLabelGotos.erase(FD);
++  FuncFieldFirstAllocLoc.erase(FD);
+ }
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -267,7 +296,7 @@   if (ArgVal.isZeroConstant())
+     return true;
+
+-  // 2) If this function path-sensitively owns the region (or its base), don't warn.
++  // 2) If this function path-sensitively owns the region (or its base), don't warn on this path.
+   const MemRegion *FreedReg = getMemRegionFromExpr(Call.getArgExpr(0), C);
+   if (FreedReg) {
+     const MemRegion *Base = FreedReg->getBaseRegion();
+@@ -278,15 +307,44 @@     }
+   }
+
+-  // 3) If this function (path-insensitive) directly assigns an allocator to this field anywhere,
+-  //    treat it as locally managed and suppress.
++  // 3) If all incoming gotos to this label lexically occur after the earliest allocator
++  //    assignment to this field in the same function, then the shared label is safe.
+   const FunctionDecl *FD = getCurrentFunction(C);
+   if (FD && FreedME) {
+-    auto It = FuncLocallyAllocFields.find(FD);
+-    if (It != FuncLocallyAllocFields.end()) {
+-      const FieldDecl *FDField = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
+-      if (FDField && It->second.count(FDField->getCanonicalDecl()))
+-        return true;
++    const FieldDecl *FreedFD = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
++    if (FreedFD) {
++      const FieldDecl *CanonFD = FreedFD->getCanonicalDecl();
++
++      auto AllocItF = FuncFieldFirstAllocLoc.find(FD);
++      auto GotoItF  = FuncLabelGotos.find(FD);
++      if (AllocItF != FuncFieldFirstAllocLoc.end() &&
++          GotoItF  != FuncLabelGotos.end()) {
++        auto AllocIt = AllocItF->second.find(CanonFD);
++        auto GLabelIt = GotoItF->second.find(EnclosingLabel);
++        if (AllocIt != AllocItF->second.end() &&
++            GLabelIt != GotoItF->second.end()) {
++          SourceLocation AllocLoc = AllocIt->second;
++          const auto &Gotos = GLabelIt->second;
++          if (!Gotos.empty()) {
++            const SourceManager &SM = C.getSourceManager();
++            bool AnyBefore = false;
++            for (const GotoStmt *GS : Gotos) {
++              SourceLocation GLoc = GS->getGotoLoc();
++              // If a goto appears before the allocator assignment, there exists
++              // a path to the label prior to ownership -> potential bug.
++              if (SM.isBeforeInTranslationUnit(GLoc, AllocLoc)) {
++                AnyBefore = true;
++                break;
++              }
++            }
++            if (!AnyBefore) {
++              // All incoming gotos occur after allocator assignment to this field.
++              // The shared label free is consistent with local ownership.
++              return true;
++            }
++          }
++        }
++      }
+     }
+   }

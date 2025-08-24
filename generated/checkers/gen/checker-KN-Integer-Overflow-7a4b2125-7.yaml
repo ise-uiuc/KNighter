@@ -1,0 +1,372 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 7a4b21250bf79eef26543d35bd390448646c536b
+commit_type: Integer-Overflow
+index: 7
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\
+  \n#include \"clang/AST/ParentMapContext.h\"\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// Program state mapping: VarDecl that stores\
+  \ result of roundup_pow_of_two() -> argument Expr* passed to the call\nREGISTER_MAP_WITH_PROGRAMSTATE(RoundupResultMap,\
+  \ const VarDecl*, const Expr*)\n// Program state set: arguments that were validated\
+  \ with an upper-bound check\nREGISTER_SET_WITH_PROGRAMSTATE(ValidatedArgSet, const\
+  \ MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n    check::PostCall,\n\
+  \    check::BranchCondition> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Unreliable overflow check with\
+  \ roundup_pow_of_two\", \"API Misuse\")) {}\n\n      void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n\n   private:\n\n      // Helpers\n      bool isRoundupPow2Call(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n      const VarDecl* getAssignedVarFromCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n      // zero-check detector\n \
+  \     bool matchesZeroCheck(const Expr *Cond, const Expr *&CheckedExpr, CheckerContext\
+  \ &C) const;\n\n      // pre-validation detector\n      bool isPrevalidationCheck(const\
+  \ Expr *Cond,\n                                const Expr *&ArgExprOut,\n      \
+  \                          const Expr *&BoundExprOut,\n                        \
+  \        CheckerContext &C) const;\n\n      const MemRegion* exprToRegion(const\
+  \ Expr *E, CheckerContext &C) const;\n\n      void reportIssue(const Stmt *Cond,\
+  \ CheckerContext &C) const;\n};\n\n// Determine if the call is roundup_pow_of_two(...)\n\
+  bool SAGenTestChecker::isRoundupPow2Call(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return\
+  \ false;\n  // Use utility for reliable name check\n  return ExprHasName(Origin,\
+  \ \"roundup_pow_of_two\", C);\n}\n\n// From a call, find the VarDecl that receives\
+  \ the result.\n// Handles: v = roundup_pow_of_two(...); and: u64 v = roundup_pow_of_two(...);\n\
+  const VarDecl* SAGenTestChecker::getAssignedVarFromCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n  \
+  \  return nullptr;\n\n  const Expr *OUnwrapped = Origin->IgnoreParenImpCasts();\n\
+  \n  // Case 1: initialization in a decl stmt\n  if (const DeclStmt *DS = findSpecificTypeInParents<DeclStmt>(Origin,\
+  \ C)) {\n    for (const Decl *D : DS->decls()) {\n      if (const auto *VD = dyn_cast<VarDecl>(D))\
+  \ {\n        if (const Expr *Init = VD->getInit()) {\n          if (Init->IgnoreParenImpCasts()\
+  \ == OUnwrapped)\n            return VD->getCanonicalDecl();\n        }\n      }\n\
+  \    }\n  }\n\n  // Case 2: assignment via BinaryOperator\n  if (const BinaryOperator\
+  \ *BO = findSpecificTypeInParents<BinaryOperator>(Origin, C)) {\n    if (BO->getOpcode()\
+  \ == BO_Assign) {\n      const Expr *RHS = BO->getRHS();\n      if (RHS && RHS->IgnoreParenImpCasts()\
+  \ == OUnwrapped) {\n        const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \        if (const auto *DRE = dyn_cast<DeclRefExpr>(LHS)) {\n          if (const\
+  \ auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n            return VD->getCanonicalDecl();\n\
+  \        }\n      }\n    }\n  }\n\n  return nullptr;\n}\n\n// Convert an expression\
+  \ to its base memory region\nconst MemRegion* SAGenTestChecker::exprToRegion(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  MR = MR->getBaseRegion();\n\
+  \  return MR;\n}\n\n// Detect if condition is a zero-check like: !E or (E == 0)\n\
+  bool SAGenTestChecker::matchesZeroCheck(const Expr *Cond, const Expr *&CheckedExpr,\
+  \ CheckerContext &C) const {\n  if (!Cond)\n    return false;\n  const Expr *E =\
+  \ Cond->IgnoreParenCasts();\n\n  // if (!E)\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      CheckedExpr = UO->getSubExpr()->IgnoreParenCasts();\n\
+  \      return true;\n    }\n  }\n\n  // if (E == 0) or (0 == E)\n  if (const auto\
+  \ *BO = dyn_cast<BinaryOperator>(E)) {\n    if (BO->getOpcode() == BO_EQ) {\n  \
+  \    llvm::APSInt Res;\n      const Expr *L = BO->getLHS()->IgnoreParenCasts();\n\
+  \      const Expr *R = BO->getRHS()->IgnoreParenCasts();\n\n      bool LIsZero =\
+  \ EvaluateExprToInt(Res, L, C) && Res.isZero();\n      bool RIsZero = EvaluateExprToInt(Res,\
+  \ R, C) && Res.isZero();\n\n      if (LIsZero && !RIsZero) {\n        CheckedExpr\
+  \ = R;\n        return true;\n      }\n      if (RIsZero && !LIsZero) {\n      \
+  \  CheckedExpr = L;\n        return true;\n      }\n    }\n  }\n\n  return false;\n\
+  }\n\n// Detect a pre-validation check of the form: (Arg > Bound) or (Arg >= Bound)\n\
+  // where Bound is a power-of-two related expression, e.g., contains '<<' or 'BITS_PER_LONG'\n\
+  bool SAGenTestChecker::isPrevalidationCheck(const Expr *Cond,\n                \
+  \                            const Expr *&ArgExprOut,\n                        \
+  \                    const Expr *&BoundExprOut,\n                              \
+  \              CheckerContext &C) const {\n  if (!Cond)\n    return false;\n\n \
+  \ const Expr *E = Cond->IgnoreParenCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(E);\n\
+  \  if (!BO)\n    return false;\n\n  BinaryOperator::Opcode Op = BO->getOpcode();\n\
+  \  if (Op != BO_GT && Op != BO_GE)\n    return false;\n\n  const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n\
+  \  const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n\n  bool HasShift = false;\n\
+  \  if (const BinaryOperator *Inner = findSpecificTypeInChildren<BinaryOperator>(RHS))\
+  \ {\n    if (Inner->getOpcode() == BO_Shl)\n      HasShift = true;\n  }\n  bool\
+  \ MentionsBitsPerLong = ExprHasName(RHS, \"BITS_PER_LONG\", C);\n\n  if (HasShift\
+  \ || MentionsBitsPerLong) {\n    ArgExprOut = LHS;\n    BoundExprOut = RHS;\n  \
+  \  return true;\n  }\n\n  return false;\n}\n\nvoid SAGenTestChecker::reportIssue(const\
+  \ Stmt *Cond, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT,\n      \"Do not test roundup_pow_of_two() result for 0; pre-validate\
+  \ input to avoid UB on 32-bit.\",\n      N);\n  if (Cond)\n    R->addRange(Cond->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\n// Record where roundup_pow_of_two result goes:\
+  \ VarDecl -> ArgExpr\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  if (!isRoundupPow2Call(Call, C))\n    return;\n\n\
+  \  ProgramStateRef State = C.getState();\n\n  const VarDecl *VD = getAssignedVarFromCall(Call,\
+  \ C);\n  if (!VD)\n    return;\n\n  // record the argument expression\n  const Expr\
+  \ *Origin = Call.getOriginExpr();\n  const CallExpr *CE = dyn_cast_or_null<CallExpr>(Origin);\n\
+  \  if (!CE || CE->getNumArgs() < 1)\n    return;\n\n  const Expr *Arg = CE->getArg(0);\n\
+  \  if (!Arg)\n    return;\n\n  State = State->set<RoundupResultMap>(VD->getCanonicalDecl(),\
+  \ Arg);\n  C.addTransition(State);\n}\n\n// Detect both prevalidation and the bad\
+  \ pattern in branch conditions.\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n  if (!CondE) {\n   \
+  \ C.addTransition(State);\n    return;\n  }\n\n  // Step A: mark pre-validated arguments\n\
+  \  {\n    const Expr *ArgExpr = nullptr;\n    const Expr *BoundExpr = nullptr;\n\
+  \    if (isPrevalidationCheck(CondE, ArgExpr, BoundExpr, C)) {\n      const MemRegion\
+  \ *ArgReg = exprToRegion(ArgExpr, C);\n      if (ArgReg) {\n        State = State->add<ValidatedArgSet>(ArgReg);\n\
+  \      }\n    }\n  }\n\n  // Step B: detect zero-check patterns\n  {\n    const\
+  \ Expr *CheckedExpr = nullptr;\n    if (matchesZeroCheck(CondE, CheckedExpr, C))\
+  \ {\n      if (!CheckedExpr)\n        goto transition;\n\n      // Case B1: directly\
+  \ checking the call result\n      if (const auto *CallE = dyn_cast<CallExpr>(CheckedExpr))\
+  \ {\n        // Make a lightweight CallEvent-like name check using ExprHasName\n\
+  \        if (ExprHasName(CallE, \"roundup_pow_of_two\", C)) {\n          if (CallE->getNumArgs()\
+  \ >= 1) {\n            const Expr *Arg = CallE->getArg(0);\n            const MemRegion\
+  \ *ArgReg = exprToRegion(Arg, C);\n            if (ArgReg) {\n              if (!State->contains<ValidatedArgSet>(ArgReg))\
+  \ {\n                reportIssue(Condition, C);\n              }\n            }\
+  \ else {\n              // If we cannot resolve the region, do not report to avoid\
+  \ FP\n            }\n          }\n        }\n      }\n      // Case B2: checking\
+  \ a variable that previously received roundup_pow_of_two result\n      else if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(CheckedExpr)) {\n        const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \        if (VD) {\n          VD = VD->getCanonicalDecl();\n          if (const\
+  \ Expr *Arg = State->get<RoundupResultMap>(VD)) {\n            const MemRegion *ArgReg\
+  \ = exprToRegion(Arg, C);\n            if (ArgReg) {\n              if (!State->contains<ValidatedArgSet>(ArgReg))\
+  \ {\n                reportIssue(Condition, C);\n              }\n            }\n\
+  \          }\n        }\n      }\n    }\n  }\n\ntransition:\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unreliable overflow checks using roundup_pow_of_two result ==\
+  \ 0 without pre-validation\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbpf: Fix stackmap overflow check on 32-bit arches\n\
+  \nThe stackmap code relies on roundup_pow_of_two() to compute the number\nof hash\
+  \ buckets, and contains an overflow check by checking if the\nresulting value is\
+  \ 0. However, on 32-bit arches, the roundup code itself\ncan overflow by doing a\
+  \ 32-bit left-shift of an unsigned long value,\nwhich is undefined behaviour, so\
+  \ it is not guaranteed to truncate\nneatly. This was triggered by syzbot on the\
+  \ DEVMAP_HASH type, which\ncontains the same check, copied from the hashtab code.\n\
+  \nThe commit in the fixes tag actually attempted to fix this, but the fix\ndid not\
+  \ account for the UB, so the fix only works on CPUs where an\noverflow does result\
+  \ in a neat truncation to zero, which is not\nguaranteed. Checking the value before\
+  \ rounding does not have this\nproblem.\n\nFixes: 6183f4d3a0a2 (\"bpf: Check for\
+  \ integer overflow when using roundup_pow_of_two()\")\nSigned-off-by: Toke H\xF8\
+  iland-J\xF8rgensen <toke@redhat.com>\nReviewed-by: Bui Quang Minh <minhquangbui99@gmail.com>\n\
+  Message-ID: <20240307120340.99577-4-toke@redhat.com>\nSigned-off-by: Alexei Starovoitov\
+  \ <ast@kernel.org>\n\n## Buggy Code\n\n```c\n// Function: stack_map_alloc in kernel/bpf/stackmap.c\n\
+  static struct bpf_map *stack_map_alloc(union bpf_attr *attr)\n{\n\tu32 value_size\
+  \ = attr->value_size;\n\tstruct bpf_stack_map *smap;\n\tu64 cost, n_buckets;\n\t\
+  int err;\n\n\tif (attr->map_flags & ~STACK_CREATE_FLAG_MASK)\n\t\treturn ERR_PTR(-EINVAL);\n\
+  \n\t/* check sanity of attributes */\n\tif (attr->max_entries == 0 || attr->key_size\
+  \ != 4 ||\n\t    value_size < 8 || value_size % 8)\n\t\treturn ERR_PTR(-EINVAL);\n\
+  \n\tBUILD_BUG_ON(sizeof(struct bpf_stack_build_id) % sizeof(u64));\n\tif (attr->map_flags\
+  \ & BPF_F_STACK_BUILD_ID) {\n\t\tif (value_size % sizeof(struct bpf_stack_build_id)\
+  \ ||\n\t\t    value_size / sizeof(struct bpf_stack_build_id)\n\t\t    > sysctl_perf_event_max_stack)\n\
+  \t\t\treturn ERR_PTR(-EINVAL);\n\t} else if (value_size / 8 > sysctl_perf_event_max_stack)\n\
+  \t\treturn ERR_PTR(-EINVAL);\n\n\t/* hash table size must be power of 2 */\n\tn_buckets\
+  \ = roundup_pow_of_two(attr->max_entries);\n\tif (!n_buckets)\n\t\treturn ERR_PTR(-E2BIG);\n\
+  \n\tcost = n_buckets * sizeof(struct stack_map_bucket *) + sizeof(*smap);\n\tsmap\
+  \ = bpf_map_area_alloc(cost, bpf_map_attr_numa_node(attr));\n\tif (!smap)\n\t\t\
+  return ERR_PTR(-ENOMEM);\n\n\tbpf_map_init_from_attr(&smap->map, attr);\n\tsmap->n_buckets\
+  \ = n_buckets;\n\n\terr = get_callchain_buffers(sysctl_perf_event_max_stack);\n\t\
+  if (err)\n\t\tgoto free_smap;\n\n\terr = prealloc_elems_and_freelist(smap);\n\t\
+  if (err)\n\t\tgoto put_buffers;\n\n\treturn &smap->map;\n\nput_buffers:\n\tput_callchain_buffers();\n\
+  free_smap:\n\tbpf_map_area_free(smap);\n\treturn ERR_PTR(err);\n}\n```\n\n## Bug\
+  \ Fix Patch\n\n```diff\ndiff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c\n\
+  index dff7ba539701..c99f8e5234ac 100644\n--- a/kernel/bpf/stackmap.c\n+++ b/kernel/bpf/stackmap.c\n\
+  @@ -91,11 +91,14 @@ static struct bpf_map *stack_map_alloc(union bpf_attr *attr)\n\
+  \ \t} else if (value_size / 8 > sysctl_perf_event_max_stack)\n \t\treturn ERR_PTR(-EINVAL);\n\
+  \ \n-\t/* hash table size must be power of 2 */\n-\tn_buckets = roundup_pow_of_two(attr->max_entries);\n\
+  -\tif (!n_buckets)\n+\t/* hash table size must be power of 2; roundup_pow_of_two()\
+  \ can overflow\n+\t * into UB on 32-bit arches, so check that first\n+\t */\n+\t\
+  if (attr->max_entries > 1UL << 31)\n \t\treturn ERR_PTR(-E2BIG);\n \n+\tn_buckets\
+  \ = roundup_pow_of_two(attr->max_entries);\n+\n \tcost = n_buckets * sizeof(struct\
+  \ stack_map_bucket *) + sizeof(*smap);\n \tsmap = bpf_map_area_alloc(cost, bpf_map_attr_numa_node(attr));\n\
+  \ \tif (!smap)\n```\n"
+pattern: "## Bug Pattern\n\nRelying on roundup_pow_of_two(x) to detect overflow after\
+  \ the fact:\n\n```\nn = roundup_pow_of_two(x);   // x may require 2^BITS_PER_LONG\
+  \ or larger\nif (!n)                      // assume overflow => 0\n    return -E2BIG;\n\
+  ```\n\nOn 32-bit arches, roundup_pow_of_two() can perform a left shift by 32 (or\
+  \ more), which is undefined behavior. Thus the \u201Cresult == 0\u201D check is\
+  \ not reliable and may not catch the overflow. The correct pattern is to pre-validate\
+  \ x against the maximum safe input before calling roundup_pow_of_two():\n\n```\n\
+  if (x > (1UL << (BITS_PER_LONG - 1)))\n    return -E2BIG;\nn = roundup_pow_of_two(x);\n\
+  ```"
+plan: "1) Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(RoundupResultMap, const\
+  \ VarDecl*, const Expr*)\n  - Key: the variable that stores the result of roundup_pow_of_two().\n\
+  \  - Val: the argument expression passed to roundup_pow_of_two() (to correlate with\
+  \ possible pre-validation).\n- REGISTER_SET_WITH_PROGRAMSTATE(ValidatedArgSet, const\
+  \ MemRegion*)\n  - Tracks argument expressions that have been pre-validated by an\
+  \ upper-bound check (e.g., x > (1UL << ...)) before calling roundup_pow_of_two().\n\
+  \n2) Helper utilities\n- bool isRoundupPow2Call(const CallEvent &Call)\n  - Return\
+  \ true if callee identifier is \"roundup_pow_of_two\".\n- const VarDecl* getAssignedVarFromCall(const\
+  \ CallEvent &Call, CheckerContext &C)\n  - Using findSpecificTypeInParents:\n  \
+  \  - If parent is a BinaryOperator \u2018=\u2019 and RHS is this call, return LHS\
+  \ VarDecl.\n    - Else if parent is a DeclStmt/VarDecl with init being this call,\
+  \ return that VarDecl.\n- bool matchesZeroCheck(const Expr *Cond, const Expr *&CheckedExpr)\n\
+  \  - Return true if Cond is a zero-check on some expression:\n    - UnaryOperator\
+  \ with opcode UO_LNot on expression E -> CheckedExpr = E.\n    - BinaryOperator\
+  \ (==, <=) comparing an expression E to integer literal 0 in any side -> CheckedExpr\
+  \ = the non-zero side.\n- bool isPrevalidationCheck(const Expr *Cond, const Expr\
+  \ *&ArgExprOut, const Expr *&BoundExprOut)\n  - Return true if Cond is a relational\
+  \ compare (>, >=) and:\n    - LHS is some expression E, RHS looks like a power-of-two\
+  \ bound (e.g., a shift Expr containing \u2018<<\u2019 or mentions BITS_PER_LONG).\n\
+  \    - To keep it simple:\n      - If Cond is BinaryOperator > or >= and\n     \
+  \ - findSpecificTypeInChildren<BinaryOperator>(RHS) shows opcode BO_Shl (<<), or\n\
+  \      - ExprHasName(RHS, \"BITS_PER_LONG\", C) is true,\n      - then ArgExprOut\
+  \ = LHS, BoundExprOut = RHS.\n- const MemRegion* exprToRegion(const Expr *E, CheckerContext\
+  \ &C)\n  - Wrapper around getMemRegionFromExpr(E, C).\n\n3) checkPostCall (record\
+  \ where roundup_pow_of_two result goes)\n- Trigger: Every call. If isRoundupPow2Call(Call)\
+  \ is true:\n  - Try getAssignedVarFromCall(Call, C); if returns VD:\n    - Record\
+  \ RoundupResultMap[VD] = Call.getArgExpr(0) (the argument x).\n  - Additionally,\
+  \ if this call later gets checked directly in an if-condition (no assigned var),\
+  \ that is handled in checkBranchCondition and does not need state here.\n\n4) checkBranchCondition\
+  \ (detect both the bad pattern and the pre-validation)\n- Step A: Mark pre-validated\
+  \ arguments\n  - If isPrevalidationCheck(ConditionExpr, ArgExpr, BoundExpr) returns\
+  \ true:\n    - const MemRegion *ArgReg = exprToRegion(ArgExpr, C);\n    - If ArgReg\
+  \ != nullptr, add ArgReg to ValidatedArgSet.\n- Step B: Find zero-checks\n  - If\
+  \ matchesZeroCheck(ConditionExpr, CheckedExpr) is true:\n    - Case B1: CheckedExpr\
+  \ is a CallExpr to roundup_pow_of_two:\n      - Extract its argument ArgExpr = call->getArg(0).\n\
+  \      - Get ArgReg = exprToRegion(ArgExpr, C).\n      - If ArgReg is not in ValidatedArgSet:\n\
+  \        - Report bug at this condition: \u201CUnreliable overflow check: testing\
+  \ roundup_pow_of_two() result for 0; pre-check the input against 1UL << (BITS_PER_LONG\
+  \ - 1).\u201D\n    - Case B2: CheckedExpr is a reference to a variable (DeclRefExpr):\n\
+  \      - Get VD = cast<DeclRefExpr>(...).getDecl()->getCanonicalDecl().\n      -\
+  \ Lookup RoundupResultMap[VD] -> ArgExpr. If found:\n        - Get ArgReg = exprToRegion(ArgExpr,\
+  \ C).\n        - If ArgReg not in ValidatedArgSet:\n          - Report the same\
+  \ bug at this condition site.\n- Notes:\n  - This catches both patterns:\n    -\
+  \ Direct: if (!roundup_pow_of_two(x)) ...\n    - Indirect: n = roundup_pow_of_two(x);\
+  \ if (!n) ...\n\n5) Reporting\n- Create a non-fatal error node with generateNonFatalErrorNode.\n\
+  - Use std::make_unique<PathSensitiveBugReport> with a short message:\n  - \u201C\
+  Do not test roundup_pow_of_two() result for 0; pre-validate input to avoid UB on\
+  \ 32-bit.\u201D\n- Point the primary location to the branch condition expression.\n\
+  - Optionally add a note at the call to roundup_pow_of_two (if available, e.g., from\
+  \ RoundupResultMap parent) to aid diagnosis.\n\n6) Other callbacks\n- checkBind:\
+  \ not needed (we purposely keep the pattern simple and only match the common case\
+  \ of direct variable receiving the call result).\n- checkLocation / evalAssume /\
+  \ checkRegionChanges / checkEndFunction: not needed.\n\n7) False-positive control\
+  \ (simple and robust)\n- We suppress the warning if we have seen a pre-validation\
+  \ on the same argument expression on the same path:\n  - Pre-validation is recognized\
+  \ heuristically by \u201Cx > (1 << ...)\" or \u201Cx > something mentioning BITS_PER_LONG\u201D\
+  .\n  - Because ValidatedArgSet is path-sensitive state, it naturally models \u201C\
+  pre-check before call.\u201D\n- We intentionally do not try to resolve complex aliasing\
+  \ or arithmetic on the result variable or the argument; the checker focuses on the\
+  \ common, simple pattern to minimize complexity and false positives.\n\n8) Summary\
+  \ of flow\n- Record: When roundup_pow_of_two is used to initialize/assign a variable,\
+  \ store VarDecl -> ArgExpr.\n- Mark: When encountering if (x > 1UL << ...) style\
+  \ conditions, mark x as pre-validated (ValidatedArgSet insert).\n- Warn: When encountering\
+  \ if (!roundup_pow_of_two(x)) or if (!n) and n maps back to roundup_pow_of_two(x),\
+  \ and x is not pre-validated, emit a diagnostic."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\
+  \n#include \"clang/AST/ParentMapContext.h\"\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// Program state mapping: VarDecl that stores\
+  \ result of roundup_pow_of_two() -> argument Expr* passed to the call\nREGISTER_MAP_WITH_PROGRAMSTATE(RoundupResultMap,\
+  \ const VarDecl*, const Expr*)\n// Program state set: arguments that were validated\
+  \ with an upper-bound check\nREGISTER_SET_WITH_PROGRAMSTATE(ValidatedArgSet, const\
+  \ MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n    check::PostCall,\n\
+  \    check::BranchCondition> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Unreliable overflow check with\
+  \ roundup_pow_of_two\", \"API Misuse\")) {}\n\n      void checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n\n   private:\n\n      // Helpers\n      bool isRoundupPow2Call(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n      const VarDecl* getAssignedVarFromCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n      // zero-check detector\n \
+  \     bool matchesZeroCheck(const Expr *Cond, const Expr *&CheckedExpr, CheckerContext\
+  \ &C) const;\n\n      // pre-validation detector\n      bool isPrevalidationCheck(const\
+  \ Expr *Cond,\n                                const Expr *&ArgExprOut,\n      \
+  \                          const Expr *&BoundExprOut,\n                        \
+  \        CheckerContext &C) const;\n\n      const MemRegion* exprToRegion(const\
+  \ Expr *E, CheckerContext &C) const;\n\n      void reportIssue(const Stmt *Cond,\
+  \ CheckerContext &C) const;\n};\n\n// Determine if the call is roundup_pow_of_two(...)\n\
+  bool SAGenTestChecker::isRoundupPow2Call(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return\
+  \ false;\n  // Use utility for reliable name check\n  return ExprHasName(Origin,\
+  \ \"roundup_pow_of_two\", C);\n}\n\n// From a call, find the VarDecl that receives\
+  \ the result.\n// Handles: v = roundup_pow_of_two(...); and: u64 v = roundup_pow_of_two(...);\n\
+  const VarDecl* SAGenTestChecker::getAssignedVarFromCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n  \
+  \  return nullptr;\n\n  const Expr *OUnwrapped = Origin->IgnoreParenImpCasts();\n\
+  \n  // Case 1: initialization in a decl stmt\n  if (const DeclStmt *DS = findSpecificTypeInParents<DeclStmt>(Origin,\
+  \ C)) {\n    for (const Decl *D : DS->decls()) {\n      if (const auto *VD = dyn_cast<VarDecl>(D))\
+  \ {\n        if (const Expr *Init = VD->getInit()) {\n          if (Init->IgnoreParenImpCasts()\
+  \ == OUnwrapped)\n            return VD->getCanonicalDecl();\n        }\n      }\n\
+  \    }\n  }\n\n  // Case 2: assignment via BinaryOperator\n  if (const BinaryOperator\
+  \ *BO = findSpecificTypeInParents<BinaryOperator>(Origin, C)) {\n    if (BO->getOpcode()\
+  \ == BO_Assign) {\n      const Expr *RHS = BO->getRHS();\n      if (RHS && RHS->IgnoreParenImpCasts()\
+  \ == OUnwrapped) {\n        const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \        if (const auto *DRE = dyn_cast<DeclRefExpr>(LHS)) {\n          if (const\
+  \ auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n            return VD->getCanonicalDecl();\n\
+  \        }\n      }\n    }\n  }\n\n  return nullptr;\n}\n\n// Convert an expression\
+  \ to its base memory region\nconst MemRegion* SAGenTestChecker::exprToRegion(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  MR = MR->getBaseRegion();\n\
+  \  return MR;\n}\n\n// Detect if condition is a zero-check like: !E or (E == 0)\n\
+  bool SAGenTestChecker::matchesZeroCheck(const Expr *Cond, const Expr *&CheckedExpr,\
+  \ CheckerContext &C) const {\n  if (!Cond)\n    return false;\n  const Expr *E =\
+  \ Cond->IgnoreParenCasts();\n\n  // if (!E)\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      CheckedExpr = UO->getSubExpr()->IgnoreParenCasts();\n\
+  \      return true;\n    }\n  }\n\n  // if (E == 0) or (0 == E)\n  if (const auto\
+  \ *BO = dyn_cast<BinaryOperator>(E)) {\n    if (BO->getOpcode() == BO_EQ) {\n  \
+  \    llvm::APSInt Res;\n      const Expr *L = BO->getLHS()->IgnoreParenCasts();\n\
+  \      const Expr *R = BO->getRHS()->IgnoreParenCasts();\n\n      bool LIsZero =\
+  \ EvaluateExprToInt(Res, L, C) && Res.isZero();\n      bool RIsZero = EvaluateExprToInt(Res,\
+  \ R, C) && Res.isZero();\n\n      if (LIsZero && !RIsZero) {\n        CheckedExpr\
+  \ = R;\n        return true;\n      }\n      if (RIsZero && !LIsZero) {\n      \
+  \  CheckedExpr = L;\n        return true;\n      }\n    }\n  }\n\n  return false;\n\
+  }\n\n// Detect a pre-validation check of the form: (Arg > Bound) or (Arg >= Bound)\n\
+  // where Bound is a power-of-two related expression, e.g., contains '<<' or 'BITS_PER_LONG'\n\
+  bool SAGenTestChecker::isPrevalidationCheck(const Expr *Cond,\n                \
+  \                            const Expr *&ArgExprOut,\n                        \
+  \                    const Expr *&BoundExprOut,\n                              \
+  \              CheckerContext &C) const {\n  if (!Cond)\n    return false;\n\n \
+  \ const Expr *E = Cond->IgnoreParenCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(E);\n\
+  \  if (!BO)\n    return false;\n\n  BinaryOperator::Opcode Op = BO->getOpcode();\n\
+  \  if (Op != BO_GT && Op != BO_GE)\n    return false;\n\n  const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n\
+  \  const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n\n  bool HasShift = false;\n\
+  \  if (const BinaryOperator *Inner = findSpecificTypeInChildren<BinaryOperator>(RHS))\
+  \ {\n    if (Inner->getOpcode() == BO_Shl)\n      HasShift = true;\n  }\n  bool\
+  \ MentionsBitsPerLong = ExprHasName(RHS, \"BITS_PER_LONG\", C);\n\n  if (HasShift\
+  \ || MentionsBitsPerLong) {\n    ArgExprOut = LHS;\n    BoundExprOut = RHS;\n  \
+  \  return true;\n  }\n\n  return false;\n}\n\nvoid SAGenTestChecker::reportIssue(const\
+  \ Stmt *Cond, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT,\n      \"Do not test roundup_pow_of_two() result for 0; pre-validate\
+  \ input to avoid UB on 32-bit.\",\n      N);\n  if (Cond)\n    R->addRange(Cond->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\n// Record where roundup_pow_of_two result goes:\
+  \ VarDecl -> ArgExpr\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  if (!isRoundupPow2Call(Call, C))\n    return;\n\n\
+  \  ProgramStateRef State = C.getState();\n\n  const VarDecl *VD = getAssignedVarFromCall(Call,\
+  \ C);\n  if (!VD)\n    return;\n\n  // record the argument expression\n  const Expr\
+  \ *Origin = Call.getOriginExpr();\n  const CallExpr *CE = dyn_cast_or_null<CallExpr>(Origin);\n\
+  \  if (!CE || CE->getNumArgs() < 1)\n    return;\n\n  const Expr *Arg = CE->getArg(0);\n\
+  \  if (!Arg)\n    return;\n\n  State = State->set<RoundupResultMap>(VD->getCanonicalDecl(),\
+  \ Arg);\n  C.addTransition(State);\n}\n\n// Detect both prevalidation and the bad\
+  \ pattern in branch conditions.\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n  if (!CondE) {\n   \
+  \ C.addTransition(State);\n    return;\n  }\n\n  // Step A: mark pre-validated arguments\n\
+  \  {\n    const Expr *ArgExpr = nullptr;\n    const Expr *BoundExpr = nullptr;\n\
+  \    if (isPrevalidationCheck(CondE, ArgExpr, BoundExpr, C)) {\n      const MemRegion\
+  \ *ArgReg = exprToRegion(ArgExpr, C);\n      if (ArgReg) {\n        State = State->add<ValidatedArgSet>(ArgReg);\n\
+  \      }\n    }\n  }\n\n  // Step B: detect zero-check patterns\n  {\n    const\
+  \ Expr *CheckedExpr = nullptr;\n    if (matchesZeroCheck(CondE, CheckedExpr, C))\
+  \ {\n      if (!CheckedExpr)\n        goto transition;\n\n      // Case B1: directly\
+  \ checking the call result\n      if (const auto *CallE = dyn_cast<CallExpr>(CheckedExpr))\
+  \ {\n        // Make a lightweight CallEvent-like name check using ExprHasName\n\
+  \        if (ExprHasName(CallE, \"roundup_pow_of_two\", C)) {\n          if (CallE->getNumArgs()\
+  \ >= 1) {\n            const Expr *Arg = CallE->getArg(0);\n            const MemRegion\
+  \ *ArgReg = exprToRegion(Arg, C);\n            if (ArgReg) {\n              if (!State->contains<ValidatedArgSet>(ArgReg))\
+  \ {\n                reportIssue(Condition, C);\n              }\n            }\
+  \ else {\n              // If we cannot resolve the region, do not report to avoid\
+  \ FP\n            }\n          }\n        }\n      }\n      // Case B2: checking\
+  \ a variable that previously received roundup_pow_of_two result\n      else if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(CheckedExpr)) {\n        const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \        if (VD) {\n          VD = VD->getCanonicalDecl();\n          if (const\
+  \ Expr *const *ArgPtr = State->get<RoundupResultMap>(VD)) {\n            const Expr\
+  \ *Arg = *ArgPtr;\n            const MemRegion *ArgReg = exprToRegion(Arg, C);\n\
+  \            if (ArgReg) {\n              if (!State->contains<ValidatedArgSet>(ArgReg))\
+  \ {\n                reportIssue(Condition, C);\n              }\n            }\n\
+  \          }\n        }\n      }\n    }\n  }\n\ntransition:\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unreliable overflow checks using roundup_pow_of_two result ==\
+  \ 0 without pre-validation\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

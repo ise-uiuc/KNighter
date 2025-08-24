@@ -1,0 +1,266 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -17,6 +17,7 @@ #include "clang/AST/Stmt.h"
+ #include "clang/Lex/Lexer.h"
+ #include <string>
++#include <memory>
+
+ using namespace clang;
+ using namespace ento;
+@@ -26,6 +27,11 @@ REGISTER_SET_WITH_PROGRAMSTATE(SuspiciousNoLockSet, const MemRegion*)
+ REGISTER_SET_WITH_PROGRAMSTATE(SuspiciousAfterLockSet, const MemRegion*)
+ REGISTER_TRAIT_WITH_PROGRAMSTATE(LockDepth, int)
++
++// Keep a small set of "index variables" that are assigned from a suspicious
++// pointer's field after lock acquisition. This adds precision for the
++// array[idx]-under-lock part of the pattern when present, while remaining optional.
++REGISTER_SET_WITH_PROGRAMSTATE(IndexVarsSet, const MemRegion*)
+
+ namespace {
+
+@@ -36,7 +42,8 @@       check::PostCall,
+       check::PreCall,
+       check::Location,
+-      check::EndFunction> {
++      check::EndFunction,
++      check::Bind> {
+    mutable std::unique_ptr<BugType> BT;
+
+    public:
+@@ -47,6 +54,7 @@       void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+       void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;
+       void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;
++      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;
+
+    private:
+
+@@ -68,6 +76,14 @@       // New helpers to reduce false positives
+       bool containsLoggingCall(const Stmt *S, CheckerContext &C) const;
+       static bool isLoggingName(StringRef Name);
++
++      // New FP suppression gates
++      bool pointerMayBeNullNow(const MemRegion *PtrVarRegion, CheckerContext &C) const;
++      bool isAllocatorLikeFunction(CheckerContext &C) const;
++      bool isFalsePositive(const Stmt *UseSite, const MemRegion *PtrVarRegion, CheckerContext &C) const;
++
++      // Lightweight pattern aid: track array index var assigned from ptr->field after lock
++      bool isIndexVarFromTrackedPtr(const Expr *IdxE, ProgramStateRef State, CheckerContext &C) const;
+ };
+
+
+@@ -180,8 +196,8 @@
+ bool SAGenTestChecker::isLoggingName(StringRef Name) {
+   // Normalize to lowercase for case-insensitive matching.
+-  std::string LowerStr = Name.lower();
+-  StringRef L(LowerStr);
++  std::string Lower = Name.lower();
++  StringRef L(Lower);
+   return L.contains("dbg") ||
+          L.contains("warn") ||
+          L.contains("err") ||
+@@ -363,6 +379,82 @@   C.emitReport(std::move(Report));
+ }
+
++bool SAGenTestChecker::pointerMayBeNullNow(const MemRegion *PtrVarRegion, CheckerContext &C) const {
++  if (!PtrVarRegion) return true;
++
++  ProgramStateRef State = C.getState();
++  SValBuilder &SVB = C.getSValBuilder();
++
++  // Read the current value of the pointer variable.
++  loc::MemRegionVal L(PtrVarRegion);
++  SVal V = State->getSVal(L);
++
++  if (V.isUnknownOrUndef())
++    return true; // be conservative
++
++  // Build (V == NULL)
++  SVal NullV = SVB.makeZeroVal(C.getASTContext().VoidPtrTy);
++  SVal Eq = SVB.evalEQ(State, V, NullV);
++  if (Eq.isUnknownOrUndef())
++    return true;
++
++  if (auto EqNL = Eq.getAs<NonLoc>()) {
++    ProgramStateRef StIsNull = State->assume(*EqNL, true);
++    return (bool)StIsNull; // feasible to be null?
++  }
++
++  // If it's a Loc comparison and not a NonLoc, be conservative.
++  return true;
++}
++
++bool SAGenTestChecker::isAllocatorLikeFunction(CheckerContext &C) const {
++  const LocationContext *LC = C.getLocationContext();
++  if (!LC) return false;
++  const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(LC->getDecl());
++  if (!FD || !FD->getIdentifier()) return false;
++  StringRef Name = FD->getName();
++
++  // Heuristic: allocator/initializer-like routines frequently use defensive checks.
++  // Keep this small and conservative to avoid suppressing real issues elsewhere.
++  std::string Lower = Name.lower();
++  StringRef L(Lower);
++  if (L.contains("alloc") ||
++      L.contains("create") ||
++      L.contains("setup") ||
++      L.contains("register") ||
++      L.contains("init"))
++    return true;
++
++  return false;
++}
++
++bool SAGenTestChecker::isFalsePositive(const Stmt *UseSite, const MemRegion *PtrVarRegion, CheckerContext &C) const {
++  // Gate 1: current path must allow ptr == NULL to be feasible.
++  if (!pointerMayBeNullNow(PtrVarRegion, C))
++    return true; // Definitely non-null along this path => FP for our pattern.
++
++  // Gate 2: optionally suppress allocator/initializer-like functions.
++  if (isAllocatorLikeFunction(C))
++    return true;
++
++  (void)UseSite;
++  return false;
++}
++
++bool SAGenTestChecker::isIndexVarFromTrackedPtr(const Expr *IdxE, ProgramStateRef State, CheckerContext &C) const {
++  if (!IdxE) return false;
++  IdxE = IdxE->IgnoreParenImpCasts();
++  if (const auto *DRE = dyn_cast<DeclRefExpr>(IdxE)) {
++    const MemRegion *VR = getBaseRegionFromExpr(DRE, C);
++    if (!VR) return false;
++    auto Set = State->get<IndexVarsSet>();
++    for (auto I = Set.begin(), E = Set.end(); I != E; ++I)
++      if (*I == VR)
++        return true;
++  }
++  return false;
++}
++
+
+ // ---------------- Checker Callbacks ----------------
+
+@@ -402,6 +494,10 @@
+   if (!containsLoggingCall(Then, C))
+     return; // Avoid FPs where the check is not "log-only".
++
++  // Suppress noisy patterns in allocator/initializer-like functions.
++  if (isAllocatorLikeFunction(C))
++    return;
+
+   // Mark this pointer as suspicious: invalid-checked, no abort, and not under lock.
+   State = State->add<SuspiciousNoLockSet>(R);
+@@ -437,12 +533,16 @@     else
+       State = State->set<LockDepth>(0);
+
+-    // When fully unlocked, clear AfterLockSet to avoid stale carry-over.
++    // When fully unlocked, clear AfterLockSet and index-vars to avoid stale carry-over.
+     int NewDepth = State->get<LockDepth>();
+     if (NewDepth <= 0) {
+       auto After = State->get<SuspiciousAfterLockSet>();
+       for (auto I = After.begin(), E = After.end(); I != E; ++I) {
+         State = State->remove<SuspiciousAfterLockSet>(*I);
++      }
++      auto IdxVars = State->get<IndexVarsSet>();
++      for (auto I = IdxVars.begin(), E = IdxVars.end(); I != E; ++I) {
++        State = State->remove<IndexVarsSet>(*I);
+       }
+       State = State->set<LockDepth>(0);
+     }
+@@ -488,7 +588,10 @@     }
+
+     if (Found) {
+-      reportDerefBug(Call.getOriginExpr(), MR, C);
++      // FP suppression gates: only report if ptr may be null now and not in allocator-like routine.
++      if (!isFalsePositive(Call.getOriginExpr(), MR, C)) {
++        reportDerefBug(Call.getOriginExpr(), MR, C);
++      }
+       // Remove to avoid duplicate reports.
+       State = State->remove<SuspiciousAfterLockSet>(MR);
+       C.addTransition(State);
+@@ -507,8 +610,71 @@   // extract the base DeclRefExpr and see if it matches our tracked pointer.
+   const MemRegion *TrackedR = nullptr;
+   if (stmtDerefsTrackedPtr(S, C, State, TrackedR) && TrackedR) {
+-    reportDerefBug(S, TrackedR, C);
++    if (!isFalsePositive(S, TrackedR, C)) {
++      reportDerefBug(S, TrackedR, C);
++    }
+     State = State->remove<SuspiciousAfterLockSet>(TrackedR);
++    C.addTransition(State);
++    return;
++  }
++
++  // Optional precision boost: if we see array subscript with an index variable
++  // that was assigned from ptr->field after lock, this is a characteristic
++  // part of the target pattern; we can treat it as a corroborating use-site.
++  if (const auto *ASE = dyn_cast_or_null<ArraySubscriptExpr>(S)) {
++    if (isIndexVarFromTrackedPtr(ASE->getIdx(), State, C)) {
++      // Report against any tracked pointer; this is a heuristic for matching
++      // the "use array[idx]" part. Keep FP gates.
++      auto After = State->get<SuspiciousAfterLockSet>();
++      for (auto I = After.begin(), E = After.end(); I != E; ++I) {
++        const MemRegion *R = *I;
++        if (!isFalsePositive(S, R, C)) {
++          reportDerefBug(S, R, C);
++        }
++        State = State->remove<SuspiciousAfterLockSet>(R);
++      }
++      C.addTransition(State);
++    }
++  }
++}
++
++void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
++  // Record index variables assigned from ptr->field inside the lock to
++  // improve recognition of the array[idx] pattern.
++  ProgramStateRef State = C.getState();
++  int Depth = State->get<LockDepth>();
++  if (Depth <= 0)
++    return;
++
++  // LHS must be a variable region.
++  const MemRegion *LHSReg = Loc.getAsRegion();
++  if (!LHSReg) return;
++
++  // RHS should be a MemberExpr with arrow on a tracked pointer.
++  if (!S) return;
++  if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
++    if (!BO->isAssignmentOp())
++      return;
++
++    const Expr *RHS = BO->getRHS();
++    const auto *ME = dyn_cast_or_null<MemberExpr>(RHS ? RHS->IgnoreParenImpCasts() : nullptr);
++    if (!ME || !ME->isArrow())
++      return;
++
++    const Expr *Base = ME->getBase();
++    if (!Base) return;
++    const MemRegion *BaseR = getBaseRegionFromExpr(Base, C);
++    if (!BaseR) return;
++
++    auto After = State->get<SuspiciousAfterLockSet>();
++    bool Found = false;
++    for (auto I = After.begin(), E = After.end(); I != E; ++I) {
++      if (*I == BaseR) { Found = true; break; }
++    }
++    if (!Found) return;
++
++    // Record this LHS variable region as an "index var" derived from the suspicious pointer.
++    State = State->add<IndexVarsSet>(LHSReg->getBaseRegion());
+     C.addTransition(State);
+   }
+ }
+@@ -517,6 +683,17 @@   // Best-effort cleanup of lock depth; sets will be discarded with state anyway.
+   ProgramStateRef State = C.getState();
+   State = State->set<LockDepth>(0);
++
++  // Cleanup helper sets too.
++  auto After = State->get<SuspiciousAfterLockSet>();
++  for (auto I = After.begin(), E = After.end(); I != E; ++I) {
++    State = State->remove<SuspiciousAfterLockSet>(*I);
++  }
++  auto IdxVars = State->get<IndexVarsSet>();
++  for (auto I = IdxVars.begin(), E = IdxVars.end(); I != E; ++I) {
++    State = State->remove<IndexVarsSet>(*I);
++  }
++
+   C.addTransition(State);
+ }

@@ -1,0 +1,158 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -147,20 +147,21 @@                                      CheckerContext &C,
+                                      llvm::SmallVectorImpl<unsigned> &Params);
+
+-      // Specialized detection for dev_* and printk* to reduce FPs:
+-      // Consider deref only if a literal format contains "%s", and only
+-      // as many arguments as "%s" occurrences.
++      // Strip common wrappers in conditions, e.g., likely/unlikely calls.
++      static const Expr *stripConditionWrappers(const Expr *E, CheckerContext &C);
++
++      // Handle IS_ERR / IS_ERR_OR_NULL wrappers to mark checks.
++      static bool isIS_ERR_LikeCall(const Expr *E, CheckerContext &C, const Expr *&PtrArg);
++
++      // Light-weight FP guard
++      static bool isFalsePositiveContext(const Stmt *S);
++
++      // Null-tolerant sinks that are safe with NULL pointers (suppress reports).
++      static bool isNullTolerantSink(const CallEvent &Call, CheckerContext &C);
++
++      // Kept for potential future use; currently not used to avoid FPs.
+       static bool loggingFormatDereferencesString(const CallEvent &Call, CheckerContext &C,
+                                                   unsigned &FormatIndex, unsigned &NumStrArgs);
+-
+-      // Strip common wrappers in conditions, e.g., likely/unlikely calls.
+-      static const Expr *stripConditionWrappers(const Expr *E, CheckerContext &C);
+-
+-      // Handle IS_ERR / IS_ERR_OR_NULL wrappers to mark checks.
+-      static bool isIS_ERR_LikeCall(const Expr *E, CheckerContext &C, const Expr *&PtrArg);
+-
+-      // Light-weight FP guard
+-      static bool isFalsePositiveContext(const Stmt *S);
+ };
+
+ ///////////////////////
+@@ -249,16 +250,15 @@         ++i;
+         continue;
+       }
+-      // Very lightweight: specifically look for "%s"
+       if (S[i + 1] == 's')
+         ++Cnt;
+-      // skip next char anyway
+       ++i;
+     }
+   }
+   return Cnt;
+ }
+
++// Kept for potential future use; currently not used to avoid FPs from NULL-tolerant printk/dev_*.
+ bool SAGenTestChecker::loggingFormatDereferencesString(const CallEvent &Call,
+                                                        CheckerContext &C,
+                                                        unsigned &FormatIndex,
+@@ -296,7 +296,6 @@     return true;
+   }
+
+-  // Non-literal format: be conservative and RETURN FALSE to reduce FPs.
+   return false;
+ }
+
+@@ -307,7 +306,7 @@   if (!Origin)
+     return false;
+
+-  // String and memory functions
++  // String and memory functions: these dereference char* args.
+   if (ExprHasName(Origin, "strlen", C)) { Params.push_back(0); return true; }
+   if (ExprHasName(Origin, "strnlen", C)) { Params.push_back(0); return true; }
+   if (ExprHasName(Origin, "strcmp", C)) { Params.push_back(0); Params.push_back(1); return true; }
+@@ -317,16 +316,6 @@   if (ExprHasName(Origin, "strcat", C)) { Params.push_back(1); return true; }
+   if (ExprHasName(Origin, "strncat", C)) { Params.push_back(1); return true; }
+
+-  // Kernel logging helpers: consider deref only if format literal contains "%s"
+-  unsigned FmtIdx = 0, NumS = 0;
+-  if (loggingFormatDereferencesString(Call, C, FmtIdx, NumS)) {
+-    unsigned N = Call.getNumArgs();
+-    unsigned StartIdx = FmtIdx + 1;
+-    for (unsigned i = 0; i < NumS && (StartIdx + i) < N; ++i)
+-      Params.push_back(StartIdx + i);
+-    return !Params.empty();
+-  }
+-
+   // Project-specific helper in the buggy code:
+   // int ice_ptp_auxbus_create_id_table(struct ice_pf *pf, char *name);
+   if (ExprHasName(Origin, "ice_ptp_auxbus_create_id_table", C)) {
+@@ -336,8 +325,8 @@     }
+   }
+
+-  // snprintf-like: format at index 2; varargs can deref string pointers, but
+-  // we only consider if format literal contains "%s".
++  // snprintf-like: format at index 2; varargs can deref string pointers.
++  // To avoid FPs, only consider literal formats and "%s" arguments.
+   if (ExprHasName(Origin, "snprintf", C) || ExprHasName(Origin, "vsnprintf", C)) {
+     if (Call.getNumArgs() >= 3) {
+       const Expr *FmtE = Call.getArgExpr(2);
+@@ -385,11 +374,8 @@ const Expr *SAGenTestChecker::stripConditionWrappers(const Expr *E, CheckerContext &C) {
+   if (!E) return E;
+
+-  // Strip parens, implicit casts, cleanups.
+   const Expr *Cur = E->IgnoreParenImpCasts();
+
+-  // Strip likely/unlikely/__builtin_expect wrappers: likely/unlikely are macros,
+-  // often result in a call expression with a single argument.
+   while (true) {
+     Cur = Cur->IgnoreParenImpCasts();
+     const auto *CE = dyn_cast<CallExpr>(Cur);
+@@ -405,7 +391,6 @@         continue;
+       }
+     }
+-    // Not a known wrapper
+     break;
+   }
+   return Cur;
+@@ -414,6 +399,34 @@ // Very small FP guard: currently unused but kept for extensibility.
+ bool SAGenTestChecker::isFalsePositiveContext(const Stmt *S) {
+   (void)S;
++  return false;
++}
++
++bool SAGenTestChecker::isNullTolerantSink(const CallEvent &Call, CheckerContext &C) {
++  const Expr *Origin = Call.getOriginExpr();
++  if (!Origin)
++    return false;
++
++  // Linux kernel logging helpers are NULL-tolerant: they print "(null)".
++  if (ExprHasName(Origin, "dev_err", C) ||
++      ExprHasName(Origin, "dev_warn", C) ||
++      ExprHasName(Origin, "dev_info", C) ||
++      ExprHasName(Origin, "dev_dbg", C) ||
++      ExprHasName(Origin, "printk", C) ||
++      ExprHasName(Origin, "pr_err", C) ||
++      ExprHasName(Origin, "pr_warn", C) ||
++      ExprHasName(Origin, "pr_info", C) ||
++      ExprHasName(Origin, "pr_debug", C))
++    return true;
++
++  // misc_register ultimately treats NULL name safely (device ends up named "(null)").
++  if (ExprHasName(Origin, "misc_register", C))
++    return true;
++
++  // kfree/devm_kfree are NULL-tolerant by design.
++  if (ExprHasName(Origin, "kfree", C) || ExprHasName(Origin, "devm_kfree", C))
++    return true;
++
+   return false;
+ }
+
+@@ -456,11 +469,14 @@       continue;
+
+     if (isUncheckedPossiblyNull(State, Sym)) {
++      // Suppress known NULL-tolerant sinks (reduces FPs like ipmb misc_register/logging).
++      if (isNullTolerantSink(Call, C))
++        continue;
++
+       report(C, Call.getOriginExpr(), "pointer may be NULL and is dereferenced");
+       // Mark as checked to avoid duplicate reports on the same path.
+       State = setChecked(State, Sym);
+       C.addTransition(State);
+-      // Continue to check other args.
+     }
+   }
+ }

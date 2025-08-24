@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Freeing a work item’s context (container of struct work_struct) from the submitter after a wait_for_completion_timeout() expires, while the work function still uses that same context (e.g., to call complete() or perform final notifications). This unsynchronized dual ownership of the context causes a use-after-free when the worker later accesses the freed memory. The correct pattern is to free the context in exactly one place based on completion state (e.g., use completion_done() so the worker frees it if the caller timed out; otherwise the caller frees it after successful completion).

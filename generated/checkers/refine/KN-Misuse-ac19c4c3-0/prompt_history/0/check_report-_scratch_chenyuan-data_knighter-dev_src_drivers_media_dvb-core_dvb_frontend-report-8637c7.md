@@ -1,0 +1,271 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Manually computing the byte count for a memory operation as sizeof(element) * count where count can come from userspace, without overflow checking. This open-coded multiplication can overflow size_t and wrap around, causing copy_from_user (or similar APIs) to operate on an incorrect size. The correct pattern is to use overflow-checked helpers like array_size(element_size, count) (or struct_size) for size calculations passed to copy/alloc functions.
+
+## Bug Pattern
+
+Manually computing the byte count for a memory operation as sizeof(element) * count where count can come from userspace, without overflow checking. This open-coded multiplication can overflow size_t and wrap around, causing copy_from_user (or similar APIs) to operate on an incorrect size. The correct pattern is to use overflow-checked helpers like array_size(element_size, count) (or struct_size) for size calculations passed to copy/alloc functions.
+
+# Report
+
+### Report Summary
+
+File:| drivers/media/dvb-core/dvb_frontend.c
+---|---
+Warning:| line 2225, column 7
+Size is computed as sizeof(x) * count; use array_size() to avoid overflow
+
+### Annotated Source Code
+
+
+2092  |  if ((file->f_flags & O_ACCMODE) == O_RDONLY
+2093  | 	    && (_IOC_DIR(cmd) != _IOC_READ
+2094  | 		|| cmd == FE_GET_EVENT
+2095  | 		|| cmd == FE_DISEQC_RECV_SLAVE_REPLY)) {
+2096  | 		up(&fepriv->sem);
+2097  |  return -EPERM;
+2098  | 	}
+2099  |
+2100  | 	err = dvb_frontend_handle_ioctl(file, cmd, parg);
+2101  |
+2102  | 	up(&fepriv->sem);
+2103  |  return err;
+2104  | }
+2105  |
+2106  | static long dvb_frontend_ioctl(struct file *file, unsigned int cmd,
+2107  |  unsigned long arg)
+2108  | {
+2109  |  struct dvb_device *dvbdev = file->private_data;
+2110  |
+2111  |  if (!dvbdev)
+2112  |  return -ENODEV;
+2113  |
+2114  |  return dvb_usercopy(file, cmd, arg, dvb_frontend_do_ioctl);
+2115  | }
+2116  |
+2117  | #ifdef CONFIG_COMPAT
+2118  | struct compat_dtv_property {
+2119  | 	__u32 cmd;
+2120  | 	__u32 reserved[3];
+2121  |  union {
+2122  | 		__u32 data;
+2123  |  struct dtv_fe_stats st;
+2124  |  struct {
+2125  | 			__u8 data[32];
+2126  | 			__u32 len;
+2127  | 			__u32 reserved1[3];
+2128  | 			compat_uptr_t reserved2;
+2129  | 		} buffer;
+2130  | 	} u;
+2131  |  int result;
+2132  | } __attribute__ ((packed));
+2133  |
+2134  | struct compat_dtv_properties {
+2135  | 	__u32 num;
+2136  | 	compat_uptr_t props;
+2137  | };
+2138  |
+2139  | #define COMPAT_FE_SET_PROPERTY _IOW('o', 82, struct compat_dtv_properties)
+2140  | #define COMPAT_FE_GET_PROPERTY _IOR('o', 83, struct compat_dtv_properties)
+2141  |
+2142  | static int dvb_frontend_handle_compat_ioctl(struct file *file, unsigned int cmd,
+2143  |  unsigned long arg)
+2144  | {
+2145  |  struct dvb_device *dvbdev = file->private_data;
+2146  |  struct dvb_frontend *fe = dvbdev->priv;
+2147  |  struct dvb_frontend_private *fepriv = fe->frontend_priv;
+2148  |  int i, err = 0;
+2149  |
+2150  |  if (cmd == COMPAT_FE_SET_PROPERTY) {
+    9←'?' condition is true→
+    10←Taking false branch→
+2151  |  struct compat_dtv_properties prop, *tvps = NULL;
+2152  |  struct compat_dtv_property *tvp = NULL;
+2153  |
+2154  |  if (copy_from_user(&prop, compat_ptr(arg), sizeof(prop)))
+2155  |  return -EFAULT;
+2156  |
+2157  | 		tvps = ∝
+2158  |
+2159  |  /*
+2160  |  * Put an arbitrary limit on the number of messages that can
+2161  |  * be sent at once
+2162  |  */
+2163  |  if (!tvps->num || (tvps->num > DTV_IOCTL_MAX_MSGS))
+2164  |  return -EINVAL;
+2165  |
+2166  | 		tvp = memdup_array_user(compat_ptr(tvps->props),
+2167  | 					tvps->num, sizeof(*tvp));
+2168  |  if (IS_ERR(tvp))
+2169  |  return PTR_ERR(tvp);
+2170  |
+2171  |  for (i = 0; i < tvps->num; i++) {
+2172  | 			err = dtv_property_process_set(fe, file,
+2173  | 						       (tvp + i)->cmd,
+2174  | 						       (tvp + i)->u.data);
+2175  |  if (err < 0) {
+2176  | 				kfree(tvp);
+2177  |  return err;
+2178  | 			}
+2179  | 		}
+2180  | 		kfree(tvp);
+2181  | 	} else if (cmd == COMPAT_FE_GET_PROPERTY) {
+    11←'?' condition is true→
+    12←Taking true branch→
+2182  |  struct compat_dtv_properties prop, *tvps = NULL;
+2183  |  struct compat_dtv_property *tvp = NULL;
+2184  |  struct dtv_frontend_properties getp = fe->dtv_property_cache;
+2185  |
+2186  |  if (copy_from_user(&prop, compat_ptr(arg), sizeof(prop)))
+    13←Assuming the condition is false→
+    14←Taking false branch→
+2187  |  return -EFAULT;
+2188  |
+2189  |  tvps = ∝
+2190  |
+2191  |  /*
+2192  |  * Put an arbitrary limit on the number of messages that can
+2193  |  * be sent at once
+2194  |  */
+2195  |  if (!tvps->num || (tvps->num > DTV_IOCTL_MAX_MSGS))
+    15←Assuming field 'num' is not equal to 0→
+    16←Assuming field 'num' is <= DTV_IOCTL_MAX_MSGS→
+    17←Taking false branch→
+2196  |  return -EINVAL;
+2197  |
+2198  |  tvp = memdup_array_user(compat_ptr(tvps->props),
+2199  | 					tvps->num, sizeof(*tvp));
+2200  |  if (IS_ERR(tvp))
+    18←Taking false branch→
+2201  |  return PTR_ERR(tvp);
+2202  |
+2203  |  /*
+2204  |  * Let's use our own copy of property cache, in order to
+2205  |  * avoid mangling with DTV zigzag logic, as drivers might
+2206  |  * return crap, if they don't check if the data is available
+2207  |  * before updating the properties cache.
+2208  |  */
+2209  |  if (fepriv->state != FESTATE_IDLE) {
+    19←Assuming field 'state' is equal to FESTATE_IDLE→
+    20←Taking false branch→
+2210  | 			err = dtv_get_frontend(fe, &getp, NULL);
+2211  |  if (err < 0) {
+2212  | 				kfree(tvp);
+2213  |  return err;
+2214  | 			}
+2215  | 		}
+2216  |  for (i = 0; i20.1'i' is < field 'num' < tvps->num; i++) {
+    21←Loop condition is true.  Entering loop body→
+    24←Assuming 'i' is >= field 'num'→
+    25←Loop condition is false. Execution continues on line 2225→
+2217  |  err = dtv_property_process_get(
+2218  |  fe, &getp, (struct dtv_property *)(tvp + i), file);
+2219  |  if (err < 0) {
+    22←Assuming 'err' is >= 0→
+    23←Taking false branch→
+2220  | 				kfree(tvp);
+2221  |  return err;
+2222  | 			}
+2223  |  }
+2224  |
+2225  |  if (copy_to_user((void __user *)compat_ptr(tvps->props), tvp,
+    26←Size is computed as sizeof(x) * count; use array_size() to avoid overflow
+2226  |  tvps->num * sizeof(struct compat_dtv_property))) {
+2227  | 			kfree(tvp);
+2228  |  return -EFAULT;
+2229  | 		}
+2230  | 		kfree(tvp);
+2231  | 	}
+2232  |
+2233  |  return err;
+2234  | }
+2235  |
+2236  | static long dvb_frontend_compat_ioctl(struct file *file, unsigned int cmd,
+2237  |  unsigned long arg)
+2238  | {
+2239  |  struct dvb_device *dvbdev = file->private_data;
+2240  |  struct dvb_frontend *fe = dvbdev->priv;
+2241  |  struct dvb_frontend_private *fepriv = fe->frontend_priv;
+2242  |  int err;
+2243  |
+2244  |  if (cmd == COMPAT_FE_SET_PROPERTY || cmd == COMPAT_FE_GET_PROPERTY) {
+    1'?' condition is true→
+    2←Assuming the condition is false→
+    3←'?' condition is true→
+    4←Assuming the condition is true→
+    5←Taking true branch→
+2245  |  if (down_interruptible(&fepriv->sem))
+    6←Assuming the condition is false→
+    7←Taking false branch→
+2246  |  return -ERESTARTSYS;
+2247  |
+2248  |  err = dvb_frontend_handle_compat_ioctl(file, cmd, arg);
+    8←Calling 'dvb_frontend_handle_compat_ioctl'→
+2249  |
+2250  | 		up(&fepriv->sem);
+2251  |  return err;
+2252  | 	}
+2253  |
+2254  |  return dvb_frontend_ioctl(file, cmd, (unsigned long)compat_ptr(arg));
+2255  | }
+2256  | #endif
+2257  |
+2258  | static int dtv_set_frontend(struct dvb_frontend *fe)
+2259  | {
+2260  |  struct dvb_frontend_private *fepriv = fe->frontend_priv;
+2261  |  struct dtv_frontend_properties *c = &fe->dtv_property_cache;
+2262  | 	u32 rolloff = 0;
+2263  |
+2264  |  if (dvb_frontend_check_parameters(fe) < 0)
+2265  |  return -EINVAL;
+2266  |
+2267  |  /*
+2268  |  * Initialize output parameters to match the values given by
+2269  |  * the user. FE_SET_FRONTEND triggers an initial frontend event
+2270  |  * with status = 0, which copies output parameters to userspace.
+2271  |  */
+2272  | 	dtv_property_legacy_params_sync(fe, c, &fepriv->parameters_out);
+2273  |
+2274  |  /*
+2275  |  * Be sure that the bandwidth will be filled for all
+2276  |  * non-satellite systems, as tuners need to know what
+2277  |  * low pass/Nyquist half filter should be applied, in
+2278  |  * order to avoid inter-channel noise.
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

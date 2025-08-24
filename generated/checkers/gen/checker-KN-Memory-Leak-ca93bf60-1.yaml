@@ -1,0 +1,400 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ca93bf607a44c1f009283dac4af7df0d9ae5e357
+commit_type: Memory-Leak
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state: live\
+  \ temporary allocations that must be freed (e.g., from kmalloc/nvmem_cell_read)\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(LiveTempAllocs, const MemRegion *)\n// Program state:\
+  \ last temporary allocation region\nREGISTER_TRAIT_WITH_PROGRAMSTATE(LastTempAllocRegion,\
+  \ const MemRegion *)\n// Program state: recent LHS targets of devm_* allocator assignments\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(RecentDevmTargets, const MemRegion *)\n// Program\
+  \ state: simple pointer aliasing (dest -> canonical src)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n\nnamespace {\nclass SAGenTestChecker\n \
+  \ : public Checker<\n      check::PostCall,\n      check::PreCall,\n      check::Bind,\n\
+  \      check::BranchCondition\n    > {\n\n   mutable std::unique_ptr<BugType> BT;\n\
+  \npublic:\n  SAGenTestChecker() : BT(new BugType(this, \"Memory leak on error path\"\
+  , \"Memory\")) {}\n\n  void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;\n\
+  \  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\n\
+  private:\n  // Helpers\n  static bool isMustFreeAllocator(const CallEvent &Call,\
+  \ CheckerContext &C);\n  static bool isDevmAllocator(const CallEvent &Call, CheckerContext\
+  \ &C);\n  const MemRegion* getAssignedLHSRegionOfCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  const MemRegion* resolveAlias(const MemRegion *R, ProgramStateRef\
+  \ State) const;\n  const MemRegion* extractPtrRegionFromNullCheck(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n\n  void reportLeak(CheckerContext &C, const Stmt *Site)\
+  \ const;\n};\n\n// Return true for allocators that require explicit kfree/kvfree.\n\
+  bool SAGenTestChecker::isMustFreeAllocator(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, \"nvmem_cell_read\", C) ||\n         ExprHasName(E, \"kmalloc\"\
+  , C) ||\n         ExprHasName(E, \"kzalloc\", C) ||\n         ExprHasName(E, \"\
+  kcalloc\", C) ||\n         ExprHasName(E, \"krealloc\", C) ||\n         ExprHasName(E,\
+  \ \"kmemdup\", C) ||\n         ExprHasName(E, \"kstrdup\", C);\n}\n\n// Return true\
+  \ for devm_* allocators.\nbool SAGenTestChecker::isDevmAllocator(const CallEvent\
+  \ &Call, CheckerContext &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E)\
+  \ return false;\n  return ExprHasName(E, \"devm_kmalloc\", C) ||\n         ExprHasName(E,\
+  \ \"devm_kzalloc\", C) ||\n         ExprHasName(E, \"devm_kcalloc\", C) ||\n   \
+  \      ExprHasName(E, \"devm_krealloc\", C) ||\n         ExprHasName(E, \"devm_kmemdup\"\
+  , C) ||\n         ExprHasName(E, \"devm_kstrdup\", C);\n}\n\n// Get the LHS region\
+  \ of an assignment where this call is on the RHS:  LHS = call(...);\nconst MemRegion*\
+  \ SAGenTestChecker::getAssignedLHSRegionOfCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  const Expr *Orig = Call.getOriginExpr();\n  if (!Orig)\n    return\
+  \ nullptr;\n\n  const BinaryOperator *BO = findSpecificTypeInParents<BinaryOperator>(Orig,\
+  \ C);\n  if (!BO)\n    return nullptr;\n  if (BO->getOpcode() != BO_Assign)\n  \
+  \  return nullptr;\n\n  const Expr *LHS = BO->getLHS();\n  if (!LHS)\n    return\
+  \ nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(LHS, C);\n  if (!MR)\n\
+  \    return nullptr;\n\n  return MR->getBaseRegion();\n}\n\n// Resolve alias chain\
+  \ using PtrAliasMap.\nconst MemRegion* SAGenTestChecker::resolveAlias(const MemRegion\
+  \ *R, ProgramStateRef State) const {\n  if (!R) return nullptr;\n  const MemRegion\
+  \ *Cur = R->getBaseRegion();\n  llvm::SmallPtrSet<const MemRegion*, 8> Visited;\n\
+  \  while (Cur) {\n    if (!Visited.insert(Cur).second)\n      break; // cycle\n\
+  \    auto Next = State->get<PtrAliasMap>(Cur);\n    if (!Next) break;\n    Cur =\
+  \ (*Next)->getBaseRegion();\n  }\n  return Cur;\n}\n\n// Extract pointer region\
+  \ being NULL-checked in a simple condition:\n// - if (!ptr)\n// - if (ptr == NULL)\
+  \ or if (ptr != NULL)\n// - optionally if (ptr)\nconst MemRegion* SAGenTestChecker::extractPtrRegionFromNullCheck(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE) return nullptr;\n\n  CondE = CondE->IgnoreParenCasts();\n\n  // if\
+  \ (!ptr)\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {\n    if (UO->getOpcode()\
+  \ == UO_LNot) {\n      const Expr *SubE = UO->getSubExpr();\n      if (!SubE) return\
+  \ nullptr;\n      const MemRegion *MR = getMemRegionFromExpr(SubE, C);\n      if\
+  \ (!MR) return nullptr;\n      return MR->getBaseRegion();\n    }\n  }\n\n  // if\
+  \ (ptr == NULL) or if (ptr != NULL)\n  if (const auto *BO = dyn_cast<BinaryOperator>(CondE))\
+  \ {\n    BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op == BO_EQ || Op\
+  \ == BO_NE) {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n     \
+  \ const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n      if (!LHS || !RHS) return\
+  \ nullptr;\n\n      bool LHSIsNull = LHS->isNullPointerConstant(C.getASTContext(),\n\
+  \                                                  Expr::NPC_ValueDependentIsNull);\n\
+  \      bool RHSIsNull = RHS->isNullPointerConstant(C.getASTContext(),\n        \
+  \                                          Expr::NPC_ValueDependentIsNull);\n\n\
+  \      const Expr *PtrExpr = nullptr;\n      if (LHSIsNull && !RHSIsNull) PtrExpr\
+  \ = RHS;\n      else if (RHSIsNull && !LHSIsNull) PtrExpr = LHS;\n\n      if (PtrExpr)\
+  \ {\n        const MemRegion *MR = getMemRegionFromExpr(PtrExpr, C);\n        if\
+  \ (!MR) return nullptr;\n        return MR->getBaseRegion();\n      }\n    }\n \
+  \ }\n\n  // if (ptr)\n  {\n    const MemRegion *MR = getMemRegionFromExpr(CondE,\
+  \ C);\n    if (MR) return MR->getBaseRegion();\n  }\n\n  return nullptr;\n}\n\n\
+  void SAGenTestChecker::reportLeak(CheckerContext &C, const Stmt *Site) const {\n\
+  \  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n  auto\
+  \ R = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"Leak of temporary\
+  \ buffer on allocation failure path; missing kfree\", N);\n  if (Site)\n    R->addRange(Site->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Track must-free temporary allocations assigned to an LHS variable.\n  if\
+  \ (isMustFreeAllocator(Call, C)) {\n    const MemRegion *LHS = getAssignedLHSRegionOfCall(Call,\
+  \ C);\n    if (LHS) {\n      LHS = LHS->getBaseRegion();\n      const MemRegion\
+  \ *Canon = resolveAlias(LHS, State);\n      if (Canon) {\n        State = State->add<LiveTempAllocs>(Canon);\n\
+  \        State = State->set<LastTempAllocRegion>(Canon);\n        C.addTransition(State);\n\
+  \      }\n    }\n    return;\n  }\n\n  // Track devm_* allocator targets on assignment.\n\
+  \  if (isDevmAllocator(Call, C)) {\n    const MemRegion *LHS = getAssignedLHSRegionOfCall(Call,\
+  \ C);\n    if (LHS) {\n      LHS = LHS->getBaseRegion();\n      const MemRegion\
+  \ *Canon = resolveAlias(LHS, State);\n      if (Canon) {\n        State = State->add<RecentDevmTargets>(Canon);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *E = Call.getOriginExpr();\n  if (!E) return;\n\n  // Intercept frees:\
+  \ kfree/kvfree/vfree(ptr)\n  if (ExprHasName(E, \"kfree\", C) || ExprHasName(E,\
+  \ \"kvfree\", C) || ExprHasName(E, \"vfree\", C)) {\n    if (Call.getNumArgs() <\
+  \ 1) return;\n\n    const Expr *Arg0 = Call.getArgExpr(0);\n    if (!Arg0) return;\n\
+  \n    const MemRegion *MR = getMemRegionFromExpr(Arg0, C);\n    if (!MR) return;\n\
+  \    MR = MR->getBaseRegion();\n\n    const MemRegion *Canon = resolveAlias(MR,\
+  \ State);\n    if (!Canon) return;\n\n    if (State->contains<LiveTempAllocs>(Canon))\
+  \ {\n      State = State->remove<LiveTempAllocs>(Canon);\n      const MemRegion\
+  \ *Last = State->get<LastTempAllocRegion>();\n      if (Last == Canon) {\n     \
+  \   State = State->set<LastTempAllocRegion>(nullptr);\n      }\n      C.addTransition(State);\n\
+  \    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  const MemRegion *Dest = Loc.getAsRegion();\n  if (!Dest) return;\n  Dest = Dest->getBaseRegion();\n\
+  \  if (!Dest) return;\n\n  const MemRegion *Src = Val.getAsRegion();\n  if (!Src)\
+  \ {\n    // Optional: could clear alias mapping when binding a non-region value.\n\
+  \    return;\n  }\n  Src = Src->getBaseRegion();\n\n  const MemRegion *CanonSrc\
+  \ = resolveAlias(Src, State);\n  if (!CanonSrc) return;\n\n  State = State->set<PtrAliasMap>(Dest,\
+  \ CanonSrc);\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Extract pointer being NULL-checked in the condition.\n  const MemRegion *PtrReg\
+  \ = extractPtrRegionFromNullCheck(Condition, C);\n  if (!PtrReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  PtrReg = PtrReg->getBaseRegion();\n  const MemRegion *CanonPtr\
+  \ = resolveAlias(PtrReg, State);\n  if (!CanonPtr) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Only proceed if pointer is a recent target of a devm_*\
+  \ allocator assignment.\n  if (!State->contains<RecentDevmTargets>(CanonPtr)) {\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  // Check if this condition's\
+  \ 'then' branch immediately returns.\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IfS) {\n    C.addTransition(State);\n    return;\n  }\n\n  const Stmt\
+  \ *ThenS = IfS->getThen();\n  if (!ThenS) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  const ReturnStmt *RS = findSpecificTypeInChildren<ReturnStmt>(ThenS);\n\
+  \  if (!RS) {\n    C.addTransition(State);\n    return;\n  }\n\n  // Now see if\
+  \ there's a live temporary allocation outstanding.\n  const MemRegion *Last = State->get<LastTempAllocRegion>();\n\
+  \  if (!Last) {\n    C.addTransition(State);\n    return;\n  }\n\n  if (State->contains<LiveTempAllocs>(Last))\
+  \ {\n    // We are about to return due to devm_* allocation failure, but a temporary\n\
+  \    // buffer allocated earlier is still live and not freed.\n    reportLeak(C,\
+  \ RS);\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\n\
+  extern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects missing kfree of a temporary\
+  \ buffer when returning on devm_* alloc failure\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nthermal/drivers/mediatek/lvts_thermal: Fix a memory\
+  \ leak in an error handling path\n\nIf devm_krealloc() fails, then 'efuse' is leaking.\n\
+  So free it to avoid a leak.\n\nFixes: f5f633b18234 (\"thermal/drivers/mediatek:\
+  \ Add the Low Voltage Thermal Sensor driver\")\nSigned-off-by: Christophe JAILLET\
+  \ <christophe.jaillet@wanadoo.fr>\nReviewed-by: Matthias Brugger <matthias.bgg@gmail.com>\n\
+  Reviewed-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>\n\
+  Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>\nLink: https://lore.kernel.org/r/481d345233862d58c3c305855a93d0dbc2bbae7e.1706431063.git.christophe.jaillet@wanadoo.fr\n\
+  \n## Buggy Code\n\n```c\n// Function: lvts_calibration_read in drivers/thermal/mediatek/lvts_thermal.c\n\
+  static int lvts_calibration_read(struct device *dev, struct lvts_domain *lvts_td,\n\
+  \t\t\t\t\tconst struct lvts_data *lvts_data)\n{\n\tstruct device_node *np = dev_of_node(dev);\n\
+  \tstruct nvmem_cell *cell;\n\tstruct property *prop;\n\tconst char *cell_name;\n\
+  \n\tof_property_for_each_string(np, \"nvmem-cell-names\", prop, cell_name) {\n\t\
+  \tsize_t len;\n\t\tu8 *efuse;\n\n\t\tcell = of_nvmem_cell_get(np, cell_name);\n\t\
+  \tif (IS_ERR(cell)) {\n\t\t\tdev_err(dev, \"Failed to get cell '%s'\\n\", cell_name);\n\
+  \t\t\treturn PTR_ERR(cell);\n\t\t}\n\n\t\tefuse = nvmem_cell_read(cell, &len);\n\
+  \n\t\tnvmem_cell_put(cell);\n\n\t\tif (IS_ERR(efuse)) {\n\t\t\tdev_err(dev, \"Failed\
+  \ to read cell '%s'\\n\", cell_name);\n\t\t\treturn PTR_ERR(efuse);\n\t\t}\n\n\t\
+  \tlvts_td->calib = devm_krealloc(dev, lvts_td->calib,\n\t\t\t\t\t       lvts_td->calib_len\
+  \ + len, GFP_KERNEL);\n\t\tif (!lvts_td->calib)\n\t\t\treturn -ENOMEM;\n\n\t\tmemcpy(lvts_td->calib\
+  \ + lvts_td->calib_len, efuse, len);\n\n\t\tlvts_td->calib_len += len;\n\n\t\tkfree(efuse);\n\
+  \t}\n\n\treturn 0;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/thermal/mediatek/lvts_thermal.c\
+  \ b/drivers/thermal/mediatek/lvts_thermal.c\nindex 98d9c80bd4c6..fd4bd650c77a 100644\n\
+  --- a/drivers/thermal/mediatek/lvts_thermal.c\n+++ b/drivers/thermal/mediatek/lvts_thermal.c\n\
+  @@ -719,8 +719,10 @@ static int lvts_calibration_read(struct device *dev, struct\
+  \ lvts_domain *lvts_td\n \n \t\tlvts_td->calib = devm_krealloc(dev, lvts_td->calib,\n\
+  \ \t\t\t\t\t       lvts_td->calib_len + len, GFP_KERNEL);\n-\t\tif (!lvts_td->calib)\n\
+  +\t\tif (!lvts_td->calib) {\n+\t\t\tkfree(efuse);\n \t\t\treturn -ENOMEM;\n+\t\t\
+  }\n \n \t\tmemcpy(lvts_td->calib + lvts_td->calib_len, efuse, len);\n \n```\n"
+pattern: '## Bug Pattern
+
+
+  Allocating a temporary (non-devm) buffer and intending to free it later, but returning
+  early on a subsequent allocation failure without freeing the temporary buffer. Concretely:
+  memory obtained (e.g., via nvmem_cell_read/kmalloc) is freed only on the success
+  path; if a later devm_krealloc (or similar) fails, the function returns without
+  kfree() of the earlier buffer, causing a leak.'
+plan: "Plan\n\n1) Program state\n- REGISTER_SET_WITH_PROGRAMSTATE(LiveTempAllocs,\
+  \ const MemRegion*)\n  - Tracks outstanding \u201Cmust-free\u201D temporary buffers\
+  \ (e.g., from nvmem_cell_read/kmalloc-family) that require kfree/kvfree.\n- REGISTER_TRAIT_WITH_PROGRAMSTATE(LastTempAllocRegion,\
+  \ const MemRegion*)\n  - Stores the most recently allocated temporary buffer region\
+  \ (or nullptr).\n- REGISTER_SET_WITH_PROGRAMSTATE(RecentDevmTargets, const MemRegion*)\n\
+  \  - Tracks pointer LHS regions that were just assigned from a devm_* allocator\
+  \ call.\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)\n\
+  \  - Tracks pointer aliases (dest \u2192 canonical src). Used to recognize frees\
+  \ done via aliases.\n\nHelper utilities to implement\n- bool isMustFreeAllocator(const\
+  \ CallEvent &Call)\n  - Returns true for: \"nvmem_cell_read\", \"kmalloc\", \"kzalloc\"\
+  , \"kcalloc\", \"krealloc\", \"kmemdup\", \"kstrdup\".\n- bool isDevmAllocator(const\
+  \ CallEvent &Call)\n  - Returns true for devm-family allocators: \"devm_kmalloc\"\
+  , \"devm_kzalloc\", \"devm_kcalloc\", \"devm_krealloc\", \"devm_kmemdup\", \"devm_kstrdup\"\
+  .\n- const MemRegion* getAssignedLHSRegionOfCall(const CallEvent &Call, CheckerContext\
+  \ &C)\n  - From Call.getOriginExpr(), use findSpecificTypeInParents<BinaryOperator>\
+  \ to get the assignment.\n  - If found, take its LHS expression and resolve its\
+  \ region via getMemRegionFromExpr(LHS, C).\n  - Return null if not an assignment\
+  \ or no region.\n- const MemRegion* resolveAlias(const MemRegion *R, ProgramStateRef\
+  \ State)\n  - Walk PtrAliasMap (R\u2192R\u2019) until fixed point to get canonical\
+  \ region.\n- const MemRegion* extractPtrRegionFromNullCheck(const Stmt *Condition,\
+  \ CheckerContext &C)\n  - Supported forms:\n    - UnaryOperator \u2018!\u2019: pointer\
+  \ is the subexpression.\n    - BinaryOperator \u2018==\u2019 or \u2018!=\u2019 comparing\
+  \ a pointer to 0/NULL: determine which side is the pointer; the other must evaluate\
+  \ to 0 via EvaluateExprToInt.\n  - Return the MemRegion (canonicalized with resolveAlias),\
+  \ or null if not a simple NULL check.\n\n2) checkPostCall\n- When isMustFreeAllocator(Call):\n\
+  \  - Identify the LHS region R = getAssignedLHSRegionOfCall(Call, C). If none, skip\
+  \ (we only handle assignment form).\n  - Canonicalize R = resolveAlias(R, State).\n\
+  \  - State = State.add<LiveTempAllocs>(R).\n  - State = State.set<LastTempAllocRegion>(R).\n\
+  \  - C.addTransition(State).\n- When isDevmAllocator(Call):\n  - Identify LHS region\
+  \ Rdevm = getAssignedLHSRegionOfCall(Call, C). If none, skip.\n  - Canonicalize\
+  \ Rdevm.\n  - State = State.add<RecentDevmTargets>(Rdevm).\n  - C.addTransition(State).\n\
+  \n3) checkPreCall\n- Intercept frees: function name in {\"kfree\", \"kvfree\", \"\
+  vfree\"}.\n  - Extract the first argument\u2019s region Rarg via getMemRegionFromExpr(Call.getArgExpr(0),\
+  \ C). Canonicalize via resolveAlias.\n  - If Rarg is null, return.\n  - If Rarg\
+  \ in LiveTempAllocs:\n    - Remove from LiveTempAllocs.\n    - If LastTempAllocRegion\
+  \ == Rarg, set LastTempAllocRegion to nullptr.\n  - Also clear any alias entries\
+  \ that map to Rarg if desired (optional; not necessary if resolveAlias works).\n\
+  \  - C.addTransition(State).\n- For any other call: no action.\n\n4) checkBind\n\
+  - Track pointer aliases on assignments:\n  - If Loc is a MemRegion Rdest of pointer\
+  \ type and Val is a region Rsrc (SVal that contains a region), record State = State.set<PtrAliasMap>(Rdest,\
+  \ resolveAlias(Rsrc, State)).\n  - On writing a non-pointer value to a pointer-typed\
+  \ region, you may clear its alias mapping (optional conservative cleanup).\n\n5)\
+  \ checkBranchCondition\n- Detect the early-return-on-alloc-failure pattern and report\
+  \ a leak if a live temp exists.\n  - Extract the pointer being tested for NULL:\
+  \ P = extractPtrRegionFromNullCheck(Condition, C). If null, skip.\n  - Find the\
+  \ parent IfStmt: IfS = findSpecificTypeInParents<IfStmt>(Condition, C). If null,\
+  \ skip.\n  - Ensure the checked branch is the \u201Cfailure\u201D branch that returns:\n\
+  \    - Inspect the Then branch if the condition is \u201C!P\u201D or \u201CP ==\
+  \ NULL\u201D (or the Else branch if \u201CP != NULL\u201D), but simplest: look for\
+  \ a ReturnStmt in the Then branch first. Use findSpecificTypeInChildren<ReturnStmt>(IfS->getThen()).\n\
+  \    - If no ReturnStmt found in IfS->getThen(), optionally check IfS->getElse()\
+  \ similarly, but only handle the common \u201Creturn in then\u201D case for simplicity.\n\
+  \  - Require that P was just assigned from a devm_* allocator:\n    - If P \u2208\
+  \ RecentDevmTargets set, proceed; else skip (reduces false positives).\n  - Leak\
+  \ decision:\n    - Read L = State.get<LastTempAllocRegion>().\n    - If L != nullptr\
+  \ and L \u2208 LiveTempAllocs, this matches the target bug pattern: a temporary\
+  \ must-free buffer was allocated earlier and is still live while returning due to\
+  \ devm_* alloc failure.\n    - Report.\n  - Reporting:\n    - Generate a non-fatal\
+  \ error node and emit a PathSensitiveBugReport with message:\n      \"Leak of temporary\
+  \ buffer on allocation failure path; missing kfree.\"\n    - Optionally add notes\
+  \ on the allocation site (from the call where LastTempAllocRegion was set) and the\
+  \ return site (current If/Return).\n  - No state update needed here; just report.\n\
+  \n6) Optional: checkEndFunction\n- Not necessary for this checker; we aim at the\
+  \ specific error-handling early return pattern, not general leaks.\n\nImplementation\
+  \ notes and simplifications\n- Only handle the assignment form of calls: ptr = nvmem_cell_read(...);\
+  \ ptr2 = devm_krealloc(...). This keeps the checker simple and precise.\n- Alias\
+  \ handling is lightweight: resolveAlias on lookup; keep a single direction mapping\
+  \ dest\u2192src and chase until fixed point.\n- We do not warn if there are no live\
+  \ temp allocations or if the null-check does not immediately return.\n- The RecentDevmTargets\
+  \ set can be left as-is; the path sensitivity ensures relevance. It\u2019s sufficient\
+  \ for the next few statements; stale entries won\u2019t lead to a report without\
+  \ a matching If with Return and a live LastTempAllocRegion.\n- Extend isMustFreeAllocator/isDevmAllocator\
+  \ tables later if needed; the core pattern works with the listed functions.\n\n\
+  Chosen callbacks summary\n- checkPostCall: track allocations (both must-free and\
+  \ devm_*), populate LiveTempAllocs, LastTempAllocRegion, RecentDevmTargets.\n- checkPreCall:\
+  \ detect frees and update LiveTempAllocs/LastTempAllocRegion.\n- checkBind: build\
+  \ PtrAliasMap for pointer aliasing.\n- checkBranchCondition: find if(P==NULL) with\
+  \ immediate Return; ensure P is recent devm allocation target; if LastTempAllocRegion\
+  \ is live, report the leak.\n\nThis minimal, path-sensitive approach precisely flags\
+  \ the target pattern in the provided patch (efuse live when devm_krealloc fails\
+  \ and returns without kfree)."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state: live\
+  \ temporary allocations that must be freed (e.g., from kmalloc/nvmem_cell_read)\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(LiveTempAllocs, const MemRegion *)\n// Program state:\
+  \ last temporary allocation region\nREGISTER_TRAIT_WITH_PROGRAMSTATE(LastTempAllocRegion,\
+  \ const MemRegion *)\n// Program state: recent LHS targets of devm_* allocator assignments\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(RecentDevmTargets, const MemRegion *)\n// Program\
+  \ state: simple pointer aliasing (dest -> canonical src)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n\nnamespace {\nclass SAGenTestChecker\n \
+  \ : public Checker<\n      check::PostCall,\n      check::PreCall,\n      check::Bind,\n\
+  \      check::BranchCondition\n    > {\n\n   mutable std::unique_ptr<BugType> BT;\n\
+  \npublic:\n  SAGenTestChecker() : BT(new BugType(this, \"Memory leak on error path\"\
+  , \"Memory\")) {}\n\n  void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;\n\
+  \  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\n\
+  private:\n  // Helpers\n  static bool isMustFreeAllocator(const CallEvent &Call,\
+  \ CheckerContext &C);\n  static bool isDevmAllocator(const CallEvent &Call, CheckerContext\
+  \ &C);\n  const MemRegion* getAssignedLHSRegionOfCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  const MemRegion* resolveAlias(const MemRegion *R, ProgramStateRef\
+  \ State) const;\n  const MemRegion* extractPtrRegionFromNullCheck(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n\n  void reportLeak(CheckerContext &C, const Stmt *Site)\
+  \ const;\n};\n\n// Return true for allocators that require explicit kfree/kvfree.\n\
+  bool SAGenTestChecker::isMustFreeAllocator(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, \"nvmem_cell_read\", C) ||\n         ExprHasName(E, \"kmalloc\"\
+  , C) ||\n         ExprHasName(E, \"kzalloc\", C) ||\n         ExprHasName(E, \"\
+  kcalloc\", C) ||\n         ExprHasName(E, \"krealloc\", C) ||\n         ExprHasName(E,\
+  \ \"kmemdup\", C) ||\n         ExprHasName(E, \"kstrdup\", C);\n}\n\n// Return true\
+  \ for devm_* allocators.\nbool SAGenTestChecker::isDevmAllocator(const CallEvent\
+  \ &Call, CheckerContext &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E)\
+  \ return false;\n  return ExprHasName(E, \"devm_kmalloc\", C) ||\n         ExprHasName(E,\
+  \ \"devm_kzalloc\", C) ||\n         ExprHasName(E, \"devm_kcalloc\", C) ||\n   \
+  \      ExprHasName(E, \"devm_krealloc\", C) ||\n         ExprHasName(E, \"devm_kmemdup\"\
+  , C) ||\n         ExprHasName(E, \"devm_kstrdup\", C);\n}\n\n// Get the LHS region\
+  \ of an assignment where this call is on the RHS:  LHS = call(...);\nconst MemRegion*\
+  \ SAGenTestChecker::getAssignedLHSRegionOfCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  const Expr *Orig = Call.getOriginExpr();\n  if (!Orig)\n    return\
+  \ nullptr;\n\n  const BinaryOperator *BO = findSpecificTypeInParents<BinaryOperator>(Orig,\
+  \ C);\n  if (!BO)\n    return nullptr;\n  if (BO->getOpcode() != BO_Assign)\n  \
+  \  return nullptr;\n\n  const Expr *LHS = BO->getLHS();\n  if (!LHS)\n    return\
+  \ nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(LHS, C);\n  if (!MR)\n\
+  \    return nullptr;\n\n  return MR->getBaseRegion();\n}\n\n// Resolve alias chain\
+  \ using PtrAliasMap.\nconst MemRegion* SAGenTestChecker::resolveAlias(const MemRegion\
+  \ *R, ProgramStateRef State) const {\n  if (!R) return nullptr;\n  const MemRegion\
+  \ *Cur = R->getBaseRegion();\n  llvm::SmallPtrSet<const MemRegion*, 8> Visited;\n\
+  \  while (Cur) {\n    if (!Visited.insert(Cur).second)\n      break; // cycle\n\
+  \    auto Next = State->get<PtrAliasMap>(Cur);\n    if (!Next) break;\n    Cur =\
+  \ (*Next)->getBaseRegion();\n  }\n  return Cur;\n}\n\n// Extract pointer region\
+  \ being NULL-checked in a simple condition:\n// - if (!ptr)\n// - if (ptr == NULL)\
+  \ or if (ptr != NULL)\n// - optionally if (ptr)\nconst MemRegion* SAGenTestChecker::extractPtrRegionFromNullCheck(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE) return nullptr;\n\n  CondE = CondE->IgnoreParenCasts();\n\n  // if\
+  \ (!ptr)\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {\n    if (UO->getOpcode()\
+  \ == UO_LNot) {\n      const Expr *SubE = UO->getSubExpr();\n      if (!SubE) return\
+  \ nullptr;\n      const MemRegion *MR = getMemRegionFromExpr(SubE, C);\n      if\
+  \ (!MR) return nullptr;\n      return MR->getBaseRegion();\n    }\n  }\n\n  // if\
+  \ (ptr == NULL) or if (ptr != NULL)\n  if (const auto *BO = dyn_cast<BinaryOperator>(CondE))\
+  \ {\n    BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op == BO_EQ || Op\
+  \ == BO_NE) {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n     \
+  \ const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n      if (!LHS || !RHS) return\
+  \ nullptr;\n\n      bool LHSIsNull = LHS->isNullPointerConstant(C.getASTContext(),\n\
+  \                                                  Expr::NPC_ValueDependentIsNull);\n\
+  \      bool RHSIsNull = RHS->isNullPointerConstant(C.getASTContext(),\n        \
+  \                                          Expr::NPC_ValueDependentIsNull);\n\n\
+  \      const Expr *PtrExpr = nullptr;\n      if (LHSIsNull && !RHSIsNull) PtrExpr\
+  \ = RHS;\n      else if (RHSIsNull && !LHSIsNull) PtrExpr = LHS;\n\n      if (PtrExpr)\
+  \ {\n        const MemRegion *MR = getMemRegionFromExpr(PtrExpr, C);\n        if\
+  \ (!MR) return nullptr;\n        return MR->getBaseRegion();\n      }\n    }\n \
+  \ }\n\n  // if (ptr)\n  {\n    const MemRegion *MR = getMemRegionFromExpr(CondE,\
+  \ C);\n    if (MR) return MR->getBaseRegion();\n  }\n\n  return nullptr;\n}\n\n\
+  void SAGenTestChecker::reportLeak(CheckerContext &C, const Stmt *Site) const {\n\
+  \  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n  auto\
+  \ R = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"Leak of temporary\
+  \ buffer on allocation failure path; missing kfree\", N);\n  if (Site)\n    R->addRange(Site->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Track must-free temporary allocations assigned to an LHS variable.\n  if\
+  \ (isMustFreeAllocator(Call, C)) {\n    const MemRegion *LHS = getAssignedLHSRegionOfCall(Call,\
+  \ C);\n    if (LHS) {\n      LHS = LHS->getBaseRegion();\n      const MemRegion\
+  \ *Canon = resolveAlias(LHS, State);\n      if (Canon) {\n        State = State->add<LiveTempAllocs>(Canon);\n\
+  \        State = State->set<LastTempAllocRegion>(Canon);\n        C.addTransition(State);\n\
+  \      }\n    }\n    return;\n  }\n\n  // Track devm_* allocator targets on assignment.\n\
+  \  if (isDevmAllocator(Call, C)) {\n    const MemRegion *LHS = getAssignedLHSRegionOfCall(Call,\
+  \ C);\n    if (LHS) {\n      LHS = LHS->getBaseRegion();\n      const MemRegion\
+  \ *Canon = resolveAlias(LHS, State);\n      if (Canon) {\n        State = State->add<RecentDevmTargets>(Canon);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *E = Call.getOriginExpr();\n  if (!E) return;\n\n  // Intercept frees:\
+  \ kfree/kvfree/vfree(ptr)\n  if (ExprHasName(E, \"kfree\", C) || ExprHasName(E,\
+  \ \"kvfree\", C) || ExprHasName(E, \"vfree\", C)) {\n    if (Call.getNumArgs() <\
+  \ 1) return;\n\n    const Expr *Arg0 = Call.getArgExpr(0);\n    if (!Arg0) return;\n\
+  \n    const MemRegion *MR = getMemRegionFromExpr(Arg0, C);\n    if (!MR) return;\n\
+  \    MR = MR->getBaseRegion();\n\n    const MemRegion *Canon = resolveAlias(MR,\
+  \ State);\n    if (!Canon) return;\n\n    if (State->contains<LiveTempAllocs>(Canon))\
+  \ {\n      State = State->remove<LiveTempAllocs>(Canon);\n      const MemRegion\
+  \ *Last = State->get<LastTempAllocRegion>();\n      if (Last == Canon) {\n     \
+  \   State = State->set<LastTempAllocRegion>(nullptr);\n      }\n      C.addTransition(State);\n\
+  \    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  const MemRegion *Dest = Loc.getAsRegion();\n  if (!Dest) return;\n  Dest = Dest->getBaseRegion();\n\
+  \  if (!Dest) return;\n\n  const MemRegion *Src = Val.getAsRegion();\n  if (!Src)\
+  \ {\n    // Optional: could clear alias mapping when binding a non-region value.\n\
+  \    return;\n  }\n  Src = Src->getBaseRegion();\n\n  const MemRegion *CanonSrc\
+  \ = resolveAlias(Src, State);\n  if (!CanonSrc) return;\n\n  State = State->set<PtrAliasMap>(Dest,\
+  \ CanonSrc);\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Extract pointer being NULL-checked in the condition.\n  const MemRegion *PtrReg\
+  \ = extractPtrRegionFromNullCheck(Condition, C);\n  if (!PtrReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  PtrReg = PtrReg->getBaseRegion();\n  const MemRegion *CanonPtr\
+  \ = resolveAlias(PtrReg, State);\n  if (!CanonPtr) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Only proceed if pointer is a recent target of a devm_*\
+  \ allocator assignment.\n  if (!State->contains<RecentDevmTargets>(CanonPtr)) {\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  // Check if this condition's\
+  \ 'then' branch immediately returns.\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IfS) {\n    C.addTransition(State);\n    return;\n  }\n\n  const Stmt\
+  \ *ThenS = IfS->getThen();\n  if (!ThenS) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  const ReturnStmt *RS = findSpecificTypeInChildren<ReturnStmt>(ThenS);\n\
+  \  if (!RS) {\n    C.addTransition(State);\n    return;\n  }\n\n  // Now see if\
+  \ there's a live temporary allocation outstanding.\n  const MemRegion *Last = State->get<LastTempAllocRegion>();\n\
+  \  if (!Last) {\n    C.addTransition(State);\n    return;\n  }\n\n  if (State->contains<LiveTempAllocs>(Last))\
+  \ {\n    // We are about to return due to devm_* allocation failure, but a temporary\n\
+  \    // buffer allocated earlier is still live and not freed.\n    reportLeak(C,\
+  \ RS);\n  }\n\n  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\n\
+  extern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects missing kfree of a temporary\
+  \ buffer when returning on devm_* alloc failure\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

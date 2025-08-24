@@ -1,0 +1,229 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -21,6 +21,8 @@ #include "clang/Lex/Lexer.h"
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/SmallPtrSet.h"
++#include "llvm/ADT/SmallString.h"
+ #include <optional>
+
+ // Added for parent queries and dyn typed nodes
+@@ -65,11 +67,17 @@
+       // Existing simple loop-level guard heuristic (kept for compatibility).
+       bool hasGuardForBound(const Stmt *Body, const VarDecl *IVar, uint64_t SmallSize, ASTContext &ACtx) const;
+-      static bool condHasIVarAgainstConst(const Expr *CondE, const VarDecl *IVar, uint64_t ConstVal, ASTContext &ACtx);
+
+       // General helpers
+       static bool containsStmt(const Stmt *Parent, const Stmt *Target);
++
++      // Robust condition parsing: find relational on IVar anywhere in the condition subtree (handles StmtExpr, wrappers).
++      static bool matchRelationalOnIVar(const BinaryOperator *BO, const VarDecl *IVar,
++                                        uint64_t &Const, GuardKind &Kind, ASTContext &ACtx);
++      static bool findRelationalOnIVarInStmt(const Stmt *S, const VarDecl *IVar,
++                                             uint64_t &Const, GuardKind &Kind, ASTContext &ACtx);
+       static bool parseCondOnIVar(const Expr *Cond, const VarDecl *IVar, uint64_t &Const, GuardKind &Kind, ASTContext &ACtx);
++      static bool condHasIVarAgainstConst(const Expr *CondE, const VarDecl *IVar, uint64_t ConstVal, ASTContext &ACtx);
+
+       // Parent-branch guard heuristic: if use is in a branch that ensures i < SmallSize
+       static bool branchImpliesIndexInRange(GuardKind Kind, uint64_t Const, bool BranchWhenCondTrue,
+@@ -285,28 +293,113 @@   }
+ }
+
++// New: robust matcher for relational operators on the loop index variable.
++bool SAGenTestChecker::matchRelationalOnIVar(const BinaryOperator *BO, const VarDecl *IVar,
++                                             uint64_t &Const, GuardKind &Kind, ASTContext &ACtx) {
++  if (!BO || !IVar) return false;
++
++  auto Op = BO->getOpcode();
++  switch (Op) {
++    case BO_LT: case BO_LE: case BO_GT: case BO_GE:
++    case BO_EQ: case BO_NE:
++      break;
++    default:
++      return false;
++  }
++
++  const Expr *L = BO->getLHS()->IgnoreParenImpCasts();
++  const Expr *R = BO->getRHS()->IgnoreParenImpCasts();
++
++  // i op Const
++  if (isVarRefTo(L, IVar)) {
++    uint64_t C;
++    if (!evalToUInt64(R, ACtx, C))
++      return false;
++    Const = C;
++    switch (Op) {
++      case BO_LT: Kind = GuardKind::Lt; break;
++      case BO_LE: Kind = GuardKind::Le; break;
++      case BO_GT: Kind = GuardKind::Gt; break;
++      case BO_GE: Kind = GuardKind::Ge; break;
++      case BO_EQ: Kind = GuardKind::Eq; break;
++      case BO_NE: Kind = GuardKind::Ne; break;
++      default: return false;
++    }
++    return true;
++  }
++
++  // Const op i  => normalize to i op' Const
++  if (isVarRefTo(R, IVar)) {
++    uint64_t C;
++    if (!evalToUInt64(L, ACtx, C))
++      return false;
++    Const = C;
++    switch (Op) {
++      case BO_LT: Kind = GuardKind::Gt; break; // Const < i  => i > Const
++      case BO_LE: Kind = GuardKind::Ge; break; // Const <= i => i >= Const
++      case BO_GT: Kind = GuardKind::Lt; break; // Const > i  => i < Const
++      case BO_GE: Kind = GuardKind::Le; break; // Const >= i => i <= Const
++      case BO_EQ: Kind = GuardKind::Eq; break;
++      case BO_NE: Kind = GuardKind::Ne; break;
++      default: return false;
++    }
++    return true;
++  }
++
++  return false;
++}
++
++// Generic DFS over Stmt (handles StmtExpr body, wrapper expressions) to find a relational on IVar.
++bool SAGenTestChecker::findRelationalOnIVarInStmt(const Stmt *S, const VarDecl *IVar,
++                                                  uint64_t &Const, GuardKind &Kind, ASTContext &ACtx) {
++  if (!S || !IVar) return false;
++
++  if (const auto *E = dyn_cast<Expr>(S)) {
++    const Expr *IE = E->IgnoreParenImpCasts();
++    if (const auto *BO = dyn_cast<BinaryOperator>(IE)) {
++      if (matchRelationalOnIVar(BO, IVar, Const, Kind, ACtx))
++        return true;
++    }
++    // Fallthrough: inspect children of the expression
++  }
++
++  for (const Stmt *Ch : S->children()) {
++    if (!Ch) continue;
++    if (findRelationalOnIVarInStmt(Ch, IVar, Const, Kind, ACtx))
++      return true;
++  }
++
++  return false;
++}
++
++bool SAGenTestChecker::parseCondOnIVar(const Expr *Cond, const VarDecl *IVar, uint64_t &Const, GuardKind &Kind, ASTContext &ACtx) {
++  Kind = GuardKind::None;
++  if (!Cond) return false;
++
++  // Try a simple direct parse first.
++  const Expr *C = Cond->IgnoreParenImpCasts();
++  if (const auto *BO = dyn_cast<BinaryOperator>(C)) {
++    if (matchRelationalOnIVar(BO, IVar, Const, Kind, ACtx))
++      return true;
++  }
++
++  // Robust path: search anywhere within the condition subtree (handles macros like WARN_ON, likely/unlikely, StmtExpr).
++  // Since Expr is a Stmt, reuse the Stmt DFS.
++  return findRelationalOnIVarInStmt(Cond, IVar, Const, Kind, ACtx);
++}
++
+ bool SAGenTestChecker::condHasIVarAgainstConst(const Expr *CondE, const VarDecl *IVar, uint64_t ConstVal, ASTContext &ACtx) {
+-  if (!CondE || !IVar) return false;
+-
+-  CondE = CondE->IgnoreParenImpCasts();
+-  if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {
+-    // i >= ConstVal OR i == ConstVal
+-    if (isVarRefTo(BO->getLHS(), IVar)) {
+-      uint64_t Val;
+-      if (evalToUInt64(BO->getRHS(), ACtx, Val) && Val == ConstVal) {
+-        if (BO->getOpcode() == BO_GE || BO->getOpcode() == BO_EQ)
+-          return true;
+-      }
+-    }
+-    // ConstVal <= i (commuted form of i >= ConstVal)
+-    if (isVarRefTo(BO->getRHS(), IVar)) {
+-      uint64_t Val;
+-      if (evalToUInt64(BO->getLHS(), ACtx, Val) && Val == ConstVal) {
+-        if (BO->getOpcode() == BO_LE || BO->getOpcode() == BO_EQ)
+-          return true;
+-      }
+-    }
+-  }
++  uint64_t C = 0;
++  GuardKind K = GuardKind::None;
++  if (!parseCondOnIVar(CondE, IVar, C, K, ACtx))
++    return false;
++
++  // We only accept guards that conclusively guard i >= SmallSize or i == SmallSize.
++  if ((K == GuardKind::Ge && C == ConstVal) ||
++      (K == GuardKind::Eq && C == ConstVal))
++    return true;
++
++  // Also accept commuted forms already normalized by parseCondOnIVar.
+   return false;
+ }
+
+@@ -347,55 +440,6 @@     if (containsStmt(Child, Target))
+       return true;
+   }
+-  return false;
+-}
+-
+-bool SAGenTestChecker::parseCondOnIVar(const Expr *Cond, const VarDecl *IVar, uint64_t &Const, GuardKind &Kind, ASTContext &ACtx) {
+-  Kind = GuardKind::None;
+-  if (!Cond) return false;
+-  Cond = Cond->IgnoreParenImpCasts();
+-  const auto *BO = dyn_cast<BinaryOperator>(Cond);
+-  if (!BO) return false;
+-
+-  const Expr *L = BO->getLHS()->IgnoreParenImpCasts();
+-  const Expr *R = BO->getRHS()->IgnoreParenImpCasts();
+-
+-  // i op Const
+-  if (isVarRefTo(L, IVar)) {
+-    uint64_t C;
+-    if (!evalToUInt64(R, ACtx, C))
+-      return false;
+-    Const = C;
+-    switch (BO->getOpcode()) {
+-      case BO_LT: Kind = GuardKind::Lt; break;
+-      case BO_LE: Kind = GuardKind::Le; break;
+-      case BO_GT: Kind = GuardKind::Gt; break;
+-      case BO_GE: Kind = GuardKind::Ge; break;
+-      case BO_EQ: Kind = GuardKind::Eq; break;
+-      case BO_NE: Kind = GuardKind::Ne; break;
+-      default: return false;
+-    }
+-    return true;
+-  }
+-
+-  // Const op i  => normalize to i op' Const
+-  if (isVarRefTo(R, IVar)) {
+-    uint64_t C;
+-    if (!evalToUInt64(L, ACtx, C))
+-      return false;
+-    Const = C;
+-    switch (BO->getOpcode()) {
+-      case BO_LT: Kind = GuardKind::Gt; break; // Const < i  => i > Const
+-      case BO_LE: Kind = GuardKind::Ge; break; // Const <= i => i >= Const
+-      case BO_GT: Kind = GuardKind::Lt; break; // Const > i  => i < Const
+-      case BO_GE: Kind = GuardKind::Le; break; // Const >= i => i <= Const
+-      case BO_EQ: Kind = GuardKind::Eq; break;
+-      case BO_NE: Kind = GuardKind::Ne; break;
+-      default: return false;
+-    }
+-    return true;
+-  }
+-
+   return false;
+ }
+
+@@ -813,7 +857,6 @@     const CompoundStmt *CS = nullptr;
+
+     // Find the immediate compound that directly contains Node as a child subtree.
+-    // Use robust multi-parent BFS to locate direct compound parent.
+     CS = findDirectCompoundParent(Node, ACtx);
+     if (!CS)
+       break;
+@@ -925,7 +968,7 @@   if (!Small)
+     return;
+
+-  // Suppress classic loop-tail early exit guards.
++  // Suppress classic loop-tail early exit guards, including macro-wrapped conditions (e.g., WARN_ON).
+   if (hasGuardForBound(FS->getBody(), IVar, Small->Size, ACtx))
+     return;

@@ -1,0 +1,545 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 19ebc1e6cab334a8193398d4152deb76019b5d34
+commit_type: Double-Free
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/StmtVisitor.h\"\n#include \"clang/Basic/SourceManager.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include <map>\n#include <set>\n#include <vector>\n\
+  #include <string>\n#include <algorithm>\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\nnamespace {\n/* The checker callbacks are to\
+  \ be decided. */\nclass SAGenTestChecker : public Checker<check::ASTCodeBody> {\n\
+  \   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Double free on retry path\", \"Memory Management\"))\
+  \ {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const;\n\n   private:\n\n      struct LabelInfo {\n        const LabelDecl\
+  \ *LD = nullptr;\n        std::string Name;\n        SourceLocation Loc;\n     \
+  \   const LabelStmt *LS = nullptr;\n      };\n\n      struct GotoInfo {\n      \
+  \  const GotoStmt *GS = nullptr;\n        const LabelDecl *Target = nullptr;\n \
+  \       SourceLocation FromLoc;\n      };\n\n      struct FreeInfo {\n        const\
+  \ CallExpr *CE = nullptr;\n        const VarDecl *VD = nullptr;\n        SourceLocation\
+  \ Loc;\n        const LabelDecl *CleanupLabel = nullptr; // Dominating label immediately\
+  \ preceding this free site\n      };\n\n      struct ResetInfo {\n        const\
+  \ VarDecl *VD = nullptr;\n        SourceLocation Loc;\n        const Stmt *S = nullptr;\n\
+  \      };\n\n      struct AllocInfo {\n        const VarDecl *VD = nullptr;\n  \
+  \      SourceLocation Loc;\n        const CallExpr *CE = nullptr;\n      };\n\n\
+  \      class BodyScanner : public RecursiveASTVisitor<BodyScanner> {\n      public:\n\
+  \        BodyScanner(ASTContext &AC, const SourceManager &SM)\n            : Ctx(AC),\
+  \ SM(SM) {}\n\n        // Collections:\n        std::vector<LabelInfo> Labels;\n\
+  \        std::map<const LabelDecl *, LabelInfo> LabelMap;\n        std::vector<GotoInfo>\
+  \ Gotos;\n        std::vector<FreeInfo> Frees;\n        std::map<const LabelDecl\
+  \ *, std::vector<const VarDecl *>> CleanupFrees; // per cleanup label which vars\
+  \ are freed\n        std::map<const VarDecl *, std::vector<ResetInfo>> Resets;\n\
+  \        std::map<const VarDecl *, std::vector<AllocInfo>> Allocs;\n\n        //\
+  \ Accessor helpers\n        static bool isFreeLike(const FunctionDecl *FD) {\n \
+  \         if (!FD) return false;\n          if (const IdentifierInfo *II = FD->getIdentifier())\
+  \ {\n            StringRef N = II->getName();\n            return N == \"kfree\"\
+  \ || N == \"kvfree\" || N == \"vfree\";\n          }\n          return false;\n\
+  \        }\n\n        static bool isAllocLike(const FunctionDecl *FD) {\n      \
+  \    if (!FD) return false;\n          if (const IdentifierInfo *II = FD->getIdentifier())\
+  \ {\n            StringRef N = II->getName();\n            return N == \"kmalloc\"\
+  \ || N == \"kzalloc\" || N == \"kcalloc\" ||\n                   N == \"kmalloc_array\"\
+  \ || N == \"kvmalloc\" || N == \"kvzalloc\" ||\n                   N == \"vmalloc\"\
+  ;\n          }\n          return false;\n        }\n\n        bool isNullExpr(const\
+  \ Expr *E) const {\n          if (!E) return false;\n          E = E->IgnoreParenImpCasts();\n\
+  \          if (E->isNullPointerConstant(Ctx, Expr::NPC_ValueDependentIsNull))\n\
+  \            return true;\n          if (isa<GNUNullExpr>(E))\n            return\
+  \ true;\n          if (const IntegerLiteral *IL = dyn_cast<IntegerLiteral>(E)) {\n\
+  \            return IL->getValue() == 0;\n          }\n          // Fallback: textual\
+  \ check for NULL macro\n          CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \          StringRef Text = Lexer::getSourceText(Range, SM, Ctx.getLangOpts());\n\
+  \          if (Text.contains(\"NULL\"))\n            return true;\n          return\
+  \ false;\n        }\n\n        bool VisitStmt(Stmt *S) {\n          if (!S) return\
+  \ true;\n\n          if (auto *LS = dyn_cast<LabelStmt>(S)) {\n            LabelInfo\
+  \ LI;\n            LI.LD = LS->getDecl();\n            if (LI.LD) LI.Name = LI.LD->getNameAsString();\n\
+  \            LI.Loc = LS->getBeginLoc();\n            LI.LS = LS;\n            Labels.push_back(LI);\n\
+  \            if (LI.LD)\n              LabelMap[LI.LD] = LI;\n          } else if\
+  \ (auto *GS = dyn_cast<GotoStmt>(S)) {\n            GotoInfo GI;\n            GI.GS\
+  \ = GS;\n            GI.Target = GS->getLabel();\n            GI.FromLoc = GS->getGotoLoc();\n\
+  \            Gotos.push_back(GI);\n          } else if (auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n            if (BO->getOpcode() == BO_Assign) {\n              const Expr *LHS\
+  \ = BO->getLHS()->IgnoreParenImpCasts();\n              const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \              const DeclRefExpr *LDRE = dyn_cast<DeclRefExpr>(LHS);\n         \
+  \     const VarDecl *VD = LDRE ? dyn_cast<VarDecl>(LDRE->getDecl()) : nullptr;\n\
+  \n              if (VD && VD->hasLocalStorage() && VD->getType()->isPointerType())\
+  \ {\n                // Null reset detection\n                if (isNullExpr(RHS))\
+  \ {\n                  ResetInfo RI;\n                  RI.VD = VD;\n          \
+  \        RI.Loc = BO->getExprLoc();\n                  RI.S = BO;\n            \
+  \      Resets[VD].push_back(RI);\n                } else if (const CallExpr *RCE\
+  \ = dyn_cast<CallExpr>(RHS)) {\n                  const FunctionDecl *FD = RCE->getDirectCallee();\n\
+  \                  if (isAllocLike(FD)) {\n                    AllocInfo AI;\n \
+  \                   AI.VD = VD;\n                    AI.Loc = BO->getExprLoc();\n\
+  \                    AI.CE = RCE;\n                    Allocs[VD].push_back(AI);\n\
+  \                  }\n                }\n              }\n            }\n      \
+  \    } else if (auto *DS = dyn_cast<DeclStmt>(S)) {\n            for (auto *D :\
+  \ DS->decls()) {\n              if (auto *VD = dyn_cast<VarDecl>(D)) {\n       \
+  \         if (!VD->hasLocalStorage() || !VD->getType()->isPointerType())\n     \
+  \             continue;\n                if (const Expr *Init = VD->getInit()) {\n\
+  \                  Init = Init->IgnoreParenImpCasts();\n                  if (isNullExpr(Init))\
+  \ {\n                    ResetInfo RI;\n                    RI.VD = VD;\n      \
+  \              RI.Loc = DS->getBeginLoc();\n                    RI.S = DS;\n   \
+  \                 Resets[VD].push_back(RI);\n                  } else if (const\
+  \ CallExpr *CE = dyn_cast<CallExpr>(Init)) {\n                    const FunctionDecl\
+  \ *FD = CE->getDirectCallee();\n                    if (isAllocLike(FD)) {\n   \
+  \                   AllocInfo AI;\n                      AI.VD = VD;\n         \
+  \             AI.Loc = DS->getBeginLoc();\n                      AI.CE = CE;\n \
+  \                     Allocs[VD].push_back(AI);\n                    }\n       \
+  \           }\n                }\n              }\n            }\n          } else\
+  \ if (auto *CE = dyn_cast<CallExpr>(S)) {\n            const FunctionDecl *FD =\
+  \ CE->getDirectCallee();\n            if (isFreeLike(FD)) {\n              // First\
+  \ arg is the freed pointer\n              if (CE->getNumArgs() >= 1) {\n       \
+  \         const Expr *Arg0 = CE->getArg(0);\n                Arg0 = Arg0 ? Arg0->IgnoreParenImpCasts()\
+  \ : nullptr;\n                const DeclRefExpr *DRE = Arg0 ? dyn_cast<DeclRefExpr>(Arg0)\
+  \ : nullptr;\n                const VarDecl *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl())\
+  \ : nullptr;\n                if (VD && VD->hasLocalStorage() && VD->getType()->isPointerType())\
+  \ {\n                  FreeInfo FI;\n                  FI.CE = CE;\n           \
+  \       FI.VD = VD;\n                  FI.Loc = CE->getExprLoc();\n            \
+  \      // Associate with the closest preceding label (cleanup)\n               \
+  \   const LabelDecl *DomLabel = findDominatingLabel(FI.Loc);\n                 \
+  \ FI.CleanupLabel = DomLabel;\n                  Frees.push_back(FI);\n        \
+  \          if (DomLabel)\n                    CleanupFrees[DomLabel].push_back(VD);\n\
+  \                }\n              }\n            }\n          }\n          return\
+  \ true;\n        }\n\n        const LabelDecl *findDominatingLabel(SourceLocation\
+  \ Loc) const {\n          // Find label with largest location that is before Loc.\n\
+  \          const LabelDecl *Best = nullptr;\n          SourceLocation BestLoc;\n\
+  \          for (const auto &LI : Labels) {\n            SourceLocation L = LI.Loc;\n\
+  \            if (SM.isBeforeInTranslationUnit(L, Loc)) {\n              if (!Best\
+  \ ||\n                  SM.isBeforeInTranslationUnit(BestLoc, L)) {\n          \
+  \      Best = LI.LD;\n                BestLoc = L;\n              }\n          \
+  \  }\n          }\n          return Best;\n        }\n\n      private:\n       \
+  \ ASTContext &Ctx;\n        const SourceManager &SM;\n      }; // BodyScanner\n\n\
+  \      // Helper comparisons on source locations\n      static bool isBefore(const\
+  \ SourceManager &SM, SourceLocation A, SourceLocation B) {\n        return SM.isBeforeInTranslationUnit(A,\
+  \ B);\n      }\n      static bool isAfter(const SourceManager &SM, SourceLocation\
+  \ A, SourceLocation B) {\n        return SM.isBeforeInTranslationUnit(B, A);\n \
+  \     }\n      static bool isAfterOrEqual(const SourceManager &SM, SourceLocation\
+  \ A, SourceLocation B) {\n        return !SM.isBeforeInTranslationUnit(A, B);\n\
+  \      }\n\n      static SourceLocation getFunctionEndLoc(const Decl *D) {\n   \
+  \     if (const auto *FD = dyn_cast<FunctionDecl>(D)) {\n          if (const Stmt\
+  \ *Body = FD->getBody())\n            return Body->getEndLoc();\n        }\n   \
+  \     return D->getEndLoc();\n      }\n};\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  ASTContext &Ctx = Mgr.getASTContext();\n\
+  \  const SourceManager &SM = Mgr.getSourceManager();\n  const Stmt *Body = FD->getBody();\n\
+  \  if (!Body)\n    return;\n\n  BodyScanner Scanner(Ctx, SM);\n  Scanner.TraverseStmt(const_cast<Stmt\
+  \ *>(Body));\n\n  if (Scanner.Labels.empty() || Scanner.Gotos.empty() || Scanner.Frees.empty())\n\
+  \    return;\n\n  // Build set of replay labels: labels that are targets of a backward\
+  \ goto\n  std::set<const LabelDecl *> ReplayLabels;\n  for (const auto &GI : Scanner.Gotos)\
+  \ {\n    const LabelDecl *T = GI.Target;\n    if (!T) continue;\n    auto It = Scanner.LabelMap.find(T);\n\
+  \    if (It == Scanner.LabelMap.end()) continue;\n    SourceLocation LabelLoc =\
+  \ It->second.Loc;\n    if (isBefore(SM, LabelLoc, GI.FromLoc)) {\n      ReplayLabels.insert(T);\n\
+  \    }\n  }\n\n  if (ReplayLabels.empty())\n    return;\n\n  // For convenience\
+  \ build map of free infos per cleanup label\n  std::map<const LabelDecl *, std::vector<FreeInfo>>\
+  \ FreeInfosPerCleanup;\n  for (const auto &FI : Scanner.Frees) {\n    if (!FI.CleanupLabel)\
+  \ continue;\n    FreeInfosPerCleanup[FI.CleanupLabel].push_back(FI);\n  }\n\n  SourceLocation\
+  \ FuncEndLoc = getFunctionEndLoc(D);\n\n  // For each replay label and cleanup label\
+  \ with frees, check the unsafe window\n  for (const LabelDecl *La : ReplayLabels)\
+  \ {\n    auto LaIt = Scanner.LabelMap.find(La);\n    if (LaIt == Scanner.LabelMap.end())\n\
+  \      continue;\n    SourceLocation LocA = LaIt->second.Loc;\n\n    for (const\
+  \ auto &LbEntry : FreeInfosPerCleanup) {\n      const LabelDecl *Lb = LbEntry.first;\n\
+  \      const auto &FIVec = LbEntry.second;\n\n      // For each freed variable at\
+  \ this cleanup label\n      for (const FreeInfo &FI : FIVec) {\n        const VarDecl\
+  \ *V = FI.VD;\n        if (!V) continue;\n\n        // 1) There must exist a goto\
+  \ to La that occurs after this free location.\n        const GotoStmt *AnchorGoto\
+  \ = nullptr;\n        for (const auto &GI : Scanner.Gotos) {\n          if (GI.Target\
+  \ == La && isAfter(SM, GI.FromLoc, FI.Loc)) {\n            AnchorGoto = GI.GS;\n\
+  \            break;\n          }\n        }\n        if (!AnchorGoto)\n        \
+  \  continue;\n\n        // 2) Find earliest allocation for V after La (replay header)\n\
+  \        SourceLocation LocAlloc = FuncEndLoc;\n        bool FoundAlloc = false;\n\
+  \        auto AIIt = Scanner.Allocs.find(V);\n        if (AIIt != Scanner.Allocs.end())\
+  \ {\n          for (const auto &AI : AIIt->second) {\n            if (isAfter(SM,\
+  \ AI.Loc, LocA)) {\n              if (!FoundAlloc || isBefore(SM, AI.Loc, LocAlloc))\
+  \ {\n                LocAlloc = AI.Loc;\n                FoundAlloc = true;\n  \
+  \            }\n            }\n          }\n        }\n\n        // 3) Check if\
+  \ there exists a reset to NULL for V between [LocA, LocAlloc)\n        bool HasReset\
+  \ = false;\n        auto RIIt = Scanner.Resets.find(V);\n        if (RIIt != Scanner.Resets.end())\
+  \ {\n          for (const auto &RI : RIIt->second) {\n            if (isAfterOrEqual(SM,\
+  \ RI.Loc, LocA) && isBefore(SM, RI.Loc, LocAlloc)) {\n              HasReset = true;\n\
+  \              break;\n            }\n          }\n        }\n        if (HasReset)\n\
+  \          continue; // safe, reset to NULL after replay label\n\n        // 4)\
+  \ Check if there exists any goto to cleanup label Lb in [LocA, LocAlloc)\n     \
+  \   bool HasEarlyGotoToCleanup = false;\n        for (const auto &GI : Scanner.Gotos)\
+  \ {\n          if (GI.Target == Lb &&\n              isAfterOrEqual(SM, GI.FromLoc,\
+  \ LocA) &&\n              isBefore(SM, GI.FromLoc, LocAlloc)) {\n            HasEarlyGotoToCleanup\
+  \ = true;\n            break;\n          }\n        }\n        if (!HasEarlyGotoToCleanup)\n\
+  \          continue;\n\n        // Report bug\n        if (!BT)\n          return;\n\
+  \n        std::string Msg = \"Pointer freed in cleanup but not reset before retry;\
+  \ possible double free on replay path\";\n        auto R = std::make_unique<BasicBugReport>(*BT,\
+  \ Msg, AnchorGoto->getSourceRange().getBegin());\n        R->addRange(AnchorGoto->getSourceRange());\n\
+  \        if (const IdentifierInfo *II = V->getIdentifier()) {\n          R->addNote(\"\
+  Freed pointer: \" + II->getName().str(), FI.Loc);\n        } else {\n          R->addNote(\"\
+  Freed pointer\", FI.Loc);\n        }\n        BR.emitReport(std::move(R));\n   \
+  \   }\n    }\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects double free risk in replay loops when a freed pointer is not\
+  \ reset to NULL before retry\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nsmb: client: fix possible double free in smb2_set_ea()\n\
+  \nClang static checker(scan-build) warning\uFF1A\nfs/smb/client/smb2ops.c:1304:2:\
+  \ Attempt to free released memory.\n 1304 |         kfree(ea);\n      |        \
+  \ ^~~~~~~~~\n\nThere is a double free in such case:\n'ea is initialized to NULL'\
+  \ -> 'first successful memory allocation for\nea' -> 'something failed, goto sea_exit'\
+  \ -> 'first memory release for ea'\n-> 'goto replay_again' -> 'second goto sea_exit\
+  \ before allocate memory\nfor ea' -> 'second memory release for ea resulted in double\
+  \ free'.\n\nRe-initialie 'ea' to NULL near to the replay_again label, it can fix\
+  \ this\ndouble free problem.\n\nFixes: 4f1fffa23769 (\"cifs: commands that are retried\
+  \ should have replay flag set\")\nReviewed-by: Dan Carpenter <dan.carpenter@linaro.org>\n\
+  Signed-off-by: Su Hui <suhui@nfschina.com>\nSigned-off-by: Steve French <stfrench@microsoft.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: smb2_set_ea in fs/smb/client/smb2ops.c\nstatic\
+  \ int\nsmb2_set_ea(const unsigned int xid, struct cifs_tcon *tcon,\n\t    const\
+  \ char *path, const char *ea_name, const void *ea_value,\n\t    const __u16 ea_value_len,\
+  \ const struct nls_table *nls_codepage,\n\t    struct cifs_sb_info *cifs_sb)\n{\n\
+  \tstruct smb2_compound_vars *vars;\n\tstruct cifs_ses *ses = tcon->ses;\n\tstruct\
+  \ TCP_Server_Info *server;\n\tstruct smb_rqst *rqst;\n\tstruct kvec *rsp_iov;\n\t\
+  __le16 *utf16_path = NULL;\n\tint ea_name_len = strlen(ea_name);\n\tint flags =\
+  \ CIFS_CP_CREATE_CLOSE_OP;\n\tint len;\n\tint resp_buftype[3];\n\tstruct cifs_open_parms\
+  \ oparms;\n\t__u8 oplock = SMB2_OPLOCK_LEVEL_NONE;\n\tstruct cifs_fid fid;\n\tunsigned\
+  \ int size[1];\n\tvoid *data[1];\n\tstruct smb2_file_full_ea_info *ea = NULL;\n\t\
+  struct smb2_query_info_rsp *rsp;\n\tint rc, used_len = 0;\n\tint retries = 0, cur_sleep\
+  \ = 1;\n\nreplay_again:\n\t/* reinitialize for possible replay */\n\tflags = CIFS_CP_CREATE_CLOSE_OP;\n\
+  \toplock = SMB2_OPLOCK_LEVEL_NONE;\n\tserver = cifs_pick_channel(ses);\n\n\tif (smb3_encryption_required(tcon))\n\
+  \t\tflags |= CIFS_TRANSFORM_REQ;\n\n\tif (ea_name_len > 255)\n\t\treturn -EINVAL;\n\
+  \n\tutf16_path = cifs_convert_path_to_utf16(path, cifs_sb);\n\tif (!utf16_path)\n\
+  \t\treturn -ENOMEM;\n\n\tresp_buftype[0] = resp_buftype[1] = resp_buftype[2] = CIFS_NO_BUFFER;\n\
+  \tvars = kzalloc(sizeof(*vars), GFP_KERNEL);\n\tif (!vars) {\n\t\trc = -ENOMEM;\n\
+  \t\tgoto out_free_path;\n\t}\n\trqst = vars->rqst;\n\trsp_iov = vars->rsp_iov;\n\
+  \n\tif (ses->server->ops->query_all_EAs) {\n\t\tif (!ea_value) {\n\t\t\trc = ses->server->ops->query_all_EAs(xid,\
+  \ tcon, path,\n\t\t\t\t\t\t\t     ea_name, NULL, 0,\n\t\t\t\t\t\t\t     cifs_sb);\n\
+  \t\t\tif (rc == -ENODATA)\n\t\t\t\tgoto sea_exit;\n\t\t} else {\n\t\t\t/* If we\
+  \ are adding a attribute we should first check\n\t\t\t * if there will be enough\
+  \ space available to store\n\t\t\t * the new EA. If not we should not add it since\
+  \ we\n\t\t\t * would not be able to even read the EAs back.\n\t\t\t */\n\t\t\trc\
+  \ = smb2_query_info_compound(xid, tcon, path,\n\t\t\t\t      FILE_READ_EA,\n\t\t\
+  \t\t      FILE_FULL_EA_INFORMATION,\n\t\t\t\t      SMB2_O_INFO_FILE,\n\t\t\t\t \
+  \     CIFSMaxBufSize -\n\t\t\t\t      MAX_SMB2_CREATE_RESPONSE_SIZE -\n\t\t\t\t\
+  \      MAX_SMB2_CLOSE_RESPONSE_SIZE,\n\t\t\t\t      &rsp_iov[1], &resp_buftype[1],\
+  \ cifs_sb);\n\t\t\tif (rc == 0) {\n\t\t\t\trsp = (struct smb2_query_info_rsp *)rsp_iov[1].iov_base;\n\
+  \t\t\t\tused_len = le32_to_cpu(rsp->OutputBufferLength);\n\t\t\t}\n\t\t\tfree_rsp_buf(resp_buftype[1],\
+  \ rsp_iov[1].iov_base);\n\t\t\tresp_buftype[1] = CIFS_NO_BUFFER;\n\t\t\tmemset(&rsp_iov[1],\
+  \ 0, sizeof(rsp_iov[1]));\n\t\t\trc = 0;\n\n\t\t\t/* Use a fudge factor of 256 bytes\
+  \ in case we collide\n\t\t\t * with a different set_EAs command.\n\t\t\t */\n\t\t\
+  \tif (CIFSMaxBufSize - MAX_SMB2_CREATE_RESPONSE_SIZE -\n\t\t\t   MAX_SMB2_CLOSE_RESPONSE_SIZE\
+  \ - 256 <\n\t\t\t   used_len + ea_name_len + ea_value_len + 1) {\n\t\t\t\trc = -ENOSPC;\n\
+  \t\t\t\tgoto sea_exit;\n\t\t\t}\n\t\t}\n\t}\n\n\t/* Open */\n\trqst[0].rq_iov =\
+  \ vars->open_iov;\n\trqst[0].rq_nvec = SMB2_CREATE_IOV_SIZE;\n\n\toparms = (struct\
+  \ cifs_open_parms) {\n\t\t.tcon = tcon,\n\t\t.path = path,\n\t\t.desired_access\
+  \ = FILE_WRITE_EA,\n\t\t.disposition = FILE_OPEN,\n\t\t.create_options = cifs_create_options(cifs_sb,\
+  \ 0),\n\t\t.fid = &fid,\n\t\t.replay = !!(retries),\n\t};\n\n\trc = SMB2_open_init(tcon,\
+  \ server,\n\t\t\t    &rqst[0], &oplock, &oparms, utf16_path);\n\tif (rc)\n\t\tgoto\
+  \ sea_exit;\n\tsmb2_set_next_command(tcon, &rqst[0]);\n\n\n\t/* Set Info */\n\t\
+  rqst[1].rq_iov = vars->si_iov;\n\trqst[1].rq_nvec = 1;\n\n\tlen = sizeof(*ea) +\
+  \ ea_name_len + ea_value_len + 1;\n\tea = kzalloc(len, GFP_KERNEL);\n\tif (ea ==\
+  \ NULL) {\n\t\trc = -ENOMEM;\n\t\tgoto sea_exit;\n\t}\n\n\tea->ea_name_length =\
+  \ ea_name_len;\n\tea->ea_value_length = cpu_to_le16(ea_value_len);\n\tmemcpy(ea->ea_data,\
+  \ ea_name, ea_name_len + 1);\n\tmemcpy(ea->ea_data + ea_name_len + 1, ea_value,\
+  \ ea_value_len);\n\n\tsize[0] = len;\n\tdata[0] = ea;\n\n\trc = SMB2_set_info_init(tcon,\
+  \ server,\n\t\t\t\t&rqst[1], COMPOUND_FID,\n\t\t\t\tCOMPOUND_FID, current->tgid,\n\
+  \t\t\t\tFILE_FULL_EA_INFORMATION,\n\t\t\t\tSMB2_O_INFO_FILE, 0, data, size);\n\t\
+  if (rc)\n\t\tgoto sea_exit;\n\tsmb2_set_next_command(tcon, &rqst[1]);\n\tsmb2_set_related(&rqst[1]);\n\
+  \n\t/* Close */\n\trqst[2].rq_iov = &vars->close_iov;\n\trqst[2].rq_nvec = 1;\n\t\
+  rc = SMB2_close_init(tcon, server,\n\t\t\t     &rqst[2], COMPOUND_FID, COMPOUND_FID,\
+  \ false);\n\tif (rc)\n\t\tgoto sea_exit;\n\tsmb2_set_related(&rqst[2]);\n\n\tif\
+  \ (retries) {\n\t\tsmb2_set_replay(server, &rqst[0]);\n\t\tsmb2_set_replay(server,\
+  \ &rqst[1]);\n\t\tsmb2_set_replay(server, &rqst[2]);\n\t}\n\n\trc = compound_send_recv(xid,\
+  \ ses, server,\n\t\t\t\tflags, 3, rqst,\n\t\t\t\tresp_buftype, rsp_iov);\n\t/* no\
+  \ need to bump num_remote_opens because handle immediately closed */\n\n sea_exit:\n\
+  \tkfree(ea);\n\tSMB2_open_free(&rqst[0]);\n\tSMB2_set_info_free(&rqst[1]);\n\tSMB2_close_free(&rqst[2]);\n\
+  \tfree_rsp_buf(resp_buftype[0], rsp_iov[0].iov_base);\n\tfree_rsp_buf(resp_buftype[1],\
+  \ rsp_iov[1].iov_base);\n\tfree_rsp_buf(resp_buftype[2], rsp_iov[2].iov_base);\n\
+  \tkfree(vars);\nout_free_path:\n\tkfree(utf16_path);\n\n\tif (is_replayable_error(rc)\
+  \ &&\n\t    smb2_should_replay(tcon, &retries, &cur_sleep))\n\t\tgoto replay_again;\n\
+  \n\treturn rc;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/smb/client/smb2ops.c\
+  \ b/fs/smb/client/smb2ops.c\nindex 6b385fce3f2a..24a2aa04a108 100644\n--- a/fs/smb/client/smb2ops.c\n\
+  +++ b/fs/smb/client/smb2ops.c\n@@ -1158,7 +1158,7 @@ smb2_set_ea(const unsigned\
+  \ int xid, struct cifs_tcon *tcon,\n \tstruct cifs_fid fid;\n \tunsigned int size[1];\n\
+  \ \tvoid *data[1];\n-\tstruct smb2_file_full_ea_info *ea = NULL;\n+\tstruct smb2_file_full_ea_info\
+  \ *ea;\n \tstruct smb2_query_info_rsp *rsp;\n \tint rc, used_len = 0;\n \tint retries\
+  \ = 0, cur_sleep = 1;\n@@ -1179,6 +1179,7 @@ smb2_set_ea(const unsigned int xid,\
+  \ struct cifs_tcon *tcon,\n \tif (!utf16_path)\n \t\treturn -ENOMEM;\n \n+\tea =\
+  \ NULL;\n \tresp_buftype[0] = resp_buftype[1] = resp_buftype[2] = CIFS_NO_BUFFER;\n\
+  \ \tvars = kzalloc(sizeof(*vars), GFP_KERNEL);\n \tif (!vars) {\n```\n"
+pattern: "## Bug Pattern\n\nRetry/replay loop with shared cleanup that frees a pointer\
+  \ without resetting it to NULL:\n\nreplay_again:\n    ...\n    // ptr not reinitialized\
+  \ here after previous cleanup\n    if (early_error)\n        goto out;\n    ptr\
+  \ = kmalloc(...);\n    if (!ptr)\n        goto out;\n    ...\nout:\n    kfree(ptr);\
+  \              // frees ptr\n    if (should_retry)\n        goto replay_again; \
+  \  // next iteration may hit 'out' before re-allocating ptr -> kfree(ptr) again\n\
+  \nRoot cause: A pointer freed in a common error/cleanup label is not reinitialized\
+  \ before a retry path jumps back, allowing a second kfree of the stale, already-freed\
+  \ pointer if an error occurs before reallocation."
+plan: "1) Program state\n- No custom program state is necessary. The pattern can be\
+  \ detected with a single AST/code-body scan.\n\n2) Callback functions\n- Use only\
+  \ checkASTCodeBody. Walk the function body once, collect the structural elements\
+  \ (labels, gotos, frees, allocs, null-resets), and then run a set of source-order\
+  \ checks to decide if the retry/replay pattern is unsafe.\n\n3) Detailed steps (checkASTCodeBody)\n\
+  \n3.1) Collect structural facts from the function body\n- Traverse the function\
+  \ body statements in a single pass (recursive walk) and collect:\n  - Labels:\n\
+  \    - For each LabelStmt LS, record:\n      - LabelDecl* LD = LS->getDecl()\n \
+  \     - Name = LD->getNameAsString()\n      - Location = LS->getBeginLoc()\n   \
+  \   - Also store a pointer to the LabelStmt itself\n    - Keep a mapping: LabelDecl*\
+  \ -> LabelInfo {Name, Location, LabelStmt*}\n  - Gotos:\n    - For each GotoStmt\
+  \ GS:\n      - Target LabelDecl* TL = GS->getLabel()\n      - Source Location =\
+  \ GS->getGotoLoc()\n      - Record vector of GotoInfo {FromLoc, TargetLabelDecl*}\n\
+  \  - Calls to free-like functions:\n    - For each CallExpr CE with callee in {\"\
+  kfree\", \"kvfree\", \"vfree\"}:\n      - Extract the first argument. If it is a\
+  \ DeclRefExpr referring to a VarDecl* V (i.e., freeing a local pointer variable),\
+  \ record FreeInfo {CallExpr*, VarDecl*, Loc}.\n      - Also, associate this free\
+  \ with the closest preceding LabelStmt that dominates it textually (cleanup label).\
+  \ For this, pick the label with location before CE and with the greatest location\
+  \ among labels before CE. Map CleanupLabelDecl* -> set of freed VarDecl* and also\
+  \ record the exact kfree CallExpr* for each VarDecl*.\n  - Assignments to NULL (reset\
+  \ to null):\n    - For each BinaryOperator BO of kind BO_Assign where LHS is DeclRefExpr\
+  \ of VarDecl* V:\n      - Let RHS = BO->getRHS()->IgnoreParenImpCasts().\n     \
+  \ - Consider RHS a \u201Cnull\u201D if:\n        - RHS->isNullPointerConstant(ASTContext,\
+  \ Expr::NPC_ValueDependentIsNotNull) is true, or\n        - ExprHasName(RHS, \"\
+  NULL\", C) returns true, or\n        - RHS is an IntegerLiteral with value 0.\n\
+  \      - If so, record NullResetInfo {VarDecl* V, Loc = BO->getExprLoc()}.\n   \
+  \ - Also handle DeclStmt with an initializer for V: if initialized to a null pointer\
+  \ constant, record as NullResetInfo.\n  - Assignments from allocation (alloc point):\n\
+  \    - For each assignment (BinaryOperator BO of kind BO_Assign) where LHS is DeclRefExpr\
+  \ of VarDecl* V and RHS is a CallExpr to an allocation function in {\"kmalloc\"\
+  , \"kzalloc\", \"kcalloc\", \"kmalloc_array\", \"kvmalloc\", \"kvzalloc\", \"vmalloc\"\
+  }:\n      - Record AllocAssignInfo {VarDecl* V, Loc = BO->getExprLoc(), CallExpr*\
+  \ RHS}\n    - For DeclStmt with initializer equal to an allocation CallExpr for\
+  \ V, record similarly.\n  - Replay/back-edge gotos:\n    - For each GotoInfo to\
+  \ label La, if La.Location isBeforeInTranslationUnit(FromLoc), consider La a replay\
+  \ label (back-edge). Record ReplayLabels set {LabelDecl*}.\n\n3.2) Derive candidate\
+  \ pairs (ReplayLabel, CleanupLabel, Var)\n- For each replay label La in ReplayLabels:\n\
+  \  - Identify gotos to La that occur after some cleanup free section. You can later\
+  \ anchor the report at any goto to La after cleanup; for now just note that the\
+  \ function retries.\n  - For each cleanup label Lb that frees some VarDecl* V (from\
+  \ the Cleanup map above):\n    - Ensure there exists at least one goto to La whose\
+  \ FromLoc is after the free location of V (kfree(V)) \u2014 this confirms we retry\
+  \ after freeing V.\n\n3.3) For each candidate VarDecl V, check the unsafe replay\
+  \ window\n- Define LocA = La.Location.\n- Find the first allocation for V after\
+  \ LocA:\n  - Among AllocAssignInfo entries for V with location > LocA, take the\
+  \ earliest one; call its location LocAlloc.\n  - If none found, treat LocAlloc as\
+  \ \u201Cfunction end\u201D (i.e., a large sentinel location).\n- Check for absence\
+  \ of reset to NULL between LocA and LocAlloc:\n  - If there exists any NullResetInfo\
+  \ for V with Loc in [LocA, LocAlloc), then it is safe \u2014 skip V for this (La,\
+  \ Lb) pair.\n- Check for early goto to cleanup before reallocation:\n  - If there\
+  \ exists any goto to Lb with FromLoc in [LocA, LocAlloc), then the following conditions\
+  \ are met:\n    - V is freed in cleanup (at Lb),\n    - We retry (goto La) after\
+  \ the cleanup free,\n    - Between the replay header La and the next allocation\
+  \ of V, there\u2019s a path to cleanup Lb,\n    - V is not reset to NULL after La,\n\
+  \    - Therefore, on the second iteration, a path can jump to Lb before re-allocating\
+  \ V and kfree(V) again (double free).\n  - If so, this is the bug pattern. Record\
+  \ a diagnostic.\n\n3.4) Emit a concise report\n- For each detected bug:\n  - Create\
+  \ a BasicBugReport with a short message: \"Pointer freed in cleanup but not reset\
+  \ before retry; possible double free on replay path.\"\n  - Choose a good location:\n\
+  \    - Prefer the goto to the replay label La that occurs after the cleanup (this\
+  \ matches the user\u2019s fix location).\n    - If multiple, pick the first such\
+  \ goto after the free.\n  - Optionally add one or two notes (if supported) to point\
+  \ to:\n    - The kfree(V) in the cleanup label,\n    - A goto to the cleanup label\
+  \ between La and LocAlloc (the early error path).\n  - Emit the report.\n\n4) Heuristics\
+  \ and helpers\n- Allocation function detection: match callee name in the set {\"\
+  kmalloc\", \"kzalloc\", \"kcalloc\", \"kmalloc_array\", \"kvmalloc\", \"kvzalloc\"\
+  , \"vmalloc\"}.\n- Free function detection: match callee name in {\"kfree\", \"\
+  kvfree\", \"vfree\"}.\n- Null reset detection:\n  - Prefer Expr::isNullPointerConstant.\
+  \ If unavailable, use ExprHasName(..., \"NULL\", C) or check IntegerLiteral zero.\n\
+  - Source order comparisons:\n  - Use SourceManager::isBeforeInTranslationUnit(A,\
+  \ B) to compare locations and to define ranges like [LocA, LocAlloc).\n\n5) Notes\
+  \ to reduce false positives\n- Only consider V if:\n  - It is a local pointer variable\
+  \ (VarDecl of pointer type) declared in the function.\n  - It is directly freed\
+  \ in the cleanup label via kfree-like calls.\n- Do not rely on initializers at declaration\
+  \ time as \u201Creset\u201D; require a reset after the replay label La (this matches\
+  \ the kernel fix pattern).\n- Require all three structural facts to hold before\
+  \ reporting:\n  - A retry/back-edge goto to La exists after a cleanup free.\n  -\
+  \ A goto to the cleanup label Lb exists between La and the next allocation of V.\n\
+  \  - No V = NULL reset between La and the next allocation of V.\n\n6) Utility functions\
+  \ usage\n- Use ExprHasName for robust matching of \"NULL\" when macros are involved.\n\
+  - No need for the other provided helpers or program state in this checker."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/Analysis/PathDiagnostic.h\"\
+  \n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\n#include \"clang/StaticAnalyzer/Core/Checker.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\n#include \"\
+  clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\
+  \n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/AST/RecursiveASTVisitor.h\"\
+  \n#include \"clang/AST/StmtVisitor.h\"\n#include \"llvm/Support/raw_ostream.h\"\n\
+  #include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"clang/Basic/SourceManager.h\"\n#include \"clang/Lex/Lexer.h\"\n#include\
+  \ <map>\n#include <set>\n#include <vector>\n#include <string>\n#include <algorithm>\n\
+  \nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nnamespace\
+  \ {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker : public\
+  \ Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Double free on retry path\",\
+  \ \"Memory Management\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n\n   private:\n\n      struct LabelInfo {\n   \
+  \     const LabelDecl *LD = nullptr;\n        std::string Name;\n        SourceLocation\
+  \ Loc;\n        const LabelStmt *LS = nullptr;\n      };\n\n      struct GotoInfo\
+  \ {\n        const GotoStmt *GS = nullptr;\n        const LabelDecl *Target = nullptr;\n\
+  \        SourceLocation FromLoc;\n      };\n\n      struct FreeInfo {\n        const\
+  \ CallExpr *CE = nullptr;\n        const VarDecl *VD = nullptr;\n        SourceLocation\
+  \ Loc;\n        const LabelDecl *CleanupLabel = nullptr; // Dominating label immediately\
+  \ preceding this free site\n      };\n\n      struct ResetInfo {\n        const\
+  \ VarDecl *VD = nullptr;\n        SourceLocation Loc;\n        const Stmt *S = nullptr;\n\
+  \      };\n\n      struct AllocInfo {\n        const VarDecl *VD = nullptr;\n  \
+  \      SourceLocation Loc;\n        const CallExpr *CE = nullptr;\n      };\n\n\
+  \      class BodyScanner : public RecursiveASTVisitor<BodyScanner> {\n      public:\n\
+  \        BodyScanner(ASTContext &AC, const SourceManager &SM)\n            : Ctx(AC),\
+  \ SM(SM) {}\n\n        // Collections:\n        std::vector<LabelInfo> Labels;\n\
+  \        std::map<const LabelDecl *, LabelInfo> LabelMap;\n        std::vector<GotoInfo>\
+  \ Gotos;\n        std::vector<FreeInfo> Frees;\n        std::map<const LabelDecl\
+  \ *, std::vector<const VarDecl *>> CleanupFrees; // per cleanup label which vars\
+  \ are freed\n        std::map<const VarDecl *, std::vector<ResetInfo>> Resets;\n\
+  \        std::map<const VarDecl *, std::vector<AllocInfo>> Allocs;\n\n        //\
+  \ Accessor helpers\n        static bool isFreeLike(const FunctionDecl *FD) {\n \
+  \         if (!FD) return false;\n          if (const IdentifierInfo *II = FD->getIdentifier())\
+  \ {\n            StringRef N = II->getName();\n            return N == \"kfree\"\
+  \ || N == \"kvfree\" || N == \"vfree\";\n          }\n          return false;\n\
+  \        }\n\n        static bool isAllocLike(const FunctionDecl *FD) {\n      \
+  \    if (!FD) return false;\n          if (const IdentifierInfo *II = FD->getIdentifier())\
+  \ {\n            StringRef N = II->getName();\n            return N == \"kmalloc\"\
+  \ || N == \"kzalloc\" || N == \"kcalloc\" ||\n                   N == \"kmalloc_array\"\
+  \ || N == \"kvmalloc\" || N == \"kvzalloc\" ||\n                   N == \"vmalloc\"\
+  ;\n          }\n          return false;\n        }\n\n        bool isNullExpr(const\
+  \ Expr *E) const {\n          if (!E) return false;\n          E = E->IgnoreParenImpCasts();\n\
+  \          if (E->isNullPointerConstant(Ctx, Expr::NPC_ValueDependentIsNull))\n\
+  \            return true;\n          if (isa<GNUNullExpr>(E))\n            return\
+  \ true;\n          if (const IntegerLiteral *IL = dyn_cast<IntegerLiteral>(E)) {\n\
+  \            return IL->getValue() == 0;\n          }\n          // Fallback: textual\
+  \ check for NULL macro\n          CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \          StringRef Text = Lexer::getSourceText(Range, SM, Ctx.getLangOpts());\n\
+  \          if (Text.contains(\"NULL\"))\n            return true;\n          return\
+  \ false;\n        }\n\n        bool VisitStmt(Stmt *S) {\n          if (!S) return\
+  \ true;\n\n          if (auto *LS = dyn_cast<LabelStmt>(S)) {\n            LabelInfo\
+  \ LI;\n            LI.LD = LS->getDecl();\n            if (LI.LD) LI.Name = LI.LD->getNameAsString();\n\
+  \            LI.Loc = LS->getBeginLoc();\n            LI.LS = LS;\n            Labels.push_back(LI);\n\
+  \            if (LI.LD)\n              LabelMap[LI.LD] = LI;\n          } else if\
+  \ (auto *GS = dyn_cast<GotoStmt>(S)) {\n            GotoInfo GI;\n            GI.GS\
+  \ = GS;\n            GI.Target = GS->getLabel();\n            GI.FromLoc = GS->getGotoLoc();\n\
+  \            Gotos.push_back(GI);\n          } else if (auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n            if (BO->getOpcode() == BO_Assign) {\n              const Expr *LHS\
+  \ = BO->getLHS()->IgnoreParenImpCasts();\n              const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \              const DeclRefExpr *LDRE = dyn_cast<DeclRefExpr>(LHS);\n         \
+  \     const VarDecl *VD = LDRE ? dyn_cast<VarDecl>(LDRE->getDecl()) : nullptr;\n\
+  \n              if (VD && VD->hasLocalStorage() && VD->getType()->isPointerType())\
+  \ {\n                // Null reset detection\n                if (isNullExpr(RHS))\
+  \ {\n                  ResetInfo RI;\n                  RI.VD = VD;\n          \
+  \        RI.Loc = BO->getExprLoc();\n                  RI.S = BO;\n            \
+  \      Resets[VD].push_back(RI);\n                } else if (const CallExpr *RCE\
+  \ = dyn_cast<CallExpr>(RHS)) {\n                  const FunctionDecl *FD = RCE->getDirectCallee();\n\
+  \                  if (isAllocLike(FD)) {\n                    AllocInfo AI;\n \
+  \                   AI.VD = VD;\n                    AI.Loc = BO->getExprLoc();\n\
+  \                    AI.CE = RCE;\n                    Allocs[VD].push_back(AI);\n\
+  \                  }\n                }\n              }\n            }\n      \
+  \    } else if (auto *DS = dyn_cast<DeclStmt>(S)) {\n            for (auto *D :\
+  \ DS->decls()) {\n              if (auto *VD = dyn_cast<VarDecl>(D)) {\n       \
+  \         if (!VD->hasLocalStorage() || !VD->getType()->isPointerType())\n     \
+  \             continue;\n                if (const Expr *Init = VD->getInit()) {\n\
+  \                  Init = Init->IgnoreParenImpCasts();\n                  if (isNullExpr(Init))\
+  \ {\n                    ResetInfo RI;\n                    RI.VD = VD;\n      \
+  \              RI.Loc = DS->getBeginLoc();\n                    RI.S = DS;\n   \
+  \                 Resets[VD].push_back(RI);\n                  } else if (const\
+  \ CallExpr *CE = dyn_cast<CallExpr>(Init)) {\n                    const FunctionDecl\
+  \ *FD = CE->getDirectCallee();\n                    if (isAllocLike(FD)) {\n   \
+  \                   AllocInfo AI;\n                      AI.VD = VD;\n         \
+  \             AI.Loc = DS->getBeginLoc();\n                      AI.CE = CE;\n \
+  \                     Allocs[VD].push_back(AI);\n                    }\n       \
+  \           }\n                }\n              }\n            }\n          } else\
+  \ if (auto *CE = dyn_cast<CallExpr>(S)) {\n            const FunctionDecl *FD =\
+  \ CE->getDirectCallee();\n            if (isFreeLike(FD)) {\n              // First\
+  \ arg is the freed pointer\n              if (CE->getNumArgs() >= 1) {\n       \
+  \         const Expr *Arg0 = CE->getArg(0);\n                Arg0 = Arg0 ? Arg0->IgnoreParenImpCasts()\
+  \ : nullptr;\n                const DeclRefExpr *DRE = Arg0 ? dyn_cast<DeclRefExpr>(Arg0)\
+  \ : nullptr;\n                const VarDecl *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl())\
+  \ : nullptr;\n                if (VD && VD->hasLocalStorage() && VD->getType()->isPointerType())\
+  \ {\n                  FreeInfo FI;\n                  FI.CE = CE;\n           \
+  \       FI.VD = VD;\n                  FI.Loc = CE->getExprLoc();\n            \
+  \      // Associate with the closest preceding label (cleanup)\n               \
+  \   const LabelDecl *DomLabel = findDominatingLabel(FI.Loc);\n                 \
+  \ FI.CleanupLabel = DomLabel;\n                  Frees.push_back(FI);\n        \
+  \          if (DomLabel)\n                    CleanupFrees[DomLabel].push_back(VD);\n\
+  \                }\n              }\n            }\n          }\n          return\
+  \ true;\n        }\n\n        const LabelDecl *findDominatingLabel(SourceLocation\
+  \ Loc) const {\n          // Find label with largest location that is before Loc.\n\
+  \          const LabelDecl *Best = nullptr;\n          SourceLocation BestLoc;\n\
+  \          for (const auto &LI : Labels) {\n            SourceLocation L = LI.Loc;\n\
+  \            if (SM.isBeforeInTranslationUnit(L, Loc)) {\n              if (!Best\
+  \ ||\n                  SM.isBeforeInTranslationUnit(BestLoc, L)) {\n          \
+  \      Best = LI.LD;\n                BestLoc = L;\n              }\n          \
+  \  }\n          }\n          return Best;\n        }\n\n      private:\n       \
+  \ ASTContext &Ctx;\n        const SourceManager &SM;\n      }; // BodyScanner\n\n\
+  \      // Helper comparisons on source locations\n      static bool isBefore(const\
+  \ SourceManager &SM, SourceLocation A, SourceLocation B) {\n        return SM.isBeforeInTranslationUnit(A,\
+  \ B);\n      }\n      static bool isAfter(const SourceManager &SM, SourceLocation\
+  \ A, SourceLocation B) {\n        return SM.isBeforeInTranslationUnit(B, A);\n \
+  \     }\n      static bool isAfterOrEqual(const SourceManager &SM, SourceLocation\
+  \ A, SourceLocation B) {\n        return !SM.isBeforeInTranslationUnit(A, B);\n\
+  \      }\n\n      static SourceLocation getFunctionEndLoc(const Decl *D) {\n   \
+  \     if (const auto *FD = dyn_cast<FunctionDecl>(D)) {\n          if (const Stmt\
+  \ *Body = FD->getBody())\n            return Body->getEndLoc();\n        }\n   \
+  \     return D->getEndLoc();\n      }\n};\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  ASTContext &Ctx = Mgr.getASTContext();\n\
+  \  const SourceManager &SM = Mgr.getSourceManager();\n  const Stmt *Body = FD->getBody();\n\
+  \  if (!Body)\n    return;\n\n  BodyScanner Scanner(Ctx, SM);\n  Scanner.TraverseStmt(const_cast<Stmt\
+  \ *>(Body));\n\n  if (Scanner.Labels.empty() || Scanner.Gotos.empty() || Scanner.Frees.empty())\n\
+  \    return;\n\n  // Build set of replay labels: labels that are targets of a backward\
+  \ goto\n  std::set<const LabelDecl *> ReplayLabels;\n  for (const auto &GI : Scanner.Gotos)\
+  \ {\n    const LabelDecl *T = GI.Target;\n    if (!T) continue;\n    auto It = Scanner.LabelMap.find(T);\n\
+  \    if (It == Scanner.LabelMap.end()) continue;\n    SourceLocation LabelLoc =\
+  \ It->second.Loc;\n    if (isBefore(SM, LabelLoc, GI.FromLoc)) {\n      ReplayLabels.insert(T);\n\
+  \    }\n  }\n\n  if (ReplayLabels.empty())\n    return;\n\n  // For convenience\
+  \ build map of free infos per cleanup label\n  std::map<const LabelDecl *, std::vector<FreeInfo>>\
+  \ FreeInfosPerCleanup;\n  for (const auto &FI : Scanner.Frees) {\n    if (!FI.CleanupLabel)\
+  \ continue;\n    FreeInfosPerCleanup[FI.CleanupLabel].push_back(FI);\n  }\n\n  SourceLocation\
+  \ FuncEndLoc = getFunctionEndLoc(D);\n\n  // For each replay label and cleanup label\
+  \ with frees, check the unsafe window\n  for (const LabelDecl *La : ReplayLabels)\
+  \ {\n    auto LaIt = Scanner.LabelMap.find(La);\n    if (LaIt == Scanner.LabelMap.end())\n\
+  \      continue;\n    SourceLocation LocA = LaIt->second.Loc;\n\n    for (const\
+  \ auto &LbEntry : FreeInfosPerCleanup) {\n      const LabelDecl *Lb = LbEntry.first;\n\
+  \      const auto &FIVec = LbEntry.second;\n\n      // For each freed variable at\
+  \ this cleanup label\n      for (const FreeInfo &FI : FIVec) {\n        const VarDecl\
+  \ *V = FI.VD;\n        if (!V) continue;\n\n        // 1) There must exist a goto\
+  \ to La that occurs after this free location.\n        const GotoStmt *AnchorGoto\
+  \ = nullptr;\n        for (const auto &GI : Scanner.Gotos) {\n          if (GI.Target\
+  \ == La && isAfter(SM, GI.FromLoc, FI.Loc)) {\n            AnchorGoto = GI.GS;\n\
+  \            break;\n          }\n        }\n        if (!AnchorGoto)\n        \
+  \  continue;\n\n        // 2) Find earliest allocation for V after La (replay header)\n\
+  \        SourceLocation LocAlloc = FuncEndLoc;\n        bool FoundAlloc = false;\n\
+  \        auto AIIt = Scanner.Allocs.find(V);\n        if (AIIt != Scanner.Allocs.end())\
+  \ {\n          for (const auto &AI : AIIt->second) {\n            if (isAfter(SM,\
+  \ AI.Loc, LocA)) {\n              if (!FoundAlloc || isBefore(SM, AI.Loc, LocAlloc))\
+  \ {\n                LocAlloc = AI.Loc;\n                FoundAlloc = true;\n  \
+  \            }\n            }\n          }\n        }\n\n        // 3) Check if\
+  \ there exists a reset to NULL for V between [LocA, LocAlloc)\n        bool HasReset\
+  \ = false;\n        auto RIIt = Scanner.Resets.find(V);\n        if (RIIt != Scanner.Resets.end())\
+  \ {\n          for (const auto &RI : RIIt->second) {\n            if (isAfterOrEqual(SM,\
+  \ RI.Loc, LocA) && isBefore(SM, RI.Loc, LocAlloc)) {\n              HasReset = true;\n\
+  \              break;\n            }\n          }\n        }\n        if (HasReset)\n\
+  \          continue; // safe, reset to NULL after replay label\n\n        // 4)\
+  \ Check if there exists any goto to cleanup label Lb in [LocA, LocAlloc)\n     \
+  \   bool HasEarlyGotoToCleanup = false;\n        for (const auto &GI : Scanner.Gotos)\
+  \ {\n          if (GI.Target == Lb &&\n              isAfterOrEqual(SM, GI.FromLoc,\
+  \ LocA) &&\n              isBefore(SM, GI.FromLoc, LocAlloc)) {\n            HasEarlyGotoToCleanup\
+  \ = true;\n            break;\n          }\n        }\n        if (!HasEarlyGotoToCleanup)\n\
+  \          continue;\n\n        // Report bug\n        if (!BT)\n          return;\n\
+  \n        std::string Msg = \"Pointer freed in cleanup but not reset before retry;\
+  \ possible double free on replay path\";\n        PathDiagnosticLocation AnchorLoc\
+  \ =\n            PathDiagnosticLocation::createBegin(AnchorGoto, SM, nullptr);\n\
+  \        auto R = std::make_unique<BasicBugReport>(*BT, Msg, AnchorLoc);\n     \
+  \   R->addRange(AnchorGoto->getSourceRange());\n        if (const IdentifierInfo\
+  \ *II = V->getIdentifier()) {\n          R->addNote(\"Freed pointer: \" + II->getName().str(),\n\
+  \                     PathDiagnosticLocation::createBegin(FI.CE, SM, nullptr));\n\
+  \        } else {\n          R->addNote(\"Freed pointer\",\n                   \
+  \  PathDiagnosticLocation::createBegin(FI.CE, SM, nullptr));\n        }\n      \
+  \  BR.emitReport(std::move(R));\n      }\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects double free risk in replay\
+  \ loops when a freed pointer is not reset to NULL before retry\",\n      \"\");\n\
+  }\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

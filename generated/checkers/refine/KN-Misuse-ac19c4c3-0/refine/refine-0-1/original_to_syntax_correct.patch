@@ -1,0 +1,298 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -21,9 +21,14 @@ using namespace ento;
+ using namespace taint;
+
++// Register a map in the ProgramState to track upper bounds for symbols.
++REGISTER_MAP_WITH_PROGRAMSTATE(SymbolUpperBoundMap, SymbolRef, llvm::APSInt)
++
+ namespace {
+
+-class SAGenTestChecker : public Checker<check::PreCall> {
++// Track per-symbol upper bounds discovered along the path (e.g., from if (n <= K)).
++class SAGenTestChecker
++    : public Checker<check::PreCall, eval::Assume> {
+    mutable std::unique_ptr<BugType> BT;
+
+ public:
+@@ -34,6 +39,9 @@
+   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+
++  ProgramStateRef evalAssume(ProgramStateRef State, SVal Cond,
++                             bool Assumption) const;
++
+ private:
+   // Return true if this is a target function, and set SizeIdx to the size arg.
+   bool isTargetFunction(const CallEvent &Call, CheckerContext &C,
+@@ -53,17 +61,25 @@   // Compute size_t bit width.
+   static unsigned getSizeTBits(CheckerContext &C);
+
+-  // Compute a conservative upper bound for CountExpr:
+-  // - First from path constraints (ConstraintManager),
+-  // - Otherwise from the integral type's maximum.
+-  // Returns true if a bound was found. Sets HasConstraintBound if bound came
+-  // from constraints (not just raw type).
++  // Canonicalize a symbol by stripping casts.
++  static SymbolRef stripCasts(SymbolRef S) {
++    while (auto SC = dyn_cast_or_null<SymbolCast>(S))
++      S = SC->getOperand();
++    return S;
++  }
++
++  // Look for an upper bound on CountExpr using:
++  // - compile-time constant,
++  // - path constraints via ConstraintManager,
++  // - our own SymbolUpperBoundMap,
++  // - or integral type-width fallback (not constraint-derived).
++  // Returns true if any bound was found. Sets HasConstraintBound true
++  // only if the bound came from constraints or our map (not just type max).
+   static bool getUpperBoundForCount(const Expr *CountExpr, CheckerContext &C,
+                                     llvm::APInt &MaxCount, bool &HasConstraintBound,
+                                     bool &IsTainted);
+
+-  // Returns true if multiplication elemSize * Count cannot overflow size_t
+-  // given the known MaxCount bound.
++  // Returns true if multiplication elemSize * Count cannot overflow size_t.
+   static bool productProvablyFitsSizeT(uint64_t ElemSizeBytes,
+                                        const llvm::APInt &MaxCount,
+                                        CheckerContext &C);
+@@ -74,6 +90,13 @@
+   // Report a concise diagnostic on SizeE.
+   void report(const Expr *SizeE, CheckerContext &C) const;
++
++  // Attempt to record an upper bound from a relational symbolic expression
++  // under the given branch assumption.
++  ProgramStateRef recordUpperBoundFromBinarySymExpr(ProgramStateRef State,
++                                                    const BinarySymExpr *BSE,
++                                                    bool Assumption,
++                                                    const ASTContext &AC) const;
+ };
+
+ bool SAGenTestChecker::isTargetFunction(const CallEvent &Call,
+@@ -115,7 +138,6 @@   llvm::APSInt V;
+   if (!tryEvaluateToAPSInt(SizeofE, C, V))
+     return false;
+-  // Sizeof always yields non-negative, fits into 64-bit for C targets.
+   OutBytes = V.getLimitedValue(/*Max*/UINT64_MAX);
+   return true;
+ }
+@@ -141,6 +163,8 @@     unsigned Bits = getSizeTBits(C);
+     uint64_t CV = ConstVal.getLimitedValue(UINT64_MAX);
+     MaxCount = llvm::APInt(Bits, CV, /*isSigned=*/false);
++    // Constants are safe to check; treat as constraint-derived for proof purposes.
++    HasConstraintBound = true;
+     return true;
+   }
+
+@@ -148,12 +172,33 @@   IsTainted = taint::isTainted(State, CountV);
+
+   // Try to retrieve a symbol and ask the constraint manager for a path-sensitive upper bound.
+-  if (SymbolRef Sym = CountV.getAsSymbol()) {
++  SymbolRef Sym = CountV.getAsSymbol();
++  if (Sym) {
++    Sym = stripCasts(Sym);
++
+     if (const llvm::APSInt *MaxFromCM = inferSymbolMaxVal(Sym, C)) {
+       unsigned Bits = getSizeTBits(C);
+       uint64_t M = MaxFromCM->getLimitedValue(UINT64_MAX);
+       MaxCount = llvm::APInt(Bits, M, /*isSigned=*/false);
+       HasConstraintBound = true;
++      // Also check our own bound map; take the tighter bound if available.
++      auto Map = State->get<SymbolUpperBoundMap>();
++      if (const llvm::APSInt *B = Map.lookup(Sym)) {
++        uint64_t BM = B->getLimitedValue(UINT64_MAX);
++        llvm::APInt BoundFromMap(Bits, BM, /*isSigned=*/false);
++        if (BoundFromMap.ult(MaxCount))
++          MaxCount = BoundFromMap;
++      }
++      return true;
++    }
++
++    // Consult our SymbolUpperBoundMap if CM doesn't return anything.
++    auto Map = State->get<SymbolUpperBoundMap>();
++    if (const llvm::APSInt *B = Map.lookup(Sym)) {
++      unsigned Bits = getSizeTBits(C);
++      uint64_t BM = B->getLimitedValue(UINT64_MAX);
++      MaxCount = llvm::APInt(Bits, BM, /*isSigned=*/false);
++      HasConstraintBound = true; // constraint-derived via our path tracking
+       return true;
+     }
+   }
+@@ -163,12 +208,12 @@   if (T->isIntegerType()) {
+     ASTContext &ACtx = C.getASTContext();
+     unsigned TyBits = ACtx.getIntWidth(T);
+-    bool IsSigned = T->isSignedIntegerType();
+-    // Compute type max: signed -> 2^(bits-1)-1, unsigned -> 2^bits-1.
+-    llvm::APInt TypeMax = IsSigned ? (llvm::APInt::getOneBitSet(TyBits, TyBits - 1) - 1)
+-                                   : llvm::APInt::getMaxValue(TyBits);
++    bool IsSignedTy = T->isSignedIntegerType();
++    llvm::APInt TypeMax = IsSignedTy ? (llvm::APInt::getOneBitSet(TyBits, TyBits - 1) - 1)
++                                     : llvm::APInt::getMaxValue(TyBits);
+     unsigned SizeBits = getSizeTBits(C);
+     MaxCount = TypeMax.zextOrTrunc(SizeBits);
++    // This is not constraint-derived; keep HasConstraintBound as false.
+     return true;
+   }
+
+@@ -179,7 +224,7 @@                                                 const llvm::APInt &MaxCount,
+                                                 CheckerContext &C) {
+   if (ElemSizeBytes == 0)
+-    return true; // degenerate, but can't overflow size_t
++    return true; // Degenerate: cannot overflow size_t
+   unsigned Bits = getSizeTBits(C);
+   llvm::APInt SizeMax = llvm::APInt::getMaxValue(Bits); // SIZE_MAX
+   llvm::APInt Elem(Bits, ElemSizeBytes, /*isSigned=*/false);
+@@ -282,9 +327,154 @@   if (IsTainted || !HasConstraintBound) {
+     report(SizeE, C);
+   }
+-  // Else: we had a constraint-derived upper bound, but couldn't prove safety.
+-  // If not tainted, suppress to avoid FPs on internal counts that are not user-controlled.
++  // Else: we had a constraint-derived upper bound, but couldn't prove safety
++  // and count is not tainted — suppress to avoid FPs on internal counts.
+   return;
++}
++
++ProgramStateRef SAGenTestChecker::recordUpperBoundFromBinarySymExpr(
++    ProgramStateRef State, const BinarySymExpr *BSE, bool Assumption,
++    const ASTContext &AC) const {
++  if (!BSE)
++    return State;
++
++  // Helper lambda: record S <= Bound into the map (keep tighter if existing).
++  auto RecordUB = [&](ProgramStateRef St, SymbolRef S, const llvm::APSInt &Bound) -> ProgramStateRef {
++    if (!S)
++      return St;
++    S = stripCasts(S);
++    auto Map = St->get<SymbolUpperBoundMap>();
++    const llvm::APSInt *Existing = Map.lookup(S);
++    llvm::APSInt UB = Bound;
++    if (Existing) {
++      // Keep the tighter (minimum) bound.
++      if (Existing->ule(UB))
++        UB = *Existing;
++    }
++    auto &F = St->get_context<SymbolUpperBoundMap>();
++    Map = F.add(Map, S, UB);
++    return St->set<SymbolUpperBoundMap>(Map);
++  };
++
++  BinaryOperatorKind Op = BSE->getOpcode();
++
++  // Case 1: Sym op Int
++  if (const auto *SIE = dyn_cast<SymIntExpr>(BSE)) {
++    SymbolRef S = SIE->getLHS();
++    llvm::APSInt C = SIE->getRHS();
++    // Normalize bound to size_t width for consistency.
++    unsigned Bits = AC.getTypeSize(AC.getSizeType());
++    C = C.extOrTrunc(Bits);
++    C.setIsUnsigned(true);
++
++    switch (Op) {
++    case BO_GT:
++      // (S > C) assumed false => S <= C
++      if (!Assumption) return RecordUB(State, S, C);
++      break;
++    case BO_GE: {
++      // (S >= C) assumed false => S < C => S <= C-1
++      if (!Assumption) {
++        if (!C.isZero()) {
++          llvm::APInt Tmp = C;
++          Tmp -= 1;
++          llvm::APSInt UB(Tmp, /*isUnsigned=*/true);
++          return RecordUB(State, S, UB);
++        } else {
++          // C == 0, S < 0 => for unsigned S no values; ignore
++        }
++      }
++      break;
++    }
++    case BO_LT: {
++      // (S < C) assumed true => S <= C-1
++      if (Assumption) {
++        if (!C.isZero()) {
++          llvm::APInt Tmp = C;
++          Tmp -= 1;
++          llvm::APSInt UB(Tmp, /*isUnsigned=*/true);
++          return RecordUB(State, S, UB);
++        } else {
++          // S < 0, ignore
++        }
++      }
++      break;
++    }
++    case BO_LE:
++      // (S <= C) assumed true => S <= C
++      if (Assumption) return RecordUB(State, S, C);
++      break;
++    default:
++      break;
++    }
++    return State;
++  }
++
++  // Case 2: Int op Sym
++  if (const auto *ISE = dyn_cast<IntSymExpr>(BSE)) {
++    llvm::APSInt C = ISE->getLHS();
++    SymbolRef S = ISE->getRHS();
++    unsigned Bits = AC.getTypeSize(AC.getSizeType());
++    C = C.extOrTrunc(Bits);
++    C.setIsUnsigned(true);
++
++    switch (Op) {
++    case BO_GT: {
++      // (C > S), assumed true => S < C => S <= C-1
++      if (Assumption) {
++        if (!C.isZero()) {
++          llvm::APInt Tmp = C;
++          Tmp -= 1;
++          llvm::APSInt UB(Tmp, /*isUnsigned=*/true);
++          return RecordUB(State, S, UB);
++        }
++      }
++      break;
++    }
++    case BO_GE:
++      // (C >= S), assumed true => S <= C
++      if (Assumption) return RecordUB(State, S, C);
++      break;
++    case BO_LT:
++      // (C < S), assumed false => C >= S => S <= C
++      if (!Assumption) return RecordUB(State, S, C);
++      break;
++    case BO_LE: {
++      // (C <= S), assumed false => C > S => S < C => S <= C-1
++      if (!Assumption) {
++        if (!C.isZero()) {
++          llvm::APInt Tmp = C;
++          Tmp -= 1;
++          llvm::APSInt UB(Tmp, /*isUnsigned=*/true);
++          return RecordUB(State, S, UB);
++        }
++      }
++      break;
++    }
++    default:
++      break;
++    }
++    return State;
++  }
++
++  // Sym op Sym: ignore for now (no constant bound).
++  return State;
++}
++
++ProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef State, SVal Cond,
++                                             bool Assumption) const {
++  // Only interested in relational symbolic expressions (NonLoc::SymbolVal over BinarySymExpr).
++  if (auto NL = Cond.getAs<NonLoc>()) {
++    if (auto SV = NL->getAs<nonloc::SymbolVal>()) {
++      if (const SymExpr *SE = SV->getSymbol()) {
++        if (const auto *BSE = dyn_cast<BinarySymExpr>(SE)) {
++          const ASTContext &AC = State->getStateManager().getContext();
++          return recordUpperBoundFromBinarySymExpr(State, BSE, Assumption, AC);
++        }
++      }
++    }
++  }
++  return State;
+ }
+
+ } // end anonymous namespace

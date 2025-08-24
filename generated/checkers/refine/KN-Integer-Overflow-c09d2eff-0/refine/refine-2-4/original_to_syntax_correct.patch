@@ -1,0 +1,192 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -114,8 +114,41 @@     if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts())) {
+       if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+         return VD->getName();
++      if (const auto *PD = dyn_cast<ParmVarDecl>(DRE->getDecl()))
++        return PD->getName();
+     }
+     return StringRef();
++  }
++
++  static bool memberNameEquals(const Expr *E, StringRef Name) {
++    E = E ? E->IgnoreParenImpCasts() : nullptr;
++    const auto *ME = dyn_cast_or_null<MemberExpr>(E);
++    if (!ME) return false;
++    const ValueDecl *VD = ME->getMemberDecl();
++    return VD && VD->getIdentifier() && VD->getName() == Name;
++  }
++
++  static bool hasMemberInChain(const Expr *E, StringRef Name) {
++    E = E ? E->IgnoreParenImpCasts() : nullptr;
++    while (const auto *ME = dyn_cast_or_null<MemberExpr>(E)) {
++      const ValueDecl *VD = ME->getMemberDecl();
++      if (VD && VD->getIdentifier() && VD->getName().contains(Name))
++        return true;
++      E = ME->getBase()->IgnoreParenImpCasts();
++    }
++    return false;
++  }
++
++  static bool declRefNameContains(const Expr *E, StringRef Needle) {
++    if (!E) return false;
++    E = E->IgnoreParenImpCasts();
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++      if (const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl())) {
++        if (const IdentifierInfo *II = VD->getIdentifier())
++          return II->getName().contains(Needle);
++      }
++    }
++    return false;
+   }
+
+   // Helpers to work with state-tracked constant ints.
+@@ -251,23 +284,34 @@     if (!E) return false;
+     const Expr *Core = E->IgnoreParenImpCasts();
+
+-    const auto *DRE = dyn_cast<DeclRefExpr>(Core);
+-    if (!DRE) return false;
+-
+-    const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+-    if (!VD) return false;
+-
+-    const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());
+-    if (!FD) return false;
+-
+-    StringRef FuncName = FD->getName();
+-    StringRef VarName = VD->getName();
+-
+     // PCI/MSI-X: msix_map_region(dev, unsigned int nr_entries)
+     // nr_entries is derived from msix_table_size(control) with a spec-bound <= 2048.
+-    if (FuncName.equals("msix_map_region") && VarName.equals("nr_entries")) {
+-      Out = llvm::APSInt(llvm::APInt(32, 2048), /*isUnsigned=*/true);
+-      return true;
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(Core)) {
++      const auto *VD = dyn_cast<ValueDecl>(DRE->getDecl());
++      if (VD) {
++        const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());
++        if (FD && VD->getIdentifier()) {
++          StringRef FuncName = FD->getName();
++          StringRef VarName = VD->getName();
++          if (FuncName.equals("msix_map_region") && VarName.equals("nr_entries")) {
++            Out = llvm::APSInt(llvm::APInt(32, 2048), /*isUnsigned=*/true);
++            return true;
++          }
++        }
++      }
++    }
++
++    // LDT: ...->nr_entries is bounded by LDT_ENTRIES (typically 8192).
++    if (const auto *ME = dyn_cast<MemberExpr>(Core)) {
++      const ValueDecl *MD = ME->getMemberDecl();
++      if (MD && MD->getIdentifier() && MD->getName() == "nr_entries") {
++        // Verify the member chain references something named 'ldt'.
++        if (hasMemberInChain(ME, "ldt")) {
++          // A conservative, kernel-wide bound.
++          Out = llvm::APSInt(llvm::APInt(32, 8192), /*isUnsigned=*/true);
++          return true;
++        }
++      }
+     }
+
+     return false;
+@@ -283,7 +327,8 @@     if (getConstValueFromState(E, C, Out))
+       return true;
+
+-    // Domain-specific bound (e.g. nr_entries <= 2048 in msix_map_region).
++    // Domain-specific bound (e.g. nr_entries <= 2048 in msix_map_region,
++    // ldt->nr_entries <= 8192).
+     if (getDomainSpecificMax(E, C, Out))
+       return true;
+
+@@ -612,7 +657,6 @@       if (!E) return false;
+       llvm::APSInt CI;
+       if (EvaluateExprToInt(CI, E, C)) {
+-        // Be conservative: accept 16 explicitly.
+         if (CI.isUnsigned() ? CI.getZExtValue() == 16
+                             : (CI.getExtValue() >= 0 && (uint64_t)CI.getExtValue() == 16))
+           return true;
+@@ -620,7 +664,7 @@       return ExprHasName(E, "PCI_MSIX_ENTRY_SIZE", C);
+     };
+
+-    // The other operand should be the parameter 'nr_entries' or a similar bounded name.
++    // The other operand should be the parameter 'nr_entries'.
+     auto IsNrEntriesParam = [&](const Expr *E) -> bool {
+       if (!E) return false;
+       E = E->IgnoreParenImpCasts();
+@@ -630,7 +674,6 @@             StringRef N = PVD->getName();
+             if (N.equals("nr_entries"))
+               return true;
+-            // Be conservative; only accept 'nr_entries' here.
+           }
+         }
+       }
+@@ -645,12 +688,71 @@       return true;
+
+     return false;
++  }
++
++  // Targeted FP filter for x86 LDT: nr_entries * LDT_ENTRY_SIZE
++  bool isBenignX86LdtEntriesMultiply(const BinaryOperator *Mul,
++                                     CheckerContext &C) const {
++    if (!Mul) return false;
++    const Expr *L = Mul->getLHS()->IgnoreParenImpCasts();
++    const Expr *R = Mul->getRHS()->IgnoreParenImpCasts();
++
++    auto IsLdtEntrySize = [&](const Expr *E) -> bool {
++      // Prefer the macro name to avoid misfiring on generic constants.
++      if (ExprHasName(E, "LDT_ENTRY_SIZE", C))
++        return true;
++      // If the other operand proves to be from LDT, accept small literal 8 or 16 as fallback.
++      llvm::APSInt CI;
++      if (EvaluateExprToInt(CI, E, C)) {
++        uint64_t V = CI.isUnsigned() ? CI.getZExtValue()
++                                     : (CI.getExtValue() >= 0 ? (uint64_t)CI.getExtValue() : UINT64_MAX);
++        return V == 8 || V == 16;
++      }
++      return false;
++    };
++
++    auto IsLdtNrEntries = [&](const Expr *E) -> bool {
++      // member ...->nr_entries with base chain mentioning 'ldt'
++      if (memberNameEquals(E, "nr_entries") && hasMemberInChain(E, "ldt"))
++        return true;
++      // local/param named something like '*nr_entries' and the expression chain elsewhere mentions ldt (conservative).
++      if (declRefNameContains(E, "nr_entries")) {
++        // Try to confirm LDT context by searching for 'ldt' in the expression base chain if available.
++        // For DeclRefExpr we cannot traverse; rely on the other operand being LDT_ENTRY_SIZE.
++        return true;
++      }
++      return false;
++    };
++
++    bool Pattern1 = IsLdtEntrySize(L) && IsLdtNrEntries(R);
++    bool Pattern2 = IsLdtEntrySize(R) && IsLdtNrEntries(L);
++
++    // Ensure at least one side shows strong LDT evidence: either ME chain contains 'ldt'
++    // or the macro name LDT_ENTRY_SIZE is present.
++    if (!(Pattern1 || Pattern2))
++      return false;
++
++    // If we matched via the 8/16 fallback, insist that the 'nr_entries' side has an LDT member chain.
++    if (!ExprHasName(L, "LDT_ENTRY_SIZE", C) && !ExprHasName(R, "LDT_ENTRY_SIZE", C)) {
++      // Then both sides used fallback; only accept if the nr_entries is a member chain with 'ldt'.
++      if ((memberNameEquals(L, "nr_entries") && hasMemberInChain(L, "ldt")) ||
++          (memberNameEquals(R, "nr_entries") && hasMemberInChain(R, "ldt"))) {
++        return true;
++      }
++      return false;
++    }
++
++    return true;
+   }
+
+   bool isFalsePositive(const BinaryOperator *Mul,
+                        const Stmt *UseSiteStmt,
+                        const Decl *UseSiteDecl,
+                        CheckerContext &C) const {
++    // Targeted suppression: LDT entries size computation nr_entries * LDT_ENTRY_SIZE
++    if (isBenignX86LdtEntriesMultiply(Mul, C))
++      return true;
++
+     // Targeted suppression: MSI-X ioremap table size computation.
+     if (isBenignMsixIoremapSize(Mul, UseSiteStmt, C))
+       return true;

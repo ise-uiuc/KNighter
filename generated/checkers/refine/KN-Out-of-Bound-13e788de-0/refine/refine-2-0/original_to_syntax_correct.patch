@@ -1,0 +1,130 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -261,6 +261,19 @@              L.find("bound") != std::string::npos));
+   }
+
++  static bool rhsTextLooksMinLike(const Expr *RHS, CheckerContext &C) {
++    StringRef Txt = getExprText(RHS, C);
++    std::string L = toLowerCopy(Txt);
++    return (!L.empty() &&
++            (L.find("min") != std::string::npos ||
++             L.find("start") != std::string::npos ||
++             L.find("begin") != std::string::npos ||
++             L.find("first") != std::string::npos ||
++             L.find("lo") != std::string::npos ||
++             L.find("low") != std::string::npos ||
++             L.find("lower") != std::string::npos));
++  }
++
+   static bool isPlainMaxLikeBound(const Expr *Bound, CheckerContext &C) {
+     if (!Bound)
+       return false;
+@@ -282,6 +295,31 @@       return nameLooksLikeCapacityOrMax(Name); // Do not treat *_count/*_num as MAX-like.
+
+     return rhsTextLooksMaxLike(Bound, C);
++  }
++
++  static bool isPlainMinLikeBound(const Expr *Bound, CheckerContext &C) {
++    if (!Bound)
++      return false;
++
++    Bound = Bound->IgnoreParenCasts();
++
++    if (isa<IntegerLiteral>(Bound)) {
++      // For literals like 0, do not consider them MIN-like by default.
++      // This avoids suppressing (idx < 0 || idx > MAX) which is a real off-by-one index check.
++      return rhsTextLooksMinLike(Bound, C);
++    }
++
++    if (isUnarySizeOf(Bound))
++      return false;
++
++    if (isCompositeBoundExpr(Bound))
++      return false;
++
++    StringRef Name = getIdentNameFromExpr(Bound);
++    if (!Name.empty())
++      return nameHasTokenMin(Name);
++
++    return rhsTextLooksMinLike(Bound, C);
+   }
+
+   // Range endpoint detection helpers.
+@@ -661,6 +699,67 @@     return false;
+   }
+
++  static bool sameRangeBase(const Expr *MinBound, const Expr *MaxBound, CheckerContext &C) {
++    if (!MinBound || !MaxBound) return false;
++    StringRef MinName = getIdentNameFromExpr(MinBound);
++    StringRef MaxName = getIdentNameFromExpr(MaxBound);
++
++    StringRef MinKey = MinName.empty() ? getExprText(MinBound, C) : MinName;
++    StringRef MaxKey = MaxName.empty() ? getExprText(MaxBound, C) : MaxName;
++
++    if (MinKey.empty() || MaxKey.empty())
++      return false;
++
++    std::string MinBase = stripRangeEndpointTokens(MinKey);
++    std::string MaxBase = stripRangeEndpointTokens(MaxKey);
++    if (MinBase.empty() || MaxBase.empty())
++      return false;
++
++    return MinBase == MaxBase;
++  }
++
++  static bool hasPairedMinGuardForVarInCond(const Expr *E, const Expr *Var, const Expr *RhsMax, CheckerContext &C) {
++    if (!E || !Var || !RhsMax) return false;
++    E = E->IgnoreParenImpCasts();
++
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      BinaryOperatorKind Op = BO->getOpcode();
++
++      if (Op == BO_LAnd || Op == BO_LOr) {
++        return hasPairedMinGuardForVarInCond(BO->getLHS(), Var, RhsMax, C) ||
++               hasPairedMinGuardForVarInCond(BO->getRHS(), Var, RhsMax, C);
++      }
++
++      const Expr *L = BO->getLHS()->IgnoreParenImpCasts();
++      const Expr *R = BO->getRHS()->IgnoreParenImpCasts();
++
++      // We consider "Var < Min" or "Min > Var" as equivalent min-guards.
++      if (Op == BO_LT) {
++        if (sameReferencedVar(L, Var) && isPlainMinLikeBound(R, C) && sameRangeBase(R, RhsMax, C))
++          return true;
++      } else if (Op == BO_GT) {
++        if (sameReferencedVar(R, Var) && isPlainMinLikeBound(L, C) && sameRangeBase(L, RhsMax, C))
++          return true;
++      }
++
++      // Also traverse deeper expressions that are not purely boolean ops.
++      return hasPairedMinGuardForVarInCond(BO->getLHS(), Var, RhsMax, C) ||
++             hasPairedMinGuardForVarInCond(BO->getRHS(), Var, RhsMax, C);
++    }
++
++    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++      return hasPairedMinGuardForVarInCond(UO->getSubExpr(), Var, RhsMax, C);
++    }
++
++    if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
++      return hasPairedMinGuardForVarInCond(CO->getCond(), Var, RhsMax, C) ||
++             hasPairedMinGuardForVarInCond(CO->getTrueExpr(), Var, RhsMax, C) ||
++             hasPairedMinGuardForVarInCond(CO->getFalseExpr(), Var, RhsMax, C);
++    }
++
++    return false;
++  }
++
+   bool isCandidateGtComparison(const BinaryOperator *BO, CheckerContext &C) const {
+     if (!BO || BO->getOpcode() != BO_GT)
+       return false;
+@@ -720,6 +819,13 @@
+     // Suppress the common 1-based ordinal check: (!x || x == 0/<=0/<1) || (x > Bound)
+     if (hasZeroOrOneGuardForVar(CondE, BO->getLHS(), C))
++      continue;
++
++    // New suppression: If the same condition also contains a paired min-guard
++    // (x < MIN) with the same base token as the RHS MAX, this is a general inclusive
++    // [MIN..MAX] range check, not an index validation. Suppress such cases.
++    if (hasPairedMinGuardForVarInCond(CondE, BO->getLHS()->IgnoreParenCasts(),
++                                      BO->getRHS()->IgnoreParenCasts(), C))
+       continue;
+
+     ExplodedNode *N = C.generateNonFatalErrorNode();

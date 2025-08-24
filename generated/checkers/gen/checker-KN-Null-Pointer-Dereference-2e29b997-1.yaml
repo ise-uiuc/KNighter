@@ -1,0 +1,316 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 2e29b9971ac54dec88baa58856a230ec2f2a2dff
+commit_type: Null-Pointer-Dereference
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ No custom program state required.\n\nnamespace {\nclass SAGenTestChecker : public\
+  \ Checker<check::BranchCondition> {\n   mutable std::unique_ptr<BugType> BT;\n\n\
+  \   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Incorrect NULL-check\
+  \ after allocation\", \"Logic\")) {}\n\n      void checkBranchCondition(const Stmt\
+  \ *Condition, CheckerContext &C) const;\n\n   private:\n      // Helpers\n     \
+  \ bool isAllocLikeCall(const CallExpr *CE, CheckerContext &C) const;\n      bool\
+  \ isNullLiteral(const Expr *E, CheckerContext &C) const;\n      const Expr *extractCheckedPointerFromCondition(const\
+  \ Expr *E, CheckerContext &C) const;\n      const Stmt *getPrevStmtInSameCompound(const\
+  \ IfStmt *IfS, CheckerContext &C) const;\n      const BinaryOperator *getAssignFromStmt(const\
+  \ Stmt *S) const;\n      const CallExpr *getAllocCallFromRHS(const Expr *RHS, CheckerContext\
+  \ &C) const;\n      const MemRegion *getMemRegionOfExpr(const Expr *E, CheckerContext\
+  \ &C) const;\n};\n  \n// Check if a call expression calls an allocation-like function\
+  \ we care about.\nbool SAGenTestChecker::isAllocLikeCall(const CallExpr *CE, CheckerContext\
+  \ &C) const {\n  if (!CE)\n    return false;\n  const Expr *CalleeE = CE->getCallee();\n\
+  \  if (!CalleeE)\n    return false;\n\n  // Use ExprHasName utility for robustness.\n\
+  \  static const char *AllocNames[] = {\n      \"kzalloc\", \"kmalloc\", \"kcalloc\"\
+  , \"kvzalloc\", \"devm_kzalloc\", \"kmemdup\"\n  };\n\n  for (const char *Name :\
+  \ AllocNames) {\n    if (ExprHasName(CalleeE, Name, C))\n      return true;\n  }\n\
+  \  return false;\n}\n\n// Determine if an expression represents a NULL literal or\
+  \ zero.\nbool SAGenTestChecker::isNullLiteral(const Expr *E, CheckerContext &C)\
+  \ const {\n  if (!E)\n    return false;\n  E = E->IgnoreParenCasts();\n\n  // Check\
+  \ null pointer constant via AST API.\n  if (E->isNullPointerConstant(C.getASTContext(),\
+  \ Expr::NPC_ValueDependentIsNull))\n    return true;\n\n  // Try to evaluate to\
+  \ int constant 0.\n  llvm::APSInt Val;\n  if (EvaluateExprToInt(Val, E, C)) {\n\
+  \    if (Val == 0)\n      return true;\n  }\n\n  // Fallback: textual match of \"\
+  NULL\" in source.\n  if (ExprHasName(E, \"NULL\", C))\n    return true;\n\n  return\
+  \ false;\n}\n\n// Extract the pointer expression being negatively checked for NULL.\n\
+  // Only accept: !ptr or (ptr == NULL). We ignore (ptr != NULL).\nconst Expr *SAGenTestChecker::extractCheckedPointerFromCondition(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E)\n    return nullptr;\n  E = E->IgnoreParenCasts();\n\
+  \n  // !ptr\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode()\
+  \ == UO_LNot) {\n      const Expr *Sub = UO->getSubExpr();\n      if (!Sub)\n  \
+  \      return nullptr;\n      return Sub->IgnoreParenCasts();\n    }\n    return\
+  \ nullptr;\n  }\n\n  // ptr == NULL\n  if (const auto *BO = dyn_cast<BinaryOperator>(E))\
+  \ {\n    if (BO->getOpcode() == BO_EQ) {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n\
+  \      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n      bool LHSNull =\
+  \ isNullLiteral(LHS, C);\n      bool RHSNull = isNullLiteral(RHS, C);\n\n      if\
+  \ (LHSNull ^ RHSNull) {\n        // Return the non-null side\n        return LHSNull\
+  \ ? RHS : LHS;\n      }\n    }\n    // Ignore ptr != NULL (positive check)\n   \
+  \ return nullptr;\n  }\n\n  return nullptr;\n}\n\n// Find the previous statement\
+  \ in the same compound block as the IfStmt.\nconst Stmt *SAGenTestChecker::getPrevStmtInSameCompound(const\
+  \ IfStmt *IfS, CheckerContext &C) const {\n  if (!IfS)\n    return nullptr;\n\n\
+  \  const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IfS, C);\n \
+  \ if (!CS)\n    return nullptr;\n\n  const Stmt *Prev = nullptr;\n  for (auto It\
+  \ = CS->body_begin(); It != CS->body_end(); ++It) {\n    const Stmt *Cur = *It;\n\
+  \    if (Cur == IfS) {\n      return Prev;\n    }\n    Prev = Cur;\n  }\n  return\
+  \ nullptr;\n}\n\n// From a statement, find a BinaryOperator that is an assignment.\n\
+  const BinaryOperator *SAGenTestChecker::getAssignFromStmt(const Stmt *S) const {\n\
+  \  if (!S)\n    return nullptr;\n  const BinaryOperator *BO = findSpecificTypeInChildren<BinaryOperator>(S);\n\
+  \  if (!BO)\n    return nullptr;\n  if (BO->getOpcode() == BO_Assign)\n    return\
+  \ BO;\n  return nullptr;\n}\n\n// From RHS expression, find a CallExpr of known\
+  \ allocation functions.\nconst CallExpr *SAGenTestChecker::getAllocCallFromRHS(const\
+  \ Expr *RHS, CheckerContext &C) const {\n  if (!RHS)\n    return nullptr;\n  const\
+  \ CallExpr *CE = findSpecificTypeInChildren<CallExpr>(RHS);\n  if (!CE)\n    return\
+  \ nullptr;\n  if (isAllocLikeCall(CE, C))\n    return CE;\n  return nullptr;\n}\n\
+  \n// Get base MemRegion of the expression.\nconst MemRegion *SAGenTestChecker::getMemRegionOfExpr(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n\
+  }\n\nvoid SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  if (!Condition)\n    return;\n\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IfS)\n    return;\n\n  const Expr *CondE = dyn_cast<Expr>(Condition);\n\
+  \  if (!CondE)\n    return;\n\n  // Extract pointer being negatively checked for\
+  \ NULL (only !ptr or ptr == NULL)\n  const Expr *CheckedPtrExpr = extractCheckedPointerFromCondition(CondE,\
+  \ C);\n  if (!CheckedPtrExpr)\n    return;\n\n  // Get previous statement in the\
+  \ same compound block.\n  const Stmt *Prev = getPrevStmtInSameCompound(IfS, C);\n\
+  \  if (!Prev)\n    return;\n\n  // Get an assignment in the previous statement.\n\
+  \  const BinaryOperator *BO = getAssignFromStmt(Prev);\n  if (!BO)\n    return;\n\
+  \n  // Check if RHS is an allocation-like call.\n  const CallExpr *AllocCE = getAllocCallFromRHS(BO->getRHS(),\
+  \ C);\n  if (!AllocCE)\n    return;\n\n  // Get regions of LHS (allocated pointer)\
+  \ and the pointer being checked.\n  const MemRegion *LHSReg = getMemRegionOfExpr(BO->getLHS(),\
+  \ C);\n  const MemRegion *CheckedReg = getMemRegionOfExpr(CheckedPtrExpr, C);\n\
+  \  if (!LHSReg || !CheckedReg)\n    return;\n\n  // If they differ, we have the\
+  \ target pattern.\n  if (LHSReg != CheckedReg) {\n    // Optional: reduce noise,\
+  \ require an error path in 'then' branch.\n    const ReturnStmt *RetInThen = findSpecificTypeInChildren<ReturnStmt>(IfS->getThen());\n\
+  \    if (!RetInThen)\n      return;\n\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    if (!N)\n      return;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \        *BT, \"Allocated pointer checked via a different pointer; possible missed\
+  \ NULL-check.\", N);\n    R->addRange(IfS->getCond()->getSourceRange());\n\n   \
+  \ const SourceManager &SM = C.getSourceManager();\n    const LocationContext *LCtx\
+  \ = C.getLocationContext();\n\n    PathDiagnosticLocation PrevLoc = PathDiagnosticLocation::createBegin(Prev,\
+  \ SM, LCtx);\n    R->addNote(\"Allocation assigned to this pointer\", PrevLoc);\n\
+  \n    PathDiagnosticLocation CondLoc = PathDiagnosticLocation::createBegin(IfS->getCond(),\
+  \ SM, LCtx);\n    R->addNote(\"But NULL-check tests a different pointer\", CondLoc);\n\
+  \n    C.emitReport(std::move(R));\n  }\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects checking a different pointer\
+  \ after allocation (missed NULL-check)\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\narm64/sme: Fix NULL check after kzalloc\n\nFix following\
+  \ coccicheck error:\n./arch/arm64/kernel/process.c:322:2-23: alloc with no test,\
+  \ possible model on line 326\n\nHere should be dst->thread.sve_state.\n\nFixes:\
+  \ 8bd7f91c03d8 (\"arm64/sme: Implement traps and syscall handling for SME\")\nSigned-off-by:\
+  \ Wan Jiabing <wanjiabing@vivo.com>\nReviwed-by: Mark Brown <broonie@kernel.org>\n\
+  Link: https://lore.kernel.org/r/20220426113054.630983-1-wanjiabing@vivo.com\nSigned-off-by:\
+  \ Catalin Marinas <catalin.marinas@arm.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ arch_dup_task_struct in arch/arm64/kernel/process.c\nint arch_dup_task_struct(struct\
+  \ task_struct *dst, struct task_struct *src)\n{\n\tif (current->mm)\n\t\tfpsimd_preserve_current_state();\n\
+  \t*dst = *src;\n\n\t/* We rely on the above assignment to initialize dst's thread_flags:\
+  \ */\n\tBUILD_BUG_ON(!IS_ENABLED(CONFIG_THREAD_INFO_IN_TASK));\n\n\t/*\n\t * Detach\
+  \ src's sve_state (if any) from dst so that it does not\n\t * get erroneously used\
+  \ or freed prematurely.  dst's copies\n\t * will be allocated on demand later on\
+  \ if dst uses SVE.\n\t * For consistency, also clear TIF_SVE here: this could be\
+  \ done\n\t * later in copy_process(), but to avoid tripping up future\n\t * maintainers\
+  \ it is best not to leave TIF flags and buffers in\n\t * an inconsistent state,\
+  \ even temporarily.\n\t */\n\tdst->thread.sve_state = NULL;\n\tclear_tsk_thread_flag(dst,\
+  \ TIF_SVE);\n\n\t/*\n\t * In the unlikely event that we create a new thread with\
+  \ ZA\n\t * enabled we should retain the ZA state so duplicate it here.\n\t * This\
+  \ may be shortly freed if we exec() or if CLONE_SETTLS\n\t * but it's simpler to\
+  \ do it here. To avoid confusing the rest\n\t * of the code ensure that we have\
+  \ a sve_state allocated\n\t * whenever za_state is allocated.\n\t */\n\tif (thread_za_enabled(&src->thread))\
+  \ {\n\t\tdst->thread.sve_state = kzalloc(sve_state_size(src),\n\t\t\t\t\t\tGFP_KERNEL);\n\
+  \t\tif (!dst->thread.za_state)\n\t\t\treturn -ENOMEM;\n\t\tdst->thread.za_state\
+  \ = kmemdup(src->thread.za_state,\n\t\t\t\t\t       za_state_size(src),\n\t\t\t\t\
+  \t       GFP_KERNEL);\n\t\tif (!dst->thread.za_state) {\n\t\t\tkfree(dst->thread.sve_state);\n\
+  \t\t\tdst->thread.sve_state = NULL;\n\t\t\treturn -ENOMEM;\n\t\t}\n\t} else {\n\t\
+  \tdst->thread.za_state = NULL;\n\t\tclear_tsk_thread_flag(dst, TIF_SME);\n\t}\n\n\
+  \t/* clear any pending asynchronous tag fault raised by the parent */\n\tclear_tsk_thread_flag(dst,\
+  \ TIF_MTE_ASYNC_FAULT);\n\n\treturn 0;\n}\n```\n\n## Bug Fix Patch\n\n```diff\n\
+  diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c\nindex 99c293513817..9734c9fb1a32\
+  \ 100644\n--- a/arch/arm64/kernel/process.c\n+++ b/arch/arm64/kernel/process.c\n\
+  @@ -321,7 +321,7 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct\
+  \ *src)\n \tif (thread_za_enabled(&src->thread)) {\n \t\tdst->thread.sve_state =\
+  \ kzalloc(sve_state_size(src),\n \t\t\t\t\t\tGFP_KERNEL);\n-\t\tif (!dst->thread.za_state)\n\
+  +\t\tif (!dst->thread.sve_state)\n \t\t\treturn -ENOMEM;\n \t\tdst->thread.za_state\
+  \ = kmemdup(src->thread.za_state,\n \t\t\t\t\t       za_state_size(src),\n```\n"
+pattern: '## Bug Pattern
+
+
+  Incorrect NULL-check after allocation: a pointer returned by kzalloc()/kmalloc()
+  is assigned to one field but the code checks a different (unrelated) pointer for
+  NULL. Concretely:
+
+  - ptr1 = kzalloc(...);
+
+  - if (!ptr2) return -ENOMEM;  // should check ptr1
+
+
+  In the patch, dst->thread.sve_state is allocated, but the code erroneously checks
+  dst->thread.za_state, allowing an allocation failure of sve_state to go unnoticed
+  and leading to inconsistent state or potential NULL dereference later.'
+plan: "1) Program state\n- No custom program state is required. The pattern can be\
+  \ detected syntactically by analyzing the IfStmt condition and the immediately preceding\
+  \ statement within the same CompoundStmt.\n\n2) Callbacks to use\n- checkBranchCondition:\
+  \ Core detection logic for \u201CNULL-check after allocation,\u201D by inspecting\
+  \ the If condition and the immediately previous statement in the same block.\n-\
+  \ (Optional) checkASTCodeBody: Not strictly needed; only checkBranchCondition is\
+  \ sufficient.\n\n3) Detailed steps\n\nA. Helper utilities to implement\n- isAllocLikeCall(const\
+  \ CallExpr*):\n  - Return true if the callee name is one of: \"kzalloc\", \"kmalloc\"\
+  , \"kcalloc\", \"kvzalloc\", \"devm_kzalloc\", \"kmemdup\".\n- isNullLiteral(const\
+  \ Expr*, CheckerContext&):\n  - Return true if expr evaluates to 0 using EvaluateExprToInt\
+  \ or the source text contains \"NULL\".\n- extractCheckedPointerFromCondition(const\
+  \ Expr*, CheckerContext&) -> const Expr*:\n  - If condition is:\n    - UnaryOperator\
+  \ UO_LNot: return the operand expression.\n    - BinaryOperator BO_EQ or BO_NE:\n\
+  \      - If exactly one side is null-literal, return the non-null side.\n    - Otherwise\
+  \ return nullptr.\n  - Only accept negative NULL check:\n    - Return a non-null\
+  \ pointer expr for \"!ptr\" or \"ptr == NULL\".\n    - For \"ptr != NULL\", return\
+  \ nullptr (we only flag negative NULL checks).\n- getPrevStmtInSameCompound(const\
+  \ IfStmt*, CheckerContext&) -> const Stmt*:\n  - Find the parent CompoundStmt using\
+  \ findSpecificTypeInParents<CompoundStmt>(IfStmt).\n  - Iterate its body to locate\
+  \ the IfStmt and return the previous statement if it exists; otherwise nullptr.\n\
+  - getAssignFromStmt(const Stmt*) -> const BinaryOperator*:\n  - From a statement\
+  \ (prevStmt), dig down to find an assignment BinaryOperator (BO_Assign).\n  - Use\
+  \ findSpecificTypeInChildren<BinaryOperator>(prevStmt) and then check if it is an\
+  \ assignment.\n- getAllocCallFromRHS(const Expr*) -> const CallExpr*:\n  - From\
+  \ the RHS, dig down with findSpecificTypeInChildren<CallExpr>(RHS). If found, check\
+  \ with isAllocLikeCall.\n- getMemRegionOfExpr(const Expr*, CheckerContext&) -> const\
+  \ MemRegion*:\n  - Use getMemRegionFromExpr.\n\nB. Detection algorithm in checkBranchCondition\n\
+  - Input: const Stmt* Condition (the analyzed condition of a branch).\n- Step 1:\
+  \ Obtain the enclosing IfStmt:\n  - IfStmt* IfS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C).\n  - If none, return.\n- Step 2: Extract the checked pointer expression:\n\
+  \  - const Expr* CheckedPtrExpr = extractCheckedPointerFromCondition(cast<Expr>(Condition),\
+  \ C).\n  - If nullptr (not a negative NULL check), return.\n- Step 3: Obtain the\
+  \ previous statement in the same block:\n  - const Stmt* Prev = getPrevStmtInSameCompound(IfS,\
+  \ C).\n  - If nullptr, return.\n- Step 4: From Prev, get an assignment to a pointer\
+  \ from an allocation call:\n  - const BinaryOperator* BO = getAssignFromStmt(Prev).\n\
+  \  - If nullptr or not BO_Assign, return.\n  - const CallExpr* CE = getAllocCallFromRHS(BO->getRHS()).\n\
+  \  - If nullptr (RHS is not an allocation call), return.\n- Step 5: Compare LHS\
+  \ region vs checked-pointer region:\n  - const MemRegion* LHSReg = getMemRegionOfExpr(BO->getLHS(),\
+  \ C).\n  - const MemRegion* CheckReg = getMemRegionOfExpr(CheckedPtrExpr, C).\n\
+  \  - If either region is nullptr, return (be conservative).\n  - If LHSReg != CheckReg:\n\
+  \    - Optional: ensure the IF \u2018then\u2019 is an error path (reduce noise):\n\
+  \      - const ReturnStmt* RS = findSpecificTypeInChildren<ReturnStmt>(IfS->getThen()).\n\
+  \      - You may also check for a GotoStmt, but Return is sufficient to reduce FPs.\n\
+  \    - If an error path is present (or you choose to report without this filter),\
+  \ then report a bug.\n- Step 6: Bug report:\n  - Create a BugType: \"Incorrect NULL-check\
+  \ after allocation\".\n  - Message: \"Allocated pointer checked via a different\
+  \ pointer; possible missed NULL-check.\"\n  - Use generateNonFatalErrorNode and\
+  \ PathSensitiveBugReport. Add notes:\n    - Note at allocation assignment (Prev):\
+  \ \"Allocation assigned to this pointer.\"\n    - Note at If condition: \"But NULL-check\
+  \ tests a different pointer.\"\n\nC. Notes and considerations\n- Focus on adjacency:\
+  \ Only warn if the allocation assignment is the immediate previous statement to\
+  \ the IfStmt. This strictly matches the target bug and minimizes false positives.\n\
+  - Negative NULL checks only: \"!ptr\" or \"ptr == NULL\". This matches typical out-of-memory\
+  \ error paths like \"return -ENOMEM\".\n- No alias tracking: We rely on MemRegion\
+  \ identity comparison. This is sufficient because the pattern consists of distinct\
+  \ struct fields or variables.\n- Functions coverage: Include kzalloc/kmalloc/kcalloc/kvzalloc/devm_kzalloc/kmemdup.\
+  \ You can extend if needed, but this set suffices for kernel allocations and the\
+  \ example.\n- Robustness for wrappers: Use findSpecificTypeInChildren to dig into\
+  \ wrappers like ExprWithCleanups so we handle real-world AST shapes."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ No custom program state required.\n\nnamespace {\nclass SAGenTestChecker : public\
+  \ Checker<check::BranchCondition> {\n   mutable std::unique_ptr<BugType> BT;\n\n\
+  \   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Incorrect NULL-check\
+  \ after allocation\", \"Logic\")) {}\n\n      void checkBranchCondition(const Stmt\
+  \ *Condition, CheckerContext &C) const;\n\n   private:\n      // Helpers\n     \
+  \ bool isAllocLikeCall(const CallExpr *CE, CheckerContext &C) const;\n      bool\
+  \ isNullLiteral(const Expr *E, CheckerContext &C) const;\n      const Expr *extractCheckedPointerFromCondition(const\
+  \ Expr *E, CheckerContext &C) const;\n      const Stmt *getPrevStmtInSameCompound(const\
+  \ IfStmt *IfS, CheckerContext &C) const;\n      const BinaryOperator *getAssignFromStmt(const\
+  \ Stmt *S) const;\n      const CallExpr *getAllocCallFromRHS(const Expr *RHS, CheckerContext\
+  \ &C) const;\n      const MemRegion *getMemRegionOfExpr(const Expr *E, CheckerContext\
+  \ &C) const;\n};\n  \n// Check if a call expression calls an allocation-like function\
+  \ we care about.\nbool SAGenTestChecker::isAllocLikeCall(const CallExpr *CE, CheckerContext\
+  \ &C) const {\n  if (!CE)\n    return false;\n  const Expr *CalleeE = CE->getCallee();\n\
+  \  if (!CalleeE)\n    return false;\n\n  // Use ExprHasName utility for robustness.\n\
+  \  static const char *AllocNames[] = {\n      \"kzalloc\", \"kmalloc\", \"kcalloc\"\
+  , \"kvzalloc\", \"devm_kzalloc\", \"kmemdup\"\n  };\n\n  for (const char *Name :\
+  \ AllocNames) {\n    if (ExprHasName(CalleeE, Name, C))\n      return true;\n  }\n\
+  \  return false;\n}\n\n// Determine if an expression represents a NULL literal or\
+  \ zero.\nbool SAGenTestChecker::isNullLiteral(const Expr *E, CheckerContext &C)\
+  \ const {\n  if (!E)\n    return false;\n  E = E->IgnoreParenCasts();\n\n  // Check\
+  \ null pointer constant via AST API.\n  if (E->isNullPointerConstant(C.getASTContext(),\
+  \ Expr::NPC_ValueDependentIsNull))\n    return true;\n\n  // Try to evaluate to\
+  \ int constant 0.\n  llvm::APSInt Val;\n  if (EvaluateExprToInt(Val, E, C)) {\n\
+  \    if (Val == 0)\n      return true;\n  }\n\n  // Fallback: textual match of \"\
+  NULL\" in source.\n  if (ExprHasName(E, \"NULL\", C))\n    return true;\n\n  return\
+  \ false;\n}\n\n// Extract the pointer expression being negatively checked for NULL.\n\
+  // Only accept: !ptr or (ptr == NULL). We ignore (ptr != NULL).\nconst Expr *SAGenTestChecker::extractCheckedPointerFromCondition(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E)\n    return nullptr;\n  E = E->IgnoreParenCasts();\n\
+  \n  // !ptr\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode()\
+  \ == UO_LNot) {\n      const Expr *Sub = UO->getSubExpr();\n      if (!Sub)\n  \
+  \      return nullptr;\n      return Sub->IgnoreParenCasts();\n    }\n    return\
+  \ nullptr;\n  }\n\n  // ptr == NULL\n  if (const auto *BO = dyn_cast<BinaryOperator>(E))\
+  \ {\n    if (BO->getOpcode() == BO_EQ) {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n\
+  \      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n      bool LHSNull =\
+  \ isNullLiteral(LHS, C);\n      bool RHSNull = isNullLiteral(RHS, C);\n\n      if\
+  \ (LHSNull ^ RHSNull) {\n        // Return the non-null side\n        return LHSNull\
+  \ ? RHS : LHS;\n      }\n    }\n    // Ignore ptr != NULL (positive check)\n   \
+  \ return nullptr;\n  }\n\n  return nullptr;\n}\n\n// Find the previous statement\
+  \ in the same compound block as the IfStmt.\nconst Stmt *SAGenTestChecker::getPrevStmtInSameCompound(const\
+  \ IfStmt *IfS, CheckerContext &C) const {\n  if (!IfS)\n    return nullptr;\n\n\
+  \  const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IfS, C);\n \
+  \ if (!CS)\n    return nullptr;\n\n  const Stmt *Prev = nullptr;\n  for (auto It\
+  \ = CS->body_begin(); It != CS->body_end(); ++It) {\n    const Stmt *Cur = *It;\n\
+  \    if (Cur == IfS) {\n      return Prev;\n    }\n    Prev = Cur;\n  }\n  return\
+  \ nullptr;\n}\n\n// From a statement, find a BinaryOperator that is an assignment.\n\
+  const BinaryOperator *SAGenTestChecker::getAssignFromStmt(const Stmt *S) const {\n\
+  \  if (!S)\n    return nullptr;\n  const BinaryOperator *BO = findSpecificTypeInChildren<BinaryOperator>(S);\n\
+  \  if (!BO)\n    return nullptr;\n  if (BO->getOpcode() == BO_Assign)\n    return\
+  \ BO;\n  return nullptr;\n}\n\n// From RHS expression, find a CallExpr of known\
+  \ allocation functions.\nconst CallExpr *SAGenTestChecker::getAllocCallFromRHS(const\
+  \ Expr *RHS, CheckerContext &C) const {\n  if (!RHS)\n    return nullptr;\n  const\
+  \ CallExpr *CE = findSpecificTypeInChildren<CallExpr>(RHS);\n  if (!CE)\n    return\
+  \ nullptr;\n  if (isAllocLikeCall(CE, C))\n    return CE;\n  return nullptr;\n}\n\
+  \n// Get base MemRegion of the expression.\nconst MemRegion *SAGenTestChecker::getMemRegionOfExpr(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E)\n    return nullptr;\n  const MemRegion\
+  \ *MR = getMemRegionFromExpr(E, C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n\
+  }\n\nvoid SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  if (!Condition)\n    return;\n\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(Condition,\
+  \ C);\n  if (!IfS)\n    return;\n\n  const Expr *CondE = dyn_cast<Expr>(Condition);\n\
+  \  if (!CondE)\n    return;\n\n  // Extract pointer being negatively checked for\
+  \ NULL (only !ptr or ptr == NULL)\n  const Expr *CheckedPtrExpr = extractCheckedPointerFromCondition(CondE,\
+  \ C);\n  if (!CheckedPtrExpr)\n    return;\n\n  // Get previous statement in the\
+  \ same compound block.\n  const Stmt *Prev = getPrevStmtInSameCompound(IfS, C);\n\
+  \  if (!Prev)\n    return;\n\n  // Get an assignment in the previous statement.\n\
+  \  const BinaryOperator *BO = getAssignFromStmt(Prev);\n  if (!BO)\n    return;\n\
+  \n  // Check if RHS is an allocation-like call.\n  const CallExpr *AllocCE = getAllocCallFromRHS(BO->getRHS(),\
+  \ C);\n  if (!AllocCE)\n    return;\n\n  // Get regions of LHS (allocated pointer)\
+  \ and the pointer being checked.\n  const MemRegion *LHSReg = getMemRegionOfExpr(BO->getLHS(),\
+  \ C);\n  const MemRegion *CheckedReg = getMemRegionOfExpr(CheckedPtrExpr, C);\n\
+  \  if (!LHSReg || !CheckedReg)\n    return;\n\n  // If they differ, we have the\
+  \ target pattern.\n  if (LHSReg != CheckedReg) {\n    // Optional: reduce noise,\
+  \ require an error path in 'then' branch.\n    const ReturnStmt *RetInThen = findSpecificTypeInChildren<ReturnStmt>(IfS->getThen());\n\
+  \    if (!RetInThen)\n      return;\n\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    if (!N)\n      return;\n\n    auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \        *BT, \"Allocated pointer checked via a different pointer; possible missed\
+  \ NULL-check.\", N);\n    R->addRange(IfS->getCond()->getSourceRange());\n\n   \
+  \ const SourceManager &SM = C.getSourceManager();\n    const LocationContext *LCtx\
+  \ = C.getLocationContext();\n\n    PathDiagnosticLocation PrevLoc = PathDiagnosticLocation::createBegin(Prev,\
+  \ SM, LCtx);\n    R->addNote(\"Allocation assigned to this pointer\", PrevLoc);\n\
+  \n    PathDiagnosticLocation CondLoc = PathDiagnosticLocation::createBegin(IfS->getCond(),\
+  \ SM, LCtx);\n    R->addNote(\"But NULL-check tests a different pointer\", CondLoc);\n\
+  \n    C.emitReport(std::move(R));\n  }\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects checking a different pointer\
+  \ after allocation (missed NULL-check)\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

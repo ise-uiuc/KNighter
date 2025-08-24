@@ -1,0 +1,271 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 3b0daecfeac0103aba8b293df07a0cbaf8b43f29
+commit_type: Integer-Overflow
+index: 5
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Type.h\"\n#include \"llvm/ADT/APInt.h\"\
+  \n#include \"llvm/ADT/APSInt.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// No custom program states are needed.\n\nnamespace {\n\
+  \nclass SAGenTestChecker : public Checker<check::PreCall> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Integer overflow\
+  \ in allocation size\", \"Memory Management\")) {}\n\n      void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n   private:\n\n      // Checks if\
+  \ the call is one of the allocation functions we care about.\n      bool isTargetAllocCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n      // Try to get the multiplication\
+  \ BO from the size argument (arg index 0).\n      const BinaryOperator *getMulInSizeArg(const\
+  \ CallEvent &Call) const;\n\n      // Whether the expr is a sizeof(...) expression.\n\
+  \      static bool isSizeofExpr(const Expr *E);\n\n      // Try an optional range-based\
+  \ suppression: if CountMax <= MaxSize/ElemSize, skip.\n      bool provenNoOverflow(const\
+  \ Expr *CountExpr, const Expr *SizeofExpr, CheckerContext &C) const;\n\n      //\
+  \ Report a diagnostic on risky pattern.\n      void reportRisk(const CallEvent &Call,\
+  \ const BinaryOperator *Mul, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isTargetAllocCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // Use ExprHasName for accurate matching.\n\
+  \  // Check common kernel allocators where arg0 is the size:\n  static const char\
+  \ *Names[] = {\n      \"kmalloc\", \"kzalloc\",\n      \"kmalloc_node\", \"kzalloc_node\"\
+  ,\n      \"kvmalloc\", \"kvzalloc\"\n  };\n\n  for (const char *N : Names) {\n \
+  \   if (ExprHasName(Origin, N, C))\n      return true;\n  }\n  return false;\n}\n\
+  \nconst BinaryOperator *SAGenTestChecker::getMulInSizeArg(const CallEvent &Call)\
+  \ const {\n  if (Call.getNumArgs() == 0)\n    return nullptr;\n  const Expr *Arg0\
+  \ = Call.getArgExpr(0);\n  if (!Arg0)\n    return nullptr;\n\n  Arg0 = Arg0->IgnoreParenImpCasts();\n\
+  \  const auto *BO = dyn_cast<BinaryOperator>(Arg0);\n  if (!BO)\n    return nullptr;\n\
+  \n  if (BO->getOpcode() != BO_Mul)\n    return nullptr;\n\n  return BO;\n}\n\nbool\
+  \ SAGenTestChecker::isSizeofExpr(const Expr *E) {\n  E = E ? E->IgnoreParenImpCasts()\
+  \ : nullptr;\n  if (!E)\n    return false;\n  if (const auto *U = dyn_cast<UnaryExprOrTypeTraitExpr>(E))\
+  \ {\n    return U->getKind() == UETT_SizeOf;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::provenNoOverflow(const\
+  \ Expr *CountExpr, const Expr *SizeofExpr, CheckerContext &C) const {\n  if (!CountExpr\
+  \ || !SizeofExpr)\n    return false;\n\n  // Get element size from sizeof, should\
+  \ be constant.\n  llvm::APSInt ElemSizeAPS;\n  if (!EvaluateExprToInt(ElemSizeAPS,\
+  \ SizeofExpr, C))\n    return false;\n\n  // sizeof(...) should be positive and\
+  \ non-zero\n  uint64_t ElemSize = ElemSizeAPS.getZExtValue();\n  if (ElemSize ==\
+  \ 0)\n    return false;\n\n  // Infer maximum of CountExpr\n  ProgramStateRef State\
+  \ = C.getState();\n  SVal CountSVal = State->getSVal(CountExpr, C.getLocationContext());\n\
+  \  SymbolRef SymCount = CountSVal.getAsSymbol();\n  if (!SymCount)\n    return false;\n\
+  \n  const llvm::APSInt *CountMax = inferSymbolMaxVal(SymCount, C);\n  if (!CountMax)\n\
+  \    return false;\n\n  // Compute Max size_t value, then SafeLimit = floor(max_size_t\
+  \ / ElemSize).\n  ASTContext &ACtx = C.getASTContext();\n  QualType SizeT = ACtx.getSizeType();\n\
+  \  unsigned BitWidth = ACtx.getTypeSize(SizeT);\n  llvm::APInt MaxSizeAP = llvm::APInt::getMaxValue(BitWidth);\n\
+  \  llvm::APInt ElemSizeAP(BitWidth, ElemSize, /*isSigned=*/false);\n  // Avoid division\
+  \ by zero (already checked).\n  llvm::APInt SafeLimitAP = MaxSizeAP.udiv(ElemSizeAP);\n\
+  \n  // Compare CountMax (might have different bitwidth). Convert CountMax to APInt\
+  \ with BitWidth.\n  llvm::APInt CountMaxAP = CountMax->getExtValue() >= 0\n    \
+  \                           ? llvm::APInt(BitWidth, CountMax->getZExtValue(), false)\n\
+  \                               : llvm::APInt(BitWidth, 0, false); // negative counts\
+  \ don't make sense; ignore as not proven safe\n\n  // If CountMax <= SafeLimit,\
+  \ proven no overflow.\n  if (CountMaxAP.ule(SafeLimitAP))\n    return true;\n\n\
+  \  return false;\n}\n\nvoid SAGenTestChecker::reportRisk(const CallEvent &Call,\
+  \ const BinaryOperator *Mul, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT,\n      \"Multiplying count and element size in kmalloc/kzalloc may overflow;\
+  \ use kcalloc/kmalloc_array\",\n      N);\n  if (Mul)\n    R->addRange(Mul->getSourceRange());\n\
+  \  else if (const Expr *Arg0 = Call.getArgExpr(0))\n    R->addRange(Arg0->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  if (!isTargetAllocCall(Call, C))\n    return;\n\
+  \n  const BinaryOperator *Mul = getMulInSizeArg(Call);\n  if (!Mul)\n    return;\n\
+  \n  const Expr *L = Mul->getLHS()->IgnoreParenImpCasts();\n  const Expr *R = Mul->getRHS()->IgnoreParenImpCasts();\n\
+  \n  // Must have a sizeof on one side.\n  bool LIsSizeof = isSizeofExpr(L);\n  bool\
+  \ RIsSizeof = isSizeofExpr(R);\n  if (!LIsSizeof && !RIsSizeof)\n    return;\n\n\
+  \  // Skip purely constant multiplications to reduce false positives.\n  llvm::APSInt\
+  \ ValTmp;\n  bool LConst = EvaluateExprToInt(ValTmp, L, C);\n  bool RConst = EvaluateExprToInt(ValTmp,\
+  \ R, C);\n  if (LConst && RConst)\n    return;\n\n  // Optional suppression: if\
+  \ we can prove max(count) * elem <= SIZE_MAX, skip.\n  const Expr *CountExpr = LIsSizeof\
+  \ ? R : L;\n  const Expr *SizeofExpr = LIsSizeof ? L : R;\n  if (provenNoOverflow(CountExpr,\
+  \ SizeofExpr, C))\n    return;\n\n  reportRisk(Call, Mul, C);\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects risky allocation size calculations using sizeof(T) * n in kmalloc/kzalloc;\
+  \ suggest kcalloc/kmalloc_array\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\namdkfd: use calloc instead of kzalloc to avoid integer\
+  \ overflow\n\nThis uses calloc instead of doing the multiplication which might\n\
+  overflow.\n\nCc: stable@vger.kernel.org\nSigned-off-by: Dave Airlie <airlied@redhat.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: kfd_ioctl_get_process_apertures_new in drivers/gpu/drm/amd/amdkfd/kfd_chardev.c\n\
+  static int kfd_ioctl_get_process_apertures_new(struct file *filp,\n\t\t\t\tstruct\
+  \ kfd_process *p, void *data)\n{\n\tstruct kfd_ioctl_get_process_apertures_new_args\
+  \ *args = data;\n\tstruct kfd_process_device_apertures *pa;\n\tint ret;\n\tint i;\n\
+  \n\tdev_dbg(kfd_device, \"get apertures for PASID 0x%x\", p->pasid);\n\n\tif (args->num_of_nodes\
+  \ == 0) {\n\t\t/* Return number of nodes, so that user space can alloacate\n\t\t\
+  \ * sufficient memory\n\t\t */\n\t\tmutex_lock(&p->mutex);\n\t\targs->num_of_nodes\
+  \ = p->n_pdds;\n\t\tgoto out_unlock;\n\t}\n\n\t/* Fill in process-aperture information\
+  \ for all available\n\t * nodes, but not more than args->num_of_nodes as that is\n\
+  \t * the amount of memory allocated by user\n\t */\n\tpa = kzalloc((sizeof(struct\
+  \ kfd_process_device_apertures) *\n\t\t\t\targs->num_of_nodes), GFP_KERNEL);\n\t\
+  if (!pa)\n\t\treturn -ENOMEM;\n\n\tmutex_lock(&p->mutex);\n\n\tif (!p->n_pdds) {\n\
+  \t\targs->num_of_nodes = 0;\n\t\tkfree(pa);\n\t\tgoto out_unlock;\n\t}\n\n\t/* Run\
+  \ over all pdd of the process */\n\tfor (i = 0; i < min(p->n_pdds, args->num_of_nodes);\
+  \ i++) {\n\t\tstruct kfd_process_device *pdd = p->pdds[i];\n\n\t\tpa[i].gpu_id =\
+  \ pdd->dev->id;\n\t\tpa[i].lds_base = pdd->lds_base;\n\t\tpa[i].lds_limit = pdd->lds_limit;\n\
+  \t\tpa[i].gpuvm_base = pdd->gpuvm_base;\n\t\tpa[i].gpuvm_limit = pdd->gpuvm_limit;\n\
+  \t\tpa[i].scratch_base = pdd->scratch_base;\n\t\tpa[i].scratch_limit = pdd->scratch_limit;\n\
+  \n\t\tdev_dbg(kfd_device,\n\t\t\t\"gpu id %u\\n\", pdd->dev->id);\n\t\tdev_dbg(kfd_device,\n\
+  \t\t\t\"lds_base %llX\\n\", pdd->lds_base);\n\t\tdev_dbg(kfd_device,\n\t\t\t\"lds_limit\
+  \ %llX\\n\", pdd->lds_limit);\n\t\tdev_dbg(kfd_device,\n\t\t\t\"gpuvm_base %llX\\\
+  n\", pdd->gpuvm_base);\n\t\tdev_dbg(kfd_device,\n\t\t\t\"gpuvm_limit %llX\\n\",\
+  \ pdd->gpuvm_limit);\n\t\tdev_dbg(kfd_device,\n\t\t\t\"scratch_base %llX\\n\", pdd->scratch_base);\n\
+  \t\tdev_dbg(kfd_device,\n\t\t\t\"scratch_limit %llX\\n\", pdd->scratch_limit);\n\
+  \t}\n\tmutex_unlock(&p->mutex);\n\n\targs->num_of_nodes = i;\n\tret = copy_to_user(\n\
+  \t\t\t(void __user *)args->kfd_process_device_apertures_ptr,\n\t\t\tpa,\n\t\t\t\
+  (i * sizeof(struct kfd_process_device_apertures)));\n\tkfree(pa);\n\treturn ret\
+  \ ? -EFAULT : 0;\n\nout_unlock:\n\tmutex_unlock(&p->mutex);\n\treturn 0;\n}\n```\n\
+  \n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c\
+  \ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c\nindex f9631f4b1a02..55aa74cbc532 100644\n\
+  --- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c\n+++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c\n\
+  @@ -779,8 +779,8 @@ static int kfd_ioctl_get_process_apertures_new(struct file *filp,\n\
+  \ \t * nodes, but not more than args->num_of_nodes as that is\n \t * the amount\
+  \ of memory allocated by user\n \t */\n-\tpa = kzalloc((sizeof(struct kfd_process_device_apertures)\
+  \ *\n-\t\t\t\targs->num_of_nodes), GFP_KERNEL);\n+\tpa = kcalloc(args->num_of_nodes,\
+  \ sizeof(struct kfd_process_device_apertures),\n+\t\t     GFP_KERNEL);\n \tif (!pa)\n\
+  \ \t\treturn -ENOMEM;\n \n```\n"
+pattern: '## Bug Pattern
+
+
+  Allocating a variable-length array with kmalloc/kzalloc by manually multiplying
+  element count and size (n * sizeof(T)) without overflow checking. If n is large,
+  the multiplication can overflow, leading to an undersized allocation and subsequent
+  out-of-bounds writes. Use kcalloc() or kmalloc_array() which perform overflow-checked
+  size calculations.'
+plan: "1) Program state\n- No custom program states are needed. This checker is a\
+  \ syntactic/semantic pattern match at call sites, with an optional lightweight constraint\
+  \ query to reduce false positives.\n\n2) Callback functions and implementation steps\n\
+  \nA. checkPreCall\n- Goal: Detect calls to kmalloc/kzalloc (and close variants)\
+  \ where the size argument is a product n * sizeof(T) (or sizeof(T) * n), which is\
+  \ overflow-prone. Recommend using kcalloc/kmalloc_array instead.\n\n- Recognize\
+  \ target allocation functions:\n  - Match callee names (exact string match of IdentifierInfo):\n\
+  \    - kmalloc, kzalloc\n    - kmalloc_node, kzalloc_node\n    - kvmalloc, kvzalloc\
+  \ (optional, if present in the code base)\n  - For all of these, the \u201Csize\u201D\
+  \ parameter is the first argument (index 0).\n\n- Extract and normalize the \u201C\
+  size\u201D argument:\n  - Retrieve Arg0 = Call.getArgExpr(0).\n  - Strip parens\
+  \ and implicit casts: Arg0 = Arg0->IgnoreParenImpCasts().\n\n- Identify the risky\
+  \ multiplication pattern:\n  - If Arg0 is not a BinaryOperator with opcode BO_Mul,\
+  \ return (no issue).\n  - Let LHS = BO->getLHS()->IgnoreParenImpCasts() and RHS\
+  \ = BO->getRHS()->IgnoreParenImpCasts().\n  - Determine which side is a sizeof:\n\
+  \    - Check if LHS or RHS is a UnaryExprOrTypeTraitExpr of kind UETT_SizeOf.\n\
+  \    - If neither side is sizeof, return (to keep false positives low).\n  - Determine\
+  \ if this is a likely variable-length allocation, not a compile-time constant:\n\
+  \    - If both operands evaluate to constants (use EvaluateExprToInt on LHS and\
+  \ RHS), then skip.\n    - Otherwise, continue.\n\n- Optional false positive reduction\
+  \ by simple range reasoning:\n  - Identify the count operand CountExpr = (the non-sizeof\
+  \ operand).\n  - Try to get element size:\n    - If the sizeof operand is present,\
+  \ EvaluateExprToInt on that operand to obtain ElemSize (APSInt). If evaluation fails\
+  \ (shouldn\u2019t for sizeof), skip the range check.\n  - Try to infer the maximum\
+  \ possible value for CountExpr:\n    - Get SymbolRef SymCount = C.getSVal(CountExpr).getAsSymbol().\n\
+  \    - If SymCount exists, query const llvm::APSInt* CountMax = inferSymbolMaxVal(SymCount,\
+  \ C).\n    - If CountMax is non-null and ElemSize is known:\n      - Compute MaxSizeT\
+  \ = all-ones for size_t (obtain width from ASTContext for size_t, create an APSInt\
+  \ with that bitwidth with all bits set).\n      - Compute SafeLimit = floor(MaxSizeT\
+  \ / ElemSize). If CountMax <= SafeLimit, then along this path the multiplication\
+  \ cannot overflow; skip reporting to avoid noise.\n  - If no symbol or no bounds\
+  \ are available, proceed with reporting (better be conservative).\n\n- Report:\n\
+  \  - If the risky pattern is found and not suppressed, emit a diagnostic.\n  - Create\
+  \ an error node with generateNonFatalErrorNode.\n  - Use PathSensitiveBugReport\
+  \ with a short message:\n    - \u201CMultiplying count and element size in kmalloc/kzalloc\
+  \ may overflow; use kcalloc/kmalloc_array.\u201D\n  - Attach the report range to\
+  \ the multiplication expression (the BinaryOperator) or the first argument of the\
+  \ call for clarity.\n\nB. (No other callbacks needed)\n- No need for checkPostCall,\
+  \ checkBind, checkLocation, or branch handling for this checker.\n- The optional\
+  \ range reasoning is already handled inside checkPreCall via inferSymbolMaxVal.\n\
+  \n3) Notes and heuristics\n- Functions to match and their argument indices:\n  -\
+  \ kmalloc(size, flags), kzalloc(size, flags): check Arg0\n  - kmalloc_node(size,\
+  \ flags, node), kzalloc_node(size, flags, node): check Arg0\n  - kvmalloc(size,\
+  \ flags), kvzalloc(size, flags): check Arg0 (optional)\n- Size expression patterns\
+  \ to accept:\n  - sizeof(T) * n, n * sizeof(T), sizeof(*p) * n, sizeof(p[0]) * n\n\
+  - Skip when:\n  - The size argument is not a multiplication.\n  - Neither side of\
+  \ the multiplication is a sizeof expression.\n  - Both sides are constants (no variability).\n\
+  \  - Optional: Proven safe bound (CountMax <= MaxSizeT / ElemSize).\n- This checker\
+  \ intentionally does not attempt to detect prior manual overflow checks in source\
+  \ code conditionals. Instead, it relies on the optional path constraint-based upper\
+  \ bound to minimize false positives. The recommendation remains to use kcalloc/kmalloc_array\
+  \ for built-in overflow checking."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Type.h\"\n#include \"llvm/ADT/APInt.h\"\
+  \n#include \"llvm/ADT/APSInt.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// No custom program states are needed.\n\nnamespace {\n\
+  \nclass SAGenTestChecker : public Checker<check::PreCall> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Integer overflow\
+  \ in allocation size\", \"Memory Management\")) {}\n\n      void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n   private:\n\n      // Checks if\
+  \ the call is one of the allocation functions we care about.\n      bool isTargetAllocCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n      // Try to get the multiplication\
+  \ BO from the size argument (arg index 0).\n      const BinaryOperator *getMulInSizeArg(const\
+  \ CallEvent &Call) const;\n\n      // Whether the expr is a sizeof(...) expression.\n\
+  \      static bool isSizeofExpr(const Expr *E);\n\n      // Try an optional range-based\
+  \ suppression: if CountMax <= MaxSize/ElemSize, skip.\n      bool provenNoOverflow(const\
+  \ Expr *CountExpr, const Expr *SizeofExpr, CheckerContext &C) const;\n\n      //\
+  \ Report a diagnostic on risky pattern.\n      void reportRisk(const CallEvent &Call,\
+  \ const BinaryOperator *Mul, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isTargetAllocCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // Use ExprHasName for accurate matching.\n\
+  \  // Check common kernel allocators where arg0 is the size:\n  static const char\
+  \ *Names[] = {\n      \"kmalloc\", \"kzalloc\",\n      \"kmalloc_node\", \"kzalloc_node\"\
+  ,\n      \"kvmalloc\", \"kvzalloc\"\n  };\n\n  for (const char *N : Names) {\n \
+  \   if (ExprHasName(Origin, N, C))\n      return true;\n  }\n  return false;\n}\n\
+  \nconst BinaryOperator *SAGenTestChecker::getMulInSizeArg(const CallEvent &Call)\
+  \ const {\n  if (Call.getNumArgs() == 0)\n    return nullptr;\n  const Expr *Arg0\
+  \ = Call.getArgExpr(0);\n  if (!Arg0)\n    return nullptr;\n\n  Arg0 = Arg0->IgnoreParenImpCasts();\n\
+  \  const auto *BO = dyn_cast<BinaryOperator>(Arg0);\n  if (!BO)\n    return nullptr;\n\
+  \n  if (BO->getOpcode() != BO_Mul)\n    return nullptr;\n\n  return BO;\n}\n\nbool\
+  \ SAGenTestChecker::isSizeofExpr(const Expr *E) {\n  E = E ? E->IgnoreParenImpCasts()\
+  \ : nullptr;\n  if (!E)\n    return false;\n  if (const auto *U = dyn_cast<UnaryExprOrTypeTraitExpr>(E))\
+  \ {\n    return U->getKind() == UETT_SizeOf;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::provenNoOverflow(const\
+  \ Expr *CountExpr, const Expr *SizeofExpr, CheckerContext &C) const {\n  if (!CountExpr\
+  \ || !SizeofExpr)\n    return false;\n\n  // Get element size from sizeof, should\
+  \ be constant.\n  llvm::APSInt ElemSizeAPS;\n  if (!EvaluateExprToInt(ElemSizeAPS,\
+  \ SizeofExpr, C))\n    return false;\n\n  // sizeof(...) should be positive and\
+  \ non-zero\n  uint64_t ElemSize = ElemSizeAPS.getZExtValue();\n  if (ElemSize ==\
+  \ 0)\n    return false;\n\n  // Infer maximum of CountExpr\n  ProgramStateRef State\
+  \ = C.getState();\n  SVal CountSVal = State->getSVal(CountExpr, C.getLocationContext());\n\
+  \  SymbolRef SymCount = CountSVal.getAsSymbol();\n  if (!SymCount)\n    return false;\n\
+  \n  const llvm::APSInt *CountMax = inferSymbolMaxVal(SymCount, C);\n  if (!CountMax)\n\
+  \    return false;\n\n  // Compute Max size_t value, then SafeLimit = floor(max_size_t\
+  \ / ElemSize).\n  ASTContext &ACtx = C.getASTContext();\n  QualType SizeT = ACtx.getSizeType();\n\
+  \  unsigned BitWidth = ACtx.getTypeSize(SizeT);\n  llvm::APInt MaxSizeAP = llvm::APInt::getMaxValue(BitWidth);\n\
+  \  llvm::APInt ElemSizeAP(BitWidth, ElemSize, /*isSigned=*/false);\n  // Avoid division\
+  \ by zero (already checked).\n  llvm::APInt SafeLimitAP = MaxSizeAP.udiv(ElemSizeAP);\n\
+  \n  // Compare CountMax (might have different bitwidth). Convert CountMax to APInt\
+  \ with BitWidth.\n  llvm::APInt CountMaxAP = CountMax->getExtValue() >= 0\n    \
+  \                           ? llvm::APInt(BitWidth, CountMax->getZExtValue(), false)\n\
+  \                               : llvm::APInt(BitWidth, 0, false); // negative counts\
+  \ don't make sense; ignore as not proven safe\n\n  // If CountMax <= SafeLimit,\
+  \ proven no overflow.\n  if (CountMaxAP.ule(SafeLimitAP))\n    return true;\n\n\
+  \  return false;\n}\n\nvoid SAGenTestChecker::reportRisk(const CallEvent &Call,\
+  \ const BinaryOperator *Mul, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT,\n      \"Multiplying count and element size in kmalloc/kzalloc may overflow;\
+  \ use kcalloc/kmalloc_array\",\n      N);\n  if (Mul)\n    R->addRange(Mul->getSourceRange());\n\
+  \  else if (const Expr *Arg0 = Call.getArgExpr(0))\n    R->addRange(Arg0->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  if (!isTargetAllocCall(Call, C))\n    return;\n\
+  \n  const BinaryOperator *Mul = getMulInSizeArg(Call);\n  if (!Mul)\n    return;\n\
+  \n  const Expr *L = Mul->getLHS()->IgnoreParenImpCasts();\n  const Expr *R = Mul->getRHS()->IgnoreParenImpCasts();\n\
+  \n  // Must have a sizeof on one side.\n  bool LIsSizeof = isSizeofExpr(L);\n  bool\
+  \ RIsSizeof = isSizeofExpr(R);\n  if (!LIsSizeof && !RIsSizeof)\n    return;\n\n\
+  \  // Skip purely constant multiplications to reduce false positives.\n  llvm::APSInt\
+  \ ValTmp;\n  bool LConst = EvaluateExprToInt(ValTmp, L, C);\n  bool RConst = EvaluateExprToInt(ValTmp,\
+  \ R, C);\n  if (LConst && RConst)\n    return;\n\n  // Optional suppression: if\
+  \ we can prove max(count) * elem <= SIZE_MAX, skip.\n  const Expr *CountExpr = LIsSizeof\
+  \ ? R : L;\n  const Expr *SizeofExpr = LIsSizeof ? L : R;\n  if (provenNoOverflow(CountExpr,\
+  \ SizeofExpr, C))\n    return;\n\n  reportRisk(Call, Mul, C);\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects risky allocation size calculations using sizeof(T) * n in kmalloc/kzalloc;\
+  \ suggest kcalloc/kmalloc_array\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

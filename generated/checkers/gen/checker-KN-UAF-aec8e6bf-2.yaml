@@ -1,0 +1,258 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: aec8e6bf839101784f3ef037dcdb9432c3f32343
+commit_type: UAF
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Type.h\"\n#include \"\
+  clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Track resource pointers that were released and must be set to NULL.\n\
+  // Key: The exact MemRegion (e.g., FieldRegion for device->bdev_file or a pointer\
+  \ VarRegion).\n// Val: true (placeholder), existence means \"released but not NULLed\"\
+  .\nREGISTER_MAP_WITH_PROGRAMSTATE(ReleasedFieldMap, const MemRegion *, bool)\n//\
+  \ Track which function context released the region, so we only warn at the same\
+  \ function's end.\nREGISTER_MAP_WITH_PROGRAMSTATE(ReleaseOwnerMap, const MemRegion\
+  \ *, const LocationContext *)\n\nnamespace {\n\nstruct FieldReleaseEntry {\n  const\
+  \ char *Func;\n  unsigned BaseParamIndex;\n  const char *FieldName;\n};\n\n// Known\
+  \ wrapper(s) that release a specific field of their first arg.\nstatic const FieldReleaseEntry\
+  \ KnownFieldReleases[] = {\n  {\"btrfs_close_bdev\", 0u, \"bdev_file\"},\n};\n\n\
+  class SAGenTestChecker\n  : public Checker<\n        check::PostCall,\n        check::PreCall,\n\
+  \        check::Bind,\n        check::EndFunction> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Stale pointer\
+  \ after release\", \"Resource Management\")) {}\n\n      void checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *S, CheckerContext &C) const;\n      void checkEndFunction(const ReturnStmt\
+  \ *RS, CheckerContext &C) const;\n\n   private:\n      // Helpers\n      static\
+  \ bool isFputCall(const CallEvent &Call, CheckerContext &C);\n      static bool\
+  \ isKnownFieldReleaseCall(const CallEvent &Call, CheckerContext &C, FieldReleaseEntry\
+  \ &Out);\n      static bool isNullSVal(ProgramStateRef State, SVal V);\n\n     \
+  \ void markExprReleased(const Expr *PtrExpr, CheckerContext &C) const;\n      void\
+  \ markFieldReleased(const Expr *BaseArg, StringRef FieldName, CheckerContext &C)\
+  \ const;\n\n      void reportDoublePut(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n      void reportNotNullifiedAtEnd(const MemRegion *R, CheckerContext\
+  \ &C) const;\n};\n\nbool SAGenTestChecker::isFputCall(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *OE = Call.getOriginExpr();\n  if (!OE) return false;\n  return\
+  \ ExprHasName(OE, \"fput\", C);\n}\n\nbool SAGenTestChecker::isKnownFieldReleaseCall(const\
+  \ CallEvent &Call, CheckerContext &C, FieldReleaseEntry &Out) {\n  const Expr *OE\
+  \ = Call.getOriginExpr();\n  if (!OE) return false;\n  for (const auto &E : KnownFieldReleases)\
+  \ {\n    if (ExprHasName(OE, E.Func, C)) {\n      Out = E;\n      return true;\n\
+  \    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isNullSVal(ProgramStateRef\
+  \ State, SVal V) {\n  if (V.isZeroConstant())\n    return true;\n  if (auto L =\
+  \ V.getAs<Loc>()) {\n    ConditionTruthVal T = State->isNull(*L);\n    if (T.isConstrainedTrue())\n\
+  \      return true;\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::markExprReleased(const\
+  \ Expr *PtrExpr, CheckerContext &C) const {\n  if (!PtrExpr) return;\n  ProgramStateRef\
+  \ State = C.getState();\n\n  const MemRegion *MR = getMemRegionFromExpr(PtrExpr,\
+  \ C);\n  if (!MR) return;\n  MR = MR->getBaseRegion();\n  if (!MR) return;\n\n \
+  \ State = State->set<ReleasedFieldMap>(MR, true);\n  State = State->set<ReleaseOwnerMap>(MR,\
+  \ C.getLocationContext());\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::markFieldReleased(const\
+  \ Expr *BaseArg, StringRef FieldName, CheckerContext &C) const {\n  if (!BaseArg)\
+  \ return;\n  ProgramStateRef State = C.getState();\n  const LocationContext *LCtx\
+  \ = C.getLocationContext();\n\n  // Get pointee region of the base argument (device)\n\
+  \  SVal BaseVal = State->getSVal(BaseArg, LCtx);\n  const MemRegion *BaseObjReg\
+  \ = BaseVal.getAsRegion();\n  if (!BaseObjReg)\n    return;\n  BaseObjReg = BaseObjReg->getBaseRegion();\n\
+  \  if (!BaseObjReg)\n    return;\n\n  // Get the pointee record of BaseArg\n  QualType\
+  \ BTy = BaseArg->getType();\n  if (!BTy->isPointerType())\n    return;\n  QualType\
+  \ Pointee = BTy->getPointeeType();\n  const RecordType *RT = Pointee->getAs<RecordType>();\n\
+  \  if (!RT)\n    return;\n  const RecordDecl *RD = RT->getDecl();\n  if (!RD)\n\
+  \    return;\n\n  const FieldDecl *TargetFD = nullptr;\n  for (const auto *FD :\
+  \ RD->fields()) {\n    if (FD && FD->getIdentifier() && FD->getName() == FieldName)\
+  \ {\n      TargetFD = FD;\n      break;\n    }\n  }\n  if (!TargetFD)\n    return;\n\
+  \n  // Build a FieldRegion for BaseObjReg->FieldName\n  SValBuilder &SVB = C.getSValBuilder();\n\
+  \  SVal BL = loc::MemRegionVal(BaseObjReg);\n  SVal FieldLoc = SVB.getLValue(TargetFD,\
+  \ BL);\n  const MemRegion *FieldReg = FieldLoc.getAsRegion();\n  if (!FieldReg)\n\
+  \    return;\n  FieldReg = FieldReg->getBaseRegion();\n  if (!FieldReg)\n    return;\n\
+  \n  State = State->set<ReleasedFieldMap>(FieldReg, true);\n  State = State->set<ReleaseOwnerMap>(FieldReg,\
+  \ C.getLocationContext());\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::reportDoublePut(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT, \"\
+  Double put on an already released pointer\", N);\n  R->addRange(Call.getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::reportNotNullifiedAtEnd(const\
+  \ MemRegion *R, CheckerContext &C) const {\n  if (!R) return;\n  ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n  if (!N) return;\n  auto BR = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ \"Released pointer not set to NULL\", N);\n  C.emitReport(std::move(BR));\n}\n\
+  \nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  if (!isFputCall(Call, C))\n    return;\n\n  // If we're calling fput()\
+  \ on a region already released, report immediate double-put.\n  const Expr *Arg0\
+  \ = Call.getArgExpr(0);\n  if (!Arg0) return;\n  const MemRegion *MR = getMemRegionFromExpr(Arg0,\
+  \ C);\n  if (!MR) return;\n  MR = MR->getBaseRegion();\n  if (!MR) return;\n\n \
+  \ ProgramStateRef State = C.getState();\n  const bool *WasReleased = State->get<ReleasedFieldMap>(MR);\n\
+  \  if (WasReleased && *WasReleased) {\n    reportDoublePut(Call, C);\n  }\n}\n\n\
+  void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  FieldReleaseEntry E;\n  if (isFputCall(Call, C)) {\n    // Mark the pointer\
+  \ passed to fput() as released (must be set to NULL afterwards)\n    const Expr\
+  \ *Arg0 = Call.getArgExpr(0);\n    markExprReleased(Arg0, C);\n    return;\n  }\
+  \ else if (isKnownFieldReleaseCall(Call, C, E)) {\n    // Mark the known field on\
+  \ the base argument as released\n    if (E.BaseParamIndex < Call.getNumArgs()) {\n\
+  \      const Expr *BaseArg = Call.getArgExpr(E.BaseParamIndex);\n      markFieldReleased(BaseArg,\
+  \ E.FieldName, C);\n    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n  const MemRegion *Dst = nullptr;\n\n  if (auto L = Loc.getAs<loc::MemRegionVal>())\
+  \ {\n    Dst = L->getRegion();\n  } else {\n    Dst = Loc.getAsRegion();\n  }\n\n\
+  \  if (!Dst) return;\n  Dst = Dst->getBaseRegion();\n  if (!Dst) return;\n\n  const\
+  \ bool *WasReleased = State->get<ReleasedFieldMap>(Dst);\n  if (!WasReleased) return;\n\
+  \n  // If it was released and now assigned NULL, clear the obligation.\n  if (isNullSVal(State,\
+  \ Val)) {\n    State = State->remove<ReleasedFieldMap>(Dst);\n    State = State->remove<ReleaseOwnerMap>(Dst);\n\
+  \    C.addTransition(State);\n  }\n}\n\nvoid SAGenTestChecker::checkEndFunction(const\
+  \ ReturnStmt *RS, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  using ReleasedFieldMapTy = ProgramStateTrait<ReleasedFieldMap>::data_type;\n\n\
+  \  ReleasedFieldMapTy Map = State->get<ReleasedFieldMap>();\n  if (!Map.isEmpty())\
+  \ {\n    const LocationContext *CurLCtx = C.getLocationContext();\n    for (auto\
+  \ I = Map.begin(), E = Map.end(); I != E; ++I) {\n      const MemRegion *R = I->first;\n\
+  \      const bool *Flag = State->get<ReleasedFieldMap>(R);\n      if (!Flag || !*Flag)\
+  \ continue;\n\n      const LocationContext *Owner = State->get<ReleaseOwnerMap>(R);\n\
+  \      if (Owner == CurLCtx) {\n        // Released in this function and not NULLed\
+  \ before return: warn.\n        reportNotNullifiedAtEnd(R, C);\n        // Do not\
+  \ clear here; allow path reports for each path end.\n      }\n    }\n  }\n}\n\n\
+  } // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects stale pointers after resource release that must be set to NULL\
+  \ (e.g., device->bdev_file after btrfs_close_bdev/fput)\",\n      \"\");\n}\n\n\
+  extern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbtrfs: fix use-after-free of block device file in\
+  \ __btrfs_free_extra_devids()\n\nMounting btrfs from two images (which have the\
+  \ same one fsid and two\ndifferent dev_uuids) in certain executing order may trigger\
+  \ an UAF for\nvariable 'device->bdev_file' in __btrfs_free_extra_devids(). And\n\
+  following are the details:\n\n1. Attach image_1 to loop0, attach image_2 to loop1,\
+  \ and scan btrfs\n   devices by ioctl(BTRFS_IOC_SCAN_DEV):\n\n             /  btrfs_device_1\
+  \ \u2192 loop0\n   fs_device\n             \\  btrfs_device_2 \u2192 loop1\n2. mount\
+  \ /dev/loop0 /mnt\n   btrfs_open_devices\n    btrfs_device_1->bdev_file = btrfs_get_bdev_and_sb(loop0)\n\
+  \    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n   btrfs_fill_super\n\
+  \    open_ctree\n     fail: btrfs_close_devices // -ENOMEM\n\t    btrfs_close_bdev(btrfs_device_1)\n\
+  \             fput(btrfs_device_1->bdev_file)\n\t      // btrfs_device_1->bdev_file\
+  \ is freed\n\t    btrfs_close_bdev(btrfs_device_2)\n             fput(btrfs_device_2->bdev_file)\n\
+  \n3. mount /dev/loop1 /mnt\n   btrfs_open_devices\n    btrfs_get_bdev_and_sb(&bdev_file)\n\
+  \     // EIO, btrfs_device_1->bdev_file is not assigned,\n     // which points to\
+  \ a freed memory area\n    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n\
+  \   btrfs_fill_super\n    open_ctree\n     btrfs_free_extra_devids\n      if (btrfs_device_1->bdev_file)\n\
+  \       fput(btrfs_device_1->bdev_file) // UAF !\n\nFix it by setting 'device->bdev_file'\
+  \ as 'NULL' after closing the\nbtrfs_device in btrfs_close_one_device().\n\nFixes:\
+  \ 142388194191 (\"btrfs: do not background blkdev_put()\")\nCC: stable@vger.kernel.org\
+  \ # 4.19+\nLink: https://bugzilla.kernel.org/show_bug.cgi?id=219408\nSigned-off-by:\
+  \ Zhihao Cheng <chengzhihao1@huawei.com>\nReviewed-by: David Sterba <dsterba@suse.com>\n\
+  Signed-off-by: David Sterba <dsterba@suse.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ btrfs_close_one_device in fs/btrfs/volumes.c\nstatic void btrfs_close_one_device(struct\
+  \ btrfs_device *device)\n{\n\tstruct btrfs_fs_devices *fs_devices = device->fs_devices;\n\
+  \n\tif (test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) &&\n\t    device->devid\
+  \ != BTRFS_DEV_REPLACE_DEVID) {\n\t\tlist_del_init(&device->dev_alloc_list);\n\t\
+  \tfs_devices->rw_devices--;\n\t}\n\n\tif (device->devid == BTRFS_DEV_REPLACE_DEVID)\n\
+  \t\tclear_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);\n\n\tif (test_bit(BTRFS_DEV_STATE_MISSING,\
+  \ &device->dev_state)) {\n\t\tclear_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state);\n\
+  \t\tfs_devices->missing_devices--;\n\t}\n\n\tbtrfs_close_bdev(device);\n\tif (device->bdev)\
+  \ {\n\t\tfs_devices->open_devices--;\n\t\tdevice->bdev = NULL;\n\t}\n\tclear_bit(BTRFS_DEV_STATE_WRITEABLE,\
+  \ &device->dev_state);\n\tbtrfs_destroy_dev_zone_info(device);\n\n\tdevice->fs_info\
+  \ = NULL;\n\tatomic_set(&device->dev_stats_ccnt, 0);\n\textent_io_tree_release(&device->alloc_state);\n\
+  \n\t/*\n\t * Reset the flush error record. We might have a transient flush error\n\
+  \t * in this mount, and if so we aborted the current transaction and set\n\t * the\
+  \ fs to an error state, guaranteeing no super blocks can be further\n\t * committed.\
+  \ However that error might be transient and if we unmount the\n\t * filesystem and\
+  \ mount it again, we should allow the mount to succeed\n\t * (btrfs_check_rw_degradable()\
+  \ should not fail) - if after mounting the\n\t * filesystem again we still get flush\
+  \ errors, then we will again abort\n\t * any transaction and set the error state,\
+  \ guaranteeing no commits of\n\t * unsafe super blocks.\n\t */\n\tdevice->last_flush_error\
+  \ = 0;\n\n\t/* Verify the device is back in a pristine state  */\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_FLUSH_SENT,\
+  \ &device->dev_state));\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state));\n\
+  \tWARN_ON(!list_empty(&device->dev_alloc_list));\n\tWARN_ON(!list_empty(&device->post_commit_list));\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c\n\
+  index 8f340ad1d938..eb51b609190f 100644\n--- a/fs/btrfs/volumes.c\n+++ b/fs/btrfs/volumes.c\n\
+  @@ -1105,6 +1105,7 @@ static void btrfs_close_one_device(struct btrfs_device *device)\n\
+  \ \tif (device->bdev) {\n \t\tfs_devices->open_devices--;\n \t\tdevice->bdev = NULL;\n\
+  +\t\tdevice->bdev_file = NULL;\n \t}\n \tclear_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state);\n\
+  \ \tbtrfs_destroy_dev_zone_info(device);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Stale pointer after resource release: a struct file* (device->bdev_file) is fput()/closed
+  but the field is left non-NULL. Later code uses a non-NULL check as an ownership
+  indicator and calls fput() again, causing use-after-free/double-put. The pattern
+  is failing to set a released resource pointer to NULL when other paths rely on pointer-nullness
+  to decide whether to free/put it again.'
+plan: "Plan\n\n1. Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(ReleasedFieldMap,\
+  \ const MemRegion *, bool)\n  - Key: the FieldRegion (or plain pointer region) that\
+  \ represents a resource pointer (e.g., device->bdev_file).\n  - Value: true means\
+  \ \u201Cthis region\u2019s resource was released and must be set to NULL\u201D;\
+  \ when it becomes NULL, erase the entry from the map.\n- No separate alias map is\
+  \ needed; we only check direct writes to the exact field/variable.\n\n2. Helper/summarization\
+  \ utilities\n- isFputCall(const CallEvent &Call): return true if callee name ==\
+  \ \"fput\".\n- KnownFieldRelease table for object-close helpers that release specific\
+  \ fields of the first parameter:\n  - struct FieldReleaseEntry { const char *Func;\
+  \ unsigned BaseParamIndex; const char *FieldName; };\n  - Initialize with: { \"\
+  btrfs_close_bdev\", 0, \"bdev_file\" }.\n- isKnownFieldReleaseCall(const CallEvent\
+  \ &Call, FieldReleaseEntry &Out): match against the above table.\n- markFieldReleased(CheckerContext\
+  \ &C, const Expr *BaseArg, StringRef FieldName):\n  - Get base MemRegion from BaseArg\
+  \ via getMemRegionFromExpr(BaseArg, C); ensure it\u2019s a region of a record pointer/object.\n\
+  \  - Find the FieldDecl named FieldName in the pointee record of BaseArg (RecordDecl\
+  \ lookup by name).\n  - Compute FieldRegion for that field on that base:\n    -\
+  \ SVal FRVal = State->getLValue(FieldDecl*, loc::MemRegionVal(BaseRegion));\n  \
+  \  - const MemRegion *FR = FRVal.getAsRegion();\n  - Insert (FR -> true) into ReleasedFieldMap.\n\
+  - markExprReleased(CheckerContext &C, const Expr *PtrExpr):\n  - Get MemRegion*\
+  \ R = getMemRegionFromExpr(PtrExpr, C).\n  - If R is non-null, insert (R -> true)\
+  \ into ReleasedFieldMap.\n- isNullSVal(ProgramStateRef State, SVal V):\n  - If V.isZeroConstant(),\
+  \ or if Optional<Loc> L = V.getAs<Loc>() and State->isNull(*L) is true.\n\n3. checkPostCall\n\
+  - Goal: detect when a resource pointer (struct file*) was released and record it\
+  \ as \u201Cmust be set to NULL\u201D.\n- Steps:\n  - If isFputCall(Call):\n    -\
+  \ Arg0 = Call.getArgExpr(0); call markExprReleased(C, Arg0).\n    - Return true\
+  \ (handled).\n  - Else if isKnownFieldReleaseCall(Call, Entry):\n    - BaseArg =\
+  \ Call.getArgExpr(Entry.BaseParamIndex).\n    - Call markFieldReleased(C, BaseArg,\
+  \ Entry.FieldName).\n- Notes:\n  - This covers both direct fput(device->bdev_file)\
+  \ and wrapped forms like btrfs_close_bdev(device) known to release device->bdev_file.\n\
+  \n4. checkBind\n- Goal: mark released fields as \u201Cfixed\u201D when explicitly\
+  \ set to NULL.\n- Steps:\n  - Extract the bound location region: if Optional<loc::MemRegionVal>\
+  \ LV = Loc.getAs<loc::MemRegionVal>(), const MemRegion *Dst = LV->getRegion().\n\
+  \  - If Dst exists in ReleasedFieldMap:\n    - If Val is NULL (use isNullSVal(State,\
+  \ Val)): remove Dst from ReleasedFieldMap (problem addressed).\n    - Else leave\
+  \ it as true (still stale non-NULL after release).\n- Notes:\n  - This will catch\
+  \ assignments like device->bdev_file = NULL; or p = NULL; if p itself was released.\n\
+  \n5. checkPreCall (optional immediate double-put)\n- Goal: catch immediate second\
+  \ release before NULLing, when visible in the same function.\n- Steps:\n  - If isFputCall(Call):\n\
+  \    - Arg0 region R = getMemRegionFromExpr(Arg0, C).\n    - If R is in ReleasedFieldMap\
+  \ and still true, report \u201CDouble put/use-after-free of released pointer\u201D\
+  \ (generateNonFatalErrorNode and PathSensitiveBugReport), and return.\n\n6. checkEndFunction\n\
+  - Goal: at the end of the function, require that any released resource pointer owned/handled\
+  \ by this function is set to NULL.\n- Steps:\n  - Iterate all entries in ReleasedFieldMap;\
+  \ for each (Region, NeedsNull=true):\n    - Heuristics to restrict to this function\u2019\
+  s responsibility:\n      - Only warn if Region\u2019s super-region belongs to the\
+  \ current stack frame (i.e., a field of a parameter/local of the current function).\
+  \ In practice:\n        - For a FieldRegion FR, let BaseR = FR->getSuperRegion();\
+  \ check BaseR\u2019s stack frame matches Ctx.getLocationContext()->getStackFrame();\n\
+  \      - This matches the pattern like device->bdev_file released inside btrfs_close_one_device\
+  \ but not nulled there.\n    - If it matches, emit a bug report:\n      - Message:\
+  \ \u201CReleased struct file* not set to NULL; may be double-put later.\u201D\n\
+  \  - Cleanup: remove any entries whose regions belong to the current frame to avoid\
+  \ leaking state across calls.\n\n7. checkBranchCondition (optional, conservative)\n\
+  - If the branch condition references a region in ReleasedFieldMap and it\u2019s\
+  \ still true (not nullified), you may optionally warn with a more targeted message:\n\
+  \  - \u201CUsing pointer after release; set it to NULL after fput().\u201D\n- This\
+  \ is optional; only enable if you want to flag suspicious non-NULL checks on released\
+  \ pointers.\n\n8. Matching details and constraints\n- fput is the primary release\
+  \ API for struct file*; by modeling it, we naturally confine to struct file* resources\
+  \ and avoid false positives.\n- For wrapper functions:\n  - Maintain a small, explicit\
+  \ summary table mapping function -> released field(s). Start with:\n    - { \"btrfs_close_bdev\"\
+  , 0, \"bdev_file\" }\n  - The table is easy to extend for other subsystems.\n- Type\
+  \ checks (optional):\n  - When resolving FieldDecl via FieldName, ensure the field\u2019\
+  s type is a pointer type. This helps reduce accidental mis-matches.\n- No alias\
+  \ tracking:\n  - The checker only requires direct writes to the exact field or pointer\
+  \ to nullify it. This is sufficient for common kernel cleanup patterns and keeps\
+  \ the checker simple.\n\n9. Reporting\n- Use std::make_unique<PathSensitiveBugReport>\
+  \ with a concise message.\n- For locations, attach the call site of the release\
+  \ (from checkPostCall) as the main diagnostic location and, if available, the expected\
+  \ nulling site (missing) by pointing at function end.\n\nSummary of callbacks used\n\
+  - checkPostCall: record resource release (fput(...) or summarized wrapper).\n- checkBind:\
+  \ detect nulling assignments and clear the obligation.\n- checkPreCall (optional):\
+  \ catch immediate double-put on already released region.\n- checkEndFunction: enforce\
+  \ \u201Cmust be set to NULL\u201D before leaving the cleanup function and report\
+  \ if not satisfied.\n\nThis plan directly detects the stale pointer after release\
+  \ in btrfs_close_one_device: btrfs_close_bdev(device) releases device->bdev_file\
+  \ via summary; absence of device->bdev_file = NULL triggers a warning at function\
+  \ end."
+refined_plan: null
+repaired_checker_code: null
+tn_score: -10
+tp_score: -10

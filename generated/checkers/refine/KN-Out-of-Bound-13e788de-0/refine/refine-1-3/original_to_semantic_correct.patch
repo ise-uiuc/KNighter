@@ -1,0 +1,316 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -78,7 +78,7 @@ extern KnownDerefFunction DerefTable[];
+
+ bool functionKnownToDeref(const CallEvent &Call,
+-                                 llvm::SmallVectorImpl<unsigned> &DerefParams) {
++                          llvm::SmallVectorImpl<unsigned> &DerefParams) {
+   if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
+     StringRef FnName = ID->getName();
+
+@@ -242,7 +242,6 @@   static bool rhsTextLooksMaxLike(const Expr *RHS, CheckerContext &C) {
+     StringRef Txt = getExprText(RHS, C);
+     std::string L = toLowerCopy(Txt);
+-    // Detect macro-like names that indicate a bound even if RHS is an IntegerLiteral in the AST.
+     return (!L.empty() &&
+             (L.find("max") != std::string::npos ||
+              L.find("limit") != std::string::npos ||
+@@ -255,44 +254,107 @@
+     Bound = Bound->IgnoreParenCasts();
+
+-    // Accept integer literal only if its source text still looks like a named MAX-like macro.
+     if (isa<IntegerLiteral>(Bound)) {
+       return rhsTextLooksMaxLike(Bound, C);
+     }
+
+-    // Do not consider sizeof-style bounds.
+     if (isUnarySizeOf(Bound))
+       return false;
+
+-    // Do not consider complex expressions; stick to named constants/fields.
+     if (isCompositeBoundExpr(Bound))
+       return false;
+
+-    // Named identifiers that look like capacity/limit.
+     StringRef Name = getIdentNameFromExpr(Bound);
+     if (!Name.empty())
+       return nameLooksLikeCapacityOrMax(Name) || nameLooksLikeCountBound(Name);
+
+-    // Fallback to source text check.
+     return rhsTextLooksMaxLike(Bound, C);
+   }
+
+-  static bool isLikelyIndexExpr(const Expr *E) {
+-    E = E ? E->IgnoreParenCasts() : nullptr;
+-    if (!E)
+-      return false;
+-
+-    // Index should be non-literal.
+-    if (isa<IntegerLiteral>(E))
+-      return false;
+-
+-    // If the expression is a named entity with length/size semantics, do not treat as index.
+-    StringRef Name = getIdentNameFromExpr(E);
+-    if (!Name.empty() && nameLooksLikeLengthOrSize(Name))
+-      return false;
+-
+-    // We consider raw vars/fields or explicit array indices as index-like.
+-    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E) || isa<ArraySubscriptExpr>(E))
++  // Range endpoint detection helpers.
++
++  static bool hasUnderscoreToken(StringRef Name, StringRef Tok) {
++    SmallVector<StringRef, 8> Parts;
++    Name.split(Parts, '_', -1, false);
++    for (StringRef P : Parts)
++      if (P.equals_insensitive(Tok))
++        return true;
++    return false;
++  }
++
++  static bool nameHasPrefixToken(StringRef Name, StringRef Tok) {
++    StringRef L = StringRef(toLowerCopy(Name));
++    std::string Prefix = (Tok + "_").str();
++    return L.startswith(Prefix);
++  }
++
++  static bool nameHasSuffixToken(StringRef Name, StringRef Tok) {
++    StringRef L = StringRef(toLowerCopy(Name));
++    std::string Suffix = ("_" + Tok).str();
++    return L.endswith(Suffix);
++  }
++
++  static bool nameHasTokenMin(StringRef Name) {
++    return hasUnderscoreToken(Name, "min") || nameHasPrefixToken(Name, "min") || nameHasSuffixToken(Name, "min") ||
++           hasUnderscoreToken(Name, "start") || nameHasPrefixToken(Name, "start") || nameHasSuffixToken(Name, "start") ||
++           hasUnderscoreToken(Name, "begin") || nameHasPrefixToken(Name, "begin") || nameHasSuffixToken(Name, "begin") ||
++           hasUnderscoreToken(Name, "first") || nameHasPrefixToken(Name, "first") || nameHasSuffixToken(Name, "first") ||
++           hasUnderscoreToken(Name, "lo") || hasUnderscoreToken(Name, "low") || hasUnderscoreToken(Name, "lower");
++  }
++
++  static bool nameHasTokenMax(StringRef Name) {
++    return hasUnderscoreToken(Name, "max") || nameHasPrefixToken(Name, "max") || nameHasSuffixToken(Name, "max") ||
++           hasUnderscoreToken(Name, "end") || nameHasPrefixToken(Name, "end") || nameHasSuffixToken(Name, "end") ||
++           hasUnderscoreToken(Name, "last") || nameHasPrefixToken(Name, "last") || nameHasSuffixToken(Name, "last") ||
++           hasUnderscoreToken(Name, "hi") || hasUnderscoreToken(Name, "high") || hasUnderscoreToken(Name, "upper");
++  }
++
++  static std::string stripRangeEndpointTokens(StringRef Name) {
++    std::string L = toLowerCopy(Name);
++    auto stripPrefix = [&](const char *Tok) {
++      std::string P = std::string(Tok) + "_";
++      if (L.rfind(P, 0) == 0) // startswith
++        L.erase(0, P.size());
++    };
++    auto stripSuffix = [&](const char *Tok) {
++      std::string S = std::string("_") + Tok;
++      if (L.size() >= S.size() && L.compare(L.size() - S.size(), S.size(), S) == 0)
++        L.erase(L.size() - S.size());
++    };
++    // Handle both min-side and max-side tokens.
++    const char *MinToks[] = {"min","start","begin","first","lo","low","lower"};
++    const char *MaxToks[] = {"max","end","last","hi","high","upper"};
++
++    for (const char *T : MinToks) { stripPrefix(T); stripSuffix(T); }
++    for (const char *T : MaxToks) { stripPrefix(T); stripSuffix(T); }
++    return L;
++  }
++
++  static bool textHasMaxLike(StringRef Text) {
++    StringRef L = StringRef(toLowerCopy(Text));
++    return L.contains("max") || L.contains("end") || L.contains("last") || L.contains("upper") || L.contains("hi") || L.contains("high");
++  }
++
++  static bool rhsHasMaxTokenOrText(const Expr *RHS, CheckerContext &C) {
++    StringRef RName = getIdentNameFromExpr(RHS);
++    if (!RName.empty() && nameHasTokenMax(RName))
++      return true;
++    return rhsTextLooksMaxLike(RHS, C) || textHasMaxLike(getExprText(RHS, C));
++  }
++
++  // Detects comparisons of the form "min_* > max_*" on the same base, which are range guards.
++  static bool isMinMaxRangeGuard(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
++    StringRef LName = getIdentNameFromExpr(LHS);
++    StringRef RName = getIdentNameFromExpr(RHS);
++    if (LName.empty() || RName.empty())
++      return false;
++
++    if (!(nameHasTokenMin(LName) && nameHasTokenMax(RName)))
++      return false;
++
++    std::string LBase = stripRangeEndpointTokens(LName);
++    std::string RBase = stripRangeEndpointTokens(RName);
++    if (!LBase.empty() && !RBase.empty() && LBase == RBase)
+       return true;
+
+     return false;
+@@ -302,30 +364,24 @@     if (!LHS || !RHS)
+       return false;
+
+-    // Right side is sizeof capacity.
+     if (isUnarySizeOf(RHS))
+       return true;
+
+-    // Left side is a strlen/strnlen result.
+     if (ExprHasName(LHS, "strlen", C) || ExprHasName(LHS, "strnlen", C))
+       return true;
+
+-    // Heuristic: LHS name looks like a length/size, and RHS looks like a capacity/max.
+     StringRef LName = getIdentNameFromExpr(LHS);
+     StringRef RName = getIdentNameFromExpr(RHS);
+     if ((!LName.empty() && nameLooksLikeLengthOrSize(LName)) &&
+         ((!RName.empty() && nameLooksLikeCapacityOrMax(RName)) || rhsTextLooksMaxLike(RHS, C)))
+       return true;
+
+-    // As a fallback, also treat explicit field named 'len'/'size' against RHS that mentions 'max' in token text as capacity checks.
+     if ((LName.equals_insensitive("len") || LName.equals_insensitive("length") || LName.equals_insensitive("size")) &&
+         rhsTextLooksMaxLike(RHS, C))
+       return true;
+
+     return false;
+   }
+-
+-  // Specific false-positive filters.
+
+   static bool containsBitsToken(StringRef S) {
+     StringRef L = S.lower();
+@@ -338,14 +394,12 @@
+     bool HasBitsToken = containsBitsToken(LT) || containsBitsToken(RT);
+
+-    // Common bit-width literals.
+     bool RHSIsBitWidthLiteral = false;
+     if (const auto *IL = dyn_cast_or_null<IntegerLiteral>(RHS ? RHS->IgnoreParenCasts() : nullptr)) {
+       uint64_t V = IL->getValue().getLimitedValue();
+       RHSIsBitWidthLiteral = (V == 8 || V == 16 || V == 32 || V == 64 || V == 128);
+     }
+
+-    // Also consider calls with 'bits' in callee name.
+     bool LHSCallHasBits = false;
+     if (const auto *CE = dyn_cast_or_null<CallExpr>(LHS ? LHS->IgnoreParenCasts() : nullptr)) {
+       if (const FunctionDecl *FD = CE->getDirectCallee()) {
+@@ -359,20 +413,9 @@     return (HasBitsToken || LHSCallHasBits) && RHSIsBitWidthLiteral;
+   }
+
+-  // Helper to test underscore-delimited token presence without matching substrings like "guid" or "idx".
+-  static bool hasUnderscoreToken(StringRef Name, StringRef Tok) {
+-    SmallVector<StringRef, 8> Parts;
+-    Name.split(Parts, '_', /*MaxSplit*/-1, /*KeepEmpty*/false);
+-    for (StringRef P : Parts)
+-      if (P.equals_insensitive(Tok))
+-        return true;
+-    return false;
+-  }
+-
+   static bool looksLikeEnumFieldName(StringRef Name) {
+     if (Name.empty())
+       return false;
+-    // Exact matches commonly used for enums.
+     if (Name.equals_insensitive("id") ||
+         Name.equals_insensitive("type") ||
+         Name.equals_insensitive("mode") ||
+@@ -388,7 +431,6 @@         Name.equals_insensitive("op"))
+       return true;
+
+-    // Underscore-separated suffix/prefix tokens.
+     if (hasUnderscoreToken(Name, "id") ||
+         hasUnderscoreToken(Name, "type") ||
+         hasUnderscoreToken(Name, "mode") ||
+@@ -411,11 +453,9 @@     if (NOrText.empty())
+       return false;
+     StringRef L = NOrText.lower();
+-    // Strong signal: contains "id_max".
+     if (L.contains("id_max"))
+       return true;
+
+-    // Common enum MAX tokenization: <token>_max or max_<token>.
+     static constexpr const char *EnumTokens[] = {
+         "id","type","mode","state","kind","class","family","proto","protocol","prio","level","opcode","op"
+     };
+@@ -426,7 +466,6 @@         return true;
+     }
+
+-    // Generic fallback: name contains both "id" and "max" tokens (underscore separated preferred).
+     if ((L.contains("max") && hasUnderscoreToken(NOrText, "id")) ||
+         (L.contains("id") && L.contains("max")))
+       return true;
+@@ -435,7 +474,6 @@   }
+
+   static bool isEnumIdMaxGuard(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+-    // Determine if this comparison is guarding an enumeration-like ID against its *_ID_MAX sentinel.
+     StringRef LName = getIdentNameFromExpr(LHS);
+     StringRef RName = getIdentNameFromExpr(RHS);
+     StringRef RText = getExprText(RHS, C); // Use source text to catch macros that expand to literals.
+@@ -450,22 +488,22 @@     if (!R)
+       return true;
+
+-    // Reject integer literal RHS outright unless it looks like a MAX-like macro in source text.
+     if (isa<IntegerLiteral>(R) && !rhsTextLooksMaxLike(RHS, C)) {
+       return true;
+     }
+
+-    // Exclude "x > MAX - 1" patterns; these are not our target in this checker.
+     StringRef TxtR = getExprText(RHS, C);
+     if (TxtR.contains("- 1") || TxtR.contains("-1"))
+       return true;
+
+-    // Exclude bit-width style guards (e.g., "foo_bits(...) > 32").
+     if (isBitWidthStyleGuard(LHS, RHS, C))
+       return true;
+
+-    // Exclude enumeration ID guards like "id > ID_MAX" or "type > TYPE_MAX".
+     if (isEnumIdMaxGuard(LHS, RHS, C))
++      return true;
++
++    // New: Exclude "min vs max" range validity guards.
++    if (isMinMaxRangeGuard(LHS, RHS, C))
+       return true;
+
+     return false;
+@@ -497,6 +535,34 @@     }
+   }
+
++  // Enhanced to use RHS context for range-endpoint suppression.
++  static bool isLikelyIndexExpr(const Expr *E, const Expr *RHSForContext = nullptr, CheckerContext *PCtx = nullptr) {
++    E = E ? E->IgnoreParenCasts() : nullptr;
++    if (!E)
++      return false;
++
++    if (isa<IntegerLiteral>(E))
++      return false;
++
++    StringRef Name = getIdentNameFromExpr(E);
++    if (!Name.empty() && nameLooksLikeLengthOrSize(Name))
++      return false;
++
++    // If LHS name looks like a range "min/start/lo" endpoint, and RHS is max-like, suppress.
++    if (!Name.empty() && nameHasTokenMin(Name)) {
++      if (RHSForContext) {
++        // If RHS looks max-like in name or text, treat LHS as not index.
++        if (rhsHasMaxTokenOrText(RHSForContext, *PCtx))
++          return false;
++      }
++    }
++
++    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E) || isa<ArraySubscriptExpr>(E))
++      return true;
++
++    return false;
++  }
++
+   bool isCandidateGtComparison(const BinaryOperator *BO, CheckerContext &C) const {
+     if (!BO || BO->getOpcode() != BO_GT)
+       return false;
+@@ -507,8 +573,8 @@     if (!LHS || !RHS)
+       return false;
+
+-    // LHS should look like an index. Exclude size/len fields.
+-    if (!isLikelyIndexExpr(LHS))
++    // LHS should look like an index. Exclude size/len fields and min/max range endpoints.
++    if (!isLikelyIndexExpr(LHS, RHS, &C))
+       return false;
+
+     // RHS should be a named MAX-like bound (including macros that expand to integers).
+@@ -519,7 +585,7 @@     if (isBufferCapacityComparison(LHS, RHS, C))
+       return false;
+
+-    // Exclude known false positives (e.g., bit-width checks, enum ID guards).
++    // Exclude known false positives (e.g., bit-width checks, enum ID guards, min/max range).
+     if (isFalsePositive(LHS, RHS, C))
+       return false;

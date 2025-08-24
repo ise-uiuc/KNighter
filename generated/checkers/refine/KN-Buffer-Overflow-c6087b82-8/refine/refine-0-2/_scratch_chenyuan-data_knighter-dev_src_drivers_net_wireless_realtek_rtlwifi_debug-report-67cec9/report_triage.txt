@@ -1,0 +1,2 @@
+- Decision: NotABug
+- Reason: The code clamps the user-supplied count to the destination buffer size before calling copy_from_user. Specifically, tmp_len is set to min(count, sizeof(tmp) - 1), where tmp is char tmp[32 + 1]. Then it copies at most 32 bytes and explicitly NUL-terminates with tmp[tmp_len] = '\0'. This matches the correct, safe pattern and does not fit the target bug pattern of an unchecked copy_from_user into a fixed-size buffer. There is no overflow risk here, so the report is a false positive.

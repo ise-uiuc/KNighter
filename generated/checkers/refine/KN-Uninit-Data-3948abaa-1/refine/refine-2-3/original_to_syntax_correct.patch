@@ -1,0 +1,252 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -48,6 +48,11 @@ // Tracks the last write destination offset (in bytes) from the base region.
+ REGISTER_MAP_WITH_PROGRAMSTATE(LastWriteOffsetMap, const MemRegion*, uint64_t)
+
++// NEW: Tracks an addend to the producer-known length (e.g. strscpy: returned_len + 1).
++REGISTER_MAP_WITH_PROGRAMSTATE(ProducerLenAddendMap, const MemRegion*, int64_t)
++// NEW: Tracks an addend to the last write length symbol.
++REGISTER_MAP_WITH_PROGRAMSTATE(LastWriteLenAddendMap, const MemRegion*, int64_t)
++
+ // Utility function declarations (provided externally in the prompt)
+ template <typename T>
+ const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
+@@ -107,6 +112,11 @@       // Additional helpers for symbol-based suppression
+       void recordSymbolicWrite(const MemRegion *DstR, SymbolRef LenSym, uint64_t Offset, CheckerContext &C) const;
+       bool suppressDueToLastWriteSymbol(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
++
++      // NEW helpers for affine length matching and constraints
++      bool decomposeLenToBaseAndAddend(SVal LenSV, SymbolRef &Base, int64_t &Addend) const;
++      bool matchLenWithAddend(SVal LenSV, SymbolRef Base, int64_t Addend) const;
++      bool isNonNegative(SymbolRef S, CheckerContext &C) const;
+ };
+
+ const MemRegion *SAGenTestChecker::canonical(ProgramStateRef State, const MemRegion *R) const {
+@@ -145,11 +155,13 @@   // Clear producer-derived initialization info to avoid stale mapping across re-allocations.
+   State = State->remove<ProducerLenSymMap>(Canon);
+   State = State->remove<ProducerStatusSymMap>(Canon);
++  State = State->remove<ProducerLenAddendMap>(Canon);
+   // Clear observed write/initialized-prefix tracking.
+   State = State->remove<InitPrefixMap>(Canon);
+   State = State->remove<WriteCountMap>(Canon);
+   // Clear last-write symbol-based info.
+   State = State->remove<LastWriteLenSymMap>(Canon);
++  State = State->remove<LastWriteLenAddendMap>(Canon);
+   State = State->remove<LastWriteOffsetMap>(Canon);
+   return State;
+ }
+@@ -220,9 +232,11 @@   // Clear producer symbols
+   State = State->remove<ProducerLenSymMap>(DstReg);
+   State = State->remove<ProducerStatusSymMap>(DstReg);
++  State = State->remove<ProducerLenAddendMap>(DstReg);
+
+   // Reset last-write symbol tracking to avoid stale matches.
+   State = State->remove<LastWriteLenSymMap>(DstReg);
++  State = State->remove<LastWriteLenAddendMap>(DstReg);
+   State = State->remove<LastWriteOffsetMap>(DstReg);
+
+   C.addTransition(State);
+@@ -296,11 +310,16 @@   if (!LenSymP || !*LenSymP)
+     return false;
+
+-  SVal LenArgV = CopyToUserCall.getArgSVal(2);
+-  SymbolRef CopyLenSym = LenArgV.getAsSymbol();
+-  if (!CopyLenSym || CopyLenSym != *LenSymP)
+-    return false;
+-
++  int64_t Addend = 0;
++  if (const int64_t *A = State->get<ProducerLenAddendMap>(FromReg))
++    Addend = *A;
++
++  // First, ensure copy length matches producer-derived length (symbol + addend).
++  SVal CopyLenV = CopyToUserCall.getArgSVal(2);
++  if (!matchLenWithAddend(CopyLenV, *LenSymP, Addend))
++    return false;
++
++  // If a status symbol is tracked (equality-to-zero indicates success), require it.
+   if (const SymbolRef *StatusSymP = State->get<ProducerStatusSymMap>(FromReg)) {
+     if (*StatusSymP) {
+       SValBuilder &SVB = C.getSValBuilder();
+@@ -314,7 +333,15 @@           return true;
+         }
+       }
+-    }
++      // If we cannot prove success, do not suppress.
++      return false;
++    }
++  }
++
++  // For producers like strscpy where Addend == 1, ensure the return value is non-negative on this path.
++  if (Addend != 0) {
++    if (!isNonNegative(*LenSymP, C))
++      return false;
+   }
+
+   return true;
+@@ -380,6 +407,7 @@
+   // This concrete-length write supersedes any symbolic last-write info.
+   State = State->remove<LastWriteLenSymMap>(CanonBase);
++  State = State->remove<LastWriteLenAddendMap>(CanonBase);
+   State = State->remove<LastWriteOffsetMap>(CanonBase);
+
+   C.addTransition(State);
+@@ -434,8 +462,9 @@   unsigned NewCnt = OldCnt ? (*OldCnt + 1) : 1u;
+   State = State->set<WriteCountMap>(CanonBase, NewCnt);
+
+-  // Set last write symbol and offset.
++  // Set last write symbol, addend=0 and offset.
+   State = State->set<LastWriteLenSymMap>(CanonBase, LenSym);
++  State = State->set<LastWriteLenAddendMap>(CanonBase, (int64_t)0);
+   State = State->set<LastWriteOffsetMap>(CanonBase, Off);
+
+   C.addTransition(State);
+@@ -547,6 +576,28 @@     // Skip if we cannot evaluate size; most kernels inline bacpy to memcpy so above path handles it.
+   }
+
++  // NEW: Model strscpy(dst, src, size)
++  // Return value is number of characters copied, excluding terminating NUL, or negative on truncation.
++  if (callNamed(Call, C, "strscpy")) {
++    const MemRegion *DstReg = getArgBaseRegion(Call, 0, C);
++    SymbolRef RetSym = Call.getReturnValue().getAsSymbol();
++    if (DstReg && RetSym) {
++      // Record as a producer-derived length with addend +1 (include NUL).
++      State = State->set<ProducerLenSymMap>(DstReg, RetSym);
++      State = State->set<ProducerLenAddendMap>(DstReg, (int64_t)1);
++      // Update last-write info: len = RetSym + 1, starting at offset 0.
++      State = State->set<LastWriteLenSymMap>(DstReg, RetSym);
++      State = State->set<LastWriteLenAddendMap>(DstReg, (int64_t)1);
++      State = State->set<LastWriteOffsetMap>(DstReg, (uint64_t)0);
++      // Bump write count heuristics.
++      const unsigned *OldCnt = State->get<WriteCountMap>(DstReg);
++      unsigned NewCnt = OldCnt ? (*OldCnt + 1) : 1u;
++      State = State->set<WriteCountMap>(DstReg, NewCnt);
++      C.addTransition(State);
++    }
++    return;
++  }
++
+   // Producer initialization modeling (len via out-pointer)
+   unsigned BufIdx = 0, LenPtrIdx = 0;
+   if (functionKnownToInitBuffer(Call, C, BufIdx, LenPtrIdx)) {
+@@ -557,6 +608,7 @@       if (LenSym && RetSym) {
+         State = State->set<ProducerLenSymMap>(BufReg, LenSym);
+         State = State->set<ProducerStatusSymMap>(BufReg, RetSym);
++        State = State->set<ProducerLenAddendMap>(BufReg, (int64_t)0);
+         C.addTransition(State);
+       }
+     }
+@@ -571,6 +623,7 @@       SymbolRef RetSym = Call.getReturnValue().getAsSymbol();
+       if (RetSym) {
+         State = State->set<ProducerLenSymMap>(BufReg, RetSym);
++        State = State->set<ProducerLenAddendMap>(BufReg, (int64_t)0);
+         // No separate status symbol for this API; clear any previous status.
+         State = State->remove<ProducerStatusSymMap>(BufReg);
+         C.addTransition(State);
+@@ -580,24 +633,21 @@   }
+ }
+
+-// Suppress false positives when the last write into the buffer used the same length symbol as copy_to_user and started at offset 0.
++// Suppress false positives when the last write into the buffer used the same length symbol (optionally with a constant addend) from offset 0.
+ bool SAGenTestChecker::suppressDueToLastWriteSymbol(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const {
+   ProgramStateRef State = C.getState();
+
+   const SymbolRef *LastLenSymP = State->get<LastWriteLenSymMap>(FromReg);
+   const uint64_t *LastOffP = State->get<LastWriteOffsetMap>(FromReg);
+-  if (!LastLenSymP || !*LastLenSymP || !LastOffP)
++  const int64_t *AddP = State->get<LastWriteLenAddendMap>(FromReg);
++  if (!LastLenSymP || !*LastLenSymP || !LastOffP || !AddP)
+     return false;
+
+   if (*LastOffP != 0)
+     return false; // Only trust writes that start at base offset 0.
+
+   SVal CopyLenV = CopyToUserCall.getArgSVal(2);
+-  SymbolRef CopyLenSym = CopyLenV.getAsSymbol();
+-  if (!CopyLenSym)
+-    return false;
+-
+-  return (CopyLenSym == *LastLenSymP);
++  return matchLenWithAddend(CopyLenV, *LastLenSymP, *AddP);
+ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -627,7 +677,7 @@   if (isFalsePositiveDueToProducer(Call, C, FromReg))
+     return;
+
+-  // Suppress when the most recent write into the source buffer used exactly the same length symbol from offset 0.
++  // Suppress when the most recent write into the source buffer used exactly the same length symbol (+ optional addend) from offset 0.
+   if (suppressDueToLastWriteSymbol(Call, C, FromReg))
+     return;
+
+@@ -715,6 +765,74 @@   C.addTransition(State);
+ }
+
++// === New helper implementations ===
++
++bool SAGenTestChecker::decomposeLenToBaseAndAddend(SVal LenSV, SymbolRef &Base, int64_t &Addend) const {
++  Base = nullptr;
++  Addend = 0;
++
++  SymbolRef SE = LenSV.getAsSymbol();
++  if (!SE)
++    return false;
++
++  // Try to detect (Sym +/- Const).
++  if (const SymIntExpr *SIE = dyn_cast<SymIntExpr>(SE)) {
++    const SymExpr *LHS = SIE->getLHS();
++    if (!LHS)
++      return false;
++
++    llvm::APSInt RHS = SIE->getRHS();
++    int64_t C = RHS.getSExtValue();
++
++    if (SIE->getOpcode() == BO_Add) {
++      Base = LHS;
++      Addend = C;
++      return true;
++    }
++    if (SIE->getOpcode() == BO_Sub) {
++      Base = LHS;
++      Addend = -C;
++      return true;
++    }
++    // Other ops are not handled.
++    return false;
++  }
++
++  // Pure symbol case: addend is 0.
++  Base = SE;
++  Addend = 0;
++  return true;
++}
++
++bool SAGenTestChecker::matchLenWithAddend(SVal LenSV, SymbolRef Base, int64_t Addend) const {
++  SymbolRef CopyBase = nullptr;
++  int64_t CopyAdd = 0;
++  if (!decomposeLenToBaseAndAddend(LenSV, CopyBase, CopyAdd))
++    return false;
++
++  if (!CopyBase || !Base)
++    return false;
++
++  return (CopyBase == Base) && (CopyAdd == Addend);
++}
++
++bool SAGenTestChecker::isNonNegative(SymbolRef S, CheckerContext &C) const {
++  ProgramStateRef State = C.getState();
++  SValBuilder &SVB = C.getSValBuilder();
++  QualType IntTy = C.getASTContext().IntTy;
++
++  SVal Cmp = SVB.evalBinOp(State, BO_LT, nonloc::SymbolVal(S), SVB.makeZeroVal(IntTy), IntTy);
++  auto MaybeCond = Cmp.getAs<DefinedOrUnknownSVal>();
++  if (!MaybeCond)
++    return false;
++  DefinedOrUnknownSVal Cond = *MaybeCond;
++
++  ProgramStateRef StNeg = State->assume(Cond, true);
++  ProgramStateRef StNotNeg = State->assume(Cond, false);
++  // Non-negative is guaranteed if "S < 0" is impossible and "!(S < 0)" is possible.
++  return (!StNeg && StNotNeg);
++}
++
+ } // end anonymous namespace
+
+ extern "C" void clang_registerCheckers(CheckerRegistry &registry) {

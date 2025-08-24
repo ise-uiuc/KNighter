@@ -1,0 +1,171 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -124,7 +124,6 @@     return Lexer::getSourceText(Range, SM, LangOpts);
+   }
+
+-  // Conservative name matcher; prefers constant-like bounds.
+   static bool nameLooksLikeCountBound(StringRef Name) {
+     std::string Lower = Name.lower();
+     if (Lower.find("max") != std::string::npos)
+@@ -214,12 +213,15 @@
+     Bound = Bound->IgnoreParenCasts();
+
++    // Do not consider literal bounds here; reduces FPs like 'bits > 32'.
+     if (isa<IntegerLiteral>(Bound))
+-      return false; // reject literal RHS outright (avoids x > 0 style guards)
+-
++      return false;
++
++    // Do not consider sizeof-style bounds.
+     if (isUnarySizeOf(Bound))
+       return false;
+
++    // Do not consider complex expressions; stick to named constants/fields.
+     if (isCompositeBoundExpr(Bound))
+       return false;
+
+@@ -231,9 +233,11 @@     if (!E)
+       return false;
+
++    // Index should be non-literal.
+     if (isa<IntegerLiteral>(E))
+       return false;
+
++    // We consider raw vars/fields or explicit array indices as index-like.
+     if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E) || isa<ArraySubscriptExpr>(E))
+       return true;
+
+@@ -253,6 +257,40 @@     return false;
+   }
+
++  // Specific false-positive filters.
++  static bool containsBitsToken(StringRef S) {
++    StringRef L = S.lower();
++    return L.contains("bit") || L.contains("bits");
++  }
++
++  static bool isBitWidthStyleGuard(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
++    StringRef LT = getExprText(LHS, C);
++    StringRef RT = getExprText(RHS, C);
++
++    bool HasBitsToken = containsBitsToken(LT) || containsBitsToken(RT);
++
++    // Common bit-width literals.
++    bool RHSIsBitWidthLiteral = false;
++    if (const auto *IL = dyn_cast_or_null<IntegerLiteral>(RHS ? RHS->IgnoreParenCasts() : nullptr)) {
++      uint64_t V = IL->getValue().getLimitedValue();
++      RHSIsBitWidthLiteral = (V == 8 || V == 16 || V == 32 || V == 64 || V == 128);
++    }
++
++    // Also consider calls with 'bits' in callee name.
++    bool LHSCallHasBits = false;
++    if (const auto *CE = dyn_cast_or_null<CallExpr>(LHS ? LHS->IgnoreParenCasts() : nullptr)) {
++      if (const FunctionDecl *FD = CE->getDirectCallee()) {
++        if (const IdentifierInfo *II = FD->getIdentifier())
++          LHSCallHasBits = containsBitsToken(II->getName());
++      } else {
++        // As a fallback, use source text.
++        LHSCallHasBits = containsBitsToken(LT);
++      }
++    }
++
++    return (HasBitsToken || LHSCallHasBits) && RHSIsBitWidthLiteral;
++  }
++
+   static bool isFalsePositive(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+     (void)LHS;
+
+@@ -260,23 +298,25 @@     if (!R)
+       return true;
+
+-    // Reject small integer literal RHS (common guards unrelated to array bounds).
++    // Reject integer literal RHS outright. This excludes many non-index guards,
++    // including 'bits > 32' and similar.
+     if (const auto *IL = dyn_cast<IntegerLiteral>(R)) {
+-      if (IL->getValue().ule(2))
+-        return true;
+-      // In general we don't want to flag literal bounds at all in this checker.
+-      return true;
+-    }
+-
+-    StringRef Txt = getExprText(RHS, C);
+-    if (Txt.contains("- 1") || Txt.contains("-1"))
+-      return true;
+-
+-    return false;
+-  }
+-
+-  // Collect all potential '>' comparisons within a condition expression by
+-  // descending into logical operators while keeping the top-level IfStmt context.
++      (void)IL;
++      return true;
++    }
++
++    // Exclude "x > MAX - 1" patterns; these are not our target in this checker.
++    StringRef TxtR = getExprText(RHS, C);
++    if (TxtR.contains("- 1") || TxtR.contains("-1"))
++      return true;
++
++    // Exclude bit-width style guards (e.g., "foo_bits(...) > 32").
++    if (isBitWidthStyleGuard(LHS, RHS, C))
++      return true;
++
++    return false;
++  }
++
+   static void collectGtComparisons(const Expr *E,
+                                    llvm::SmallVectorImpl<const BinaryOperator*> &Out) {
+     if (!E)
+@@ -295,7 +335,6 @@       }
+     }
+
+-    // Also traverse ternary conditions if ever present directly in the condition.
+     if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
+       collectGtComparisons(CO->getCond(), Out);
+       collectGtComparisons(CO->getTrueExpr(), Out);
+@@ -304,7 +343,6 @@     }
+   }
+
+-  // Decide if a BinaryOperator 'LHS > RHS' is our off-by-one candidate.
+   bool isCandidateGtComparison(const BinaryOperator *BO, CheckerContext &C) const {
+     if (!BO || BO->getOpcode() != BO_GT)
+       return false;
+@@ -315,18 +353,19 @@     if (!LHS || !RHS)
+       return false;
+
++    // LHS should look like an index.
+     if (!isLikelyIndexExpr(LHS))
+       return false;
+
++    // RHS should be a named MAX-like bound.
+     if (!isPlainMaxLikeBound(RHS, C))
+       return false;
+
++    // Avoid comparisons that are about buffer capacity/length, not indexing.
+     if (isBufferCapacityComparison(LHS, RHS, C))
+       return false;
+
+-    if (isa<IntegerLiteral>(LHS))
+-      return false;
+-
++    // Exclude known false positives (e.g., bit-width checks).
+     if (isFalsePositive(LHS, RHS, C))
+       return false;
+
+@@ -347,18 +386,16 @@   if (!CondE)
+     return;
+
+-  // Look for any '>' comparisons inside the condition (handles &&/||).
+   llvm::SmallVector<const BinaryOperator*, 4> GtComps;
+   collectGtComparisons(CondE, GtComps);
+
+   if (GtComps.empty())
+     return;
+
+-  // The Then branch should look like an error path with early negative return.
++  // The Then branch should look like an errno-style error path.
+   if (!thenBranchHasEarlyErrorReturn(IS, C))
+     return;
+
+-  // If any candidate comparison satisfies our rules, report.
+   for (const BinaryOperator *BO : GtComps) {
+     if (!isCandidateGtComparison(BO, C))
+       continue;

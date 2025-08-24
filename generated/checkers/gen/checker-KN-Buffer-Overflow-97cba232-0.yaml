@@ -1,0 +1,438 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 97cba232549b9fe7e491fb60a69cf93075015f29
+commit_type: Buffer-Overflow
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"llvm/ADT/APSInt.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// No extra program states are needed for this checker.\n\
+  namespace {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker\
+  \ : public Checker<check::Location> {\n   mutable std::unique_ptr<BugType> BT;\n\
+  \n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Off-by-one array\
+  \ access\", \"Array bounds\")) {}\n\n      void checkLocation(SVal Loc, bool IsLoad,\
+  \ const Stmt *S, CheckerContext &C) const;\n\n   private:\n\n      // Try to extract\
+  \ a constant array size from the base expression of an array subscript.\n      bool\
+  \ getConstArraySizeFromBase(const Expr *BaseE, llvm::APInt &ArrSize, CheckerContext\
+  \ &C) const;\n\n      // Parse an index expression into \"LoopVar +/- Const\". Return\
+  \ true if matched and Const (K) >= 1.\n      bool parseIndexOffset(const Expr *IdxE,\
+  \ const VarDecl *&LoopVarVD, long long &K,\n                            CheckerContext\
+  \ &C) const;\n\n      // Analyze the loop condition and extract the bound expression\
+  \ if it matches \"i < Bound\" or \"Bound > i\"\n      // with the same loop variable.\n\
+  \      bool getLoopBoundFromFor(const ForStmt *FS, const VarDecl *LoopVarVD,\n \
+  \                              const Expr *&BoundE) const;\n\n      // Try to evaluate\
+  \ a constant expression to APSInt. Wrapper around provided helper.\n      bool evalToInt(llvm::APSInt\
+  \ &Res, const Expr *E, CheckerContext &C) const {\n        return EvaluateExprToInt(Res,\
+  \ E, C);\n      }\n\n      // Check for a guarding if-statement inside the loop\
+  \ that ensures \"i + K < Bound\"\n      // via patterns \"i + K2 < Bound\" with\
+  \ K2 >= K, or \"i < Bound - K2\" with K2 >= K.\n      bool hasGuardingIfInsideLoop(const\
+  \ ArraySubscriptExpr *ASE, const ForStmt *FS,\n                                \
+  \   const VarDecl *LoopVarVD, long long K,\n                                   const\
+  \ llvm::APSInt &BoundVal, CheckerContext &C) const;\n\n      // Helper: compare\
+  \ two expressions by constant integer value equality.\n      bool constExprsEqualByIntValue(const\
+  \ Expr *A, const Expr *B, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::getConstArraySizeFromBase(const\
+  \ Expr *BaseE, llvm::APInt &ArrSize,\n                                         \
+  \        CheckerContext &C) const {\n  if (!BaseE) return false;\n  const Expr *E\
+  \ = BaseE->IgnoreParenImpCasts();\n  QualType T = E->getType();\n\n  // Directly\
+  \ from the expression type\n  if (const auto *CAT = dyn_cast<ConstantArrayType>(T.getTypePtr()))\
+  \ {\n    ArrSize = CAT->getSize();\n    return true;\n  }\n\n  // Try member's declared\
+  \ type if it's a field access.\n  if (const auto *ME = dyn_cast<MemberExpr>(E))\
+  \ {\n    if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {\n    \
+  \  QualType FT = FD->getType();\n      if (const auto *CAT = dyn_cast<ConstantArrayType>(FT.getTypePtr()))\
+  \ {\n        ArrSize = CAT->getSize();\n        return true;\n      }\n    }\n \
+  \ }\n\n  // Fall back to provided helper for DeclRefExpr of arrays\n  if (getArraySizeFromExpr(ArrSize,\
+  \ E))\n    return true;\n\n  return false;\n}\n\nbool SAGenTestChecker::parseIndexOffset(const\
+  \ Expr *IdxE, const VarDecl *&LoopVarVD,\n                                     \
+  \   long long &K, CheckerContext &C) const {\n  LoopVarVD = nullptr;\n  K = 0;\n\
+  \  if (!IdxE) return false;\n\n  const Expr *E = IdxE->IgnoreParenImpCasts();\n\n\
+  \  // Case: i + C or C + i or i - C\n  if (const auto *BO = dyn_cast<BinaryOperator>(E))\
+  \ {\n    BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op != BO_Add && Op\
+  \ != BO_Sub)\n      return false;\n\n    const Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \    const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\n    const DeclRefExpr\
+  \ *VarSide = nullptr;\n    const Expr *ConstSide = nullptr;\n    bool VarOnLeft\
+  \ = false;\n\n    if ((VarSide = dyn_cast<DeclRefExpr>(L))) {\n      VarOnLeft =\
+  \ true;\n      ConstSide = R;\n    } else if ((VarSide = dyn_cast<DeclRefExpr>(R)))\
+  \ {\n      VarOnLeft = false;\n      ConstSide = L;\n    } else {\n      return\
+  \ false;\n    }\n\n    const VarDecl *VD = dyn_cast<VarDecl>(VarSide->getDecl());\n\
+  \    if (!VD)\n      return false;\n\n    llvm::APSInt Val;\n    if (!evalToInt(Val,\
+  \ ConstSide, C))\n      return false;\n\n    long long ConstK = 0;\n    if (Val.isSigned())\n\
+  \      ConstK = Val.getSExtValue();\n    else\n      ConstK = static_cast<long long>(Val.getZExtValue());\n\
+  \n    if (Op == BO_Add) {\n      // i + C or C + i\n      LoopVarVD = VD;\n    \
+  \  K = ConstK;\n    } else {\n      // subtraction: i - C\n      if (!VarOnLeft)\n\
+  \        return false; // C - i is not our pattern\n      LoopVarVD = VD;\n    \
+  \  K = -ConstK;\n    }\n\n    // Only care about positive offsets\n    if (K >=\
+  \ 1)\n      return true;\n\n    return false;\n  }\n\n  // Pure variable: i (no\
+  \ offset) - not our target\n  if (const auto *DR = dyn_cast<DeclRefExpr>(E)) {\n\
+  \    (void)DR;\n    return false;\n  }\n\n  // Not a supported pattern\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::getLoopBoundFromFor(const ForStmt *FS, const\
+  \ VarDecl *LoopVarVD,\n                                           const Expr *&BoundE)\
+  \ const {\n  BoundE = nullptr;\n  if (!FS || !LoopVarVD)\n    return false;\n\n\
+  \  const Stmt *CondS = FS->getCond();\n  if (!CondS)\n    return false;\n\n  const\
+  \ Expr *CondE = dyn_cast<Expr>(CondS);\n  if (!CondE)\n    return false;\n\n  CondE\
+  \ = CondE->IgnoreParenImpCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(CondE);\n\
+  \  if (!BO)\n    return false;\n\n  // i < Bound\n  if (BO->getOpcode() == BO_LT)\
+  \ {\n    const Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n    const auto *DL\
+  \ = dyn_cast<DeclRefExpr>(L);\n    if (!DL) return false;\n    const VarDecl *LVD\
+  \ = dyn_cast<VarDecl>(DL->getDecl());\n    if (LVD != LoopVarVD)\n      return false;\n\
+  \    BoundE = BO->getRHS();\n    return BoundE != nullptr;\n  }\n\n  // Bound >\
+  \ i\n  if (BO->getOpcode() == BO_GT) {\n    const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \    const auto *DR = dyn_cast<DeclRefExpr>(R);\n    if (!DR) return false;\n  \
+  \  const VarDecl *RVD = dyn_cast<VarDecl>(DR->getDecl());\n    if (RVD != LoopVarVD)\n\
+  \      return false;\n    BoundE = BO->getLHS();\n    return BoundE != nullptr;\n\
+  \  }\n\n  return false;\n}\n\nbool SAGenTestChecker::constExprsEqualByIntValue(const\
+  \ Expr *A, const Expr *B,\n                                                 CheckerContext\
+  \ &C) const {\n  if (!A || !B) return false;\n  llvm::APSInt VA, VB;\n  if (!evalToInt(VA,\
+  \ A->IgnoreParenImpCasts(), C))\n    return false;\n  if (!evalToInt(VB, B->IgnoreParenImpCasts(),\
+  \ C))\n    return false;\n  // Compare values (treat as unsigned to avoid sign issues)\n\
+  \  return VA.getLimitedValue() == VB.getLimitedValue();\n}\n\nbool SAGenTestChecker::hasGuardingIfInsideLoop(const\
+  \ ArraySubscriptExpr *ASE, const ForStmt *FS,\n                                \
+  \               const VarDecl *LoopVarVD, long long K,\n                       \
+  \                        const llvm::APSInt &BoundVal,\n                       \
+  \                        CheckerContext &C) const {\n  if (!ASE || !FS || !LoopVarVD)\n\
+  \    return false;\n\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(ASE,\
+  \ C);\n  if (!IfS)\n    return false;\n\n  // Ensure this IfStmt is within the same\
+  \ for-loop's body (ancestor relation)\n  const ForStmt *AncFor = findSpecificTypeInParents<ForStmt>(IfS,\
+  \ C);\n  if (AncFor != FS)\n    return false;\n\n  const Expr *Cond = IfS->getCond();\n\
+  \  if (!Cond)\n    return false;\n\n  const Expr *CE = Cond->IgnoreParenImpCasts();\n\
+  \  const auto *BO = dyn_cast<BinaryOperator>(CE);\n  if (!BO)\n    return false;\n\
+  \n  // Only handle strict less-than guards for now to reduce false positives.\n\
+  \  if (BO->getOpcode() != BO_LT)\n    return false;\n\n  const Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \  const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\n  // Evaluate BoundRHS\
+  \ numeric value for comparing with loop bound.\n  llvm::APSInt RHSVal;\n  if (!evalToInt(RHSVal,\
+  \ R, C))\n    return false;\n\n  // If Right side equals the same bound value, handle\
+  \ \"i + K2 < Bound\"\n  if (RHSVal.getLimitedValue() == BoundVal.getLimitedValue())\
+  \ {\n    const VarDecl *Var2 = nullptr;\n    long long K2 = 0;\n    if (parseIndexOffset(L,\
+  \ Var2, K2, C) && Var2 == LoopVarVD) {\n      if (K2 >= K)\n        return true;\n\
+  \    }\n  }\n\n  // Handle \"i < Bound - K2\"\n  if (const auto *BOR = dyn_cast<BinaryOperator>(R))\
+  \ {\n    if (BOR->getOpcode() == BO_Sub) {\n      const Expr *RL = BOR->getLHS()->IgnoreParenImpCasts();\n\
+  \      const Expr *RR = BOR->getRHS()->IgnoreParenImpCasts();\n\n      // Check\
+  \ RL equals bound by value\n      if (!constExprsEqualByIntValue(RL, R, C)) {\n\
+  \        // We compared R to itself; instead compare RL to the original loop bound\
+  \ value.\n        llvm::APSInt RLVal;\n        if (!evalToInt(RLVal, RL, C))\n \
+  \         return false;\n        if (RLVal.getLimitedValue() != BoundVal.getLimitedValue())\n\
+  \          return false;\n      }\n\n      llvm::APSInt K2Val;\n      if (!evalToInt(K2Val,\
+  \ RR, C))\n        return false;\n\n      unsigned long long K2 = K2Val.getLimitedValue();\n\
+  \      // Left side must be the loop variable alone.\n      if (const auto *DL =\
+  \ dyn_cast<DeclRefExpr>(L)) {\n        const VarDecl *LV = dyn_cast<VarDecl>(DL->getDecl());\n\
+  \        if (LV == LoopVarVD) {\n          if (K2 >= static_cast<unsigned long long>(K))\n\
+  \            return true;\n        }\n      }\n    }\n  }\n\n  return false;\n}\n\
+  \nvoid SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const {\n  // Only act on array subscripts\n  const auto *ASE = dyn_cast_or_null<ArraySubscriptExpr>(S);\n\
+  \  if (!ASE)\n    return;\n\n  const Expr *BaseE = ASE->getBase();\n  const Expr\
+  \ *IdxE  = ASE->getIdx();\n  if (!BaseE || !IdxE)\n    return;\n\n  // Step B: Parse\
+  \ index \"i +/- K\" with K >= 1\n  const VarDecl *LoopVarVD = nullptr;\n  long long\
+  \ K = 0;\n  if (!parseIndexOffset(IdxE, LoopVarVD, K, C))\n    return;\n\n  // Step\
+  \ C: Find enclosing for-statement and extract loop bound\n  const ForStmt *FS =\
+  \ findSpecificTypeInParents<ForStmt>(ASE, C);\n  if (!FS)\n    return;\n\n  const\
+  \ Expr *BoundE = nullptr;\n  if (!getLoopBoundFromFor(FS, LoopVarVD, BoundE))\n\
+  \    return;\n\n  // Step D: Get array size of the base\n  llvm::APInt ArrSize(64,\
+  \ 0);\n  if (!getConstArraySizeFromBase(BaseE, ArrSize, C))\n    return;\n\n  //\
+  \ Step E: Evaluate loop bound and compare to array size\n  llvm::APSInt BoundVal;\n\
+  \  if (!evalToInt(BoundVal, BoundE->IgnoreParenImpCasts(), C))\n    return;\n\n\
+  \  unsigned long long NArr = ArrSize.getLimitedValue();\n  unsigned long long NBound\
+  \ = BoundVal.getLimitedValue();\n\n  if (NArr != NBound)\n    return; // Only warn\
+  \ when loop upper bound equals array length\n\n  // Step F: Look for a guarding\
+  \ if-statement inside the loop\n  if (hasGuardingIfInsideLoop(ASE, FS, LoopVarVD,\
+  \ K, BoundVal, C))\n    return;\n\n  // Step G: Report the bug\n  ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Loop iterates to last index while accessing arr[i+1] (off-by-one OOB).\"\
+  , N);\n  R->addRange(ASE->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\
+  \n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects off-by-one out-of-bounds when looping with i < N but accessing\
+  \ arr[i+1]\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ndrm/amd/display: Fix buffer overflow in 'get_host_router_total_dp_tunnel_bw()'\n\
+  \nThe error message buffer overflow 'dc->links' 12 <= 12 suggests that the\ncode\
+  \ is trying to access an element of the dc->links array that is\nbeyond its bounds.\
+  \ In C, arrays are zero-indexed, so an array with 12\nelements has valid indices\
+  \ from 0 to 11. Trying to access dc->links[12]\nwould be an attempt to access the\
+  \ 13th element of a 12-element array,\nwhich is a buffer overflow.\n\nTo fix this,\
+  \ ensure that the loop does not go beyond the last valid\nindex when accessing dc->links[i\
+  \ + 1] by subtracting 1 from the loop\ncondition.\n\nThis would ensure that i +\
+  \ 1 is always a valid index in the array.\n\nFixes the below:\ndrivers/gpu/drm/amd/amdgpu/../display/dc/link/protocols/link_dp_dpia_bw.c:208\
+  \ get_host_router_total_dp_tunnel_bw() error: buffer overflow 'dc->links' 12 <=\
+  \ 12\n\nFixes: 59f1622a5f05 (\"drm/amd/display: Add dpia display mode validation\
+  \ logic\")\nCc: PeiChen Huang <peichen.huang@amd.com>\nCc: Aric Cyr <aric.cyr@amd.com>\n\
+  Cc: Rodrigo Siqueira <rodrigo.siqueira@amd.com>\nCc: Aurabindo Pillai <aurabindo.pillai@amd.com>\n\
+  Cc: Meenakshikumar Somasundaram <meenakshikumar.somasundaram@amd.com>\nSigned-off-by:\
+  \ Srinivasan Shanmugam <srinivasan.shanmugam@amd.com>\nReviewed-by: Tom Chung <chiahsuan.chung@amd.com>\n\
+  Signed-off-by: Alex Deucher <alexander.deucher@amd.com>\n\n## Buggy Code\n\n```c\n\
+  // Function: get_host_router_total_dp_tunnel_bw in drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c\n\
+  static int get_host_router_total_dp_tunnel_bw(const struct dc *dc, uint8_t hr_index)\n\
+  {\n\tuint8_t lowest_dpia_index = get_lowest_dpia_index(dc->links[0]);\n\tuint8_t\
+  \ hr_index_temp = 0;\n\tstruct dc_link *link_dpia_primary, *link_dpia_secondary;\n\
+  \tint total_bw = 0;\n\n\tfor (uint8_t i = 0; i < MAX_PIPES * 2; ++i) {\n\n\t\tif\
+  \ (!dc->links[i] || dc->links[i]->ep_type != DISPLAY_ENDPOINT_USB4_DPIA)\n\t\t\t\
+  continue;\n\n\t\thr_index_temp = (dc->links[i]->link_index - lowest_dpia_index)\
+  \ / 2;\n\n\t\tif (hr_index_temp == hr_index) {\n\t\t\tlink_dpia_primary = dc->links[i];\n\
+  \t\t\tlink_dpia_secondary = dc->links[i + 1];\n\n\t\t\t/**\n\t\t\t * If BW allocation\
+  \ enabled on both DPIAs, then\n\t\t\t * HR BW = Estimated(dpia_primary) + Allocated(dpia_secondary)\n\
+  \t\t\t * otherwise HR BW = Estimated(bw alloc enabled dpia)\n\t\t\t */\n\t\t\tif\
+  \ ((link_dpia_primary->hpd_status &&\n\t\t\t\tlink_dpia_primary->dpia_bw_alloc_config.bw_alloc_enabled)\
+  \ &&\n\t\t\t\t(link_dpia_secondary->hpd_status &&\n\t\t\t\tlink_dpia_secondary->dpia_bw_alloc_config.bw_alloc_enabled))\
+  \ {\n\t\t\t\t\ttotal_bw += link_dpia_primary->dpia_bw_alloc_config.estimated_bw\
+  \ +\n\t\t\t\t\t\tlink_dpia_secondary->dpia_bw_alloc_config.allocated_bw;\n\t\t\t\
+  } else if (link_dpia_primary->hpd_status &&\n\t\t\t\t\tlink_dpia_primary->dpia_bw_alloc_config.bw_alloc_enabled)\
+  \ {\n\t\t\t\ttotal_bw = link_dpia_primary->dpia_bw_alloc_config.estimated_bw;\n\t\
+  \t\t} else if (link_dpia_secondary->hpd_status &&\n\t\t\t\tlink_dpia_secondary->dpia_bw_alloc_config.bw_alloc_enabled)\
+  \ {\n\t\t\t\ttotal_bw += link_dpia_secondary->dpia_bw_alloc_config.estimated_bw;\n\
+  \t\t\t}\n\t\t\tbreak;\n\t\t}\n\t}\n\n\treturn total_bw;\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c\
+  \ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c\nindex dd0d2b206462..5491b707cec8\
+  \ 100644\n--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c\n\
+  +++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c\n@@ -196,7\
+  \ +196,7 @@ static int get_host_router_total_dp_tunnel_bw(const struct dc *dc, uint8_t\
+  \ hr_in\n \tstruct dc_link *link_dpia_primary, *link_dpia_secondary;\n \tint total_bw\
+  \ = 0;\n \n-\tfor (uint8_t i = 0; i < MAX_PIPES * 2; ++i) {\n+\tfor (uint8_t i =\
+  \ 0; i < (MAX_PIPES * 2) - 1; ++i) {\n \n \t\tif (!dc->links[i] || dc->links[i]->ep_type\
+  \ != DISPLAY_ENDPOINT_USB4_DPIA)\n \t\t\tcontinue;\n```\n"
+pattern: "## Bug Pattern\n\nLoop iterates up to the last valid index of an array while\
+  \ accessing the next element (i + 1) without a bound check, causing an off-by-one\
+  \ out-of-bounds access.\n\nPattern example:\n- Given an array of length N:\n  -\
+  \ for (i = 0; i < N; ++i) {\n      ...\n      use(arr[i + 1]); // OOB when i ==\
+  \ N - 1\n    }\n\nCorrect patterns:\n- for (i = 0; i + 1 < N; ++i) { ... use(arr[i\
+  \ + 1]); ... }\n- or guard the access: if (i + 1 < N) use(arr[i + 1]);"
+plan: "Plan to detect \u201Cfor (i < N) with arr[i+1]\u201D off-by-one OOB\n\n1) Program\
+  \ state\n- No custom program state is required. This checker is primarily syntactic/semantic\
+  \ and can be implemented with local AST inspection and constant evaluation.\n\n\
+  2) Callback functions\n- Use checkLocation (primary)\n  - Rationale: Array element\
+  \ accesses (both loads and stores) trigger checkLocation with the ArraySubscriptExpr\
+  \ as Stmt*, which lets us analyze the index and its surrounding loop context precisely.\n\
+  \n3) Detailed implementation steps\n\nStep A: Trigger on array subscripts in checkLocation\n\
+  - In checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C):\n \
+  \ - dyn_cast the Stmt S to const ArraySubscriptExpr *ASE. If not an ASE, return.\n\
+  \  - Extract the base expression BaseE = ASE->getBase()->IgnoreParenCasts().\n \
+  \ - Extract the index expression IdxE = ASE->getIdx()->IgnoreParenImpCasts().\n\n\
+  Step B: Parse index \u201Ci + K\u201D\n- Attempt to match IdxE to the form \u201C\
+  LoopVar +/- Const\u201D:\n  - If IdxE is a DeclRefExpr: not our target, return (we\
+  \ only care about i + 1 pattern).\n  - If IdxE is a BinaryOperator BO with opcode\
+  \ BO_Add or BO_Sub:\n    - Normalize so that one side is DeclRefExpr (VarDecl* LoopVarVD)\
+  \ and the other side is an integer constant (APSInt KVal).\n      - Use EvaluateExprToInt\
+  \ to evaluate the constant operand.\n      - If const evaluation fails, return.\n\
+  \      - For BO_Sub of form \u201Ci - C\u201D, treat as K = -C.\n      - We only\
+  \ report for K >= 1. If K <= 0, return.\n  - If the above pattern fails, return.\n\
+  \nStep C: Find the enclosing for-loop and extract loop condition\n- Use findSpecificTypeInParents<ForStmt>(ASE,\
+  \ C) to find the closest for-loop F.\n  - If not found, return.\n- Analyze F->getCond():\n\
+  \  - After IgnoreParenImpCasts(), require a BinaryOperator CondBO.\n  - Accept two\
+  \ canonical forms:\n    - \u201Ci < BoundExpr\u201D (CondBO->getOpcode() == BO_LT\
+  \ and LHS is the same LoopVarVD).\n    - \u201CBoundExpr > i\u201D (CondBO->getOpcode()\
+  \ == BO_GT and RHS is the same LoopVarVD).\n  - If neither matches with the same\
+  \ LoopVarVD, return.\n  - Extract BoundExpr (the non-i side). Let BoundE be that\
+  \ expression (IgnoreParenImpCasts()).\n\nStep D: Compute the array length of the\
+  \ subscripted base\n- Implement a tiny helper inside the checker (used only here):\n\
+  \  - bool getConstArraySizeFromBase(const Expr *BaseE, llvm::APInt &ArrSize):\n\
+  \    - First try provided getArraySizeFromExpr(ArrSize, BaseE). If true, return\
+  \ true.\n    - Else, if BaseE is a MemberExpr to a FieldDecl:\n      - If FieldDecl->getType()\
+  \ is ConstantArrayType, retrieve size and return true.\n    - Else, if BaseE is\
+  \ a UnaryOperator or ImplicitCast hiding a DeclRefExpr/MemberExpr, unwrap via IgnoreParenImpCasts()\
+  \ and retry.\n    - Return false if not a constant array.\n- If size cannot be determined,\
+  \ return.\n\nStep E: Evaluate loop bound and compare to array size\n- Evaluate BoundE\
+  \ to an integer with EvaluateExprToInt(BoundVal, BoundE, C).\n  - If evaluation\
+  \ fails, return (we only handle constant/constexpr bounds).\n- Compare ArrSize with\
+  \ BoundVal:\n  - If ArrSize != BoundVal, return (to avoid FPs when loop bound is\
+  \ already N-1, or unrelated to this array).\n  - Now we have: loop is \u201Ci <\
+  \ N\u201D and array length is N, and index is \u201Ci + K\u201D with K >= 1.\n\n\
+  Step F: Skip if guarded inside the loop by an if-condition \u201Ci + K < Bound\u201D\
+  \n- Detect a guarding if that encloses the subscript but is inside the same for-loop:\n\
+  \  - Use findSpecificTypeInParents<IfStmt>(ASE, C) to get the nearest enclosing\
+  \ IfStmt IfS.\n  - Ensure that IfS is lexically between ASE and the ForStmt found\
+  \ above (i.e., an ancestor of ASE and a descendant of F). If not, ignore.\n  - Let\
+  \ Cond = IfS->getCond()->IgnoreParenImpCasts().\n  - If Cond is a BinaryOperator\
+  \ with opcode BO_LT or BO_LE, check two patterns:\n    - Left is a BinaryOperator\
+  \ BO_Add/BO_Sub with loop variable LoopVarVD and a constant K2 (EvaluateExprToInt).\
+  \ Right equals BoundE semantically (try evaluating both sides to int and compare\
+  \ values). If K2 >= K, consider guarded; skip reporting.\n    - Or Left is the loop\
+  \ variable \u201Ci\u201D and Right is \u201CBoundExpr - K2\u201D (where K2 >= K).\
+  \ Pattern: Right is BinaryOperator BO_Sub with RHS constant K2 and LHS BoundExpr\
+  \ equal to BoundE semantically. If satisfied, consider guarded; skip reporting.\n\
+  \  - If no such guarding condition is found, proceed to report.\n  - You can use\
+  \ EvaluateExprToInt for constants and compare BoundE with the LHS of an eventual\
+  \ BO_Sub by evaluating both to integers. If integer evaluation of the Bound side\
+  \ fails, fall back to a textual check using ExprHasName to ensure the If condition\
+  \ references the same loop variable name and the bound\u2019s source text; only\
+  \ skip if both are clearly present with a \u201C<\u201D comparison and a constant\
+  \ \u2265 K.\n\nStep G: Report the bug\n- Create a BugType (category \u201CArray\
+  \ bounds\u201D, name \u201CPossible out-of-bounds via i+1 in loop\u201D).\n- Use\
+  \ C.generateNonFatalErrorNode() to get an ExplodedNode. If null, return.\n- Create\
+  \ a PathSensitiveBugReport with a short message:\n  - \u201CLoop iterates to last\
+  \ index while accessing arr[i+1] (off-by-one OOB).\u201D\n- Add a source range to\
+  \ highlight ASE->getSourceRange() or the index expression range.\n- Emit the report.\n\
+  \n4) Notes and heuristics to reduce false positives\n- Only warn when all of the\
+  \ following hold simultaneously:\n  - Index is syntactically \u201Ci +/- const\u201D\
+  , with const >= 1.\n  - For-loop condition is exactly \u201Ci < Bound\u201D or \u201C\
+  Bound > i\u201D, using the same loop variable \u201Ci\u201D.\n  - Bound is a constant\
+  \ evaluable integer (EvaluateExprToInt succeeds).\n  - Array size is a compile-time\
+  \ constant and equals Bound.\n  - No guarding If-statement within the loop that\
+  \ ensures \u201Ci + const <= last valid index\u201D (as described in Step F).\n\
+  - Initially handle K == 1; allowing K >= 1 is fine with the same logic.\n\n5) Utility\
+  \ functions used\n- findSpecificTypeInParents (to find enclosing ForStmt and IfStmt).\n\
+  - findSpecificTypeInChildren (optional inside Step F if you want to search \u201C\
+  i+K\u201D form inside the If condition).\n- EvaluateExprToInt (to evaluate bounds\
+  \ and constants).\n- getArraySizeFromExpr (used in the helper to obtain array length\
+  \ from DeclRefExpr bases).\n- ExprHasName (fallback for textual guard detection\
+  \ when exact semantic matching fails).\n\n6) Why this catches the target patch\n\
+  - In the buggy code, the loop runs i < (MAX_PIPES * 2), and the access is links[i\
+  \ + 1], with links\u2019 size equal to MAX_PIPES * 2. Our checker:\n  - Recognizes\
+  \ index \u201Ci + 1\u201D with K = 1.\n  - Finds for-condition \u201Ci < (MAX_PIPES\
+  \ * 2)\u201D, evaluates to BoundVal.\n  - Retrieves links\u2019 array length via\
+  \ MemberExpr -> FieldDecl -> ConstantArrayType.\n  - Finds ArrSize == BoundVal,\
+  \ no guarding If, hence reports.\n- The fixed code changes the loop bound to < (N\
+  \ - 1), so ArrSize != BoundVal; checker will not warn."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"llvm/ADT/APSInt.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// No extra program states are needed for this checker.\n\
+  namespace {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker\
+  \ : public Checker<check::Location> {\n   mutable std::unique_ptr<BugType> BT;\n\
+  \n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Off-by-one array\
+  \ access\", \"Array bounds\")) {}\n\n      void checkLocation(SVal Loc, bool IsLoad,\
+  \ const Stmt *S, CheckerContext &C) const;\n\n   private:\n\n      // Try to extract\
+  \ a constant array size from the base expression of an array subscript.\n      bool\
+  \ getConstArraySizeFromBase(const Expr *BaseE, llvm::APInt &ArrSize, CheckerContext\
+  \ &C) const;\n\n      // Parse an index expression into \"LoopVar +/- Const\". Return\
+  \ true if matched and Const (K) >= 1.\n      bool parseIndexOffset(const Expr *IdxE,\
+  \ const VarDecl *&LoopVarVD, long long &K,\n                            CheckerContext\
+  \ &C) const;\n\n      // Analyze the loop condition and extract the bound expression\
+  \ if it matches \"i < Bound\" or \"Bound > i\"\n      // with the same loop variable.\n\
+  \      bool getLoopBoundFromFor(const ForStmt *FS, const VarDecl *LoopVarVD,\n \
+  \                              const Expr *&BoundE) const;\n\n      // Try to evaluate\
+  \ a constant expression to APSInt. Wrapper around provided helper.\n      bool evalToInt(llvm::APSInt\
+  \ &Res, const Expr *E, CheckerContext &C) const {\n        return EvaluateExprToInt(Res,\
+  \ E, C);\n      }\n\n      // Check for a guarding if-statement inside the loop\
+  \ that ensures \"i + K < Bound\"\n      // via patterns \"i + K2 < Bound\" with\
+  \ K2 >= K, or \"i < Bound - K2\" with K2 >= K.\n      bool hasGuardingIfInsideLoop(const\
+  \ ArraySubscriptExpr *ASE, const ForStmt *FS,\n                                \
+  \   const VarDecl *LoopVarVD, long long K,\n                                   const\
+  \ llvm::APSInt &BoundVal, CheckerContext &C) const;\n\n      // Helper: compare\
+  \ two expressions by constant integer value equality.\n      bool constExprsEqualByIntValue(const\
+  \ Expr *A, const Expr *B, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::getConstArraySizeFromBase(const\
+  \ Expr *BaseE, llvm::APInt &ArrSize,\n                                         \
+  \        CheckerContext &C) const {\n  if (!BaseE) return false;\n  const Expr *E\
+  \ = BaseE->IgnoreParenImpCasts();\n  QualType T = E->getType();\n\n  // Directly\
+  \ from the expression type\n  if (const auto *CAT = dyn_cast<ConstantArrayType>(T.getTypePtr()))\
+  \ {\n    ArrSize = CAT->getSize();\n    return true;\n  }\n\n  // Try member's declared\
+  \ type if it's a field access.\n  if (const auto *ME = dyn_cast<MemberExpr>(E))\
+  \ {\n    if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {\n    \
+  \  QualType FT = FD->getType();\n      if (const auto *CAT = dyn_cast<ConstantArrayType>(FT.getTypePtr()))\
+  \ {\n        ArrSize = CAT->getSize();\n        return true;\n      }\n    }\n \
+  \ }\n\n  // Fall back to provided helper for DeclRefExpr of arrays\n  if (getArraySizeFromExpr(ArrSize,\
+  \ E))\n    return true;\n\n  return false;\n}\n\nbool SAGenTestChecker::parseIndexOffset(const\
+  \ Expr *IdxE, const VarDecl *&LoopVarVD,\n                                     \
+  \   long long &K, CheckerContext &C) const {\n  LoopVarVD = nullptr;\n  K = 0;\n\
+  \  if (!IdxE) return false;\n\n  const Expr *E = IdxE->IgnoreParenImpCasts();\n\n\
+  \  // Case: i + C or C + i or i - C\n  if (const auto *BO = dyn_cast<BinaryOperator>(E))\
+  \ {\n    BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op != BO_Add && Op\
+  \ != BO_Sub)\n      return false;\n\n    const Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \    const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\n    const DeclRefExpr\
+  \ *VarSide = nullptr;\n    const Expr *ConstSide = nullptr;\n    bool VarOnLeft\
+  \ = false;\n\n    if ((VarSide = dyn_cast<DeclRefExpr>(L))) {\n      VarOnLeft =\
+  \ true;\n      ConstSide = R;\n    } else if ((VarSide = dyn_cast<DeclRefExpr>(R)))\
+  \ {\n      VarOnLeft = false;\n      ConstSide = L;\n    } else {\n      return\
+  \ false;\n    }\n\n    const VarDecl *VD = dyn_cast<VarDecl>(VarSide->getDecl());\n\
+  \    if (!VD)\n      return false;\n\n    llvm::APSInt Val;\n    if (!evalToInt(Val,\
+  \ ConstSide, C))\n      return false;\n\n    long long ConstK = 0;\n    if (Val.isSigned())\n\
+  \      ConstK = Val.getSExtValue();\n    else\n      ConstK = static_cast<long long>(Val.getZExtValue());\n\
+  \n    if (Op == BO_Add) {\n      // i + C or C + i\n      LoopVarVD = VD;\n    \
+  \  K = ConstK;\n    } else {\n      // subtraction: i - C\n      if (!VarOnLeft)\n\
+  \        return false; // C - i is not our pattern\n      LoopVarVD = VD;\n    \
+  \  K = -ConstK;\n    }\n\n    // Only care about positive offsets\n    if (K >=\
+  \ 1)\n      return true;\n\n    return false;\n  }\n\n  // Pure variable: i (no\
+  \ offset) - not our target\n  if (const auto *DR = dyn_cast<DeclRefExpr>(E)) {\n\
+  \    (void)DR;\n    return false;\n  }\n\n  // Not a supported pattern\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::getLoopBoundFromFor(const ForStmt *FS, const\
+  \ VarDecl *LoopVarVD,\n                                           const Expr *&BoundE)\
+  \ const {\n  BoundE = nullptr;\n  if (!FS || !LoopVarVD)\n    return false;\n\n\
+  \  const Stmt *CondS = FS->getCond();\n  if (!CondS)\n    return false;\n\n  const\
+  \ Expr *CondE = dyn_cast<Expr>(CondS);\n  if (!CondE)\n    return false;\n\n  CondE\
+  \ = CondE->IgnoreParenImpCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(CondE);\n\
+  \  if (!BO)\n    return false;\n\n  // i < Bound\n  if (BO->getOpcode() == BO_LT)\
+  \ {\n    const Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n    const auto *DL\
+  \ = dyn_cast<DeclRefExpr>(L);\n    if (!DL) return false;\n    const VarDecl *LVD\
+  \ = dyn_cast<VarDecl>(DL->getDecl());\n    if (LVD != LoopVarVD)\n      return false;\n\
+  \    BoundE = BO->getRHS();\n    return BoundE != nullptr;\n  }\n\n  // Bound >\
+  \ i\n  if (BO->getOpcode() == BO_GT) {\n    const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \    const auto *DR = dyn_cast<DeclRefExpr>(R);\n    if (!DR) return false;\n  \
+  \  const VarDecl *RVD = dyn_cast<VarDecl>(DR->getDecl());\n    if (RVD != LoopVarVD)\n\
+  \      return false;\n    BoundE = BO->getLHS();\n    return BoundE != nullptr;\n\
+  \  }\n\n  return false;\n}\n\nbool SAGenTestChecker::constExprsEqualByIntValue(const\
+  \ Expr *A, const Expr *B,\n                                                 CheckerContext\
+  \ &C) const {\n  if (!A || !B) return false;\n  llvm::APSInt VA, VB;\n  if (!evalToInt(VA,\
+  \ A->IgnoreParenImpCasts(), C))\n    return false;\n  if (!evalToInt(VB, B->IgnoreParenImpCasts(),\
+  \ C))\n    return false;\n  // Compare values (treat as unsigned to avoid sign issues)\n\
+  \  return VA.getLimitedValue() == VB.getLimitedValue();\n}\n\nbool SAGenTestChecker::hasGuardingIfInsideLoop(const\
+  \ ArraySubscriptExpr *ASE, const ForStmt *FS,\n                                \
+  \               const VarDecl *LoopVarVD, long long K,\n                       \
+  \                        const llvm::APSInt &BoundVal,\n                       \
+  \                        CheckerContext &C) const {\n  if (!ASE || !FS || !LoopVarVD)\n\
+  \    return false;\n\n  const IfStmt *IfS = findSpecificTypeInParents<IfStmt>(ASE,\
+  \ C);\n  if (!IfS)\n    return false;\n\n  // Ensure this IfStmt is within the same\
+  \ for-loop's body (ancestor relation)\n  const ForStmt *AncFor = findSpecificTypeInParents<ForStmt>(IfS,\
+  \ C);\n  if (AncFor != FS)\n    return false;\n\n  const Expr *Cond = IfS->getCond();\n\
+  \  if (!Cond)\n    return false;\n\n  const Expr *CE = Cond->IgnoreParenImpCasts();\n\
+  \  const auto *BO = dyn_cast<BinaryOperator>(CE);\n  if (!BO)\n    return false;\n\
+  \n  // Only handle strict less-than guards for now to reduce false positives.\n\
+  \  if (BO->getOpcode() != BO_LT)\n    return false;\n\n  const Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \  const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\n  // Evaluate BoundRHS\
+  \ numeric value for comparing with loop bound.\n  llvm::APSInt RHSVal;\n  if (!evalToInt(RHSVal,\
+  \ R, C))\n    return false;\n\n  // If Right side equals the same bound value, handle\
+  \ \"i + K2 < Bound\"\n  if (RHSVal.getLimitedValue() == BoundVal.getLimitedValue())\
+  \ {\n    const VarDecl *Var2 = nullptr;\n    long long K2 = 0;\n    if (parseIndexOffset(L,\
+  \ Var2, K2, C) && Var2 == LoopVarVD) {\n      if (K2 >= K)\n        return true;\n\
+  \    }\n  }\n\n  // Handle \"i < Bound - K2\"\n  if (const auto *BOR = dyn_cast<BinaryOperator>(R))\
+  \ {\n    if (BOR->getOpcode() == BO_Sub) {\n      const Expr *RL = BOR->getLHS()->IgnoreParenImpCasts();\n\
+  \      const Expr *RR = BOR->getRHS()->IgnoreParenImpCasts();\n\n      // Check\
+  \ RL equals bound by value\n      if (!constExprsEqualByIntValue(RL, R, C)) {\n\
+  \        // We compared R to itself; instead compare RL to the original loop bound\
+  \ value.\n        llvm::APSInt RLVal;\n        if (!evalToInt(RLVal, RL, C))\n \
+  \         return false;\n        if (RLVal.getLimitedValue() != BoundVal.getLimitedValue())\n\
+  \          return false;\n      }\n\n      llvm::APSInt K2Val;\n      if (!evalToInt(K2Val,\
+  \ RR, C))\n        return false;\n\n      unsigned long long K2 = K2Val.getLimitedValue();\n\
+  \      // Left side must be the loop variable alone.\n      if (const auto *DL =\
+  \ dyn_cast<DeclRefExpr>(L)) {\n        const VarDecl *LV = dyn_cast<VarDecl>(DL->getDecl());\n\
+  \        if (LV == LoopVarVD) {\n          if (K2 >= static_cast<unsigned long long>(K))\n\
+  \            return true;\n        }\n      }\n    }\n  }\n\n  return false;\n}\n\
+  \nvoid SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const {\n  // Only act on array subscripts\n  const auto *ASE = dyn_cast_or_null<ArraySubscriptExpr>(S);\n\
+  \  if (!ASE)\n    return;\n\n  const Expr *BaseE = ASE->getBase();\n  const Expr\
+  \ *IdxE  = ASE->getIdx();\n  if (!BaseE || !IdxE)\n    return;\n\n  // Step B: Parse\
+  \ index \"i +/- K\" with K >= 1\n  const VarDecl *LoopVarVD = nullptr;\n  long long\
+  \ K = 0;\n  if (!parseIndexOffset(IdxE, LoopVarVD, K, C))\n    return;\n\n  // Step\
+  \ C: Find enclosing for-statement and extract loop bound\n  const ForStmt *FS =\
+  \ findSpecificTypeInParents<ForStmt>(ASE, C);\n  if (!FS)\n    return;\n\n  const\
+  \ Expr *BoundE = nullptr;\n  if (!getLoopBoundFromFor(FS, LoopVarVD, BoundE))\n\
+  \    return;\n\n  // Step D: Get array size of the base\n  llvm::APInt ArrSize(64,\
+  \ 0);\n  if (!getConstArraySizeFromBase(BaseE, ArrSize, C))\n    return;\n\n  //\
+  \ Step E: Evaluate loop bound and compare to array size\n  llvm::APSInt BoundVal;\n\
+  \  if (!evalToInt(BoundVal, BoundE->IgnoreParenImpCasts(), C))\n    return;\n\n\
+  \  unsigned long long NArr = ArrSize.getLimitedValue();\n  unsigned long long NBound\
+  \ = BoundVal.getLimitedValue();\n\n  if (NArr != NBound)\n    return; // Only warn\
+  \ when loop upper bound equals array length\n\n  // Step F: Look for a guarding\
+  \ if-statement inside the loop\n  if (hasGuardingIfInsideLoop(ASE, FS, LoopVarVD,\
+  \ K, BoundVal, C))\n    return;\n\n  // Step G: Report the bug\n  ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Loop iterates to last index while accessing arr[i+1] (off-by-one OOB).\"\
+  , N);\n  R->addRange(ASE->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\
+  \n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects off-by-one out-of-bounds when looping with i < N but accessing\
+  \ arr[i+1]\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

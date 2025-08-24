@@ -1,0 +1,334 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -18,11 +18,14 @@ #include "clang/AST/Stmt.h"
+ #include "clang/AST/Decl.h"
+ #include "clang/AST/ParentMapContext.h"
++#include "clang/AST/ASTTypeTraits.h"
+ #include "clang/Lex/Lexer.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include <vector>
+ #include <utility>
+ #include <memory>
++#include <queue>
++#include <unordered_set>
+
+ using namespace clang;
+ using namespace ento;
+@@ -54,6 +57,23 @@   SourceLocation Loc;
+   bool ResetToNull = false;
+ };
++
++struct AllocSite {
++  const VarDecl *P = nullptr;
++  const CallExpr *Call = nullptr;             // allocator call
++  SourceLocation Loc;
++};
++
++static bool isAllocatorName(StringRef N) {
++  // A conservative set sufficient for the target bug and common kernel code.
++  return N == "kzalloc" || N == "kmalloc" || N == "kmalloc_array" ||
++         N == "kcalloc" || N == "kvzalloc" || N == "kvalloc" ||
++         N == "kvmalloc";
++}
++
++static bool isFreeName(StringRef N) {
++  return N == "kfree" || N == "kvfree";
++}
+
+ class BodyScanner : public RecursiveASTVisitor<BodyScanner> {
+ public:
+@@ -61,9 +81,10 @@               std::vector<LabelInfo> &Labels,
+               std::vector<GotoInfo> &Gotos,
+               std::vector<FreeSite> &Frees,
+-              std::vector<AssignInfo> &Assigns)
++              std::vector<AssignInfo> &Assigns,
++              std::vector<AllocSite> &Allocs)
+       : Ctx(Ctx), SM(Ctx.getSourceManager()), Labels(Labels), Gotos(Gotos),
+-        Frees(Frees), Assigns(Assigns) {}
++        Frees(Frees), Assigns(Assigns), Allocs(Allocs) {}
+
+   bool VisitLabelStmt(LabelStmt *L) {
+     LabelInfo Info;
+@@ -106,12 +127,29 @@     if (!VD->getType()->isAnyPointerType())
+       return true;
+
++    // Track NULL resets.
+     bool IsNull = isNullPointerExpr(RHS);
+     AssignInfo AI;
+     AI.P = VD;
+     AI.Loc = getExpansionLocSafe(BO->getExprLoc());
+     AI.ResetToNull = IsNull;
+     Assigns.push_back(AI);
++
++    // Track allocator assignments: p = kmalloc(...);
++    const CallExpr *Call = dyn_cast<CallExpr>(RHS->IgnoreParenImpCasts());
++    if (Call) {
++      if (const FunctionDecl *FD = Call->getDirectCallee()) {
++        if (const IdentifierInfo *II = FD->getIdentifier()) {
++          if (isAllocatorName(II->getName())) {
++            AllocSite AS;
++            AS.P = VD;
++            AS.Call = Call;
++            AS.Loc = getExpansionLocSafe(Call->getExprLoc());
++            Allocs.push_back(AS);
++          }
++        }
++      }
++    }
+     return true;
+   }
+
+@@ -122,16 +160,33 @@         continue;
+       if (!VD->getType()->isAnyPointerType())
+         continue;
+-      if (!VD->hasInit())
+-        continue;
+-
+-      const Expr *Init = VD->getInit();
+-      bool IsNull = isNullPointerExpr(Init);
+-      AssignInfo AI;
+-      AI.P = VD;
+-      AI.Loc = getExpansionLocSafe(VD->getLocation());
+-      AI.ResetToNull = IsNull;
+-      Assigns.push_back(AI);
++
++      // Track initialization to NULL.
++      if (VD->hasInit()) {
++        const Expr *Init = VD->getInit();
++        bool IsNull = isNullPointerExpr(Init);
++        AssignInfo AI;
++        AI.P = VD;
++        AI.Loc = getExpansionLocSafe(VD->getLocation());
++        AI.ResetToNull = IsNull;
++        Assigns.push_back(AI);
++
++        // Track allocator initialization: T *p = kmalloc(...);
++        const CallExpr *Call = dyn_cast<CallExpr>(Init->IgnoreParenImpCasts());
++        if (Call) {
++          if (const FunctionDecl *FD = Call->getDirectCallee()) {
++            if (const IdentifierInfo *II = FD->getIdentifier()) {
++              if (isAllocatorName(II->getName())) {
++                AllocSite AS;
++                AS.P = VD;
++                AS.Call = Call;
++                AS.Loc = getExpansionLocSafe(Call->getExprLoc());
++                Allocs.push_back(AS);
++              }
++            }
++          }
++        }
++      }
+     }
+     return true;
+   }
+@@ -143,15 +198,12 @@   std::vector<GotoInfo> &Gotos;
+   std::vector<FreeSite> &Frees;
+   std::vector<AssignInfo> &Assigns;
++  std::vector<AllocSite> &Allocs;
+
+   SourceLocation getExpansionLocSafe(SourceLocation L) const {
+     if (L.isInvalid())
+       return L;
+     return SM.getExpansionLoc(L);
+-  }
+-
+-  static bool isFreeName(StringRef N) {
+-    return N == "kfree" || N == "kvfree";
+   }
+
+   bool isNullPointerExpr(const Expr *E) const {
+@@ -248,19 +300,56 @@       }
+
+       static bool isSelfCleanupJump(const GotoInfo &GR, const FreeSite &FS) {
+-        // A restart candidate must not be a goto back to the same cleanup label.
+-        // Such a jump cannot form a retry loop and can cause false positives,
+-        // e.g. "bail: ... goto out;" which is unrelated to retrying.
+         return GR.Target && FS.CleanupLabel && (GR.Target == FS.CleanupLabel);
+       }
++
++      static const IfStmt *findIfAncestor(const Stmt *S, ASTContext &AC);
+
+       void detectAndReport(const FunctionDecl *FD,
+                            const std::vector<LabelInfo> &Labels,
+                            const std::vector<GotoInfo> &Gotos,
+                            const std::vector<FreeSite> &Frees,
+                            const std::vector<AssignInfo> &Assigns,
++                           const std::vector<AllocSite> &Allocs,
+                            BugReporter &BR, ASTContext &AC) const;
+ };
++
++const IfStmt *SAGenTestChecker::findIfAncestor(const Stmt *S, ASTContext &AC) {
++  if (!S)
++    return nullptr;
++
++  // BFS up the parent chain to find an IfStmt.
++  std::queue<clang::DynTypedNode> Q;
++  std::unordered_set<const void *> Visited;
++
++  Q.push(clang::DynTypedNode::create(*S));
++  Visited.insert(S);
++
++  unsigned Steps = 0, MaxSteps = 1024;
++  while (!Q.empty() && Steps++ < MaxSteps) {
++    clang::DynTypedNode Cur = Q.front();
++    Q.pop();
++
++    auto Parents = AC.getParents(Cur);
++    for (const auto &P : Parents) {
++      if (const IfStmt *IS = P.get<IfStmt>())
++        return IS;
++
++      if (const Stmt *PS = P.get<Stmt>()) {
++        if (!Visited.count(PS)) {
++          Visited.insert(PS);
++          Q.push(clang::DynTypedNode::create(*PS));
++        }
++      } else if (const Decl *PD = P.get<Decl>()) {
++        if (!Visited.count(PD)) {
++          Visited.insert(PD);
++          Q.push(clang::DynTypedNode::create(*PD));
++        }
++      }
++    }
++  }
++  return nullptr;
++}
+
+ void SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {
+   const auto *FD = dyn_cast<FunctionDecl>(D);
+@@ -275,11 +364,12 @@   std::vector<GotoInfo> Gotos;
+   std::vector<FreeSite> Frees;
+   std::vector<AssignInfo> Assigns;
+-
+-  BodyScanner Scanner(Ctx, Labels, Gotos, Frees, Assigns);
++  std::vector<AllocSite> Allocs;
++
++  BodyScanner Scanner(Ctx, Labels, Gotos, Frees, Assigns, Allocs);
+   Scanner.TraverseStmt(const_cast<Stmt *>(Body));
+
+-  detectAndReport(FD, Labels, Gotos, Frees, Assigns, BR, Ctx);
++  detectAndReport(FD, Labels, Gotos, Frees, Assigns, Allocs, BR, Ctx);
+ }
+
+ void SAGenTestChecker::detectAndReport(const FunctionDecl *FD,
+@@ -287,6 +377,7 @@                                        const std::vector<GotoInfo> &Gotos,
+                                        const std::vector<FreeSite> &Frees,
+                                        const std::vector<AssignInfo> &Assigns,
++                                       const std::vector<AllocSite> &Allocs,
+                                        BugReporter &BR, ASTContext &AC) const {
+   const SourceManager &SM = AC.getSourceManager();
+
+@@ -307,12 +398,12 @@     if (FreeLoc.isInvalid() || CleanupLoc.isInvalid())
+       continue;
+
+-    // Find a backward goto (retry) after the free that does NOT target the cleanup label.
++    // Consider only backward gotos (potential retries) occurring after the free
++    // and targeting a label before the free, not the cleanup label itself.
+     for (const auto &GR : Gotos) {
+       if (!GR.Target)
+         continue;
+
+-      // Important: don't treat a goto to the same cleanup label as a restart.
+       if (isSelfCleanupJump(GR, FS))
+         continue;
+
+@@ -321,11 +412,17 @@       if (GoLoc.isInvalid() || TargetLoc.isInvalid())
+         continue;
+
+-      // Must be: free ... goto restart_label; where restart_label is before free.
++      // Must be: free ... goto restart_label; with restart_label before free.
+       if (!(before(SM, FreeLoc, GoLoc) && before(SM, TargetLoc, FreeLoc)))
+         continue;
+
+-      // Safety check 1: reset to NULL between free and retry goto
++      // Heuristic: In real replay/retry bugs the restart goto is conditional.
++      // Require an enclosing IfStmt for the goto to reduce false positives
++      // where the jump is just another cleanup flow.
++      if (!findIfAncestor(GR.G, AC))
++        continue;
++
++      // Safety check 1: reset to NULL between free and the retry goto?
+       bool ResetBetween = false;
+       for (const auto &AI : Assigns) {
+         if (AI.P != FS.P)
+@@ -336,51 +433,46 @@         }
+       }
+       if (ResetBetween)
+-        continue; // safe for this retry goto
+-
+-      // Safety check 2: earliest assignment after restart label
+-      const AssignInfo *Earliest = nullptr;
+-      for (const auto &AI : Assigns) {
+-        if (AI.P != FS.P)
++        continue;
++
++      // Find the earliest allocation of P after restart label and before the free.
++      const AllocSite *EarliestAlloc = nullptr;
++      for (const auto &AS : Allocs) {
++        if (AS.P != FS.P)
+           continue;
+-        if (before(SM, TargetLoc, AI.Loc)) {
+-          if (!Earliest || before(SM, AI.Loc, Earliest->Loc))
+-            Earliest = &AI;
+-        }
+-      }
+-
+-      // Look for an early goto to the cleanup label between restart label and earliest assignment.
+-      bool EarlyGotoToCleanup = false;
++        if (!before(SM, TargetLoc, AS.Loc))
++          continue;
++        if (!before(SM, AS.Loc, FreeLoc))
++          continue;
++        if (!EarliestAlloc || before(SM, AS.Loc, EarliestAlloc->Loc))
++          EarliestAlloc = &AS;
++      }
++      if (!EarliestAlloc)
++        continue; // No allocation in the segment - not our pattern.
++
++      // Look for an early goto to cleanup between restart label and the earliest allocation.
++      bool EarlyGotoToCleanupBeforeAlloc = false;
+       for (const auto &GE : Gotos) {
+         if (GE.Target != FS.CleanupLabel)
+           continue;
+-
+         SourceLocation ELoc = GE.Loc;
+-        if (!before(SM, TargetLoc, ELoc))
+-          continue;
+-
+-        if (Earliest) {
+-          if (before(SM, ELoc, Earliest->Loc)) {
+-            EarlyGotoToCleanup = true;
+-            break;
+-          }
+-        } else {
+-          // No assignment after restart; any early goto to cleanup after restart is problematic.
+-          EarlyGotoToCleanup = true;
++        if (strictlyBetween(SM, ELoc, TargetLoc, EarliestAlloc->Loc)) {
++          EarlyGotoToCleanupBeforeAlloc = true;
+           break;
+         }
+       }
+-
+-      if (EarlyGotoToCleanup) {
+-        auto R = std::make_unique<BasicBugReport>(
+-            *BT,
+-            "Pointer freed in cleanup then retried without resetting to NULL; "
+-            "early goto can double free",
+-            PathDiagnosticLocation(FS.FreeLoc, SM));
+-        R->addRange(FS.FreeCall->getSourceRange());
+-        BR.emitReport(std::move(R));
+-        break;
+-      }
++      if (!EarlyGotoToCleanupBeforeAlloc)
++        continue;
++
++      // All conditions satisfied: report.
++      auto R = std::make_unique<BasicBugReport>(
++          *BT,
++          "Pointer freed in cleanup then retried without resetting to NULL; "
++          "early goto can double free",
++          PathDiagnosticLocation(FS.FreeLoc, SM));
++      R->addRange(FS.FreeCall->getSourceRange());
++      BR.emitReport(std::move(R));
++      break; // Avoid duplicates for this FreeSite.
+     }
+   }
+ }

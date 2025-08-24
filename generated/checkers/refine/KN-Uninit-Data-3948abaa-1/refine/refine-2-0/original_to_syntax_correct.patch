@@ -1,0 +1,198 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -90,6 +90,9 @@       // Producer modeling helpers
+       bool functionKnownToInitBuffer(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx, unsigned &LenPtrParamIdx) const;
+       bool functionKnownToInitLenIsReturn(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const;
++      // Heuristic producer recognition: returns length written in return value.
++      bool functionLikelyReturnsWriteLen(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const;
++
+       SymbolRef getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const;
+       bool isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
+
+@@ -99,6 +102,9 @@       bool getRegionOffsetAndBase(const MemRegion *R, const MemRegion *&Base, uint64_t &ByteOffset) const;
+       uint64_t getTypeSizeInBytes(QualType T, ASTContext &ASTC) const;
+       void noteWriteCallWithLen(const CallEvent &Call, CheckerContext &C, unsigned PtrArgIdx, unsigned LenArgIdx) const;
++
++      // Symbol peeling helper
++      SymbolRef peelCastsToSymbol(SVal V) const;
+ };
+
+ const MemRegion *SAGenTestChecker::canonical(ProgramStateRef State, const MemRegion *R) const {
+@@ -171,7 +177,6 @@ uint64_t SAGenTestChecker::getTypeSizeInBytes(QualType T, ASTContext &ASTC) const {
+   if (T.isNull())
+     return 0;
+-  // Incomplete or variable-length types might return 0.
+   if (T->isIncompleteType())
+     return 0;
+   CharUnits CU = ASTC.getTypeSizeInChars(T);
+@@ -256,6 +261,73 @@       }
+     }
+   }
++  return false;
++}
++
++// Heuristic recognition: functions that likely return number of bytes written to an out buffer.
++// Targets names like "*copy_to_buffer*", "*_to_buf*", and snprintf-family APIs.
++bool SAGenTestChecker::functionLikelyReturnsWriteLen(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const {
++  const IdentifierInfo *ID = Call.getCalleeIdentifier();
++  if (!ID)
++    return false;
++  StringRef Name = ID->getName();
++
++  auto findLikelyOutBufArgIndex = [&]() -> int {
++    for (unsigned i = 0, e = Call.getNumArgs(); i < e; ++i) {
++      QualType T = Call.getArgExpr(i) ? Call.getArgExpr(i)->getType() : QualType();
++      if (T.isNull())
++        T = Call.getArgSVal(i).getType(C.getASTContext());
++      if (T.isNull())
++        continue;
++      if (!T->isPointerType())
++        continue;
++      QualType PT = T->getPointeeType();
++      if (PT.isNull())
++        continue;
++      // Non-const pointer to byte-ish or void is a likely out-buffer.
++      if (PT.isConstQualified())
++        continue;
++      if (PT->isVoidType() || PT->isAnyCharacterType())
++        return (int)i;
++    }
++    return -1;
++  };
++
++  // snprintf/scnprintf/vsnprintf are canonical producers: return bytes written, buf is arg 0.
++  if (Name.equals("snprintf") || Name.equals("scnprintf") || Name.equals("vsnprintf")) {
++    if (Call.getNumArgs() >= 1) {
++      BufParamIdx = 0;
++      return true;
++    }
++  }
++
++  // General "copy_to_buffer" style.
++  if (Name.contains("copy_to_buffer")) {
++    int Idx = findLikelyOutBufArgIndex();
++    if (Idx >= 0) {
++      BufParamIdx = (unsigned)Idx;
++      return true;
++    }
++  }
++
++  // Common kernel naming shorthands.
++  if (Name.contains("_to_buf") || Name.contains("to_buf") || Name.endswith("_tobuffer") || Name.contains("_copy_to_buf")) {
++    int Idx = findLikelyOutBufArgIndex();
++    if (Idx >= 0) {
++      BufParamIdx = (unsigned)Idx;
++      return true;
++    }
++  }
++
++  // Specific case from the false positive report: i915_gpu_coredump_copy_to_buffer(...)
++  if (Name.equals("i915_gpu_coredump_copy_to_buffer")) {
++    // Prototype: (error, buf, pos, count) => buf is arg 1
++    if (Call.getNumArgs() >= 2) {
++      BufParamIdx = 1;
++      return true;
++    }
++  }
++
+   return false;
+ }
+
+@@ -271,7 +343,21 @@   return Pointee.getAsSymbol();
+ }
+
+-// Decide if this copy_to_user should be suppressed because a known producer
++// Peel casts from an SVal to get the underlying symbol if possible.
++SymbolRef SAGenTestChecker::peelCastsToSymbol(SVal V) const {
++  if (SymbolRef S = V.getAsSymbol()) {
++    const SymExpr *Cur = S;
++    // Strip SymbolCast layers.
++    while (const auto *SC = dyn_cast<SymbolCast>(Cur)) {
++      Cur = SC->getOperand();
++    }
++    if (isa<SymbolData>(Cur))
++      return Cur;
++  }
++  return nullptr;
++}
++
++// Decide if this copy_to_user should be suppressed because a known or likely producer
+ // fully initialized the buffer for exactly the number of bytes being copied.
+ bool SAGenTestChecker::isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const {
+   ProgramStateRef State = C.getState();
+@@ -281,10 +367,11 @@     return false;
+
+   SVal LenArgV = CopyToUserCall.getArgSVal(2);
+-  SymbolRef CopyLenSym = LenArgV.getAsSymbol();
++  SymbolRef CopyLenSym = peelCastsToSymbol(LenArgV);
+   if (!CopyLenSym || CopyLenSym != *LenSymP)
+     return false;
+
++  // If we know the producer had a separate status symbol and it must be 0 on success, require success.
+   if (const SymbolRef *StatusSymP = State->get<ProducerStatusSymMap>(FromReg)) {
+     if (*StatusSymP) {
+       SValBuilder &SVB = C.getSValBuilder();
+@@ -298,9 +385,12 @@           return true;
+         }
+       }
+-    }
+-  }
+-
++      // If we cannot conclude success, do not suppress based on status.
++      return false;
++    }
++  }
++
++  // No separate status symbol; len symbol matches exactly => suppress.
+   return true;
+ }
+
+@@ -487,12 +577,12 @@     return;
+   }
+
+-  // Producer initialization modeling (len is return value)
++  // Producer initialization modeling (len is return value) - explicit known list
+   unsigned RetLenBufIdx = 0;
+   if (functionKnownToInitLenIsReturn(Call, C, RetLenBufIdx)) {
+     const MemRegion *BufReg = getArgBaseRegion(Call, RetLenBufIdx, C);
+     if (BufReg) {
+-      SymbolRef RetSym = Call.getReturnValue().getAsSymbol();
++      SymbolRef RetSym = peelCastsToSymbol(Call.getReturnValue());
+       if (RetSym) {
+         State = State->set<ProducerLenSymMap>(BufReg, RetSym);
+         // No separate status symbol for this API; clear any previous status.
+@@ -502,6 +592,21 @@     }
+     return;
+   }
++
++  // Heuristic producer modeling (len is return value) - broader recognition
++  unsigned HeurBufIdx = 0;
++  if (functionLikelyReturnsWriteLen(Call, C, HeurBufIdx)) {
++    const MemRegion *BufReg = getArgBaseRegion(Call, HeurBufIdx, C);
++    if (BufReg) {
++      SymbolRef RetSym = peelCastsToSymbol(Call.getReturnValue());
++      if (RetSym) {
++        State = State->set<ProducerLenSymMap>(BufReg, RetSym);
++        State = State->remove<ProducerStatusSymMap>(BufReg);
++        C.addTransition(State);
++      }
++    }
++    return;
++  }
+ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -527,7 +632,7 @@   if (*Kind != 2)
+     return;
+
+-  // Recognize and suppress false positives when a known producer initialized exactly the copied bytes.
++  // Recognize and suppress false positives when a known/likely producer initialized exactly the copied bytes.
+   if (isFalsePositiveDueToProducer(Call, C, FromReg))
+     return;
+
+@@ -550,7 +655,7 @@   // If copy length is symbolic, try to infer a safe upper bound.
+   if (!LenKnown) {
+     SVal LenSV = Call.getArgSVal(2);
+-    if (SymbolRef Sym = LenSV.getAsSymbol()) {
++    if (SymbolRef Sym = peelCastsToSymbol(LenSV)) {
+       if (const llvm::APSInt *MaxV = inferSymbolMaxVal(Sym, C)) {
+         CopyLen = MaxV->getZExtValue();
+         LenKnown = true;

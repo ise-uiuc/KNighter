@@ -1,0 +1,252 @@
+--- attempt_1_original.cpp+++ attempt_1.cpp@@ -16,6 +16,7 @@ #include "clang/AST/Expr.h"
+ #include "clang/AST/Stmt.h"
+ #include "clang/Lex/Lexer.h"
++#include <string>
+
+ using namespace clang;
+ using namespace ento;
+@@ -63,6 +64,10 @@                                 const MemRegion *&TrackedPtrOut) const;
+
+       void reportDerefBug(const Stmt *S, const MemRegion *R, CheckerContext &C) const;
++
++      // New helpers to reduce false positives
++      bool containsLoggingCall(const Stmt *S, CheckerContext &C) const;
++      static bool isLoggingName(StringRef Name);
+ };
+
+
+@@ -114,7 +119,6 @@
+       // Look for (ptr == NULL) or (ptr != NULL)
+       if (LHSNull && !RHSNull) {
+-        // RHS should be pointer DeclRefExpr
+         if (RHS->getType()->isAnyPointerType()) {
+           if (isa<DeclRefExpr>(RHS))
+             return getBaseRegionFromExpr(RHS, C);
+@@ -153,17 +157,98 @@   return false;
+ }
+
++static bool stmtContainsCallWithName(const Stmt *S, StringRef Name, CheckerContext &C) {
++  if (!S) return false;
++  if (const auto *CE = dyn_cast<CallExpr>(S)) {
++    // Try callee identifier first
++    if (const FunctionDecl *FD = CE->getDirectCallee()) {
++      if (FD->getIdentifier()) {
++        if (FD->getName().equals(Name))
++          return true;
++      }
++    }
++    // Fallback to source text name matching (macro-expanded cases)
++    if (ExprHasName(CE->getCallee(), Name, C))
++      return true;
++  }
++  for (const Stmt *Child : S->children()) {
++    if (stmtContainsCallWithName(Child, Name, C))
++      return true;
++  }
++  return false;
++}
++
++bool SAGenTestChecker::isLoggingName(StringRef Name) {
++  // Normalize to lowercase for case-insensitive matching.
++  std::string LowerStr = Name.lower();
++  StringRef L(LowerStr);
++  return L.contains("dbg") ||
++         L.contains("warn") ||
++         L.contains("err") ||
++         L.contains("printk") ||
++         L.startswith("pr_") ||
++         L.contains("log") ||
++         L.startswith("dev_") ||
++         L.equals("xhci_dbg") ||
++         Name.contains("WARN");
++}
++
++bool SAGenTestChecker::containsLoggingCall(const Stmt *S, CheckerContext &C) const {
++  if (!S) return false;
++  if (const auto *CE = dyn_cast<CallExpr>(S)) {
++    if (const FunctionDecl *FD = CE->getDirectCallee()) {
++      if (const IdentifierInfo *ID = FD->getIdentifier()) {
++        if (isLoggingName(ID->getName()))
++          return true;
++      }
++    }
++    // Fallback to textual sniffing on callee/source if no identifier
++    const Expr *CalleeE = CE->getCallee();
++    if (CalleeE) {
++      const SourceManager &SM = C.getSourceManager();
++      const LangOptions &LangOpts = C.getLangOpts();
++      CharSourceRange Range = CharSourceRange::getTokenRange(CalleeE->getSourceRange());
++      StringRef Text = Lexer::getSourceText(Range, SM, LangOpts);
++      if (isLoggingName(Text))
++        return true;
++    }
++  }
++  for (const Stmt *Child : S->children()) {
++    if (containsLoggingCall(Child, C))
++      return true;
++  }
++  return false;
++}
++
+ bool SAGenTestChecker::isLockAcquire(const CallEvent &Call, CheckerContext &C) const {
++  // Prefer callee identifier when available
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    StringRef FnName = ID->getName();
++    // Common Linux locking APIs
++    static const char *LockNames[] = {
++      "spin_lock", "spin_lock_irq", "spin_lock_irqsave", "spin_lock_bh",
++      "mutex_lock", "rt_mutex_lock", "raw_spin_lock",
++      // XA/RCU-like helpers used as locks in some subsystems
++      "xa_lock", "xa_lock_irq", "xa_lock_irqsave", "xa_lock_bh",
++      "read_lock", "write_lock", "down_read", "down_write", "down"
++    };
++    for (const char *Name : LockNames)
++      if (FnName.equals(Name))
++        return true;
++  }
++
+   const Expr *OE = Call.getOriginExpr();
+   if (!OE) return false;
+
+-  // Common Linux locking APIs
+-  static const char *LockNames[] = {
++  // Fallback textual match when identifier is not available or macro-expanded
++  static const char *LockTextNames[] = {
+     "spin_lock", "spin_lock_irq", "spin_lock_irqsave", "spin_lock_bh",
+-    "mutex_lock", "rt_mutex_lock", "raw_spin_lock"
++    "mutex_lock", "rt_mutex_lock", "raw_spin_lock",
++    "xa_lock", "xa_lock_irq", "xa_lock_irqsave", "xa_lock_bh",
++    "read_lock", "write_lock", "down_read", "down_write", "down("
+   };
+
+-  for (const char *Name : LockNames) {
++  for (const char *Name : LockTextNames) {
+     if (ExprHasName(OE, Name, C))
+       return true;
+   }
+@@ -171,15 +256,30 @@ }
+
+ bool SAGenTestChecker::isLockRelease(const CallEvent &Call, CheckerContext &C) const {
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    StringRef FnName = ID->getName();
++    static const char *UnlockNames[] = {
++      "spin_unlock", "spin_unlock_irq", "spin_unlock_irqrestore", "spin_unlock_bh",
++      "mutex_unlock", "rt_mutex_unlock", "raw_spin_unlock",
++      "xa_unlock", "xa_unlock_irq", "xa_unlock_irqrestore", "xa_unlock_bh",
++      "read_unlock", "write_unlock", "up_read", "up_write", "up"
++    };
++    for (const char *Name : UnlockNames)
++      if (FnName.equals(Name))
++        return true;
++  }
++
+   const Expr *OE = Call.getOriginExpr();
+   if (!OE) return false;
+
+-  static const char *UnlockNames[] = {
++  static const char *UnlockTextNames[] = {
+     "spin_unlock", "spin_unlock_irq", "spin_unlock_irqrestore", "spin_unlock_bh",
+-    "mutex_unlock", "rt_mutex_unlock", "raw_spin_unlock"
++    "mutex_unlock", "rt_mutex_unlock", "raw_spin_unlock",
++    "xa_unlock", "xa_unlock_irq", "xa_unlock_irqrestore", "xa_unlock_bh",
++    "read_unlock", "write_unlock", "up_read", "up_write", "up("
+   };
+
+-  for (const char *Name : UnlockNames) {
++  for (const char *Name : UnlockTextNames) {
+     if (ExprHasName(OE, Name, C))
+       return true;
+   }
+@@ -282,15 +382,26 @@   if (!R)
+     return;
+
+-  // If then-branch contains early exit, it's OK (no log-and-continue)
+-  if (thenHasEarlyExit(Then, C))
+-    return;
+-
+   ProgramStateRef State = C.getState();
+   int Depth = State->get<LockDepth>();
+-  // We only care if the validation is happening outside the lock
+-  if (Depth > 0)
+-    return;
++
++  // If inside the lock and we see re-validation with early-exit, clear suspicion.
++  if (Depth > 0) {
++    if (thenHasEarlyExit(Then, C)) {
++      State = State->remove<SuspiciousAfterLockSet>(R);
++      C.addTransition(State);
++    }
++    return;
++  }
++
++  // We only care about the "log-and-continue" pattern outside the lock:
++  // - Then branch must not have early exit
++  // - Then branch must contain a logging call (dbg/warn/err/printk/...)
++  if (thenHasEarlyExit(Then, C))
++    return;
++
++  if (!containsLoggingCall(Then, C))
++    return; // Avoid FPs where the check is not "log-only".
+
+   // Mark this pointer as suspicious: invalid-checked, no abort, and not under lock.
+   State = State->add<SuspiciousNoLockSet>(R);
+@@ -310,7 +421,7 @@       const MemRegion *R = *I;
+       State = State->add<SuspiciousAfterLockSet>(R);
+     }
+-    // Clear SuspiciousNoLockSet
++    // Clear SuspiciousNoLockSet after transferring
+     for (auto I = NoLock.begin(), E = NoLock.end(); I != E; ++I) {
+       State = State->remove<SuspiciousNoLockSet>(*I);
+     }
+@@ -325,19 +436,35 @@       State = State->set<LockDepth>(Depth - 1);
+     else
+       State = State->set<LockDepth>(0);
++
++    // When fully unlocked, clear AfterLockSet to avoid stale carry-over.
++    int NewDepth = State->get<LockDepth>();
++    if (NewDepth <= 0) {
++      auto After = State->get<SuspiciousAfterLockSet>();
++      for (auto I = After.begin(), E = After.end(); I != E; ++I) {
++        State = State->remove<SuspiciousAfterLockSet>(*I);
++      }
++      State = State->set<LockDepth>(0);
++    }
++
+     C.addTransition(State);
+     return;
+   }
+ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
++  // Only report deref if we're currently under a lock.
++  ProgramStateRef State = C.getState();
++  int Depth = State->get<LockDepth>();
++  if (Depth <= 0)
++    return;
++
+   // For calls that are known to dereference pointer arguments, check if any of those
+   // arguments correspond to our suspicious pointer after the lock.
+   llvm::SmallVector<unsigned, 4> DerefParams;
+   if (!functionKnownToDeref(Call, DerefParams))
+     return;
+
+-  ProgramStateRef State = C.getState();
+   for (unsigned Idx : DerefParams) {
+     if (Idx >= Call.getNumArgs())
+       continue;
+@@ -372,6 +499,9 @@
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
++  int Depth = State->get<LockDepth>();
++  if (Depth <= 0)
++    return;
+
+   // Heuristic: for members like ir->intr_num or deref *ir or arr like ir[idx],
+   // extract the base DeclRefExpr and see if it matches our tracked pointer.
+@@ -387,8 +517,6 @@   // Best-effort cleanup of lock depth; sets will be discarded with state anyway.
+   ProgramStateRef State = C.getState();
+   State = State->set<LockDepth>(0);
+-
+-  // We don't strictly need to clear the sets; analysis state ends at function end.
+   C.addTransition(State);
+ }

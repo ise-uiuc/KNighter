@@ -1,0 +1,4 @@
+- Decision: NotABug
+- Reason: The target pattern concerns calling an “optional” resource getter (e.g., devm_gpiod_get_array_optional()) and only checking IS_ERR() without handling a possible NULL return, followed by dereferencing that optional pointer. In the reported code, the flagged dereference is mcp->regmap inside mcp_read(), not an optional resource. regmap is a required resource created by the bus-specific probe using devm_regmap_init_*(), which returns ERR_PTR on failure and does not return NULL on success. Thus, mcp->regmap is not optional and is expected to be non-NULL when mcp23s08_probe_one() is reached.
+
+While the file does call an optional getter (mcp->reset_gpio = devm_gpiod_get_optional(...)), the warning is not about dereferencing reset_gpio, and there is no evidence here of dereferencing an optional resource without a NULL check. Therefore, the report does not match the target bug pattern and does not indicate a real bug.

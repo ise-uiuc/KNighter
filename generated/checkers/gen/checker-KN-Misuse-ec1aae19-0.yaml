@@ -1,0 +1,442 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ec1aae190c7729ffdd3603de311dc00f7ff988f9
+commit_type: Misuse
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Type.h\"\n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\
+  \n#include \"clang/AST/Attr.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Program state: tracks zero-initializing allocations\
+  \ and whether the\n// length field that guards a counted_by flexible array has been\
+  \ set.\nREGISTER_MAP_WITH_PROGRAMSTATE(KZeroAllocs, const MemRegion *, bool)\nREGISTER_MAP_WITH_PROGRAMSTATE(LenInitialized,\
+  \ const MemRegion *, bool)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public\
+  \ Checker<\n        check::PostCall,\n        check::PreCall,\n        check::Bind,\n\
+  \        check::Location> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Unsafe flexible-array write\"\
+  , \"Memory Safety\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n      void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const;\n\n   private:\n      // Helpers\n      static bool isZeroAllocFn(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static bool isMemWriteFn(const CallEvent\
+  \ &Call, CheckerContext &C,\n                               unsigned &DstIdx, unsigned\
+  \ &LenIdx);\n      static const MemberExpr *getFlexArrayMEInExpr(const Expr *E);\n\
+  \      static const FieldDecl *getCountFieldForFlex(const FieldDecl *FlexFD);\n\
+  \      static const MemRegion *getBaseRegionFromME(const MemberExpr *ME, CheckerContext\
+  \ &C);\n\n      static bool isFlexibleArrayField(const FieldDecl *FD);\n      static\
+  \ bool isCountFieldForAnyFlexInRecord(const FieldDecl *FD);\n\n      void markLenInitializedForRegion(const\
+  \ MemRegion *BaseR, CheckerContext &C) const;\n      void reportFlexWriteBeforeLenInit(const\
+  \ Stmt *Trigger, CheckerContext &C) const;\n};\n\n// ------------------------ Helper\
+  \ Implementations ------------------------\n\nbool SAGenTestChecker::isZeroAllocFn(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE) return false;\n\n  // Recognize common Linux zero-initializing allocators\n\
+  \  return ExprHasName(OE, \"kzalloc\", C) ||\n         ExprHasName(OE, \"kvzalloc\"\
+  , C) ||\n         ExprHasName(OE, \"kcalloc\", C) ||\n         ExprHasName(OE, \"\
+  kzalloc_array\", C) ||\n         ExprHasName(OE, \"devm_kzalloc\", C) ||\n     \
+  \    ExprHasName(OE, \"devm_kcalloc\", C) ||\n         ExprHasName(OE, \"devm_kzalloc_array\"\
+  , C);\n}\n\nbool SAGenTestChecker::isMemWriteFn(const CallEvent &Call, CheckerContext\
+  \ &C,\n                                    unsigned &DstIdx, unsigned &LenIdx) {\n\
+  \  const Expr *OE = Call.getOriginExpr();\n  if (!OE) return false;\n\n  // libc-like\
+  \ memory writing APIs\n  // memcpy(void *dst, const void *src, size_t n)\n  if (ExprHasName(OE,\
+  \ \"memcpy\", C)) {\n    DstIdx = 0; LenIdx = 2; return true;\n  }\n  // memmove(void\
+  \ *dst, const void *src, size_t n)\n  if (ExprHasName(OE, \"memmove\", C)) {\n \
+  \   DstIdx = 0; LenIdx = 2; return true;\n  }\n  // memset(void *dst, int c, size_t\
+  \ n)\n  if (ExprHasName(OE, \"memset\", C)) {\n    DstIdx = 0; LenIdx = 2; return\
+  \ true;\n  }\n\n  return false;\n}\n\nconst MemberExpr *SAGenTestChecker::getFlexArrayMEInExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  // Search downwards for a MemberExpr.\
+  \ Only return one if there are many.\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(E);\n\
+  \  if (!ME) return nullptr;\n\n  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FD) return nullptr;\n\n  if (!isFlexibleArrayField(FD))\n    return nullptr;\n\
+  \n  return ME;\n}\n\nbool SAGenTestChecker::isFlexibleArrayField(const FieldDecl\
+  \ *FD) {\n  if (!FD) return false;\n  QualType FT = FD->getType();\n\n  // Flexible\
+  \ array members in C are represented as IncompleteArrayType.\n  if (!FT->isIncompleteArrayType())\n\
+  \    return false;\n\n  return true;\n}\n\nconst FieldDecl *SAGenTestChecker::getCountFieldForFlex(const\
+  \ FieldDecl *FlexFD) {\n  if (!FlexFD) return nullptr;\n  if (!isFlexibleArrayField(FlexFD))\n\
+  \    return nullptr;\n\n  // Only handle fields explicitly annotated with counted_by.\n\
+  \  if (const auto *CBA = FlexFD->getAttr<CountedByAttr>()) {\n    // Retrieve the\
+  \ expression naming the counter field and resolve it.\n    if (const Expr *CE =\
+  \ CBA->getCountExpr()) {\n      CE = CE->IgnoreParenImpCasts();\n      if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(CE)) {\n        const auto *FD = dyn_cast<FieldDecl>(DRE->getDecl());\n\
+  \        return FD;\n      }\n      // Some forms may appear as MemberExpr when\
+  \ using anonymous structs/unions.\n      if (const auto *ME = dyn_cast<MemberExpr>(CE))\
+  \ {\n        const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n      \
+  \  return FD;\n      }\n    }\n  }\n  return nullptr;\n}\n\nconst MemRegion *SAGenTestChecker::getBaseRegionFromME(const\
+  \ MemberExpr *ME, CheckerContext &C) {\n  if (!ME) return nullptr;\n\n  // Use the\
+  \ whole MemberExpr to get a region referring to the field, then\n  // collapse to\
+  \ the base region representing the underlying object.\n  const MemRegion *R = getMemRegionFromExpr(ME,\
+  \ C);\n  if (!R) return nullptr;\n  return R->getBaseRegion();\n}\n\nbool SAGenTestChecker::isCountFieldForAnyFlexInRecord(const\
+  \ FieldDecl *FD) {\n  if (!FD) return false;\n  const RecordDecl *RD = FD->getParent();\n\
+  \  if (!RD) return false;\n\n  for (const FieldDecl *F : RD->fields()) {\n    if\
+  \ (!isFlexibleArrayField(F))\n      continue;\n    if (const FieldDecl *Counter\
+  \ = getCountFieldForFlex(F)) {\n      if (Counter == FD)\n        return true;\n\
+  \    }\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::markLenInitializedForRegion(const\
+  \ MemRegion *BaseR, CheckerContext &C) const {\n  if (!BaseR) return;\n  ProgramStateRef\
+  \ State = C.getState();\n  State = State->set<LenInitialized>(BaseR, true);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::reportFlexWriteBeforeLenInit(const Stmt *Trigger, CheckerContext\
+  \ &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n \
+  \   return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\
+  \ \"write to counted_by flexible array before updating length field\", N);\n  if\
+  \ (Trigger)\n    R->addRange(Trigger->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// ------------------------ Checker Callbacks ------------------------\n\n\
+  void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  if (!isZeroAllocFn(Call, C))\n    return;\n\n  // Mark the returned allocation\
+  \ object as zero-initialized and its\n  // length field as not-yet-initialized.\n\
+  \  const Expr *OE = Call.getOriginExpr();\n  if (!OE) return;\n  const CallExpr\
+  \ *CE = dyn_cast<CallExpr>(OE);\n  if (!CE) return;\n\n  const MemRegion *MR = getMemRegionFromExpr(CE,\
+  \ C);\n  if (!MR) return;\n\n  MR = MR->getBaseRegion();\n  if (!MR) return;\n\n\
+  \  ProgramStateRef State = C.getState();\n  State = State->set<KZeroAllocs>(MR,\
+  \ true);\n  State = State->set<LenInitialized>(MR, false);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  unsigned DstIdx = 0, LenIdx = 0;\n  if (!isMemWriteFn(Call, C, DstIdx,\
+  \ LenIdx))\n    return;\n\n  if (DstIdx >= Call.getNumArgs())\n    return;\n\n \
+  \ const Expr *DstE = Call.getArgExpr(DstIdx);\n  if (!DstE) return;\n\n  // Are\
+  \ we writing into a flexible array member?\n  const MemberExpr *ME = getFlexArrayMEInExpr(DstE);\n\
+  \  if (!ME) return;\n\n  const auto *FlexFD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FlexFD) return;\n\n  // Only consider flexible arrays that are annotated\
+  \ with counted_by.\n  const FieldDecl *CountFD = getCountFieldForFlex(FlexFD);\n\
+  \  if (!CountFD)\n    return;\n\n  // Identify the underlying object region that\
+  \ contains the flexible array.\n  const MemRegion *BaseR = getBaseRegionFromME(ME,\
+  \ C);\n  if (!BaseR) return;\n\n  BaseR = BaseR->getBaseRegion();\n  ProgramStateRef\
+  \ State = C.getState();\n\n  // Only warn if we know the object is zero-initialized\
+  \ (kzalloc-family).\n  const bool *Zeroed = State->get<KZeroAllocs>(BaseR);\n  if\
+  \ (!Zeroed || !*Zeroed)\n    return;\n\n  // If the length field hasn't been written\
+  \ yet, this is the bug.\n  const bool *Init = State->get<LenInitialized>(BaseR);\n\
+  \  if (Init && *Init)\n    return;\n\n  // Optionally suppress zero-length writes.\n\
+  \  if (LenIdx < Call.getNumArgs()) {\n    const Expr *LenE = Call.getArgExpr(LenIdx);\n\
+  \    llvm::APSInt LenVal;\n    if (LenE && EvaluateExprToInt(LenVal, LenE, C)) {\n\
+  \      if (LenVal == 0)\n        return;\n    }\n  }\n\n  reportFlexWriteBeforeLenInit(Call.getOriginExpr(),\
+  \ C);\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,\
+  \ CheckerContext &C) const {\n  // Detect \"obj->len = ...\" when 'len' is the counted_by\
+  \ field for some flexible array.\n  const MemRegion *R = Loc.getAsRegion();\n  if\
+  \ (!R)\n    return;\n\n  const FieldRegion *FR = dyn_cast<FieldRegion>(R);\n  if\
+  \ (!FR)\n    return;\n\n  const FieldDecl *FD = FR->getDecl();\n  if (!FD)\n   \
+  \ return;\n\n  // If this field is the counter for any counted_by flexible array\
+  \ in the same record\n  // then mark the base object as having its length initialized.\n\
+  \  if (!isCountFieldForAnyFlexInRecord(FD))\n    return;\n\n  const MemRegion *BaseR\
+  \ = FR->getBaseRegion();\n  if (!BaseR)\n    return;\n\n  markLenInitializedForRegion(BaseR,\
+  \ C);\n}\n\nvoid SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt\
+  \ *S, CheckerContext &C) const {\n  // Optional: detect direct stores into obj->flex[i]\
+  \ before len is set.\n  if (IsLoad)\n    return;\n\n  const MemRegion *R = Loc.getAsRegion();\n\
+  \  if (!R)\n    return;\n\n  // Walk up to find a FieldRegion that corresponds to\
+  \ a flexible array member.\n  const SubRegion *SR = dyn_cast<SubRegion>(R);\n  const\
+  \ FieldRegion *FlexFR = nullptr;\n  while (SR) {\n    if (const auto *FR = dyn_cast<FieldRegion>(SR))\
+  \ {\n      const FieldDecl *FD = FR->getDecl();\n      if (FD && isFlexibleArrayField(FD)\
+  \ && getCountFieldForFlex(FD)) {\n        FlexFR = FR;\n        break;\n      }\n\
+  \    }\n    SR = dyn_cast<SubRegion>(SR->getSuperRegion());\n  }\n\n  if (!FlexFR)\n\
+  \    return;\n\n  const MemRegion *BaseR = FlexFR->getBaseRegion();\n  if (!BaseR)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n\n  const bool *Zeroed\
+  \ = State->get<KZeroAllocs>(BaseR);\n  if (!Zeroed || !*Zeroed)\n    return;\n\n\
+  \  const bool *Init = State->get<LenInitialized>(BaseR);\n  if (Init && *Init)\n\
+  \    return;\n\n  reportFlexWriteBeforeLenInit(S, C);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detect writes to __counted_by flexible\
+  \ arrays before updating their length field after kzalloc-like allocations\",\n\
+  \      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nwifi: brcmfmac: fweh: Fix boot crash on Raspberry\
+  \ Pi 4\n\nFix boot crash on Raspberry Pi by moving the update to `event->datalen`\n\
+  before data is copied into flexible-array member `data` via `memcpy()`.\n\nFlexible-array\
+  \ member `data` was annotated with `__counted_by(datalen)`\nin commit 62d19b358088\
+  \ (\"wifi: brcmfmac: fweh: Add __counted_by for\nstruct brcmf_fweh_queue_item and\
+  \ use struct_size()\"). The intention of\nthis is to gain visibility into the size\
+  \ of `data` at run-time through\nits _counter_ (in this case `datalen`), and with\
+  \ this have its accesses\nbounds-checked at run-time via CONFIG_FORTIFY_SOURCE and\n\
+  CONFIG_UBSAN_BOUNDS.\n\nTo effectively accomplish the above, we shall update the\
+  \ counter\n(`datalen`), before the first access to the flexible array (`data`),\n\
+  which was also done in the mentioned commit.\n\nHowever, commit edec42821911 (\"\
+  wifi: brcmfmac: allow per-vendor event\nhandling\") inadvertently caused a buffer\
+  \ overflow, detected by\nFORTIFY_SOURCE. It moved the `event->datalen = datalen;`\
+  \ update to after\nthe first `data` access, at which point `event->datalen` was\
+  \ not yet\nupdated from zero (after calling `kzalloc()`), leading to the overflow\n\
+  issue.\n\nThis fix repositions the `event->datalen = datalen;` update before\naccessing\
+  \ `data`, restoring the intended buffer overflow protection. :)\n\nFixes: edec42821911\
+  \ (\"wifi: brcmfmac: allow per-vendor event handling\")\nReported-by: Nathan Chancellor\
+  \ <nathan@kernel.org>\nCloses: https://gist.github.com/nathanchance/e22f681f3bfc467f15cdf6605021aaa6\n\
+  Tested-by: Nathan Chancellor <nathan@kernel.org>\nSigned-off-by: Gustavo A. R. Silva\
+  \ <gustavoars@kernel.org>\nReviewed-by: Kees Cook <keescook@chromium.org>\nAcked-by:\
+  \ Arend van Spriel <arend.vanspriel@broadcom.com>\nSigned-off-by: Kalle Valo <kvalo@kernel.org>\n\
+  Link: https://msgid.link/Zc+3PFCUvLoVlpg8@neat\n\n## Buggy Code\n\n```c\n// Function:\
+  \ brcmf_fweh_process_event in drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c\n\
+  void brcmf_fweh_process_event(struct brcmf_pub *drvr,\n\t\t\t      struct brcmf_event\
+  \ *event_packet,\n\t\t\t      u32 packet_len, gfp_t gfp)\n{\n\tu32 fwevt_idx;\n\t\
+  struct brcmf_fweh_info *fweh = drvr->fweh;\n\tstruct brcmf_fweh_queue_item *event;\n\
+  \tvoid *data;\n\tu32 datalen;\n\n\t/* get event info */\n\tfwevt_idx = get_unaligned_be32(&event_packet->msg.event_type);\n\
+  \tdatalen = get_unaligned_be32(&event_packet->msg.datalen);\n\tdata = &event_packet[1];\n\
+  \n\tif (fwevt_idx >= fweh->num_event_codes)\n\t\treturn;\n\n\tif (fwevt_idx != BRCMF_E_IF\
+  \ && !fweh->evt_handler[fwevt_idx])\n\t\treturn;\n\n\tif (datalen > BRCMF_DCMD_MAXLEN\
+  \ ||\n\t    datalen + sizeof(*event_packet) > packet_len)\n\t\treturn;\n\n\tevent\
+  \ = kzalloc(struct_size(event, data, datalen), gfp);\n\tif (!event)\n\t\treturn;\n\
+  \n\tevent->code = fwevt_idx;\n\tevent->ifidx = event_packet->msg.ifidx;\n\n\t/*\
+  \ use memcpy to get aligned event message */\n\tmemcpy(&event->emsg, &event_packet->msg,\
+  \ sizeof(event->emsg));\n\tmemcpy(event->data, data, datalen);\n\tevent->datalen\
+  \ = datalen;\n\tmemcpy(event->ifaddr, event_packet->eth.h_dest, ETH_ALEN);\n\n\t\
+  brcmf_fweh_queue_event(fweh, event);\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff\
+  \ --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c\n\
+  index 0774f6c59226..f0b6a7607f16 100644\n--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c\n\
+  +++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c\n@@ -497,12 +497,12\
+  \ @@ void brcmf_fweh_process_event(struct brcmf_pub *drvr,\n \t\treturn;\n \n \t\
+  event->code = fwevt_idx;\n+\tevent->datalen = datalen;\n \tevent->ifidx = event_packet->msg.ifidx;\n\
+  \ \n \t/* use memcpy to get aligned event message */\n \tmemcpy(&event->emsg, &event_packet->msg,\
+  \ sizeof(event->emsg));\n \tmemcpy(event->data, data, datalen);\n-\tevent->datalen\
+  \ = datalen;\n \tmemcpy(event->ifaddr, event_packet->eth.h_dest, ETH_ALEN);\n \n\
+  \ \tbrcmf_fweh_queue_event(fweh, event);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Writing to a flexible-array member that is annotated with __counted_by(len_field)
+  before initializing/updating its length field. Because kzalloc() zeros the struct,
+  the len_field is 0 at first access, so CONFIG_FORTIFY_SOURCE/UBSAN_BOUNDS treat
+  the flexible array as size 0 and flag memcpy()/memset() into it as an overflow.
+
+
+  Example:
+
+  struct S { u32 len; u8 data[] __counted_by(len); };
+
+
+  s = kzalloc(struct_size(s, data, n), GFP_KERNEL);
+
+  /* BUG: len not set yet; bounds check sees data size 0 */
+
+  memcpy(s->data, src, n);
+
+  s->len = n;  /* must be set before accessing s->data */'
+plan: "1) Program state\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(KZeroAllocs, const MemRegion\
+  \ *, bool)\n  - Tracks heap objects known to be zero-initialized (result of kzalloc-like\
+  \ APIs). Value true means the pointee object is zeroed.\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(LenInitialized,\
+  \ const MemRegion *, bool)\n  - Tracks whether the length field that guards a flexible-array\
+  \ member (via __counted_by) has been initialized on this object. Default is false;\
+  \ set to true on first store to the counter field.\n\nRationale: We only warn when\
+  \ (1) the destination object is known to be zero-initialized (kzalloc-family), and\
+  \ (2) a write into a counted_by flex-array occurs before its counter field is written\
+  \ on this path.\n\n\n2) Helper utilities (internal to the checker)\n\n- bool isZeroAllocFn(const\
+  \ CallEvent &Call)\n  - Return true for functions that zero-initialize allocations:\n\
+  \    - \"kzalloc\", \"kvzalloc\", \"kcalloc\", \"kzalloc_array\",\n      \"devm_kzalloc\"\
+  , \"devm_kcalloc\", \"devm_kzalloc_array\"\n  - Keep the list small and explicit.\n\
+  \n- bool isMemWriteFn(const CallEvent &Call, unsigned &DstIdx, unsigned &LenIdx)\n\
+  \  - Recognize memory-writing APIs and identify the destination and length parameters:\n\
+  \    - memcpy(dst, src, n): DstIdx = 0, LenIdx = 2\n    - memmove(dst, src, n):\
+  \ DstIdx = 0, LenIdx = 2\n    - memset(dst, c, n): DstIdx = 0, LenIdx = 2\n  - Optionally\
+  \ include kernel helpers if desired (e.g., memcpy_toio), but keep initial scope\
+  \ to libc-like calls.\n\n- const MemberExpr *getFlexArrayMEInExpr(const Expr *E)\n\
+  \  - Walk E (use findSpecificTypeInChildren<MemberExpr>(E)) to locate a MemberExpr\
+  \ (ME) that refers to a field whose type is a flexible array:\n    - FieldDecl FD\
+  \ has type IncompleteArrayType (or is a flexible array member in the RecordDecl).\n\
+  \  - Return that MemberExpr if found; otherwise return nullptr.\n\n- const FieldDecl\
+  \ *getCountFieldForFlex(const FieldDecl *FlexFD)\n  - If FlexFD has the CountedBy/Counted_by\
+  \ attribute, return the referenced counter FieldDecl. If no attribute, return nullptr\
+  \ and do not warn.\n  - This keeps the checker specific to __counted_by-annotated\
+  \ arrays (the target pattern).\n\n- const MemRegion *getBaseRegionFromME(const MemberExpr\
+  \ *ME, CheckerContext &C)\n  - Compute the base object region of the MemberExpr:\n\
+  \    - Use ME->getBase() and getMemRegionFromExpr to obtain the underlying MemRegion\
+  \ of the struct object the flexible array belongs to.\n  - Return nullptr if not\
+  \ available.\n\n\n3) Callback usage and behavior\n\n- checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C)\n  - Detect zero-initializing allocators:\n    - If\
+  \ isZeroAllocFn(Call), obtain the returned region:\n      - const MemRegion *RetReg\
+  \ = Call.getReturnValue().getAsRegion();\n      - If RetReg is non-null, set:\n\
+  \        - KZeroAllocs[RetReg] = true\n        - LenInitialized[RetReg] = false\n\
+  \    - Do nothing for non-zeroing allocators to reduce false positives.\n\n- checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C)\n  - Detect assignment to the\
+  \ counter field (length) that governs a __counted_by flexible array:\n    - If Loc\
+  \ is a region and can be cast to FieldRegion:\n      - const FieldRegion *FR = dyn_cast_or_null<FieldRegion>(Loc.getAsRegion());\n\
+  \      - const FieldDecl *FD = FR ? FR->getDecl() : nullptr;\n      - If FD is null,\
+  \ return.\n      - Determine if FD is the target (counter) for any flexible-array\
+  \ field in the same record:\n        - Inspect FD->getParent() (RecordDecl). Iterate\
+  \ its fields, find a flexible array field FAFD where FAFD has CountedBy attribute\
+  \ referencing FD (use getCountFieldForFlex(FAFD) == FD).\n        - If such FAFD\
+  \ exists:\n          - Get the base object region: const MemRegion *BaseR = FR->getSuperRegion();\n\
+  \          - Mark LenInitialized[BaseR] = true.\n    - Note: We do not require Val\
+  \ to be nonzero; simply recording that the counter was explicitly written is sufficient\
+  \ to suppress the warning.\n\n- checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C)\n  - Detect writes into a counted_by flexible array before its counter is\
+  \ set:\n    - If not isMemWriteFn(Call, DstIdx, LenIdx), return.\n    - Obtain the\
+  \ destination expression: const Expr *DstE = Call.getArgExpr(DstIdx);\n    - Find\
+  \ a flex-array member in the destination:\n      - const MemberExpr *ME = getFlexArrayMEInExpr(DstE);\n\
+  \      - If ME is null, return (we only care about member writes into the flexible\
+  \ array).\n      - const FieldDecl *FlexFD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \      - If FlexFD is null or not a flexible array (IncompleteArrayType), return.\n\
+  \      - Find the counted_by counter field: const FieldDecl *CounterFD = getCountFieldForFlex(FlexFD);\n\
+  \      - If CounterFD is null, return (only handle __counted_by-annotated arrays).\n\
+  \    - Get the base object region: const MemRegion *BaseR = getBaseRegionFromME(ME,\
+  \ C);\n      - If null, return.\n    - Check that the object was zero-initialized:\n\
+  \      - If KZeroAllocs[BaseR] != true, return (reduce false positives; the bug\
+  \ relies on kzalloc zeroing).\n    - Check if the length (counter) has been initialized:\n\
+  \      - If LenInitialized[BaseR] != true, report a bug.\n        - Create a non-fatal\
+  \ error node and emit a PathSensitiveBugReport with a short message:\n         \
+  \ - \"write to counted_by flexible array before updating length field\"\n      \
+  \  - Add a note on the destination argument location if possible.\n    - Optional\
+  \ minor filter: If the length argument (LenIdx) can be evaluated and equals 0, skip\
+  \ reporting. Use EvaluateExprToInt utility.\n\n- checkLocation(SVal Loc, bool IsLoad,\
+  \ const Stmt *S, CheckerContext &C)\n  - Optional extension to catch direct stores\
+  \ like obj->data[i] = v; (not via memcpy/memset):\n    - If IsLoad is true, return\
+  \ (we only care about writes).\n    - Get the region: const MemRegion *R = Loc.getAsRegion();\n\
+  \    - If R is null, return.\n    - Walk up to find if this region is inside a FieldRegion\
+  \ FR that corresponds to a flexible-array field with __counted_by:\n      - For\
+  \ example, climb super-regions until a FieldRegion is found; check that field type\
+  \ is flexible array and has CountedBy attribute.\n    - Once found, compute BaseR\
+  \ = FR->getSuperRegion().\n    - If KZeroAllocs[BaseR] == true and LenInitialized[BaseR]\
+  \ != true, report the same bug as above.\n    - This step is optional; keep it if\
+  \ you want to catch scalar element writes, not just bulk copies.\n\n- checkBeginFunction\
+  \ / checkEndFunction\n  - Not needed; no special per-function initialization required\
+  \ beyond default state handling.\n\n- Other callbacks\n  - checkBranchCondition,\
+  \ checkPreStmt, checkPostStmt, checkPostCall (beyond zero alloc) are not needed\
+  \ for the simplest workable checker.\n\n\n4) Notes on robustness and precision\n\
+  \n- The checker relies on the presence of the __counted_by attribute on the flexible-array\
+  \ field. If the attribute is missing, the checker will not warn (to avoid FPs).\n\
+  - We purposely limit warnings to objects known to be zero-initialized by kzalloc-family\
+  \ APIs to match the real hazard described (CONFIG_FORTIFY_SOURCE/UBSAN_BOUNDS interprets\
+  \ counter as 0 after kzalloc).\n- We do not attempt to model aliasing beyond MemRegion\
+  \ identity. Accesses through aliases still share the same base region in the analyzer,\
+  \ so this is typically sufficient.\n- We do not require that the counter assignment\
+  \ precedes every possible write; path-sensitivity ensures that if \"counter is assigned\"\
+  \ is observed earlier on the path, LenInitialized[BaseR] will be true and suppress\
+  \ the warning.\n\n\n5) Bug report\n\n- Message: \"write to counted_by flexible array\
+  \ before updating length field\"\n- Emission: Use generateNonFatalErrorNode() and\
+  \ std::make_unique<PathSensitiveBugReport>.\n- Location: Prefer to highlight the\
+  \ destination expression of memcpy/memset (or the store statement in checkLocation)."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Type.h\"\n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\
+  \n#include \"clang/AST/Attr.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Program state: tracks zero-initializing allocations\
+  \ and whether the\n// length field that guards a counted_by flexible array has been\
+  \ set.\nREGISTER_MAP_WITH_PROGRAMSTATE(KZeroAllocs, const MemRegion *, bool)\nREGISTER_MAP_WITH_PROGRAMSTATE(LenInitialized,\
+  \ const MemRegion *, bool)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public\
+  \ Checker<\n        check::PostCall,\n        check::PreCall,\n        check::Bind,\n\
+  \        check::Location> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Unsafe flexible-array write\"\
+  , \"Memory Safety\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n      void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const;\n\n   private:\n      // Helpers\n      static bool isZeroAllocFn(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static bool isMemWriteFn(const CallEvent\
+  \ &Call, CheckerContext &C,\n                               unsigned &DstIdx, unsigned\
+  \ &LenIdx);\n      static const MemberExpr *getFlexArrayMEInExpr(const Expr *E);\n\
+  \      static const FieldDecl *getCountFieldForFlex(const FieldDecl *FlexFD);\n\
+  \      static const MemRegion *getBaseRegionFromME(const MemberExpr *ME, CheckerContext\
+  \ &C);\n\n      static bool isFlexibleArrayField(const FieldDecl *FD);\n      static\
+  \ bool isCountFieldForAnyFlexInRecord(const FieldDecl *FD);\n\n      void markLenInitializedForRegion(const\
+  \ MemRegion *BaseR, CheckerContext &C) const;\n      void reportFlexWriteBeforeLenInit(const\
+  \ Stmt *Trigger, CheckerContext &C) const;\n};\n\n// ------------------------ Helper\
+  \ Implementations ------------------------\n\nbool SAGenTestChecker::isZeroAllocFn(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE) return false;\n\n  // Recognize common Linux zero-initializing allocators\n\
+  \  return ExprHasName(OE, \"kzalloc\", C) ||\n         ExprHasName(OE, \"kvzalloc\"\
+  , C) ||\n         ExprHasName(OE, \"kcalloc\", C) ||\n         ExprHasName(OE, \"\
+  kzalloc_array\", C) ||\n         ExprHasName(OE, \"devm_kzalloc\", C) ||\n     \
+  \    ExprHasName(OE, \"devm_kcalloc\", C) ||\n         ExprHasName(OE, \"devm_kzalloc_array\"\
+  , C);\n}\n\nbool SAGenTestChecker::isMemWriteFn(const CallEvent &Call, CheckerContext\
+  \ &C,\n                                    unsigned &DstIdx, unsigned &LenIdx) {\n\
+  \  const Expr *OE = Call.getOriginExpr();\n  if (!OE) return false;\n\n  // libc-like\
+  \ memory writing APIs\n  // memcpy(void *dst, const void *src, size_t n)\n  if (ExprHasName(OE,\
+  \ \"memcpy\", C)) {\n    DstIdx = 0; LenIdx = 2; return true;\n  }\n  // memmove(void\
+  \ *dst, const void *src, size_t n)\n  if (ExprHasName(OE, \"memmove\", C)) {\n \
+  \   DstIdx = 0; LenIdx = 2; return true;\n  }\n  // memset(void *dst, int c, size_t\
+  \ n)\n  if (ExprHasName(OE, \"memset\", C)) {\n    DstIdx = 0; LenIdx = 2; return\
+  \ true;\n  }\n\n  return false;\n}\n\nconst MemberExpr *SAGenTestChecker::getFlexArrayMEInExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  // Search downwards for a MemberExpr.\
+  \ Only return one if there are many.\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(E);\n\
+  \  if (!ME) return nullptr;\n\n  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FD) return nullptr;\n\n  if (!isFlexibleArrayField(FD))\n    return nullptr;\n\
+  \n  return ME;\n}\n\nbool SAGenTestChecker::isFlexibleArrayField(const FieldDecl\
+  \ *FD) {\n  if (!FD) return false;\n  QualType FT = FD->getType();\n\n  // Flexible\
+  \ array members in C are represented as IncompleteArrayType.\n  if (!FT->isIncompleteArrayType())\n\
+  \    return false;\n\n  return true;\n}\n\nconst FieldDecl *SAGenTestChecker::getCountFieldForFlex(const\
+  \ FieldDecl *FlexFD) {\n  if (!FlexFD) return nullptr;\n  if (!isFlexibleArrayField(FlexFD))\n\
+  \    return nullptr;\n\n  // Only handle fields explicitly annotated with counted_by.\n\
+  \  if (const auto *CBA = FlexFD->getAttr<CountedByAttr>()) {\n    // In Clang 18,\
+  \ CountedByAttr stores the identifier of the count field.\n    if (IdentifierInfo\
+  \ *II = CBA->getCountedByField()) {\n      const RecordDecl *RD = FlexFD->getParent();\n\
+  \      if (!RD) return nullptr;\n      for (const FieldDecl *FD : RD->fields())\
+  \ {\n        if (FD->getIdentifier() == II)\n          return FD;\n      }\n   \
+  \ }\n  }\n  return nullptr;\n}\n\nconst MemRegion *SAGenTestChecker::getBaseRegionFromME(const\
+  \ MemberExpr *ME, CheckerContext &C) {\n  if (!ME) return nullptr;\n\n  // Use the\
+  \ whole MemberExpr to get a region referring to the field, then\n  // collapse to\
+  \ the base region representing the underlying object.\n  const MemRegion *R = getMemRegionFromExpr(ME,\
+  \ C);\n  if (!R) return nullptr;\n  return R->getBaseRegion();\n}\n\nbool SAGenTestChecker::isCountFieldForAnyFlexInRecord(const\
+  \ FieldDecl *FD) {\n  if (!FD) return false;\n  const RecordDecl *RD = FD->getParent();\n\
+  \  if (!RD) return false;\n\n  for (const FieldDecl *F : RD->fields()) {\n    if\
+  \ (!isFlexibleArrayField(F))\n      continue;\n    if (const FieldDecl *Counter\
+  \ = getCountFieldForFlex(F)) {\n      if (Counter == FD)\n        return true;\n\
+  \    }\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::markLenInitializedForRegion(const\
+  \ MemRegion *BaseR, CheckerContext &C) const {\n  if (!BaseR) return;\n  ProgramStateRef\
+  \ State = C.getState();\n  State = State->set<LenInitialized>(BaseR, true);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::reportFlexWriteBeforeLenInit(const Stmt *Trigger, CheckerContext\
+  \ &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n \
+  \   return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\
+  \ \"write to counted_by flexible array before updating length field\", N);\n  if\
+  \ (Trigger)\n    R->addRange(Trigger->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// ------------------------ Checker Callbacks ------------------------\n\n\
+  void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  if (!isZeroAllocFn(Call, C))\n    return;\n\n  // Mark the returned allocation\
+  \ object as zero-initialized and its\n  // length field as not-yet-initialized.\n\
+  \  const Expr *OE = Call.getOriginExpr();\n  if (!OE) return;\n  const CallExpr\
+  \ *CE = dyn_cast<CallExpr>(OE);\n  if (!CE) return;\n\n  const MemRegion *MR = getMemRegionFromExpr(CE,\
+  \ C);\n  if (!MR) return;\n\n  MR = MR->getBaseRegion();\n  if (!MR) return;\n\n\
+  \  ProgramStateRef State = C.getState();\n  State = State->set<KZeroAllocs>(MR,\
+  \ true);\n  State = State->set<LenInitialized>(MR, false);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  unsigned DstIdx = 0, LenIdx = 0;\n  if (!isMemWriteFn(Call, C, DstIdx,\
+  \ LenIdx))\n    return;\n\n  if (DstIdx >= Call.getNumArgs())\n    return;\n\n \
+  \ const Expr *DstE = Call.getArgExpr(DstIdx);\n  if (!DstE) return;\n\n  // Are\
+  \ we writing into a flexible array member?\n  const MemberExpr *ME = getFlexArrayMEInExpr(DstE);\n\
+  \  if (!ME) return;\n\n  const auto *FlexFD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FlexFD) return;\n\n  // Only consider flexible arrays that are annotated\
+  \ with counted_by.\n  const FieldDecl *CountFD = getCountFieldForFlex(FlexFD);\n\
+  \  if (!CountFD)\n    return;\n\n  // Identify the underlying object region that\
+  \ contains the flexible array.\n  const MemRegion *BaseR = getBaseRegionFromME(ME,\
+  \ C);\n  if (!BaseR) return;\n\n  BaseR = BaseR->getBaseRegion();\n  ProgramStateRef\
+  \ State = C.getState();\n\n  // Only warn if we know the object is zero-initialized\
+  \ (kzalloc-family).\n  const bool *Zeroed = State->get<KZeroAllocs>(BaseR);\n  if\
+  \ (!Zeroed || !*Zeroed)\n    return;\n\n  // If the length field hasn't been written\
+  \ yet, this is the bug.\n  const bool *Init = State->get<LenInitialized>(BaseR);\n\
+  \  if (Init && *Init)\n    return;\n\n  // Optionally suppress zero-length writes.\n\
+  \  if (LenIdx < Call.getNumArgs()) {\n    const Expr *LenE = Call.getArgExpr(LenIdx);\n\
+  \    llvm::APSInt LenVal;\n    if (LenE && EvaluateExprToInt(LenVal, LenE, C)) {\n\
+  \      if (LenVal == 0)\n        return;\n    }\n  }\n\n  reportFlexWriteBeforeLenInit(Call.getOriginExpr(),\
+  \ C);\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,\
+  \ CheckerContext &C) const {\n  // Detect \"obj->len = ...\" when 'len' is the counted_by\
+  \ field for some flexible array.\n  const MemRegion *R = Loc.getAsRegion();\n  if\
+  \ (!R)\n    return;\n\n  const FieldRegion *FR = dyn_cast<FieldRegion>(R);\n  if\
+  \ (!FR)\n    return;\n\n  const FieldDecl *FD = FR->getDecl();\n  if (!FD)\n   \
+  \ return;\n\n  // If this field is the counter for any counted_by flexible array\
+  \ in the same record\n  // then mark the base object as having its length initialized.\n\
+  \  if (!isCountFieldForAnyFlexInRecord(FD))\n    return;\n\n  const MemRegion *BaseR\
+  \ = FR->getBaseRegion();\n  if (!BaseR)\n    return;\n\n  markLenInitializedForRegion(BaseR,\
+  \ C);\n}\n\nvoid SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt\
+  \ *S, CheckerContext &C) const {\n  // Optional: detect direct stores into obj->flex[i]\
+  \ before len is set.\n  if (IsLoad)\n    return;\n\n  const MemRegion *R = Loc.getAsRegion();\n\
+  \  if (!R)\n    return;\n\n  // Walk up to find a FieldRegion that corresponds to\
+  \ a flexible array member.\n  const SubRegion *SR = dyn_cast<SubRegion>(R);\n  const\
+  \ FieldRegion *FlexFR = nullptr;\n  while (SR) {\n    if (const auto *FR = dyn_cast<FieldRegion>(SR))\
+  \ {\n      const FieldDecl *FD = FR->getDecl();\n      if (FD && isFlexibleArrayField(FD)\
+  \ && getCountFieldForFlex(FD)) {\n        FlexFR = FR;\n        break;\n      }\n\
+  \    }\n    SR = dyn_cast<SubRegion>(SR->getSuperRegion());\n  }\n\n  if (!FlexFR)\n\
+  \    return;\n\n  const MemRegion *BaseR = FlexFR->getBaseRegion();\n  if (!BaseR)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n\n  const bool *Zeroed\
+  \ = State->get<KZeroAllocs>(BaseR);\n  if (!Zeroed || !*Zeroed)\n    return;\n\n\
+  \  const bool *Init = State->get<LenInitialized>(BaseR);\n  if (Init && *Init)\n\
+  \    return;\n\n  reportFlexWriteBeforeLenInit(S, C);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detect writes to __counted_by flexible\
+  \ arrays before updating their length field after kzalloc-like allocations\",\n\
+  \      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

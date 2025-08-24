@@ -1,0 +1,258 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -38,7 +38,9 @@     check::PreCall,
+     check::BranchCondition,
+     check::Location,
+-    check::Bind> {
++    check::Bind,
++    check::PreStmt<UnaryOperator>,
++    check::PreStmt<ArraySubscriptExpr>> {
+    mutable std::unique_ptr<BugType> BT;
+
+    public:
+@@ -52,6 +54,9 @@       void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;
+       void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;
+       void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;
++
++      void checkPreStmt(const UnaryOperator *U, CheckerContext &C) const;
++      void checkPreStmt(const ArraySubscriptExpr *ASE, CheckerContext &C) const;
+
+    private:
+
+@@ -68,6 +73,12 @@       static bool callIsKnownToDeref(const CallEvent &Call,
+                                      CheckerContext &C,
+                                      llvm::SmallVectorImpl<unsigned> &Params);
++
++      // Mark pointers that are NULL-checked within a (possibly compound) condition.
++      ProgramStateRef markNullCheckedInCondition(ProgramStateRef State, const Expr *E, CheckerContext &C) const;
++
++      // Mark a single pointer expression as checked (if it is tracked or an alias of a tracked ptr).
++      ProgramStateRef markPtrExprChecked(ProgramStateRef State, const Expr *PtrE, CheckerContext &C) const;
+ };
+
+ ///////////////////////
+@@ -272,12 +283,76 @@
+     if (isUncheckedPossiblyNull(State, MR)) {
+       report(C, Call.getOriginExpr(), MR, "pointer may be NULL and is dereferenced");
+-      // Optionally mark as checked to avoid duplicate reports on the same path.
++      // Mark as checked to avoid duplicate reports on the same path.
+       State = setChecked(State, MR);
+       C.addTransition(State);
+-      // Do not return early; continue to check other args.
+-    }
+-  }
++      // Continue to check other args.
++    }
++  }
++}
++
++ProgramStateRef SAGenTestChecker::markPtrExprChecked(ProgramStateRef State, const Expr *PtrE, CheckerContext &C) const {
++  if (!PtrE)
++    return State;
++
++  const Expr *E = PtrE->IgnoreParenImpCasts();
++  if (!E->getType()->isPointerType())
++    return State;
++
++  SVal PSV = State->getSVal(E, C.getLocationContext());
++  const MemRegion *MR = getRegionFromSValOrExpr(PSV, E, C);
++  MR = canonicalize(MR);
++  if (MR) {
++    State = setChecked(State, MR);
++  }
++  return State;
++}
++
++ProgramStateRef SAGenTestChecker::markNullCheckedInCondition(ProgramStateRef State, const Expr *E, CheckerContext &C) const {
++  if (!E)
++    return State;
++
++  E = E->IgnoreParenImpCasts();
++
++  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    if (UO->getOpcode() == UO_LNot) {
++      // '!ptr' or '!expr' - descend into subexpr and mark accordingly
++      return markNullCheckedInCondition(State, UO->getSubExpr(), C);
++    }
++    return State;
++  }
++
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++    BinaryOperator::Opcode Op = BO->getOpcode();
++    if (Op == BO_LAnd || Op == BO_LOr) {
++      State = markNullCheckedInCondition(State, BO->getLHS(), C);
++      State = markNullCheckedInCondition(State, BO->getRHS(), C);
++      return State;
++    }
++    if (Op == BO_EQ || Op == BO_NE) {
++      const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
++      const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
++      ASTContext &ACtx = C.getASTContext();
++
++      bool LHSIsNull = LHS && LHS->isNullPointerConstant(ACtx, Expr::NPC_ValueDependentIsNull);
++      bool RHSIsNull = RHS && RHS->isNullPointerConstant(ACtx, Expr::NPC_ValueDependentIsNull);
++
++      if (LHSIsNull && !RHSIsNull)
++        return markPtrExprChecked(State, RHS, C);
++      if (!LHSIsNull && RHSIsNull)
++        return markPtrExprChecked(State, LHS, C);
++      // Other comparisons are ignored.
++      return State;
++    }
++    return State;
++  }
++
++  // If condition is a pure pointer converted to boolean: if (ptr)
++  if (E->getType()->isPointerType())
++    return markPtrExprChecked(State, E, C);
++
++  // Calls like IS_ERR_OR_NULL(ptr) could be handled here if needed.
++  return State;
+ }
+
+ void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+@@ -288,92 +363,84 @@     return;
+   }
+
+-  CondE = CondE->IgnoreParenCasts();
+-
+-  // Pattern: if (!ptr)
+-  if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {
+-    if (UO->getOpcode() == UO_LNot) {
+-      const Expr *SubE = UO->getSubExpr();
+-      if (SubE) {
+-        SVal SubSV = State->getSVal(SubE, C.getLocationContext());
+-        const MemRegion *MR = getRegionFromSValOrExpr(SubSV, SubE, C);
+-        MR = canonicalize(MR);
+-        if (MR) {
+-          State = setChecked(State, MR);
+-        }
+-      }
+-    }
+-  }
+-  // Pattern: if (ptr == NULL) or if (ptr != NULL)
+-  else if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {
+-    BinaryOperator::Opcode Op = BO->getOpcode();
+-    if (Op == BO_EQ || Op == BO_NE) {
+-      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();
+-      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();
+-      ASTContext &ACtx = C.getASTContext();
+-
+-      bool LHSIsNull = LHS && LHS->isNullPointerConstant(ACtx, Expr::NPC_ValueDependentIsNull);
+-      bool RHSIsNull = RHS && RHS->isNullPointerConstant(ACtx, Expr::NPC_ValueDependentIsNull);
+-
+-      const Expr *PtrE = nullptr;
+-      if (LHSIsNull && !RHSIsNull) PtrE = RHS;
+-      if (!LHSIsNull && RHSIsNull) PtrE = LHS;
+-
+-      if (PtrE) {
+-        SVal PSV = State->getSVal(PtrE, C.getLocationContext());
+-        const MemRegion *MR = getRegionFromSValOrExpr(PSV, PtrE, C);
+-        MR = canonicalize(MR);
+-        if (MR) {
+-          State = setChecked(State, MR);
+-        }
+-      }
+-    }
+-  }
+-  // Pattern: if (ptr)
+-  else {
+-    SVal CSV = State->getSVal(CondE, C.getLocationContext());
+-    const MemRegion *MR = getRegionFromSValOrExpr(CSV, CondE, C);
+-    MR = canonicalize(MR);
+-    if (MR) {
+-      State = setChecked(State, MR);
+-    }
+-  }
+-
++  State = markNullCheckedInCondition(State, CondE, C);
+   C.addTransition(State);
+ }
+
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+-  ProgramStateRef State = C.getState();
+-
+-  const MemRegion *MR = Loc.getAsRegion();
+-  if (!MR) return;
++  // Do not treat loads/stores of the pointer variable (or its storage cell)
++  // as dereferences. Reporting here caused false positives where code
++  // stores the pointer into a struct field or reads it for a NULL-check.
++  // We rely on:
++  //  - checkPreCall (known-deref functions), and
++  //  - checkPreStmt for explicit dereferences (*p, p[i]).
++  (void)Loc;
++  (void)IsLoad;
++  (void)S;
++  (void)C;
++}
++
++void SAGenTestChecker::checkPreStmt(const UnaryOperator *U, CheckerContext &C) const {
++  if (U->getOpcode() != UO_Deref)
++    return;
++
++  ProgramStateRef State = C.getState();
++  const Expr *E = U->getSubExpr();
++  if (!E)
++    return;
++
++  E = E->IgnoreParenImpCasts();
++  SVal SV = State->getSVal(E, C.getLocationContext());
++  const MemRegion *MR = getRegionFromSValOrExpr(SV, E, C);
+   MR = canonicalize(MR);
+-  if (!MR) return;
++
++  if (!MR)
++    return;
+
+   if (isUncheckedPossiblyNull(State, MR)) {
+-    report(C, S, MR, "pointer may be NULL and is dereferenced");
++    report(C, U, MR, "pointer may be NULL and is dereferenced");
+     State = setChecked(State, MR);
+     C.addTransition(State);
+   }
+ }
+
++void SAGenTestChecker::checkPreStmt(const ArraySubscriptExpr *ASE, CheckerContext &C) const {
++  // p[i] implies dereference of p
++  ProgramStateRef State = C.getState();
++  const Expr *Base = ASE->getBase();
++  if (!Base)
++    return;
++
++  const Expr *E = Base->IgnoreParenImpCasts();
++  SVal SV = State->getSVal(E, C.getLocationContext());
++  const MemRegion *MR = getRegionFromSValOrExpr(SV, E, C);
++  MR = canonicalize(MR);
++
++  if (!MR)
++    return;
++
++  if (isUncheckedPossiblyNull(State, MR)) {
++    report(C, ASE, MR, "pointer may be NULL and is dereferenced");
++    State = setChecked(State, MR);
++    C.addTransition(State);
++  }
++}
++
+ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE,
+                                  CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+
+   const MemRegion *LHS = Loc.getAsRegion();
+-  if (!LHS) {
+-    C.addTransition(State);
+-    return;
+-  }
+-  LHS = canonicalize(LHS);
++  if (LHS)
++    LHS = canonicalize(LHS);
+
+   const MemRegion *RHS = Val.getAsRegion();
+   if (!RHS && StoreE) {
+     if (const Expr *E = dyn_cast<Expr>(StoreE))
+       RHS = getMemRegionFromExpr(E, C);
+   }
+-  RHS = canonicalize(RHS);
++  if (RHS)
++    RHS = canonicalize(RHS);
+
+   if (LHS && RHS) {
+     State = addAlias(State, LHS, RHS);

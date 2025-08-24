@@ -1,0 +1,461 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: e61dd678601eac53d501dda1eb1bcffec7b11bd6
+commit_type: Double-Free
+index: 7
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"llvm/ADT/ImmutableSet.h\"\n#include \"llvm/ADT/SmallVector.h\"\n\n\
+  using namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program\
+  \ states\nusing FieldSet = llvm::ImmutableSet<const FieldDecl *>;\nREGISTER_MAP_WITH_PROGRAMSTATE(FreedFieldPerBaseMap,\
+  \ const MemRegion *, FieldSet)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasBaseMap,\
+  \ const MemRegion *, const MemRegion *)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasFieldMap,\
+  \ const MemRegion *, const FieldDecl *)\n\nnamespace {\n\nclass SAGenTestChecker\n\
+  \    : public Checker<\n          check::PreCall,\n          check::PostCall,\n\
+  \          check::Bind> {\n  mutable std::unique_ptr<BugType> BT;\n\npublic:\n \
+  \ SAGenTestChecker()\n      : BT(new BugType(this, \"Double free of struct member\"\
+  , \"Memory Management\")) {}\n\n  void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \nprivate:\n  // Helpers\n  static bool callHasName(const CallEvent &Call, StringRef\
+  \ Name, CheckerContext &C);\n  static bool isKfreeLike(const CallEvent &Call, CheckerContext\
+  \ &C);\n\n  struct CompositeSpec {\n    unsigned BaseParamIndex = 0;\n    llvm::SmallVector<StringRef,\
+  \ 4> Members;\n  };\n  static bool isCompositeCleanup(const CallEvent &Call, CheckerContext\
+  \ &C,\n                                 CompositeSpec &Out);\n\n  static bool getMemberFromExpr(const\
+  \ Expr *E, CheckerContext &C,\n                                const MemRegion *&OutBase,\n\
+  \                                const FieldDecl *&OutField);\n\n  static const\
+  \ MemRegion *getVarRegionFromExpr(const Expr *E, CheckerContext &C);\n\n  static\
+  \ const FieldDecl *lookupFieldInPointee(QualType PtrTy, StringRef Name);\n\n  static\
+  \ bool wasFreed(ProgramStateRef State, const MemRegion *Base,\n                \
+  \       const FieldDecl *FD);\n  static ProgramStateRef setFreed(ProgramStateRef\
+  \ State, const MemRegion *Base,\n                                  const FieldDecl\
+  \ *FD);\n\n  static ProgramStateRef clearAliasFor(ProgramStateRef State, const MemRegion\
+  \ *PtrReg);\n\n  void reportDoubleFree(CheckerContext &C, StringRef Msg,\n     \
+  \                   SourceRange R) const;\n};\n\n// Implementation\n\nbool SAGenTestChecker::callHasName(const\
+  \ CallEvent &Call, StringRef Name,\n                                   CheckerContext\
+  \ &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E)\n    return false;\n\
+  \  return ExprHasName(E, Name, C);\n}\n\nbool SAGenTestChecker::isKfreeLike(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  return callHasName(Call, \"kfree\", C)\
+  \ ||\n         callHasName(Call, \"kvfree\", C) ||\n         callHasName(Call, \"\
+  vfree\", C) ||\n         callHasName(Call, \"kfree_sensitive\", C);\n}\n\nbool SAGenTestChecker::isCompositeCleanup(const\
+  \ CallEvent &Call, CheckerContext &C,\n                                        \
+  \  CompositeSpec &Out) {\n  struct Entry {\n    const char *Name;\n    unsigned\
+  \ BaseParamIndex;\n    const char *Members[4];\n    unsigned NumMembers;\n  };\n\
+  \  static const Entry Table[] = {\n      {\"bch2_dev_buckets_free\", 0, {\"buckets_nouse\"\
+  }, 1},\n  };\n\n  for (const auto &E : Table) {\n    if (callHasName(Call, E.Name,\
+  \ C)) {\n      Out.BaseParamIndex = E.BaseParamIndex;\n      Out.Members.clear();\n\
+  \      for (unsigned i = 0; i < E.NumMembers; ++i)\n        Out.Members.push_back(E.Members[i]);\n\
+  \      return true;\n    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::getMemberFromExpr(const\
+  \ Expr *E, CheckerContext &C,\n                                         const MemRegion\
+  \ *&OutBase,\n                                         const FieldDecl *&OutField)\
+  \ {\n  OutBase = nullptr;\n  OutField = nullptr;\n  if (!E)\n    return false;\n\
+  \n  // Find a MemberExpr inside the expression\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(E);\n\
+  \  if (!ME)\n    return false;\n\n  const ValueDecl *VD = ME->getMemberDecl();\n\
+  \  const auto *FD = dyn_cast<FieldDecl>(VD);\n  if (!FD)\n    return false;\n\n\
+  \  const Expr *BaseE = ME->getBase();\n  if (!BaseE)\n    return false;\n\n  const\
+  \ MemRegion *BaseReg = getMemRegionFromExpr(BaseE, C);\n  if (!BaseReg)\n    return\
+  \ false;\n\n  BaseReg = BaseReg->getBaseRegion();\n  if (!BaseReg)\n    return false;\n\
+  \n  OutBase = BaseReg;\n  OutField = FD;\n  return true;\n}\n\nconst MemRegion *SAGenTestChecker::getVarRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n  const Expr *EE\
+  \ = E->IgnoreParenImpCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(EE))\
+  \ {\n    const MemRegion *R = getMemRegionFromExpr(DRE, C);\n    if (!R)\n     \
+  \ return nullptr;\n    return R->getBaseRegion();\n  }\n  return nullptr;\n}\n\n\
+  const FieldDecl *SAGenTestChecker::lookupFieldInPointee(QualType PtrTy, StringRef\
+  \ Name) {\n  if (PtrTy.isNull())\n    return nullptr;\n  if (!PtrTy->isPointerType())\n\
+  \    return nullptr;\n\n  QualType Pointee = PtrTy->getPointeeType();\n  if (Pointee.isNull())\n\
+  \    return nullptr;\n\n  const RecordType *RT = dyn_cast<RecordType>(Pointee.getTypePtr());\n\
+  \  if (!RT)\n    return nullptr;\n\n  const RecordDecl *RD = RT->getDecl();\n  if\
+  \ (!RD)\n    return nullptr;\n\n  for (const FieldDecl *FD : RD->fields()) {\n \
+  \   if (FD && FD->getName() == Name)\n      return FD;\n  }\n  return nullptr;\n\
+  }\n\nbool SAGenTestChecker::wasFreed(ProgramStateRef State, const MemRegion *Base,\n\
+  \                                const FieldDecl *FD) {\n  if (!State || !Base ||\
+  \ !FD)\n    return false;\n\n  const FieldSet *SetPtr = State->get<FreedFieldPerBaseMap>(Base);\n\
+  \  if (!SetPtr)\n    return false;\n\n  FieldSet S = *SetPtr;\n  return S.contains(FD);\n\
+  }\n\nProgramStateRef SAGenTestChecker::setFreed(ProgramStateRef State,\n       \
+  \                                    const MemRegion *Base,\n                  \
+  \                         const FieldDecl *FD) {\n  if (!State || !Base || !FD)\n\
+  \    return State;\n\n  auto &Factory = State->get_context<FieldSet>();\n  const\
+  \ FieldSet *SetPtr = State->get<FreedFieldPerBaseMap>(Base);\n  FieldSet S = SetPtr\
+  \ ? *SetPtr : Factory.getEmptySet();\n  if (!S.contains(FD)) {\n    S = Factory.add(S,\
+  \ FD);\n    State = State->set<FreedFieldPerBaseMap>(Base, S);\n  }\n  return State;\n\
+  }\n\nProgramStateRef SAGenTestChecker::clearAliasFor(ProgramStateRef State, const\
+  \ MemRegion *PtrReg) {\n  if (!State || !PtrReg)\n    return State;\n  State = State->remove<PtrAliasBaseMap>(PtrReg);\n\
+  \  State = State->remove<PtrAliasFieldMap>(PtrReg);\n  return State;\n}\n\nvoid\
+  \ SAGenTestChecker::reportDoubleFree(CheckerContext &C, StringRef Msg,\n       \
+  \                                 SourceRange R) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto Report = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (R.isValid())\n    Report->addRange(R);\n  C.emitReport(std::move(Report));\n\
+  }\n\n// Callbacks\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n  if (!LHSReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  const Expr *RHSExpr = nullptr;\n\n  // Try to extract RHS\
+  \ from the statement if possible.\n  if (const auto *BO = dyn_cast_or_null<BinaryOperator>(S))\
+  \ {\n    if (BO->getOpcode() == BO_Assign)\n      RHSExpr = BO->getRHS();\n  } else\
+  \ if (const auto *DS = dyn_cast_or_null<DeclStmt>(S)) {\n    // For declaration\
+  \ with initializer: int *p = ...;\n    if (const auto *VR = dyn_cast<VarRegion>(LHSReg))\
+  \ {\n      const VarDecl *LHSVD = VR->getDecl();\n      for (const Decl *D : DS->decls())\
+  \ {\n        if (const auto *VD = dyn_cast<VarDecl>(D)) {\n          if (VD == LHSVD)\
+  \ {\n            RHSExpr = VD->getInit();\n            break;\n          }\n   \
+  \     }\n      }\n    }\n  }\n\n  bool DidAlias = false;\n\n  if (RHSExpr) {\n \
+  \   // Case 1: p = ca->member;\n    const MemRegion *Base = nullptr;\n    const\
+  \ FieldDecl *FD = nullptr;\n    if (getMemberFromExpr(RHSExpr, C, Base, FD)) {\n\
+  \      if (Base && FD) {\n        State = State->set<PtrAliasBaseMap>(LHSReg, Base);\n\
+  \        State = State->set<PtrAliasFieldMap>(LHSReg, FD);\n        DidAlias = true;\n\
+  \      }\n    } else {\n      // Case 2: p = q; copy alias if q is known\n     \
+  \ const MemRegion *RHSReg = getVarRegionFromExpr(RHSExpr, C);\n      if (RHSReg\
+  \ && RHSReg != LHSReg) {\n        RHSReg = RHSReg->getBaseRegion();\n        const\
+  \ MemRegion *AliasedBase = State->get<PtrAliasBaseMap>(RHSReg);\n        const FieldDecl\
+  \ *AliasedField = State->get<PtrAliasFieldMap>(RHSReg);\n        if (AliasedBase\
+  \ && AliasedField) {\n          State = State->set<PtrAliasBaseMap>(LHSReg, AliasedBase);\n\
+  \          State = State->set<PtrAliasFieldMap>(LHSReg, AliasedField);\n       \
+  \   DidAlias = true;\n        }\n      }\n    }\n  }\n\n  if (!DidAlias) {\n   \
+  \ // Not an alias to a tracked member. Clear any stale alias info.\n    State =\
+  \ clearAliasFor(State, LHSReg);\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isKfreeLike(Call, C))\n  \
+  \  return;\n\n  ProgramStateRef State = C.getState();\n\n  if (Call.getNumArgs()\
+  \ < 1) {\n    C.addTransition(State);\n    return;\n  }\n\n  const Expr *E0 = Call.getArgExpr(0);\n\
+  \  const MemRegion *Base = nullptr;\n  const FieldDecl *FD = nullptr;\n\n  // Direct\
+  \ form: kfree(ca->member)\n  if (getMemberFromExpr(E0, C, Base, FD)) {\n    if (Base\
+  \ && FD) {\n      if (wasFreed(State, Base, FD)) {\n        SmallString<128> Msg;\n\
+  \        Msg += \"Double free of struct member '\";\n        Msg += FD->getName();\n\
+  \        Msg += \"'.\";\n        reportDoubleFree(C, Msg, E0 ? E0->getSourceRange()\
+  \ : SourceRange());\n        return;\n      }\n      State = setFreed(State, Base,\
+  \ FD);\n      C.addTransition(State);\n      return;\n    }\n  }\n\n  // Aliased\
+  \ form: p aliases ca->member; kfree(p)\n  const MemRegion *PtrReg = getVarRegionFromExpr(E0,\
+  \ C);\n  if (PtrReg) {\n    PtrReg = PtrReg->getBaseRegion();\n    const MemRegion\
+  \ *AliasedBase = State->get<PtrAliasBaseMap>(PtrReg);\n    const FieldDecl *AliasedField\
+  \ = State->get<PtrAliasFieldMap>(PtrReg);\n    if (AliasedBase && AliasedField)\
+  \ {\n      if (wasFreed(State, AliasedBase, AliasedField)) {\n        SmallString<128>\
+  \ Msg;\n        Msg += \"Double free of struct member '\";\n        Msg += AliasedField->getName();\n\
+  \        Msg += \"'.\";\n        reportDoubleFree(C, Msg, E0 ? E0->getSourceRange()\
+  \ : SourceRange());\n        return;\n      }\n      State = setFreed(State, AliasedBase,\
+  \ AliasedField);\n      C.addTransition(State);\n      return;\n    }\n  }\n\n \
+  \ // Not a tracked case; proceed.\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  CompositeSpec Spec;\n  if (!isCompositeCleanup(Call, C, Spec)) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  if (Call.getNumArgs() <= Spec.BaseParamIndex) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  const Expr *BaseArg = Call.getArgExpr(Spec.BaseParamIndex);\n\
+  \  if (!BaseArg) {\n    C.addTransition(State);\n    return;\n  }\n\n  const MemRegion\
+  \ *BaseReg = getMemRegionFromExpr(BaseArg, C);\n  if (!BaseReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n  BaseReg = BaseReg->getBaseRegion();\n  if (!BaseReg) {\n  \
+  \  C.addTransition(State);\n    return;\n  }\n\n  QualType BaseTy = BaseArg->getType();\n\
+  \  for (StringRef Name : Spec.Members) {\n    const FieldDecl *FD = lookupFieldInPointee(BaseTy,\
+  \ Name);\n    if (!FD)\n      continue;\n\n    if (wasFreed(State, BaseReg, FD))\
+  \ {\n      SmallString<160> Msg;\n      Msg += \"Double free: member '\";\n    \
+  \  Msg += FD->getName();\n      Msg += \"' already freed before calling '\";\n \
+  \     // Try to get the function name from the origin expr\n      if (const Expr\
+  \ *OE = Call.getOriginExpr()) {\n        const SourceManager &SM = C.getSourceManager();\n\
+  \        const LangOptions &LO = C.getLangOpts();\n        StringRef Text = Lexer::getSourceText(CharSourceRange::getTokenRange(OE->getSourceRange()),\
+  \ SM, LO);\n        // Best effort; do not overcomplicate extracting just the callee\
+  \ identifier.\n        if (!Text.empty())\n          Msg += Text.split('(').first;\
+  \ // take token before '('\n        else\n          Msg += \"composite\";\n    \
+  \  } else {\n        Msg += \"composite\";\n      }\n      Msg += \"'.\";\n    \
+  \  reportDoubleFree(C, Msg, Call.getSourceRange());\n      // Keep modeling anyway\n\
+  \    }\n\n    State = setFreed(State, BaseReg, FD);\n  }\n\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects double free when a struct member is kfree'd and later freed again\
+  \ by a composite cleanup helper\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbcachefs: Fix double free of ca->buckets_nouse\n\n\
+  Reported-by: Dan Carpenter <dan.carpenter@linaro.org>\nFixes: ffcbec6076 (\"bcachefs:\
+  \ Kill opts.buckets_nouse\")\nSigned-off-by: Kent Overstreet <kent.overstreet@linux.dev>\n\
+  \n## Buggy Code\n\n```c\n// Function: bch2_dev_free in fs/bcachefs/super.c\nstatic\
+  \ void bch2_dev_free(struct bch_dev *ca)\n{\n\tcancel_work_sync(&ca->io_error_work);\n\
+  \n\tif (ca->kobj.state_in_sysfs &&\n\t    ca->disk_sb.bdev)\n\t\tsysfs_remove_link(bdev_kobj(ca->disk_sb.bdev),\
+  \ \"bcachefs\");\n\n\tif (ca->kobj.state_in_sysfs)\n\t\tkobject_del(&ca->kobj);\n\
+  \n\tkfree(ca->buckets_nouse);\n\tbch2_free_super(&ca->disk_sb);\n\tbch2_dev_allocator_background_exit(ca);\n\
+  \tbch2_dev_journal_exit(ca);\n\n\tfree_percpu(ca->io_done);\n\tbch2_dev_buckets_free(ca);\n\
+  \tfree_page((unsigned long) ca->sb_read_scratch);\n\n\tbch2_time_stats_quantiles_exit(&ca->io_latency[WRITE]);\n\
+  \tbch2_time_stats_quantiles_exit(&ca->io_latency[READ]);\n\n\tpercpu_ref_exit(&ca->io_ref);\n\
+  #ifndef CONFIG_BCACHEFS_DEBUG\n\tpercpu_ref_exit(&ca->ref);\n#endif\n\tkobject_put(&ca->kobj);\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/bcachefs/super.c b/fs/bcachefs/super.c\n\
+  index 0455a1001fec..e7fa2de35014 100644\n--- a/fs/bcachefs/super.c\n+++ b/fs/bcachefs/super.c\n\
+  @@ -1193,7 +1193,6 @@ static void bch2_dev_free(struct bch_dev *ca)\n \tif (ca->kobj.state_in_sysfs)\n\
+  \ \t\tkobject_del(&ca->kobj);\n \n-\tkfree(ca->buckets_nouse);\n \tbch2_free_super(&ca->disk_sb);\n\
+  \ \tbch2_dev_allocator_background_exit(ca);\n \tbch2_dev_journal_exit(ca);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Manually kfree''ing a struct member in a destructor/teardown path while also calling
+  a subsequent cleanup helper that frees the same member, resulting in a double free.
+  Specifically: a pointer field (e.g., ca->buckets_nouse) is freed directly and then
+  freed again by a later called composite/free routine (e.g., bch2_dev_buckets_free()),
+  indicating overlapping ownership/responsibility in cleanup.'
+plan: "Plan to detect \u201Cmanual kfree of struct member plus later composite/cleanup\
+  \ free\u201D double-free\n\n1) Program state\n- Needed: Yes.\n- Define the following\
+  \ program state traits to track already-freed members and simple pointer aliases:\n\
+  \  - Freed members (per base object):\n    - REGISTER_MAP_WITH_PROGRAMSTATE(FreedFieldPerBaseMap,\
+  \ const MemRegion*, llvm::ImmutableSet<const FieldDecl*>)\n      - Key: base object\u2019\
+  s MemRegion (e.g., the region of \u2018ca\u2019).\n      - Value: set of FieldDecl*\
+  \ that have been freed for that base.\n    - You will use the set factory from the\
+  \ state context to add/remove FieldDecl* entries.\n\n  - Pointer aliasing to members:\n\
+  \    - REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasBaseMap, const MemRegion*, const MemRegion*)\n\
+  \      - pointer variable MemRegion -> base object MemRegion (e.g., p -> ca)\n \
+  \   - REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasFieldMap, const MemRegion*, const FieldDecl*)\n\
+  \      - pointer variable MemRegion -> FieldDecl* (e.g., p -> buckets_nouse)\n\n\
+  \  - Notes:\n    - This keeps the state minimal and precise enough to match the\
+  \ concrete pattern:\n      - Direct kfree(ca->member) is matched via MemberExpr.\n\
+  \      - kfree(p) where p aliases ca->member is matched via the alias maps.\n  \
+  \  - We intentionally do not attempt interprocedural modeling of composite frees;\
+  \ instead we use a small \u201Cknown composite-free functions\u201D table.\n\n2)\
+  \ Helper utilities\n- Use these small helpers internally to normalize and extract\
+  \ information:\n  - isKfreeLike(const CallEvent &Call):\n    - Return true if callee\
+  \ name in {\"kfree\", \"kvfree\", \"vfree\", \"kfree_sensitive\"}.\n  - isCompositeCleanup(const\
+  \ CallEvent &Call, CompositeSpec &Out):\n    - A small hard-coded table for composite/cleanup\
+  \ functions that free certain members of a base object parameter. For this bug:\n\
+  \      - Entry: Name=\"bch2_dev_buckets_free\", BaseParamIndex=0, FreedMembers={\"\
+  buckets_nouse\"}.\n    - Out contains BaseParamIndex and the vector of freed field\
+  \ names.\n  - getMemberFromExpr(const Expr *E, CheckerContext &C, const MemRegion*\
+  \ &OutBase, const FieldDecl* &OutField):\n    - E = argument expression to kfree-like.\n\
+  \    - Find the MemberExpr inside E using findSpecificTypeInChildren<MemberExpr>(E)\
+  \ (after IgnoreParenImpCasts).\n    - If found:\n      - Field: FD = cast<FieldDecl>(ME->getMemberDecl()).\n\
+  \      - Base: OutBase = getMemRegionFromExpr(ME->getBase(), C) (the region of the\
+  \ base pointer expression, e.g., \u2018ca\u2019).\n      - Return true.\n    - Else\
+  \ return false.\n  - getVarRegionFromExpr(const Expr *E, CheckerContext &C):\n \
+  \   - If E is DeclRefExpr to a pointer variable, return its MemRegion via getMemRegionFromExpr(E,\
+  \ C), otherwise nullptr.\n  - lookupFieldInPointee(QualType PtrTy, StringRef Name):\n\
+  \    - If PtrTy is pointer to a record, iterate its fields and return FieldDecl*\
+  \ with matching Name, otherwise nullptr.\n  - setFreed(State, Base, FD) and wasFreed(State,\
+  \ Base, FD):\n    - Get ImmutableSet from FreedFieldPerBaseMap[Base]; check/insert\
+  \ FD and write back.\n  - clearAliasFor(State, PtrReg):\n    - Remove PtrReg from\
+  \ both PtrAliasBaseMap and PtrAliasFieldMap.\n\n3) Callback selection and implementation\n\
+  \n- checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const\n  - Goal:\
+  \ Build simple aliasing: pointer variable = struct_member_pointer.\n  - Steps:\n\
+  \    - Identify LHS pointer variable region:\n      - If Loc.getAsRegion() returns\
+  \ a MemRegion R and the bound type is a pointer type, proceed.\n    - Try to find\
+  \ a MemberExpr in RHS:\n      - Use findSpecificTypeInChildren<MemberExpr>(S) to\
+  \ locate a MemberExpr used on RHS.\n      - If found:\n        - Compute OutBase\
+  \ and OutField via getMemberFromExpr on the RHS expression.\n        - If both non-null:\
+  \ set PtrAliasBaseMap[R] = OutBase and PtrAliasFieldMap[R] = OutField.\n      -\
+  \ Else if RHS is another pointer variable (DeclRefExpr):\n        - If the RHS var\
+  \ has alias entries in {PtrAliasBaseMap, PtrAliasFieldMap}, copy both aliases from\
+  \ RHS var region to LHS var region.\n      - Else:\n        - Not an alias to a\
+  \ member; call clearAliasFor on LHS region to avoid stale mappings.\n\n- checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const\n  - Goal: Catch direct manual frees\
+  \ and detect duplicates.\n  - Steps:\n    - If !isKfreeLike(Call) return.\n    -\
+  \ Extract the free argument expression E0 = Call.getArgExpr(0).\n    - Try direct\
+  \ member:\n      - If getMemberFromExpr(E0, C, Base, FD) succeeds:\n        - Check\
+  \ if wasFreed(State, Base, FD):\n          - If yes: report double free.\n     \
+  \     - If no: setFreed(State, Base, FD).\n        - return.\n    - Try alias:\n\
+  \      - If E0 is a DeclRefExpr to pointer variable:\n        - PtrReg = getVarRegionFromExpr(E0,\
+  \ C).\n        - Lookup Base = PtrAliasBaseMap[PtrReg] and FD = PtrAliasFieldMap[PtrReg].\n\
+  \        - If both exist:\n          - Same as above: if already freed -> report;\
+  \ else mark freed.\n          - return.\n    - Otherwise: do nothing (we only target\
+  \ frees of struct members for this checker).\n\n- checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const\n  - Goal: Model composite/cleanup helpers known\
+  \ to free certain members so that:\n    - We flag if those members were manually\
+  \ freed earlier.\n    - We mark them as freed so that later manual kfree will also\
+  \ be caught.\n  - Steps:\n    - CompositeSpec CS;\n    - If !isCompositeCleanup(Call,\
+  \ CS) return.\n    - Get the base parameter expression: EBase = Call.getArgExpr(CS.BaseParamIndex).\n\
+  \    - Compute BaseReg = getMemRegionFromExpr(EBase, C).\n    - Get the base\u2019\
+  s pointee type (QualType Pointee) from EBase->getType() (pointer to record).\n \
+  \   - For each Name in CS.FreedMembers:\n      - FD = lookupFieldInPointee(Pointee,\
+  \ Name).\n      - If FD is nullptr, continue (stay conservative).\n      - If wasFreed(State,\
+  \ BaseReg, FD) is true:\n        - Report double free (member previously freed manually,\
+  \ now freed by composite).\n      - Regardless, setFreed(State, BaseReg, FD) to\
+  \ model the composite free.\n\n4) Reporting\n- When a double free is detected (either\
+  \ in checkPreCall or checkPostCall):\n  - Create a non-fatal error node via C.generateNonFatalErrorNode().\n\
+  \  - Use a PathSensitiveBugReport with a short, clear message:\n    - If detected\
+  \ at manual free after composite: \"Double free of struct member 'FIELD'.\"\n  \
+  \  - If detected at composite after manual: \"Double free: member 'FIELD' already\
+  \ freed before calling 'FUNC'.\"\n  - Add the related expression range (the free\
+  \ argument or the call expression) to the report for clarity.\n  - Use std::make_unique<PathSensitiveBugReport>(...).\n\
+  \n5) Minimal composite-free knowledge base\n- Implement isCompositeCleanup with\
+  \ a small static table:\n  - { Name: \"bch2_dev_buckets_free\", BaseParamIndex:\
+  \ 0, FreedMembers: {\"buckets_nouse\"} }\n- The design is extensible: add more entries\
+  \ if needed.\n\n6) Notes and simplifications\n- We intentionally limit aliasing\
+  \ to:\n  - Direct \u201Cp = ca->member;\u201D or chain \u201Cq = p;\u201D.\n  -\
+  \ Overwrites of pointer variables clear alias entries.\n- We do not try to reconstruct\
+  \ unknown/heap super-regions; matching uses base variable\u2019s MemRegion (e.g.,\
+  \ DeclRefExpr for \u2018ca\u2019) plus FieldDecl* identity, which is stable and\
+  \ precise in destructor/teardown functions like the target.\n- We do not attempt\
+  \ to reason about reinitialization; if the same member is freed, then reallocated\
+  \ and freed again, this checker may warn. This is acceptable for the targeted bug\
+  \ pattern in teardown paths."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"llvm/ADT/ImmutableSet.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include\
+  \ \"clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing\
+  \ namespace taint;\n\n// Program states\nREGISTER_SET_WITH_PROGRAMSTATE(FreedFieldRegionSet,\
+  \ const FieldRegion *)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasBaseMap, const MemRegion\
+  \ *, const MemRegion *)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasFieldMap, const\
+  \ MemRegion *, const FieldDecl *)\n\nnamespace {\n\nclass SAGenTestChecker\n   \
+  \ : public Checker<\n          check::PreCall,\n          check::PostCall,\n   \
+  \       check::Bind> {\n  mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \      : BT(new BugType(this, \"Double free of struct member\", \"Memory Management\"\
+  )) {}\n\n  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n  void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n\
+  \  static bool callHasName(const CallEvent &Call, StringRef Name, CheckerContext\
+  \ &C);\n  static bool isKfreeLike(const CallEvent &Call, CheckerContext &C);\n\n\
+  \  struct CompositeSpec {\n    unsigned BaseParamIndex = 0;\n    llvm::SmallVector<StringRef,\
+  \ 4> Members;\n  };\n  static bool isCompositeCleanup(const CallEvent &Call, CheckerContext\
+  \ &C,\n                                 CompositeSpec &Out);\n\n  static bool getMemberFromExpr(const\
+  \ Expr *E, CheckerContext &C,\n                                const MemRegion *&OutBase,\n\
+  \                                const FieldDecl *&OutField);\n\n  static const\
+  \ MemRegion *getVarRegionFromExpr(const Expr *E, CheckerContext &C);\n\n  static\
+  \ const FieldDecl *lookupFieldInPointee(QualType PtrTy, StringRef Name);\n\n  static\
+  \ const FieldRegion *getFieldRegionFor(const MemRegion *Base,\n                \
+  \                              const FieldDecl *FD,\n                          \
+  \                    CheckerContext &C);\n\n  static bool wasFreed(ProgramStateRef\
+  \ State, const MemRegion *Base,\n                       const FieldDecl *FD, CheckerContext\
+  \ &C);\n  static ProgramStateRef setFreed(ProgramStateRef State, const MemRegion\
+  \ *Base,\n                                  const FieldDecl *FD, CheckerContext\
+  \ &C);\n\n  static ProgramStateRef clearAliasFor(ProgramStateRef State, const MemRegion\
+  \ *PtrReg);\n\n  void reportDoubleFree(CheckerContext &C, StringRef Msg,\n     \
+  \                   SourceRange R) const;\n};\n\n// Implementation\n\nbool SAGenTestChecker::callHasName(const\
+  \ CallEvent &Call, StringRef Name,\n                                   CheckerContext\
+  \ &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E)\n    return false;\n\
+  \  return ExprHasName(E, Name, C);\n}\n\nbool SAGenTestChecker::isKfreeLike(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  return callHasName(Call, \"kfree\", C)\
+  \ ||\n         callHasName(Call, \"kvfree\", C) ||\n         callHasName(Call, \"\
+  vfree\", C) ||\n         callHasName(Call, \"kfree_sensitive\", C);\n}\n\nbool SAGenTestChecker::isCompositeCleanup(const\
+  \ CallEvent &Call, CheckerContext &C,\n                                        \
+  \  CompositeSpec &Out) {\n  struct Entry {\n    const char *Name;\n    unsigned\
+  \ BaseParamIndex;\n    const char *Members[4];\n    unsigned NumMembers;\n  };\n\
+  \  static const Entry Table[] = {\n      {\"bch2_dev_buckets_free\", 0, {\"buckets_nouse\"\
+  }, 1},\n  };\n\n  for (const auto &E : Table) {\n    if (callHasName(Call, E.Name,\
+  \ C)) {\n      Out.BaseParamIndex = E.BaseParamIndex;\n      Out.Members.clear();\n\
+  \      for (unsigned i = 0; i < E.NumMembers; ++i)\n        Out.Members.push_back(E.Members[i]);\n\
+  \      return true;\n    }\n  }\n  return false;\n}\n\nbool SAGenTestChecker::getMemberFromExpr(const\
+  \ Expr *E, CheckerContext &C,\n                                         const MemRegion\
+  \ *&OutBase,\n                                         const FieldDecl *&OutField)\
+  \ {\n  OutBase = nullptr;\n  OutField = nullptr;\n  if (!E)\n    return false;\n\
+  \n  // Find a MemberExpr inside the expression\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(E);\n\
+  \  if (!ME)\n    return false;\n\n  const ValueDecl *VD = ME->getMemberDecl();\n\
+  \  const auto *FD = dyn_cast<FieldDecl>(VD);\n  if (!FD)\n    return false;\n\n\
+  \  const Expr *BaseE = ME->getBase();\n  if (!BaseE)\n    return false;\n\n  const\
+  \ MemRegion *BaseReg = getMemRegionFromExpr(BaseE, C);\n  if (!BaseReg)\n    return\
+  \ false;\n\n  BaseReg = BaseReg->getBaseRegion();\n  if (!BaseReg)\n    return false;\n\
+  \n  OutBase = BaseReg;\n  OutField = FD;\n  return true;\n}\n\nconst MemRegion *SAGenTestChecker::getVarRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return nullptr;\n  const Expr *EE\
+  \ = E->IgnoreParenImpCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(EE))\
+  \ {\n    const MemRegion *R = getMemRegionFromExpr(DRE, C);\n    if (!R)\n     \
+  \ return nullptr;\n    return R->getBaseRegion();\n  }\n  return nullptr;\n}\n\n\
+  const FieldDecl *SAGenTestChecker::lookupFieldInPointee(QualType PtrTy, StringRef\
+  \ Name) {\n  if (PtrTy.isNull())\n    return nullptr;\n  if (!PtrTy->isPointerType())\n\
+  \    return nullptr;\n\n  QualType Pointee = PtrTy->getPointeeType();\n  if (Pointee.isNull())\n\
+  \    return nullptr;\n\n  const RecordType *RT = dyn_cast<RecordType>(Pointee.getTypePtr());\n\
+  \  if (!RT)\n    return nullptr;\n\n  const RecordDecl *RD = RT->getDecl();\n  if\
+  \ (!RD)\n    return nullptr;\n\n  for (const FieldDecl *FD : RD->fields()) {\n \
+  \   if (FD && FD->getName() == Name)\n      return FD;\n  }\n  return nullptr;\n\
+  }\n\nconst FieldRegion *SAGenTestChecker::getFieldRegionFor(const MemRegion *Base,\n\
+  \                                                       const FieldDecl *FD,\n \
+  \                                                      CheckerContext &C) {\n  if\
+  \ (!Base || !FD)\n    return nullptr;\n  const auto *Super = dyn_cast<SubRegion>(Base);\n\
+  \  if (!Super)\n    return nullptr;\n  MemRegionManager &MRMgr = C.getSValBuilder().getRegionManager();\n\
+  \  return MRMgr.getFieldRegion(FD, Super);\n}\n\nbool SAGenTestChecker::wasFreed(ProgramStateRef\
+  \ State, const MemRegion *Base,\n                                const FieldDecl\
+  \ *FD, CheckerContext &C) {\n  if (!State || !Base || !FD)\n    return false;\n\
+  \  const FieldRegion *FR = getFieldRegionFor(Base, FD, C);\n  if (!FR)\n    return\
+  \ false;\n  return State->contains<FreedFieldRegionSet>(FR);\n}\n\nProgramStateRef\
+  \ SAGenTestChecker::setFreed(ProgramStateRef State,\n                          \
+  \                 const MemRegion *Base,\n                                     \
+  \      const FieldDecl *FD,\n                                           CheckerContext\
+  \ &C) {\n  if (!State || !Base || !FD)\n    return State;\n  const FieldRegion *FR\
+  \ = getFieldRegionFor(Base, FD, C);\n  if (!FR)\n    return State;\n  return State->add<FreedFieldRegionSet>(FR);\n\
+  }\n\nProgramStateRef SAGenTestChecker::clearAliasFor(ProgramStateRef State, const\
+  \ MemRegion *PtrReg) {\n  if (!State || !PtrReg)\n    return State;\n  State = State->remove<PtrAliasBaseMap>(PtrReg);\n\
+  \  State = State->remove<PtrAliasFieldMap>(PtrReg);\n  return State;\n}\n\nvoid\
+  \ SAGenTestChecker::reportDoubleFree(CheckerContext &C, StringRef Msg,\n       \
+  \                                 SourceRange R) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto Report = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (R.isValid())\n    Report->addRange(R);\n  C.emitReport(std::move(Report));\n\
+  }\n\n// Callbacks\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const\
+  \ Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n  if (!LHSReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  const Expr *RHSExpr = nullptr;\n\n  // Try to extract RHS\
+  \ from the statement if possible.\n  if (const auto *BO = dyn_cast_or_null<BinaryOperator>(S))\
+  \ {\n    if (BO->getOpcode() == BO_Assign)\n      RHSExpr = BO->getRHS();\n  } else\
+  \ if (const auto *DS = dyn_cast_or_null<DeclStmt>(S)) {\n    // For declaration\
+  \ with initializer: int *p = ...;\n    if (const auto *VR = dyn_cast<VarRegion>(LHSReg))\
+  \ {\n      const VarDecl *LHSVD = VR->getDecl();\n      for (const Decl *D : DS->decls())\
+  \ {\n        if (const auto *VD = dyn_cast<VarDecl>(D)) {\n          if (VD == LHSVD)\
+  \ {\n            RHSExpr = VD->getInit();\n            break;\n          }\n   \
+  \     }\n      }\n    }\n  }\n\n  bool DidAlias = false;\n\n  if (RHSExpr) {\n \
+  \   // Case 1: p = ca->member;\n    const MemRegion *Base = nullptr;\n    const\
+  \ FieldDecl *FD = nullptr;\n    if (getMemberFromExpr(RHSExpr, C, Base, FD)) {\n\
+  \      if (Base && FD) {\n        State = State->set<PtrAliasBaseMap>(LHSReg, Base);\n\
+  \        State = State->set<PtrAliasFieldMap>(LHSReg, FD);\n        DidAlias = true;\n\
+  \      }\n    } else {\n      // Case 2: p = q; copy alias if q is known\n     \
+  \ const MemRegion *RHSReg = getVarRegionFromExpr(RHSExpr, C);\n      if (RHSReg\
+  \ && RHSReg != LHSReg) {\n        RHSReg = RHSReg->getBaseRegion();\n        const\
+  \ MemRegion *AliasedBase = nullptr;\n        const FieldDecl *AliasedField = nullptr;\n\
+  \        if (const MemRegion *const *AB = State->get<PtrAliasBaseMap>(RHSReg))\n\
+  \          AliasedBase = *AB;\n        if (const FieldDecl *const *AF = State->get<PtrAliasFieldMap>(RHSReg))\n\
+  \          AliasedField = *AF;\n        if (AliasedBase && AliasedField) {\n   \
+  \       State = State->set<PtrAliasBaseMap>(LHSReg, AliasedBase);\n          State\
+  \ = State->set<PtrAliasFieldMap>(LHSReg, AliasedField);\n          DidAlias = true;\n\
+  \        }\n      }\n    }\n  }\n\n  if (!DidAlias) {\n    // Not an alias to a\
+  \ tracked member. Clear any stale alias info.\n    State = clearAliasFor(State,\
+  \ LHSReg);\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isKfreeLike(Call, C))\n  \
+  \  return;\n\n  ProgramStateRef State = C.getState();\n\n  if (Call.getNumArgs()\
+  \ < 1) {\n    C.addTransition(State);\n    return;\n  }\n\n  const Expr *E0 = Call.getArgExpr(0);\n\
+  \  const MemRegion *Base = nullptr;\n  const FieldDecl *FD = nullptr;\n\n  // Direct\
+  \ form: kfree(ca->member)\n  if (getMemberFromExpr(E0, C, Base, FD)) {\n    if (Base\
+  \ && FD) {\n      if (wasFreed(State, Base, FD, C)) {\n        SmallString<128>\
+  \ Msg;\n        Msg += \"Double free of struct member '\";\n        Msg += FD->getName();\n\
+  \        Msg += \"'.\";\n        reportDoubleFree(C, Msg, E0 ? E0->getSourceRange()\
+  \ : SourceRange());\n        return;\n      }\n      State = setFreed(State, Base,\
+  \ FD, C);\n      C.addTransition(State);\n      return;\n    }\n  }\n\n  // Aliased\
+  \ form: p aliases ca->member; kfree(p)\n  const MemRegion *PtrReg = getVarRegionFromExpr(E0,\
+  \ C);\n  if (PtrReg) {\n    PtrReg = PtrReg->getBaseRegion();\n    const MemRegion\
+  \ *AliasedBase = nullptr;\n    const FieldDecl *AliasedField = nullptr;\n    if\
+  \ (const MemRegion *const *AB = State->get<PtrAliasBaseMap>(PtrReg))\n      AliasedBase\
+  \ = *AB;\n    if (const FieldDecl *const *AF = State->get<PtrAliasFieldMap>(PtrReg))\n\
+  \      AliasedField = *AF;\n    if (AliasedBase && AliasedField) {\n      if (wasFreed(State,\
+  \ AliasedBase, AliasedField, C)) {\n        SmallString<128> Msg;\n        Msg +=\
+  \ \"Double free of struct member '\";\n        Msg += AliasedField->getName();\n\
+  \        Msg += \"'.\";\n        reportDoubleFree(C, Msg, E0 ? E0->getSourceRange()\
+  \ : SourceRange());\n        return;\n      }\n      State = setFreed(State, AliasedBase,\
+  \ AliasedField, C);\n      C.addTransition(State);\n      return;\n    }\n  }\n\n\
+  \  // Not a tracked case; proceed.\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  CompositeSpec Spec;\n  if (!isCompositeCleanup(Call, C, Spec)) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  if (Call.getNumArgs() <= Spec.BaseParamIndex) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  const Expr *BaseArg = Call.getArgExpr(Spec.BaseParamIndex);\n\
+  \  if (!BaseArg) {\n    C.addTransition(State);\n    return;\n  }\n\n  const MemRegion\
+  \ *BaseReg = getMemRegionFromExpr(BaseArg, C);\n  if (!BaseReg) {\n    C.addTransition(State);\n\
+  \    return;\n  }\n  BaseReg = BaseReg->getBaseRegion();\n  if (!BaseReg) {\n  \
+  \  C.addTransition(State);\n    return;\n  }\n\n  QualType BaseTy = BaseArg->getType();\n\
+  \  for (StringRef Name : Spec.Members) {\n    const FieldDecl *FD = lookupFieldInPointee(BaseTy,\
+  \ Name);\n    if (!FD)\n      continue;\n\n    if (wasFreed(State, BaseReg, FD,\
+  \ C)) {\n      SmallString<160> Msg;\n      Msg += \"Double free: member '\";\n\
+  \      Msg += FD->getName();\n      Msg += \"' already freed before calling '\"\
+  ;\n      // Try to get the function name from the origin expr\n      if (const Expr\
+  \ *OE = Call.getOriginExpr()) {\n        const SourceManager &SM = C.getSourceManager();\n\
+  \        const LangOptions &LO = C.getLangOpts();\n        StringRef Text = Lexer::getSourceText(\n\
+  \            CharSourceRange::getTokenRange(OE->getSourceRange()), SM, LO);\n  \
+  \      // Best effort; do not overcomplicate extracting just the callee identifier.\n\
+  \        if (!Text.empty())\n          Msg += Text.split('(').first; // take token\
+  \ before '('\n        else\n          Msg += \"composite\";\n      } else {\n  \
+  \      Msg += \"composite\";\n      }\n      Msg += \"'.\";\n      reportDoubleFree(C,\
+  \ Msg, Call.getSourceRange());\n      // Keep modeling anyway\n    }\n\n    State\
+  \ = setFreed(State, BaseReg, FD, C);\n  }\n\n  C.addTransition(State);\n}\n\n} //\
+  \ end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects double free when a struct member is kfree'd and later freed again\
+  \ by a composite cleanup helper\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

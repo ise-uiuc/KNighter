@@ -1,0 +1,8 @@
+- Decision: NotABug
+- Reason: The reported site is in __vmalloc_area_node()’s fail label calling vfree(area->addr). This does not match the target bug pattern. In this function:
+  - area->addr is set by __get_vm_area_node() before entering __vmalloc_area_node(), and the vm_struct is registered (with VM_UNINITIALIZED) so that vfree() can clean it up on failure paths.
+  - There are two distinct failure cleanups:
+    - If allocating the pages array (area->pages) fails, the function uses free_vm_area(area) and returns immediately (no jump to the shared fail label).
+    - If page allocation is partial or mapping fails (the two goto fail sites), nothing has freed the vm area yet. In those cases, vfree(area->addr) is the correct single cleanup that will free the vm_struct, the vmap area, and any partially allocated/mapped pages.
+  - Thus, there is no path where the same resource is freed twice via a shared error label. The earlier cleanup path returns directly and does not fall through to the fail label.
+  - This differs from the target bug pattern (freeing a callee-managed/conditionally allocated pointer unconditionally in a shared label). Here, the resource is owned and consistently freed, and the shared label is only used by paths that have not freed it yet.

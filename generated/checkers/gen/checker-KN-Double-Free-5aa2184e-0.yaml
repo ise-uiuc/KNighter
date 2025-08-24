@@ -1,0 +1,276 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 5aa2184e29081665f915594bc6de9b7fee6e4883
+commit_type: Double-Free
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/ParentMapContext.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"llvm/ADT/DenseSet.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include\
+  \ \"llvm/ADT/StringRef.h\"\n#include <algorithm>\n#include <string>\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// No custom program\
+  \ state needed.\n\nnamespace {\n\n// Helper: Get callee name for a call expression.\n\
+  static StringRef getCalleeName(const CallExpr *CE) {\n  if (!CE) return StringRef();\n\
+  \  const FunctionDecl *FD = CE->getDirectCallee();\n  if (!FD) return StringRef();\n\
+  \  if (const IdentifierInfo *II = FD->getIdentifier())\n    return II->getName();\n\
+  \  return StringRef();\n}\n\nstatic bool isAllocName(StringRef N) {\n  return N\
+  \ == \"kmalloc\" || N == \"kzalloc\" || N == \"kcalloc\";\n}\nstatic bool isFreeName(StringRef\
+  \ N) {\n  return N == \"kfree\" || N == \"kvfree\" || N == \"vfree\";\n}\n\n// Extract\
+  \ a CallExpr from a statement if the statement is (or contains) a call.\n// Returns\
+  \ nullptr if not a call.\nstatic const CallExpr *stmtToCall(const Stmt *S) {\n \
+  \ if (!S) return nullptr;\n  if (const auto *E = dyn_cast<Expr>(S)) {\n    const\
+  \ Expr *EI = E->IgnoreImplicit();\n    return dyn_cast<CallExpr>(EI);\n  }\n  return\
+  \ nullptr;\n}\n\n// If S is a free call, return true and set OutArg to the freed\
+  \ expression (after IgnoreParenCasts).\nstatic bool isFreeCallAndGetArg(const Stmt\
+  \ *S, const Expr *&OutArg) {\n  OutArg = nullptr;\n  const CallExpr *CE = stmtToCall(S);\n\
+  \  if (!CE) return false;\n  StringRef Name = getCalleeName(CE);\n  if (!isFreeName(Name))\
+  \ return false;\n  if (CE->getNumArgs() < 1) return false;\n  const Expr *Arg =\
+  \ CE->getArg(0);\n  if (!Arg) return false;\n  OutArg = Arg->IgnoreParenCasts();\n\
+  \  return true;\n}\n\nstatic bool exprIsParamMember(const Expr *E) {\n  if (!E)\
+  \ return false;\n  const Expr *EI = E->IgnoreParenCasts();\n  if (const auto *ME\
+  \ = dyn_cast<MemberExpr>(EI)) {\n    const Expr *Base = ME->getBase();\n    if (!Base)\
+  \ return false;\n    Base = Base->IgnoreParenCasts();\n    if (const auto *DRE =\
+  \ dyn_cast<DeclRefExpr>(Base)) {\n      return isa<ParmVarDecl>(DRE->getDecl());\n\
+  \    }\n  }\n  return false;\n}\n\nstatic bool exprIsLocalAllocated(const Expr *E,\
+  \ const llvm::DenseSet<const VarDecl*> &Locals) {\n  if (!E) return false;\n  const\
+  \ Expr *EI = E->IgnoreParenCasts();\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(EI))\
+  \ {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n      return\
+  \ Locals.count(VD) != 0;\n    }\n  }\n  return false;\n}\n\nstatic std::string getExprSourceText(const\
+  \ Expr *E, const ASTContext &AC) {\n  if (!E) return std::string();\n  const SourceManager\
+  \ &SM = AC.getSourceManager();\n  CharSourceRange R = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \  StringRef S = Lexer::getSourceText(R, SM, AC.getLangOpts());\n  return S.str();\n\
+  }\n\n// Walk up parents to find nearest IfStmt.\nstatic const IfStmt *findParentIf(const\
+  \ Stmt *S, ASTContext &AC) {\n  if (!S) return nullptr;\n  DynTypedNode Node = DynTypedNode::create(*S);\n\
+  \  // Limit depth to avoid potential cycles in pathological cases.\n  for (int depth\
+  \ = 0; depth < 20; ++depth) {\n    auto Parents = AC.getParents(Node);\n    if (Parents.empty())\n\
+  \      return nullptr;\n    const DynTypedNode &P = Parents[0];\n    if (const Stmt\
+  \ *PS = P.get<Stmt>()) {\n      if (const auto *IS = dyn_cast<IfStmt>(PS))\n   \
+  \     return IS;\n      Node = DynTypedNode::create(*PS);\n      continue;\n   \
+  \ }\n    // If parent is a Decl or other, continue one more level if possible.\n\
+  \    if (const Decl *PD = P.get<Decl>()) {\n      Node = DynTypedNode::create(*PD);\n\
+  \      continue;\n    }\n    break;\n  }\n  return nullptr;\n}\n\n// Visitor to\
+  \ collect:\n//  - Locally allocated vars (assigned from kmalloc-family).\n//  -\
+  \ Goto statements and their enclosing If (if any).\nstruct BodyCollector : public\
+  \ RecursiveASTVisitor<BodyCollector> {\n  ASTContext &AC;\n  llvm::DenseSet<const\
+  \ VarDecl*> &LocalAllocs;\n  struct GotoInfo {\n    const GotoStmt *GS = nullptr;\n\
+  \    const LabelDecl *Target = nullptr;\n    const IfStmt *ParentIf = nullptr;\n\
+  \    SourceLocation Loc;\n  };\n  llvm::SmallVector<GotoInfo, 8> &Gotos;\n\n  BodyCollector(ASTContext\
+  \ &AC, llvm::DenseSet<const VarDecl*> &LocalAllocs,\n                llvm::SmallVector<GotoInfo,\
+  \ 8> &Gotos)\n      : AC(AC), LocalAllocs(LocalAllocs), Gotos(Gotos) {}\n\n  bool\
+  \ VisitVarDecl(VarDecl *VD) {\n    if (!VD || !VD->hasInit())\n      return true;\n\
+  \    const Expr *Init = VD->getInit();\n    if (!Init) return true;\n    const Expr\
+  \ *EI = Init->IgnoreImplicit();\n    if (const auto *CE = dyn_cast<CallExpr>(EI))\
+  \ {\n      if (isAllocName(getCalleeName(CE))) {\n        LocalAllocs.insert(VD);\n\
+  \      }\n    }\n    return true;\n  }\n\n  bool VisitBinaryOperator(BinaryOperator\
+  \ *BO) {\n    if (!BO) return true;\n    if (BO->getOpcode() != BO_Assign)\n   \
+  \   return true;\n    const Expr *LHS = BO->getLHS();\n    const Expr *RHS = BO->getRHS();\n\
+  \    if (!LHS || !RHS) return true;\n\n    const Expr *LHSE = LHS->IgnoreParenCasts();\n\
+  \    const Expr *RHSE = RHS->IgnoreParenCasts();\n    const auto *CE = dyn_cast<CallExpr>(RHSE);\n\
+  \    if (!CE) return true;\n    if (!isAllocName(getCalleeName(CE)))\n      return\
+  \ true;\n\n    if (const auto *DRE = dyn_cast<DeclRefExpr>(LHSE)) {\n      if (const\
+  \ auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n        LocalAllocs.insert(VD);\n\
+  \      }\n    }\n    return true;\n  }\n\n  bool VisitGotoStmt(GotoStmt *GS) {\n\
+  \    if (!GS) return true;\n    GotoInfo GI;\n    GI.GS = GS;\n    GI.Target = GS->getLabel();\n\
+  \    GI.ParentIf = findParentIf(GS, AC);\n    GI.Loc = GS->getGotoLoc();\n    Gotos.push_back(GI);\n\
+  \    return true;\n  }\n};\n\nclass SAGenTestChecker : public Checker<check::ASTCodeBody>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Shared cleanup frees callee-owned pointer\", \"Memory\
+  \ Error\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr,\
+  \ BugReporter &BR) const;\n\n   private:\n\n      // No additional members.\n};\n\
+  \nvoid SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD || !FD->hasBody())\n\
+  \    return;\n\n  const Stmt *BodyS = FD->getBody();\n  const auto *TopCS = dyn_cast<CompoundStmt>(BodyS);\n\
+  \  if (!TopCS)\n    return;\n\n  ASTContext &AC = Mgr.getASTContext();\n  const\
+  \ SourceManager &SM = AC.getSourceManager();\n\n  // Pass 1: collect local allocations\
+  \ and gotos.\n  llvm::DenseSet<const VarDecl*> LocalAllocs;\n  using GotoInfo =\
+  \ BodyCollector::GotoInfo;\n  llvm::SmallVector<GotoInfo, 8> AllGotos;\n  BodyCollector\
+  \ Collector(AC, LocalAllocs, AllGotos);\n  Collector.TraverseStmt(const_cast<Stmt*>(BodyS));\n\
+  \n  // Pass 2: collect label cleanups at top level.\n  struct LabelInfo {\n    const\
+  \ LabelStmt *LS = nullptr;\n    const LabelDecl *LD = nullptr;\n    bool FreesParamMember\
+  \ = false;\n    bool FreesLocal = false;\n    std::string OneParamMemberText; //\
+  \ store one example for diagnostics\n  };\n  llvm::DenseMap<const LabelDecl*, LabelInfo>\
+  \ LabelMap;\n\n  // Build a vector for iteration with index.\n  llvm::SmallVector<const\
+  \ Stmt*, 64> TopStmts;\n  for (const Stmt *S : TopCS->body())\n    TopStmts.push_back(S);\n\
+  \n  for (size_t i = 0; i < TopStmts.size(); ++i) {\n    const Stmt *S = TopStmts[i];\n\
+  \    const auto *LS = dyn_cast<LabelStmt>(S);\n    if (!LS)\n      continue;\n\n\
+  \    LabelInfo LI;\n    LI.LS = LS;\n    LI.LD = LS->getDecl();\n\n    // First\
+  \ statement: the sub-statement of the label.\n    const Expr *Arg = nullptr;\n \
+  \   if (isFreeCallAndGetArg(LS->getSubStmt(), Arg)) {\n      if (exprIsParamMember(Arg))\
+  \ {\n        LI.FreesParamMember = true;\n        if (LI.OneParamMemberText.empty())\n\
+  \          LI.OneParamMemberText = getExprSourceText(Arg, AC);\n      }\n      if\
+  \ (exprIsLocalAllocated(Arg, LocalAllocs)) {\n        LI.FreesLocal = true;\n  \
+  \    }\n    }\n\n    // Then scan subsequent siblings until another label/return/non-free.\n\
+  \    size_t j = i + 1;\n    for (; j < TopStmts.size(); ++j) {\n      const Stmt\
+  \ *Sib = TopStmts[j];\n      if (isa<LabelStmt>(Sib) || isa<ReturnStmt>(Sib))\n\
+  \        break;\n\n      const Expr *Arg2 = nullptr;\n      if (isFreeCallAndGetArg(Sib,\
+  \ Arg2)) {\n        if (exprIsParamMember(Arg2)) {\n          LI.FreesParamMember\
+  \ = true;\n          if (LI.OneParamMemberText.empty())\n            LI.OneParamMemberText\
+  \ = getExprSourceText(Arg2, AC);\n        }\n        if (exprIsLocalAllocated(Arg2,\
+  \ LocalAllocs)) {\n          LI.FreesLocal = true;\n        }\n        continue;\n\
+  \      }\n\n      // Non-free statement encountered: stop collecting.\n      break;\n\
+  \    }\n\n    LabelMap[LI.LD] = std::move(LI);\n  }\n\n  if (LabelMap.empty() ||\
+  \ AllGotos.empty())\n    return;\n\n  // Map gotos to labels\n  llvm::DenseMap<const\
+  \ LabelDecl*, llvm::SmallVector<const GotoInfo*, 8>> LabelToGotos;\n  for (const\
+  \ auto &GI : AllGotos) {\n    if (!GI.Target) continue;\n    LabelToGotos[GI.Target].push_back(&GI);\n\
+  \  }\n\n  // For each label that frees both param-member and local, and has >=2\
+  \ gotos, warn on earlier gotos.\n  for (const auto &P : LabelMap) {\n    const LabelDecl\
+  \ *LD = P.first;\n    const LabelInfo &LI = P.second;\n\n    if (!(LI.FreesParamMember\
+  \ && LI.FreesLocal))\n      continue;\n\n    auto It = LabelToGotos.find(LD);\n\
+  \    if (It == LabelToGotos.end())\n      continue;\n    auto &GVec = It->second;\n\
+  \    if (GVec.size() < 2)\n      continue;\n\n    // Sort by source location\n \
+  \   std::sort(GVec.begin(), GVec.end(),\n              [&SM](const GotoInfo *A,\
+  \ const GotoInfo *B) {\n                return SM.isBeforeInTranslationUnit(A->Loc,\
+  \ B->Loc);\n              });\n\n    // Report for all but the last goto. Prefer\
+  \ those inside an if-stmt.\n    for (size_t k = 0; k + 1 < GVec.size(); ++k) {\n\
+  \      const GotoInfo *GI = GVec[k];\n      if (!GI || !GI->GS) continue;\n\n  \
+  \    // Prefer/report only gotos within an if-branch to reduce noise.\n      if\
+  \ (!GI->ParentIf)\n        continue;\n\n      std::string Msg = \"Shared cleanup\
+  \ frees callee-owned pointer; potential double free. Split cleanups.\";\n      if\
+  \ (!LI.OneParamMemberText.empty()) {\n        Msg += \" (frees \";\n        Msg\
+  \ += LI.OneParamMemberText;\n        Msg += \")\";\n      }\n\n      auto R = std::make_unique<BasicBugReport>(*BT,\
+  \ Msg, GI->GS->getGotoLoc());\n      R->addRange(GI->GS->getSourceRange());\n  \
+  \    BR.emitReport(std::move(R));\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects shared error cleanup that frees\
+  \ both local and callee-owned pointers (possible double free)\",\n      \"\");\n\
+  }\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nnet/mlx5: HWS, fixed double free in error flow of\
+  \ definer layout\n\nFix error flow bug that could lead to double free of a buffer\n\
+  during a failure to calculate a suitable definer layout.\n\nFixes: 74a778b4a63f\
+  \ (\"net/mlx5: HWS, added definers handling\")\nSigned-off-by: Yevgeny Kliteynik\
+  \ <kliteyn@nvidia.com>\nReviewed-by: Itamar Gozlan <igozlan@nvidia.com>\nSigned-off-by:\
+  \ Tariq Toukan <tariqt@nvidia.com>\nSigned-off-by: Paolo Abeni <pabeni@redhat.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: mlx5hws_definer_calc_layout in drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\n\
+  int\nmlx5hws_definer_calc_layout(struct mlx5hws_context *ctx,\n\t\t\t    struct\
+  \ mlx5hws_match_template *mt,\n\t\t\t    struct mlx5hws_definer *match_definer)\n\
+  {\n\tu8 *match_hl;\n\tint ret;\n\n\t/* Union header-layout (hl) is used for creating\
+  \ a single definer\n\t * field layout used with different bitmasks for hash and\
+  \ match.\n\t */\n\tmatch_hl = kzalloc(MLX5_ST_SZ_BYTES(definer_hl), GFP_KERNEL);\n\
+  \tif (!match_hl)\n\t\treturn -ENOMEM;\n\n\t/* Convert all mt items to header layout\
+  \ (hl)\n\t * and allocate the match and range field copy array (fc & fcr).\n\t */\n\
+  \tret = hws_definer_conv_match_params_to_hl(ctx, mt, match_hl);\n\tif (ret) {\n\t\
+  \tmlx5hws_err(ctx, \"Failed to convert items to header layout\\n\");\n\t\tgoto free_fc;\n\
+  \t}\n\n\t/* Find the match definer layout for header layout match union */\n\tret\
+  \ = hws_definer_find_best_match_fit(ctx, match_definer, match_hl);\n\tif (ret) {\n\
+  \t\tif (ret == -E2BIG)\n\t\t\tmlx5hws_dbg(ctx,\n\t\t\t\t    \"Failed to create match\
+  \ definer from header layout - E2BIG\\n\");\n\t\telse\n\t\t\tmlx5hws_err(ctx,\n\t\
+  \t\t\t    \"Failed to create match definer from header layout (%d)\\n\",\n\t\t\t\
+  \t    ret);\n\t\tgoto free_fc;\n\t}\n\n\tkfree(match_hl);\n\treturn 0;\n\nfree_fc:\n\
+  \tkfree(mt->fc);\n\n\tkfree(match_hl);\n\treturn ret;\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\
+  \ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\nindex\
+  \ d566d2ddf424..3f4c58bada37 100644\n--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\n\
+  +++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\n@@\
+  \ -1925,7 +1925,7 @@ mlx5hws_definer_calc_layout(struct mlx5hws_context *ctx,\n\
+  \ \tret = hws_definer_conv_match_params_to_hl(ctx, mt, match_hl);\n \tif (ret) {\n\
+  \ \t\tmlx5hws_err(ctx, \"Failed to convert items to header layout\\n\");\n-\t\t\
+  goto free_fc;\n+\t\tgoto free_match_hl;\n \t}\n \n \t/* Find the match definer layout\
+  \ for header layout match union */\n@@ -1946,7 +1946,7 @@ mlx5hws_definer_calc_layout(struct\
+  \ mlx5hws_context *ctx,\n \n free_fc:\n \tkfree(mt->fc);\n-\n+free_match_hl:\n \t\
+  kfree(match_hl);\n \treturn ret;\n }\n```\n"
+pattern: '## Bug Pattern
+
+
+  Using a shared error path that unconditionally frees multiple resources, including
+  a pointer owned/managed by a callee. Specifically, after a helper fails (and has
+  already freed or never allocated mt->fc), the caller jumps to a common cleanup label
+  that also kfree(mt->fc), causing a double free/invalid free. The correct pattern
+  is to use per-path cleanup that only frees resources allocated/owned by the caller
+  on that path.'
+plan: "Plan\n\n1) Program state\n- No custom program state is necessary. This checker\
+  \ will be purely AST-structural (function-body level) because the targeted pattern\
+  \ is a shared cleanup label that frees multiple resources, and at least one of them\
+  \ is a field of a function parameter that is not allocated/owned by the current\
+  \ function.\n\n2) Callbacks\n- Use only checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR).\n\n3) Overall approach\n- Within each function body:\n\
+  \  - Find cleanup labels and the frees they perform.\n  - Find all gotos targeting\
+  \ those labels and the relative order of those gotos.\n  - If a label frees a mix\
+  \ of resources (at least one locally allocated in this function and at least one\
+  \ member field of a parameter), and there are multiple error gotos to that label\
+  \ from different earlier points, report on the earlier goto(s): \u201CShared error\
+  \ label frees callee-owned field; potential double free. Split cleanups.\u201D\n\
+  \n4) Detailed steps for checkASTCodeBody\n\n4.1) Pre-scan for local allocations\n\
+  - Walk the function body (CompoundStmt) in source order.\n- Collect names/Decls\
+  \ of variables that are locally allocated by the current function. A variable counts\
+  \ as \u201Clocally allocated\u201D if:\n  - It is assigned the result of kmalloc/kzalloc/kcalloc\
+  \ (standard kernel allocation family).\n  - Implementation details:\n    - For each\
+  \ BinaryOperator with op \u201C=\u201D, inspect the RHS; if it is a CallExpr whose\
+  \ callee name is one of {\"kmalloc\", \"kzalloc\", \"kcalloc\"}, record the LHS\
+  \ variable Decl as LocallyAllocated.\n    - Also handle direct initialization of\
+  \ a variable with those calls (VarDecl with Init as CallExpr to kmalloc family).\n\
+  \  - This provides a conservative \u201COwnedByCaller\u201D classification.\n\n\
+  4.2) Collect cleanup labels and the resources they free\n- Walk the body to find\
+  \ LabelStmt nodes; for each LabelStmt L:\n  - Starting from the statement immediately\
+  \ following L, collect consecutive free calls until:\n    - another LabelStmt is\
+  \ encountered, or\n    - a ReturnStmt is encountered, or\n    - the end of the compound\
+  \ statement.\n  - A \u201Cfree call\u201D is any CallExpr whose callee name is in\
+  \ {\"kfree\", \"kvfree\", \"vfree\"}.\n  - For each free call arg expression E (the\
+  \ pointer being freed), classify the freed resource:\n    - IsParamMember(E): true\
+  \ if E is a MemberExpr and its base is a DeclRefExpr to a ParmVarDecl (e.g., mt->fc).\n\
+  \    - IsLocallyAllocated(E): true if E references a local variable that was captured\
+  \ in step 4.1.\n      - If E is a DeclRefExpr of a local variable, check if that\
+  \ variable is in LocallyAllocated.\n      - If E is a MemberExpr of a local aggregate\
+  \ variable, optionally check if we recorded that exact field; otherwise treat this\
+  \ as not LocallyAllocated (we only consider plain local pointer variables as \u201C\
+  locally allocated\u201D in this simple heuristic).\n  - Store for label L:\n   \
+  \ - The vector of freed expressions (keep the Expr*).\n    - Two booleans: FreesAnyParamMember,\
+  \ FreesAnyLocallyAllocated.\n    - Optionally, store a short string for each freed\
+  \ expression for diagnostics (use Lexer::getSourceText over E->getSourceRange()).\n\
+  \n4.3) Collect gotos and map them to labels\n- Walk the body and collect all GotoStmt\
+  \ nodes.\n  - Record for each goto: its SourceLocation and its target LabelDecl\
+  \ (use GotoStmt::getLabel()).\n  - For each GotoStmt, also try to find its enclosing\
+  \ IfStmt (the error check) using findSpecificTypeInParents<IfStmt>(GotoStmt, Ctx).\
+  \ This lets us confirm it\u2019s in an if-branch used as an error path.\n  - Keep\
+  \ a map LabelDecl* -> vector of GotoInfo {GotoStmt*, SourceLocation, EnclosingIfStmt*}.\n\
+  \n4.4) Decide when to warn (suspicious shared cleanup)\n- For each label L:\n  -\
+  \ If L\u2019s FreesAnyParamMember == true AND FreesAnyLocallyAllocated == true:\n\
+  \    - Retrieve the vector of gotos to L; sort them by SourceLocation using SourceManager::isBeforeInTranslationUnit().\n\
+  \    - If the vector size >= 2, that indicates \u201Cshared\u201D error path (multiple\
+  \ error sites go to the same label).\n    - For each goto except the last (i.e.,\
+  \ earlier gotos in the function):\n      - Optionally ensure it is in an error branch:\n\
+  \        - If EnclosingIfStmt is not null, and its condition looks like an error\
+  \ check (heuristic):\n          - Accept any non-literal condition; or\n       \
+  \   - Use ExprHasName on the IfStmt condition to check the presence of \u201Cret\u201D\
+  \ or a similarly named variable; either is fine; keep it simple.\n      - Report\
+  \ a bug on that earlier GotoStmt:\n        - Message: \u201CShared cleanup frees\
+  \ callee-owned pointer; potential double free. Split cleanups.\u201D\n        -\
+  \ If available, append the freed param member\u2019s text, e.g., \u201C(frees mt->fc)\u201D\
+  .\n        - Use BasicBugReport with a range at the goto token.\n    - Rationale:\
+  \ A label that frees both a locally allocated buffer (owned by the current function)\
+  \ and a parameter\u2019s member (likely managed by callees) is suspicious; if multiple\
+  \ different failure sites jump to this label, earlier sites may precede the point\
+  \ at which the param member became valid/owned and safe to free, causing an invalid/double\
+  \ free on those paths.\n\n5) Utilities used\n- ExprHasName to quickly check condition\
+  \ text for simple error checks (optional; not required for core logic).\n- Lexer::getSourceText\
+  \ with the CheckerContext\u2019s SourceManager/LangOptions (available in checkASTCodeBody\
+  \ via AnalysisManager) to extract readable names for freed expressions.\n- findSpecificTypeInParents<IfStmt>\
+  \ to get the enclosing IfStmt for a GotoStmt, to ensure we focus on error-flow gotos.\n\
+  - No need for EvaluateExprToInt, getArraySizeFromExpr, getStringSize, inferSymbolMaxVal,\
+  \ getMemRegionFromExpr in this checker.\n\n6) Important filters to reduce false\
+  \ positives\n- Only consider labels that free at least:\n  - one ParamMember resource\
+  \ (e.g., mt->fc), AND\n  - one LocallyAllocated resource (e.g., match_hl from kzalloc).\n\
+  - Only warn on earlier gotos if there are at least two distinct gotos to the same\
+  \ label.\n- Prefer reporting gotos that are inside an IfStmt branch (typical \u201C\
+  if (ret) goto label;\u201D pattern).\n\n7) Bug report creation\n- Use std::make_unique<BasicBugReport>\
+  \ because this is AST-level analysis in checkASTCodeBody.\n- Short message as required:\
+  \ \u201CShared cleanup frees callee-owned pointer; potential double free. Split\
+  \ cleanups.\u201D\n- Highlight the goto statement and optionally add a note with\
+  \ the label name and the freed expression text.\n\n8) Why this detects the target\
+  \ patch\n- In the buggy code, the label free_fc freed both:\n  - mt->fc (a param\
+  \ member likely not owned/created on the early-failure path), and\n  - match_hl\
+  \ (a local kzalloc\u2019d buffer).\n- There were multiple gotos to free_fc from\
+  \ different failure sites. The earlier failure site (after the first helper) should\
+  \ not free mt->fc; our checker flags that early goto as jumping to a label that\
+  \ also frees the callee-owned pointer, suggesting to split into free_match_hl for\
+  \ that path."
+refined_plan: null
+repaired_checker_code: null
+tn_score: -10
+tp_score: -10

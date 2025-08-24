@@ -1,0 +1,161 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -36,6 +36,12 @@ // Tracks producer-initialized buffers: buffer -> symbol of status/return value of producer call.
+ REGISTER_MAP_WITH_PROGRAMSTATE(ProducerStatusSymMap, const MemRegion*, SymbolRef)
+
++// KFIFO-specific producer modeling:
++// Map buffer -> symbol of the requested length passed to kfifo_out.
++REGISTER_MAP_WITH_PROGRAMSTATE(KFifoLenArgSymMap, const MemRegion*, SymbolRef)
++// Map buffer -> symbol of the return value of kfifo_out.
++REGISTER_MAP_WITH_PROGRAMSTATE(KFifoRetSymMap, const MemRegion*, SymbolRef)
++
+ // Utility Functions provided externally in the prompt:
+ // - findSpecificTypeInParents
+ // - findSpecificTypeInChildren
+@@ -114,6 +120,9 @@   // Also clear producer-derived initialization info to avoid stale mapping across re-allocations.
+   State = State->remove<ProducerLenSymMap>(Canon);
+   State = State->remove<ProducerStatusSymMap>(Canon);
++  // Clear KFIFO-specific producer info as well.
++  State = State->remove<KFifoLenArgSymMap>(Canon);
++  State = State->remove<KFifoRetSymMap>(Canon);
+   return State;
+ }
+
+@@ -164,6 +173,9 @@   State = State->set<ZeroInitSizeMap>(DstReg, NewLen);
+   State = State->remove<ProducerLenSymMap>(DstReg);
+   State = State->remove<ProducerStatusSymMap>(DstReg);
++  // Also clear KFIFO producer info; an explicit memset supersedes previous knowledge.
++  State = State->remove<KFifoLenArgSymMap>(DstReg);
++  State = State->remove<KFifoRetSymMap>(DstReg);
+   C.addTransition(State);
+ }
+
+@@ -225,32 +237,64 @@ bool SAGenTestChecker::isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const {
+   ProgramStateRef State = C.getState();
+
++  // Case 1: General producers where the produced length equals the symbol tracked.
+   const SymbolRef *LenSymP = State->get<ProducerLenSymMap>(FromReg);
+-  if (!LenSymP || !*LenSymP)
+-    return false;
+-
+-  SVal LenArgV = CopyToUserCall.getArgSVal(2);
+-  SymbolRef CopyLenSym = LenArgV.getAsSymbol();
+-  if (!CopyLenSym || CopyLenSym != *LenSymP)
+-    return false;
+-
+-  if (const SymbolRef *StatusSymP = State->get<ProducerStatusSymMap>(FromReg)) {
+-    if (*StatusSymP) {
+-      SValBuilder &SVB = C.getSValBuilder();
+-      QualType IntTy = C.getASTContext().IntTy;
+-      DefinedOrUnknownSVal Cond = SVB.evalEQ(State,
+-                                             nonloc::SymbolVal(*StatusSymP),
+-                                             SVB.makeZeroVal(IntTy));
+-      if (auto StTrue = State->assume(Cond, true)) {
+-        auto StFalse = State->assume(Cond, false);
+-        if (StTrue && !StFalse) {
+-          return true;
++  if (LenSymP && *LenSymP) {
++    SVal LenArgV = CopyToUserCall.getArgSVal(2);
++    SymbolRef CopyLenSym = LenArgV.getAsSymbol();
++    if (CopyLenSym && CopyLenSym == *LenSymP) {
++      if (const SymbolRef *StatusSymP = State->get<ProducerStatusSymMap>(FromReg)) {
++        if (*StatusSymP) {
++          SValBuilder &SVB = C.getSValBuilder();
++          QualType IntTy = C.getASTContext().IntTy;
++          DefinedOrUnknownSVal Cond = SVB.evalEQ(State,
++                                                 nonloc::SymbolVal(*StatusSymP),
++                                                 SVB.makeZeroVal(IntTy));
++          if (auto StTrue = State->assume(Cond, true)) {
++            auto StFalse = State->assume(Cond, false);
++            if (StTrue && !StFalse) {
++              return true; // success path implied
++            }
++          }
+         }
+-      }
+-    }
+-  }
+-
+-  return true;
++      } else {
++        // No separate status symbol; assume success path (best-effort).
++        return true;
++      }
++    }
++  }
++
++  // Case 2: KFIFO producer heuristic.
++  // Suppress when:
++  //  - The copy length symbol equals the kfifo_out requested length symbol for this buffer, and
++  //  - The current path implies kfifo_out return > 0 (i.e., we are on the success path).
++  if (const SymbolRef *KFifoLenSymP = State->get<KFifoLenArgSymMap>(FromReg)) {
++    if (*KFifoLenSymP) {
++      SVal LenArgV = CopyToUserCall.getArgSVal(2);
++      SymbolRef CopyLenSym = LenArgV.getAsSymbol();
++      if (CopyLenSym && CopyLenSym == *KFifoLenSymP) {
++        if (const SymbolRef *KFifoRetSymP = State->get<KFifoRetSymMap>(FromReg)) {
++          if (*KFifoRetSymP) {
++            SValBuilder &SVB = C.getSValBuilder();
++            QualType IntTy = C.getASTContext().IntTy;
++            // Check if the path implies ret > 0.
++            SVal CmpV = SVB.evalBinOp(State, BO_GT,
++                                      nonloc::SymbolVal(*KFifoRetSymP),
++                                      SVB.makeZeroVal(IntTy),
++                                      SVB.getConditionType());
++            DefinedOrUnknownSVal GT = CmpV.castAs<DefinedOrUnknownSVal>();
++            auto StTrue = State->assume(GT, true);
++            auto StFalse = State->assume(GT, false);
++            if (StTrue && !StFalse) {
++              return true;
++            }
++          }
++        }
++      }
++    }
++  }
++
++  return false;
+ }
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -299,6 +343,25 @@   if (callNamed(Call, C, "memzero_explicit")) {
+     // memzero_explicit(ptr, len)
+     noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/1);
++    return;
++  }
++
++  // KFIFO producer modeling: kfifo_out(fifo, buf, len)
++  if (callNamed(Call, C, "kfifo_out")) {
++    if (Call.getNumArgs() >= 3) {
++      const MemRegion *BufReg = getArgBaseRegion(Call, /*Idx=*/1, C);
++      if (BufReg) {
++        SymbolRef LenArgSym = Call.getArgSVal(/*Idx=*/2).getAsSymbol();
++        SymbolRef RetSym = Call.getReturnValue().getAsSymbol();
++        if (LenArgSym) {
++          State = State->set<KFifoLenArgSymMap>(BufReg, LenArgSym);
++        }
++        if (RetSym) {
++          State = State->set<KFifoRetSymMap>(BufReg, RetSym);
++        }
++        C.addTransition(State);
++      }
++    }
+     return;
+   }
+
+@@ -312,6 +375,9 @@       if (LenSym && RetSym) {
+         State = State->set<ProducerLenSymMap>(BufReg, LenSym);
+         State = State->set<ProducerStatusSymMap>(BufReg, RetSym);
++        // Clear KFIFO info when a different producer is used.
++        State = State->remove<KFifoLenArgSymMap>(BufReg);
++        State = State->remove<KFifoRetSymMap>(BufReg);
+         C.addTransition(State);
+       }
+     }
+@@ -328,6 +394,9 @@         State = State->set<ProducerLenSymMap>(BufReg, RetSym);
+         // No separate status symbol for this API; clear any previous status.
+         State = State->remove<ProducerStatusSymMap>(BufReg);
++        // Clear KFIFO info when a different producer is used.
++        State = State->remove<KFifoLenArgSymMap>(BufReg);
++        State = State->remove<KFifoRetSymMap>(BufReg);
+         C.addTransition(State);
+       }
+     }

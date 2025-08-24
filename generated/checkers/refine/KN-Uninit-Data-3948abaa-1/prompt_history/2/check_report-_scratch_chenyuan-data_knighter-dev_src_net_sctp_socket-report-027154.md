@@ -1,0 +1,235 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Allocating a kernel buffer with kmalloc() and then copying it to userspace (via copy_to_user) without guaranteeing that every byte in the copied region has been initialized. This leaves padding/tail bytes uninitialized, causing a kernel information leak. The fix is to zero-initialize the buffer (e.g., with kzalloc or memset) or ensure the entire copied size is explicitly initialized before copy_to_user.
+
+## Bug Pattern
+
+Allocating a kernel buffer with kmalloc() and then copying it to userspace (via copy_to_user) without guaranteeing that every byte in the copied region has been initialized. This leaves padding/tail bytes uninitialized, causing a kernel information leak. The fix is to zero-initialize the buffer (e.g., with kzalloc or memset) or ensure the entire copied size is explicitly initialized before copy_to_user.
+
+# Report
+
+### Report Summary
+
+File:| net/sctp/socket.c
+---|---
+Warning:| line 6320, column 6
+copy_to_user may leak uninitialized kernel memory from kmalloc buffer; use
+kzalloc or memset
+
+### Annotated Source Code
+
+
+6186  |  return -EFAULT;
+6187  |
+6188  |  return 0;
+6189  | }
+6190  |
+6191  | static int sctp_copy_laddrs(struct sock *sk, __u16 port, void *to,
+6192  | 			    size_t space_left, int *bytes_copied)
+6193  | {
+6194  |  struct sctp_sockaddr_entry *addr;
+6195  |  union sctp_addr temp;
+6196  |  int cnt = 0;
+6197  |  int addrlen;
+6198  |  struct net *net = sock_net(sk);
+6199  |
+6200  | 	rcu_read_lock();
+6201  |  list_for_each_entry_rcu(addr, &net->sctp.local_addr_list, list) {
+6202  |  if (!addr->valid)
+6203  |  continue;
+6204  |
+6205  |  if ((PF_INET == sk->sk_family) &&
+6206  | 		    (AF_INET6 == addr->a.sa.sa_family))
+6207  |  continue;
+6208  |  if ((PF_INET6 == sk->sk_family) &&
+6209  | 		    inet_v6_ipv6only(sk) &&
+6210  | 		    (AF_INET == addr->a.sa.sa_family))
+6211  |  continue;
+6212  |  memcpy(&temp, &addr->a, sizeof(temp));
+6213  |  if (!temp.v4.sin_port)
+6214  | 			temp.v4.sin_port = htons(port);
+6215  |
+6216  | 		addrlen = sctp_get_pf_specific(sk->sk_family)
+6217  | 			      ->addr_to_user(sctp_sk(sk), &temp);
+6218  |
+6219  |  if (space_left < addrlen) {
+6220  | 			cnt =  -ENOMEM;
+6221  |  break;
+6222  | 		}
+6223  |  memcpy(to, &temp, addrlen);
+6224  |
+6225  | 		to += addrlen;
+6226  | 		cnt++;
+6227  | 		space_left -= addrlen;
+6228  | 		*bytes_copied += addrlen;
+6229  | 	}
+6230  | 	rcu_read_unlock();
+6231  |
+6232  |  return cnt;
+6233  | }
+6234  |
+6235  |
+6236  | static int sctp_getsockopt_local_addrs(struct sock *sk, int len,
+6237  |  char __user *optval, int __user *optlen)
+6238  | {
+6239  |  struct sctp_bind_addr *bp;
+6240  |  struct sctp_association *asoc;
+6241  |  int cnt = 0;
+6242  |  struct sctp_getaddrs getaddrs;
+6243  |  struct sctp_sockaddr_entry *addr;
+6244  |  void __user *to;
+6245  |  union sctp_addr temp;
+6246  |  struct sctp_sock *sp = sctp_sk(sk);
+6247  |  int addrlen;
+6248  |  int err = 0;
+6249  | 	size_t space_left;
+6250  |  int bytes_copied = 0;
+6251  |  void *addrs;
+6252  |  void *buf;
+6253  |
+6254  |  if (len < sizeof(struct sctp_getaddrs))
+    1Assuming the condition is false→
+    2←Taking false branch→
+6255  |  return -EINVAL;
+6256  |
+6257  |  if (copy_from_user(&getaddrs, optval, sizeof(struct sctp_getaddrs)))
+    3←Assuming the condition is false→
+    4←Taking false branch→
+6258  |  return -EFAULT;
+6259  |
+6260  |  /*
+6261  |  *  For UDP-style sockets, id specifies the association to query.
+6262  |  *  If the id field is set to the value '0' then the locally bound
+6263  |  *  addresses are returned without regard to any particular
+6264  |  *  association.
+6265  |  */
+6266  |  if (0 == getaddrs.assoc_id) {
+    5←Assuming 0 is equal to field 'assoc_id'→
+    6←Taking true branch→
+6267  |  bp = &sctp_sk(sk)->ep->base.bind_addr;
+6268  | 	} else {
+6269  | 		asoc = sctp_id2assoc(sk, getaddrs.assoc_id);
+6270  |  if (!asoc)
+6271  |  return -EINVAL;
+6272  | 		bp = &asoc->base.bind_addr;
+6273  | 	}
+6274  |
+6275  |  to = optval + offsetof(struct sctp_getaddrs, addrs);
+6276  | 	space_left = len - offsetof(struct sctp_getaddrs, addrs);
+6277  |
+6278  | 	addrs = kmalloc(space_left, GFP_USER | __GFP_NOWARN);
+6279  |  if (!addrs)
+    7←Assuming 'addrs' is non-null→
+    8←Taking false branch→
+6280  |  return -ENOMEM;
+6281  |
+6282  |  /* If the endpoint is bound to 0.0.0.0 or ::0, get the valid
+6283  |  * addresses from the global local address list.
+6284  |  */
+6285  |  if (sctp_list_single_entry(&bp->address_list)) {
+    9←Taking false branch→
+6286  | 		addr = list_entry(bp->address_list.next,
+6287  |  struct sctp_sockaddr_entry, list);
+6288  |  if (sctp_is_any(sk, &addr->a)) {
+6289  | 			cnt = sctp_copy_laddrs(sk, bp->port, addrs,
+6290  | 						space_left, &bytes_copied);
+6291  |  if (cnt < 0) {
+6292  | 				err = cnt;
+6293  |  goto out;
+6294  | 			}
+6295  |  goto copy_getaddrs;
+6296  | 		}
+6297  | 	}
+6298  |
+6299  |  buf = addrs;
+6300  |  /* Protection on the bound address list is not needed since
+6301  |  * in the socket option context we hold a socket lock and
+6302  |  * thus the bound address list can't change.
+6303  |  */
+6304  |  list_for_each_entry(addr, &bp->address_list, list) {
+    10←Loop condition is false. Execution continues on line 6320→
+6305  |  memcpy(&temp, &addr->a, sizeof(temp));
+6306  | 		addrlen = sctp_get_pf_specific(sk->sk_family)
+6307  | 			      ->addr_to_user(sp, &temp);
+6308  |  if (space_left < addrlen) {
+6309  | 			err =  -ENOMEM; /*fixme: right error?*/
+6310  |  goto out;
+6311  | 		}
+6312  |  memcpy(buf, &temp, addrlen);
+6313  | 		buf += addrlen;
+6314  | 		bytes_copied += addrlen;
+6315  | 		cnt++;
+6316  | 		space_left -= addrlen;
+6317  | 	}
+6318  |
+6319  | copy_getaddrs:
+6320  |  if (copy_to_user(to, addrs, bytes_copied)) {
+    11←copy_to_user may leak uninitialized kernel memory from kmalloc buffer; use kzalloc or memset
+6321  | 		err = -EFAULT;
+6322  |  goto out;
+6323  | 	}
+6324  |  if (put_user(cnt, &((struct sctp_getaddrs __user *)optval)->addr_num)) {
+6325  | 		err = -EFAULT;
+6326  |  goto out;
+6327  | 	}
+6328  |  /* XXX: We should have accounted for sizeof(struct sctp_getaddrs) too,
+6329  |  * but we can't change it anymore.
+6330  |  */
+6331  |  if (put_user(bytes_copied, optlen))
+6332  | 		err = -EFAULT;
+6333  | out:
+6334  | 	kfree(addrs);
+6335  |  return err;
+6336  | }
+6337  |
+6338  | /* 7.1.10 Set Primary Address (SCTP_PRIMARY_ADDR)
+6339  |  *
+6340  |  * Requests that the local SCTP stack use the enclosed peer address as
+6341  |  * the association primary.  The enclosed address must be one of the
+6342  |  * association peer's addresses.
+6343  |  */
+6344  | static int sctp_getsockopt_primary_addr(struct sock *sk, int len,
+6345  |  char __user *optval, int __user *optlen)
+6346  | {
+6347  |  struct sctp_prim prim;
+6348  |  struct sctp_association *asoc;
+6349  |  struct sctp_sock *sp = sctp_sk(sk);
+6350  |
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

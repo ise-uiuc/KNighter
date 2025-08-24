@@ -1,0 +1,492 @@
+## Role
+
+You are an expert in developing and analyzing Clang Static Analyzer checkers, with decades of experience in the Clang project, particularly in the Static Analyzer plugin.
+
+## Instruction
+
+The following checker fails to compile, and your task is to resolve the compilation error based on the provided error messages.
+
+Here are some potential ways to fix the issue:
+
+1. Use the correct API: The current API may not exist, or the class has no such member. Replace it with an appropriate one.
+
+2. Use correct arguments: Ensure the arguments passed to the API have the correct types and the correct number.
+
+3. Change the variable types: Adjust the types of some variables based on the error messages.
+
+4. Be careful if you want to include a header file. Please make sure the header file exists. For instance "fatal error: clang/StaticAnalyzer/Core/PathDiagnostic.h: No such file or directory".
+
+**The version of Clang environment is Clang-18. You should consider the API compatibility.**
+
+**Please only repair the failed parts and keep the original semantics.**
+**Please return the whole checker code after fixing the compilation error.**
+
+## Suggestions
+
+1. Please only use two types of bug reports:
+  - BasicBugReport (const BugType &bt, StringRef desc, PathDiagnosticLocation l)
+  - PathSensitiveBugReport (const BugType &bt, StringRef desc, const ExplodedNode *errorNode)
+  - PathSensitiveBugReport (const BugType &bt, StringRef shortDesc, StringRef desc, const ExplodedNode *errorNode)
+
+## Example
+
+- Error Line: 48 |   Optional<DefinedOrUnknownSVal> SizeSVal;
+
+  - Error Messages: ‘Optional’ was not declared in this scope; did you mean ‘clang::ObjCImplementationControl::Optional’?
+
+  - Fix: Replace 'Optional<DefinedOrUnknownSVal>' with 'std::optional<DefinedOrUnknownSVal>', and include the appropriate header.
+
+- Error Line: 113 |     const MemRegion *MR = Entry.first;
+
+    - Error Messages: unused variable ‘MR’ [-Wunused-variable]
+
+    - Fix: Remove the variable 'MR' if it is not used.
+
+## Checker
+
+```cpp
+#include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
+#include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
+#include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
+#include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/Type.h"
+#include "llvm/ADT/APSInt.h"
+#include <cstdint>
+#include <algorithm>
+#include <memory>
+
+using namespace clang;
+using namespace ento;
+using namespace taint;
+
+// Program state maps
+// 0 = Unknown/not tracked, 1 = Zeroed allocation (kzalloc/kcalloc), 2 = Possibly-uninitialized (kmalloc/*)
+REGISTER_MAP_WITH_PROGRAMSTATE(AllocKindMap, const MemRegion*, unsigned)
+// Records last known initialized byte size via memset/memzero_explicit for the base region.
+REGISTER_MAP_WITH_PROGRAMSTATE(ZeroInitSizeMap, const MemRegion*, uint64_t)
+// Tracks pointer aliases.
+REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)
+// Tracks producer-initialized buffers: buffer -> symbol of length value after producer call.
+REGISTER_MAP_WITH_PROGRAMSTATE(ProducerLenSymMap, const MemRegion*, SymbolRef)
+// Tracks producer-initialized buffers: buffer -> symbol of status/return value of producer call.
+REGISTER_MAP_WITH_PROGRAMSTATE(ProducerStatusSymMap, const MemRegion*, SymbolRef)
+
+// Utility Functions provided externally in the prompt:
+// - findSpecificTypeInParents
+// - findSpecificTypeInChildren
+// - EvaluateExprToInt
+// - inferSymbolMaxVal
+// - getArraySizeFromExpr
+// - getStringSize
+// - getMemRegionFromExpr
+// - KnownDerefFunction etc.
+// - ExprHasName
+
+namespace {
+/* The checker callbacks are to be decided. */
+class SAGenTestChecker : public Checker<
+                             check::PostCall,
+                             check::PreCall,
+                             check::Bind> {
+   mutable std::unique_ptr<BugType> BT;
+
+   public:
+      SAGenTestChecker() : BT(new BugType(this, "Kernel information leak", "Security")) {}
+
+      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
+      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+      void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;
+
+   private:
+
+      // Helpers
+      const MemRegion *canonical(ProgramStateRef State, const MemRegion *R) const;
+      ProgramStateRef setAllocKind(ProgramStateRef State, const MemRegion *R, unsigned Kind) const;
+      bool callNamed(const CallEvent &Call, CheckerContext &C, StringRef Name) const;
+      const MemRegion *getArgBaseRegion(const CallEvent &Call, unsigned Idx, CheckerContext &C) const;
+      void noteExplicitInitLen(const CallEvent &Call, CheckerContext &C, unsigned PtrArgIndex, unsigned LenArgIndex) const;
+      void reportLeak(const CallEvent &Call, CheckerContext &C, const MemRegion *SrcReg) const;
+
+      // Producer modeling helpers
+      bool functionKnownToInitBuffer(const CallEvent &Call, unsigned &BufParamIdx, unsigned &LenPtrParamIdx) const;
+      SymbolRef getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const;
+      bool isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
+};
+
+const MemRegion *SAGenTestChecker::canonical(ProgramStateRef State, const MemRegion *R) const {
+  if (!R)
+    return nullptr;
+  const MemRegion *Base = R->getBaseRegion();
+  if (!Base)
+    return nullptr;
+
+  // Follow alias chain to a fixed point (both directions are stored, but forward is enough).
+  const MemRegion *Cur = Base;
+  // Limit steps to avoid cycles.
+  for (unsigned i = 0; i < 8; ++i) {
+    if (const MemRegion *const *NextP = State->get<PtrAliasMap>(Cur)) {
+      const MemRegion *Next = *NextP;
+      if (Next == Cur)
+        break;
+      Cur = Next->getBaseRegion();
+      continue;
+    }
+    break;
+  }
+  return Cur;
+}
+
+ProgramStateRef SAGenTestChecker::setAllocKind(ProgramStateRef State, const MemRegion *R, unsigned Kind) const {
+  if (!R)
+    return State;
+  R = R->getBaseRegion();
+  if (!R)
+    return State;
+  const MemRegion *Canon = canonical(State, R);
+  if (!Canon)
+    return State;
+  State = State->set<AllocKindMap>(Canon, Kind);
+  // Reset any previous explicit-init info; a fresh allocation supersedes it.
+  State = State->remove<ZeroInitSizeMap>(Canon);
+  // Also clear producer-derived initialization info to avoid stale mapping across re-allocations.
+  State = State->remove<ProducerLenSymMap>(Canon);
+  State = State->remove<ProducerStatusSymMap>(Canon);
+  return State;
+}
+
+bool SAGenTestChecker::callNamed(const CallEvent &Call, CheckerContext &C, StringRef Name) const {
+  const Expr *Origin = Call.getOriginExpr();
+  if (!Origin)
+    return false;
+  return ExprHasName(Origin, Name, C);
+}
+
+const MemRegion *SAGenTestChecker::getArgBaseRegion(const CallEvent &Call, unsigned Idx, CheckerContext &C) const {
+  const Expr *ArgE = Call.getArgExpr(Idx);
+  const MemRegion *MR = nullptr;
+  if (ArgE)
+    MR = getMemRegionFromExpr(ArgE, C);
+  if (!MR) {
+    SVal V = Call.getArgSVal(Idx);
+    MR = V.getAsRegion();
+  }
+  if (!MR)
+    return nullptr;
+  MR = MR->getBaseRegion();
+  if (!MR)
+    return nullptr;
+  ProgramStateRef State = C.getState();
+  return canonical(State, MR);
+}
+
+void SAGenTestChecker::noteExplicitInitLen(const CallEvent &Call, CheckerContext &C,
+                                           unsigned PtrArgIndex, unsigned LenArgIndex) const {
+  ProgramStateRef State = C.getState();
+
+  const MemRegion *DstReg = getArgBaseRegion(Call, PtrArgIndex, C);
+  if (!DstReg)
+    return;
+
+  const Expr *LenE = Call.getArgExpr(LenArgIndex);
+  if (!LenE)
+    return;
+
+  llvm::APSInt EvalRes;
+  if (!EvaluateExprToInt(EvalRes, LenE, C))
+    return;
+
+  uint64_t Len = EvalRes.getZExtValue();
+  // Record the max of existing length and new length.
+  const uint64_t *Old = State->get<ZeroInitSizeMap>(DstReg);
+  uint64_t NewLen = Old ? std::max(*Old, Len) : Len;
+  State = State->set<ZeroInitSizeMap>(DstReg, NewLen);
+  // Producer info not needed for explicit init; clear to be safe.
+  State = State->remove<ProducerLenSymMap>(DstReg);
+  State = State->remove<ProducerStatusSymMap>(DstReg);
+  C.addTransition(State);
+}
+
+void SAGenTestChecker::reportLeak(const CallEvent &Call, CheckerContext &C, const MemRegion *SrcReg) const {
+  ExplodedNode *N = C.generateNonFatalErrorNode();
+  if (!N)
+    return;
+
+  auto R = std::make_unique<PathSensitiveBugReport>(
+      *BT, "copy_to_user may leak uninitialized kernel memory from kmalloc buffer; use kzalloc or memset", N);
+  if (const Expr *E = Call.getOriginExpr())
+    R->addRange(E->getSourceRange());
+  C.emitReport(std::move(R));
+}
+
+// Recognize known producer that fills an output buffer up to length returned in len-pointer on success.
+// For this false positive, we need to recognize efi.get_variable(name, guid, attr, data_size_ptr, data_ptr).
+bool SAGenTestChecker::functionKnownToInitBuffer(const CallEvent &Call, unsigned &BufParamIdx, unsigned &LenPtrParamIdx) const {
+  // Use textual match on the origin expression to tolerate function pointers / struct members.
+  // We purposefully search for the leaf name to handle expressions like "efi.get_variable(...)".
+  if (const Expr *Origin = Call.getOriginExpr()) {
+    // Match "get_variable(" in the call text; avoid accidental matches by including underscore+name.
+    // This is intentionally conservative and specific to the EFI API we need.
+    // More producers can be added here as needed.
+    // Note: ExprHasName checks token range, so Name without '(' is fine as a substring.
+    if (ExprHasName(Origin, "get_variable", *const_cast<CheckerContext *>(&Call.getCheckerContext()))) {
+      // Expect at least 5 args: name, vendor, attr*, len*, data
+      if (Call.getNumArgs() >= 5) {
+        BufParamIdx = 4;
+        LenPtrParamIdx = 3;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+SymbolRef SAGenTestChecker::getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+  SVal PtrV = Call.getArgSVal(Idx);
+  const MemRegion *PtrReg = PtrV.getAsRegion();
+  if (!PtrReg)
+    return nullptr;
+  // Load the value at the pointer location; we only need its symbol.
+  SValBuilder &SVB = C.getSValBuilder();
+  Loc L = SVB.makeLoc(PtrReg);
+  SVal Pointee = State->getSVal(L);
+  return Pointee.getAsSymbol();
+}
+
+// Decide if this copy_to_user should be suppressed because a known producer
+// fully initialized the buffer for exactly the number of bytes being copied.
+bool SAGenTestChecker::isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const {
+  ProgramStateRef State = C.getState();
+
+  // We require: recorded producer length symbol for this buffer, and copy length uses the same symbol.
+  const SymbolRef *LenSymP = State->get<ProducerLenSymMap>(FromReg);
+  if (!LenSymP || !*LenSymP)
+    return false;
+
+  // Check that the copy length arg is exactly that symbol.
+  SVal LenArgV = CopyToUserCall.getArgSVal(2);
+  SymbolRef CopyLenSym = LenArgV.getAsSymbol();
+  if (!CopyLenSym || CopyLenSym != *LenSymP)
+    return false;
+
+  // Optional: If we can prove that the producer's status symbol is constrained to success (0),
+  // accept this as fully initialized. If we cannot prove it, we still suppress because the
+  // path to this call typically assumes success (guarded by a status check). This avoids FPs
+  // while remaining specific to the producer API.
+  if (const SymbolRef *StatusSymP = State->get<ProducerStatusSymMap>(FromReg)) {
+    if (*StatusSymP) {
+      // Try to determine if StatusSym == 0 is known on this path.
+      SValBuilder &SVB = C.getSValBuilder();
+      // Build (Status == 0). We don't have the exact type; use 0 of 'int' which is fine for equality.
+      QualType IntTy = C.getASTContext().IntTy;
+      DefinedOrUnknownSVal Cond = SVB.evalEQ(State,
+                                             nonloc::SymbolVal(*StatusSymP),
+                                             SVB.makeZeroVal(IntTy));
+      if (auto StTrue = State->assume(Cond, true)) {
+        auto StFalse = State->assume(Cond, false);
+        if (StTrue && !StFalse) {
+          // Constrained to success: definitely safe
+          return true;
+        }
+      }
+      // Not provably true; fall through to conservative suppression guarded by length-symbol match.
+    }
+  }
+
+  // Length symbol matches producer's returned length => consider safe for this specific copy.
+  return true;
+}
+
+void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+
+  // Allocation modeling
+  if (callNamed(Call, C, "kzalloc") || callNamed(Call, C, "kcalloc")) {
+    const MemRegion *RetReg = Call.getReturnValue().getAsRegion();
+    if (!RetReg) {
+      if (const Expr *OE = Call.getOriginExpr())
+        RetReg = getMemRegionFromExpr(OE, C);
+    }
+    if (RetReg) {
+      RetReg = RetReg->getBaseRegion();
+      if (RetReg) {
+        State = setAllocKind(State, canonical(State, RetReg), 1);
+        C.addTransition(State);
+      }
+    }
+    return;
+  }
+
+  if (callNamed(Call, C, "kmalloc") || callNamed(Call, C, "kmalloc_array") || callNamed(Call, C, "kmalloc_node")) {
+    const MemRegion *RetReg = Call.getReturnValue().getAsRegion();
+    if (!RetReg) {
+      if (const Expr *OE = Call.getOriginExpr())
+        RetReg = getMemRegionFromExpr(OE, C);
+    }
+    if (RetReg) {
+      RetReg = RetReg->getBaseRegion();
+      if (RetReg) {
+        State = setAllocKind(State, canonical(State, RetReg), 2);
+        C.addTransition(State);
+      }
+    }
+    return;
+  }
+
+  // Explicit initialization modeling
+  if (callNamed(Call, C, "memset")) {
+    // memset(ptr, val, len) -> we record len as initialized for base region
+    noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/2);
+    return;
+  }
+
+  if (callNamed(Call, C, "memzero_explicit")) {
+    // memzero_explicit(ptr, len)
+    noteExplicitInitLen(Call, C, /*PtrArgIndex=*/0, /*LenArgIndex=*/1);
+    return;
+  }
+
+  // Producer initialization modeling
+  unsigned BufIdx = 0, LenPtrIdx = 0;
+  if (functionKnownToInitBuffer(Call, BufIdx, LenPtrIdx)) {
+    const MemRegion *BufReg = getArgBaseRegion(Call, BufIdx, C);
+    if (BufReg) {
+      SymbolRef LenSym = getPointeeSymbolForPointerArg(Call, LenPtrIdx, C);
+      SymbolRef RetSym = Call.getReturnValue().getAsSymbol();
+      if (LenSym && RetSym) {
+        // Record producer info for this buffer.
+        State = State->set<ProducerLenSymMap>(BufReg, LenSym);
+        State = State->set<ProducerStatusSymMap>(BufReg, RetSym);
+        C.addTransition(State);
+      }
+    }
+    return;
+  }
+}
+
+void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+  if (!callNamed(Call, C, "copy_to_user"))
+    return;
+
+  ProgramStateRef State = C.getState();
+
+  // copy_to_user(to, from, len)
+  const MemRegion *FromReg = getArgBaseRegion(Call, 1, C);
+  if (!FromReg)
+    return;
+
+  const unsigned *Kind = State->get<AllocKindMap>(FromReg);
+  if (!Kind)
+    return;
+
+  // Zeroed allocation (safe)
+  if (*Kind == 1)
+    return;
+
+  // Only warn for possibly-uninitialized allocations
+  if (*Kind != 2)
+    return;
+
+  // Recognize and suppress the specific false positive case:
+  if (isFalsePositiveDueToProducer(Call, C, FromReg))
+    return;
+
+  // Evaluate length if possible
+  const Expr *LenE = Call.getArgExpr(2);
+  uint64_t CopyLen = 0;
+  bool LenKnown = false;
+  if (LenE) {
+    llvm::APSInt EvalRes;
+    if (EvaluateExprToInt(EvalRes, LenE, C)) {
+      CopyLen = EvalRes.getZExtValue();
+      LenKnown = true;
+    }
+  }
+
+  const uint64_t *ZeroedBytes = State->get<ZeroInitSizeMap>(FromReg);
+  if (LenKnown) {
+    if (ZeroedBytes && *ZeroedBytes >= CopyLen)
+      return; // Fully initialized by memset/memzero_explicit
+    // Otherwise, report
+    reportLeak(Call, C, FromReg);
+    return;
+  } else {
+    // Length unknown: if we have no evidence of explicit initialization, report
+    if (!ZeroedBytes) {
+      reportLeak(Call, C, FromReg);
+    }
+    return;
+  }
+}
+
+void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {
+  ProgramStateRef State = C.getState();
+
+  const MemRegion *LHS = Loc.getAsRegion();
+  if (!LHS)
+    return;
+  LHS = LHS->getBaseRegion();
+  if (!LHS)
+    return;
+
+  const MemRegion *RHS = Val.getAsRegion();
+  if (!RHS)
+    return;
+  RHS = RHS->getBaseRegion();
+  if (!RHS)
+    return;
+
+  // Record aliasing in both directions to resolve easily
+  const MemRegion *LC = canonical(State, LHS);
+  const MemRegion *RC = canonical(State, RHS);
+  if (!LC || !RC)
+    return;
+
+  State = State->set<PtrAliasMap>(LC, RC);
+  State = State->set<PtrAliasMap>(RC, LC);
+  C.addTransition(State);
+}
+
+} // end anonymous namespace
+
+extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+  registry.addChecker<SAGenTestChecker>(
+      "custom.SAGenTestChecker",
+      "Detect kmalloc buffers copied to userspace without full initialization (kernel info leak)",
+      "");
+}
+
+extern "C" const char clang_analyzerAPIVersionString[] =
+    CLANG_ANALYZER_API_VERSION_STRING;
+
+```
+
+## Error Messages
+
+- Error Line: 196 |     if (ExprHasName(Origin, "get_variable", *const_cast<CheckerContext *>(&Call.getCheckerContext()))) {
+
+	- Error Messages: ‘const class clang::ento::CallEvent’ has no member named ‘getCheckerContext’
+
+
+
+## Formatting
+
+Your response should be like:
+
+```cpp
+{{whole fixed checker code here}}
+```
+
+Note, please return the **whole** checker code after fixing the compilation error.

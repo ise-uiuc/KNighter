@@ -1,0 +1,193 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -75,7 +75,6 @@   llvm::APSInt V;
+   if (!evalInt(Ctx, E, V))
+     return false;
+-  // Treat negative as unsupported.
+   if (V.isSigned() && V.isNegative())
+     return false;
+   Out = V.getLimitedValue();
+@@ -180,7 +179,7 @@ }
+
+ // Parse a comparator "IVar <op> Const" or "Const <op> IVar".
+-// Returns true and fills ConstVal (unsigned) and OpOut if matches; otherwise false.
++// Returns true and fills ConstVal and OpOut if matches; otherwise false.
+ static bool parseIVarVsConst(const ASTContext &Ctx, const Expr *Cond, const VarDecl *IVar,
+                              uint64_t &ConstVal, BinaryOperator::Opcode &OpOut) {
+   if (!Cond) return false;
+@@ -231,6 +230,108 @@       }
+       return true;
+     }
++  }
++
++  return false;
++}
++
++// Recursively detect if a condition contains a conjunct/disjunct or negated form
++// that ensures i >= Cap in the THEN branch of an if-statement.
++//
++// Accepted patterns:
++//   - i >= Cap
++//   - !(i < Cap)
++//   - Combined with && or || at any depth, e.g. (i >= Cap && X), (X || i >= Cap), !(i < Cap) || Y, etc.
++// For usage with "if (Cond) { break/continue/return; }", any occurrence is enough to ensure
++// that when i >= Cap, Cond is true and execution will not reach subsequent array uses.
++static bool condMentionsIVarGeCapForThen(const ASTContext &Ctx, const Expr *Cond,
++                                         const VarDecl *IVar, uint64_t Cap) {
++  if (!Cond) return false;
++  Cond = Cond->IgnoreParenImpCasts();
++
++  if (const auto *PE = dyn_cast<ParenExpr>(Cond))
++    return condMentionsIVarGeCapForThen(Ctx, PE->getSubExpr(), IVar, Cap);
++
++  if (const auto *UO = dyn_cast<UnaryOperator>(Cond)) {
++    if (UO->getOpcode() == UO_LNot) {
++      // !(i < Cap) implies i >= Cap
++      uint64_t CVal = 0;
++      BinaryOperator::Opcode Op;
++      if (parseIVarVsConst(Ctx, UO->getSubExpr(), IVar, CVal, Op)) {
++        if (Op == BO_LT && CVal == Cap)
++          return true;
++      }
++      // Otherwise, try recursively but conservatively do not attempt double negations
++      return false;
++    }
++  }
++
++  if (const auto *BO = dyn_cast<BinaryOperator>(Cond)) {
++    if (BO->isLogicalOp()) {
++      // For both && and ||, if any side contains "i >= Cap" (or !(i < Cap)),
++      // then when i >= Cap the condition will be true at least in the || case.
++      // For &&, this is heuristic; it matches common Linux "AND with mode flag"
++      // pre-terminators (e.g. !(HT40) gating), and reduces FPs like ath9k.
++      return condMentionsIVarGeCapForThen(Ctx, BO->getLHS(), IVar, Cap) ||
++             condMentionsIVarGeCapForThen(Ctx, BO->getRHS(), IVar, Cap);
++    }
++
++    // Direct comparator
++    uint64_t CVal = 0;
++    BinaryOperator::Opcode Op;
++    if (parseIVarVsConst(Ctx, BO, IVar, CVal, Op)) {
++      if (CVal == Cap && (Op == BO_GE)) // only accept >= Cap exactly
++        return true;
++    }
++  }
++
++  // Also check the direct comparator case when Cond is itself a comparator not wrapped as BO
++  uint64_t CVal = 0;
++  BinaryOperator::Opcode Op;
++  if (parseIVarVsConst(Ctx, Cond, IVar, CVal, Op)) {
++    if (CVal == Cap && (Op == BO_GE))
++      return true;
++  }
++
++  return false;
++}
++
++// Recursively detect if the THEN-branch of an if-statement implies i < Cap due to a
++// conjunction containing i < Cap. We reject any condition containing '||' to avoid FNs.
++static bool condEnsuresIVarLtCapForThen(const ASTContext &Ctx, const Expr *Cond,
++                                        const VarDecl *IVar, uint64_t Cap) {
++  if (!Cond) return false;
++  Cond = Cond->IgnoreParenImpCasts();
++
++  if (const auto *PE = dyn_cast<ParenExpr>(Cond))
++    return condEnsuresIVarLtCapForThen(Ctx, PE->getSubExpr(), IVar, Cap);
++
++  if (const auto *BO = dyn_cast<BinaryOperator>(Cond)) {
++    if (BO->getOpcode() == BO_LAnd) {
++      // In A && B, THEN-branch requires both; it's safe if either conjunct includes (i < Cap).
++      return condEnsuresIVarLtCapForThen(Ctx, BO->getLHS(), IVar, Cap) ||
++             condEnsuresIVarLtCapForThen(Ctx, BO->getRHS(), IVar, Cap);
++    }
++    if (BO->getOpcode() == BO_LOr) {
++      // Not safe to conclude i < Cap in general.
++      return false;
++    }
++
++    uint64_t CVal = 0;
++    BinaryOperator::Opcode Op;
++    if (parseIVarVsConst(Ctx, BO, IVar, CVal, Op)) {
++      if (Op == BO_LT && CVal == Cap)
++        return true;
++    }
++    return false;
++  }
++
++  // Fallback: direct comparator
++  uint64_t CVal = 0;
++  BinaryOperator::Opcode Op;
++  if (parseIVarVsConst(Ctx, Cond, IVar, CVal, Op)) {
++    if (Op == BO_LT && CVal == Cap)
++      return true;
+   }
+
+   return false;
+@@ -483,12 +584,11 @@   return false;
+ }
+
++// Enhanced: accept "i < Cap" as a conjunct within &&-chains (reject ||) for then-branch safety.
+ static bool isGuardedByEnclosingIfLtCap(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+                                         const VarDecl *IVar, uint64_t Cap) {
+   if (!ASE) return false;
+
+-  // Walk up the parents and look for an IfStmt where ASE is located within the 'then' branch
+-  // and the condition is i < Cap (or i <= Cap).
+   const Stmt *Curr = ASE;
+   while (true) {
+     const Stmt *ParentS = nullptr;
+@@ -498,13 +598,10 @@     if (!ParentS) break;
+
+     if (const auto *IS = dyn_cast<IfStmt>(ParentS)) {
+-      bool IsLTorLE = false, IsGEorGT = false;
+-      if (parseGuardCondition(Ctx, IS->getCond(), IVar, Cap, IsLTorLE, IsGEorGT)) {
+-        if (IsLTorLE) {
+-          const Stmt *Then = IS->getThen();
+-          if (Then && stmtContains(Then, ASE))
+-            return true;
+-        }
++      const Stmt *Then = IS->getThen();
++      if (Then && stmtContains(Then, ASE)) {
++        if (condEnsuresIVarLtCapForThen(Ctx, IS->getCond(), IVar, Cap))
++          return true;
+       }
+     }
+     Curr = ParentS;
+@@ -545,7 +642,7 @@   }
+   if (!ContainerChild) return false;
+
+-  // Scan previous statements for if (i >= Cap) { break; } or return; or continue;
++  // Scan previous statements for if (cond) { break; } or continue; or return;
+   Index = 0;
+   for (const Stmt *Child : CS->body()) {
+     if (Index >= FoundIndex) break;
+@@ -554,15 +651,12 @@     const auto *IS = dyn_cast<IfStmt>(Child);
+     if (!IS) continue;
+
+-    bool IsLTorLE = false, IsGEorGT = false;
+-    if (!parseGuardCondition(Ctx, IS->getCond(), IVar, Cap, IsLTorLE, IsGEorGT))
+-      continue;
+-
+-    if (!IsGEorGT)
+-      continue;
+-
+     const Stmt *Then = IS->getThen();
+     if (!Then) continue;
++
++    // Check the condition contains a GE-cap (or !(LT-cap)) test
++    if (!condMentionsIVarGeCapForThen(Ctx, IS->getCond(), IVar, Cap))
++      continue;
+
+     // Look for a BreakStmt, ContinueStmt or ReturnStmt inside the then-branch.
+     struct FindTerminator : public RecursiveASTVisitor<FindTerminator> {
+@@ -582,11 +676,12 @@
+ static bool isGuardedBeforeUse(const ASTContext &Ctx, const ArraySubscriptExpr *ASE,
+                                const VarDecl *IVar, uint64_t Cap, uint64_t UBExclusive) {
+-  // Heuristic A: ASE is inside an enclosing if (i < Cap) { ... ASE ... }
++  // Heuristic A: ASE is inside an enclosing if (i < Cap) [possibly && ...] { ... ASE ... }
+   if (isGuardedByEnclosingIfLtCap(Ctx, ASE, IVar, Cap))
+     return true;
+
+-  // Heuristic B: Just before ASE in the same block, there is if (i >= Cap) { break; } or return; or continue;
++  // Heuristic B: Just before ASE in the same block, there is if (cond) { break/continue/return; },
++  // where cond contains i >= Cap (or !(i < Cap)) even inside a compound condition.
+   if (isGuardedByPrevIfGeBreak(Ctx, ASE, IVar, Cap))
+     return true;

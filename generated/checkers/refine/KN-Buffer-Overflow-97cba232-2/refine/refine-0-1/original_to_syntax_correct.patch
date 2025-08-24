@@ -1,0 +1,166 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -187,11 +187,14 @@     return false;
+   }
+
++  // Extended to also return the bound expression used in the comparison.
+   static bool analyzeLoopCondition(const Expr *Cond, const VarDecl *V,
+                                    bool &IsStrictUpper,
+-                                   bool &IsMinusOneAdjusted) {
++                                   bool &IsMinusOneAdjusted,
++                                   const Expr *&BoundExprOut) {
+     IsStrictUpper = false;
+     IsMinusOneAdjusted = false;
++    BoundExprOut = nullptr;
+
+     if (!Cond || !V)
+       return false;
+@@ -208,6 +211,7 @@         IsStrictUpper = true;
+         if (isMinusOneAdjustedExpr(R))
+           IsMinusOneAdjusted = true;
++        BoundExprOut = R;
+         return true;
+       }
+       break;
+@@ -216,6 +220,7 @@         IsStrictUpper = true;
+         if (isMinusOneAdjustedExpr(L))
+           IsMinusOneAdjusted = true;
++        BoundExprOut = L;
+         return true;
+       }
+       break;
+@@ -223,6 +228,7 @@       if (isRefToVar(L, V) && isMinusOneAdjustedExpr(R)) {
+         IsStrictUpper = false;
+         IsMinusOneAdjusted = true;
++        BoundExprOut = R;
+         return true;
+       }
+       break;
+@@ -230,6 +236,7 @@       if (isRefToVar(R, V) && isMinusOneAdjustedExpr(L)) {
+         IsStrictUpper = false;
+         IsMinusOneAdjusted = true;
++        BoundExprOut = L;
+         return true;
+       }
+       break;
+@@ -421,6 +428,66 @@     return F.Found;
+   }
+
++  // Attempt to recover the constant array size from the base expression.
++  // Supports:
++  //  - DeclRefExpr to VarDecl of ConstantArrayType
++  //  - MemberExpr to FieldDecl of ConstantArrayType (e.g., dc->links)
++  static bool getConstantArraySizeFromBase(const Expr *Base, llvm::APInt &Size) {
++    Base = stripCastsAndParens(Base);
++    if (!Base)
++      return false;
++
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(Base)) {
++      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++        QualType QT = VD->getType();
++        if (const auto *CAT = dyn_cast<ConstantArrayType>(QT.getTypePtr())) {
++          Size = CAT->getSize();
++          return true;
++        }
++      }
++    } else if (const auto *ME = dyn_cast<MemberExpr>(Base)) {
++      if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {
++        QualType FT = FD->getType();
++        if (const auto *CAT = dyn_cast<ConstantArrayType>(FT.getTypePtr())) {
++          Size = CAT->getSize();
++          return true;
++        }
++      }
++    }
++    return false;
++  }
++
++  // Evaluate an expression as integer constant. Returns true on success.
++  static bool evaluateExprToAPSInt(const Expr *E, ASTContext &Ctx,
++                                   llvm::APSInt &Res) {
++    if (!E)
++      return false;
++    Expr::EvalResult ER;
++    if (E->EvaluateAsInt(ER, Ctx)) {
++      Res = ER.Val.getInt();
++      return true;
++    }
++    return false;
++  }
++
++  // Additional FP filter: ensure the loop bound equals the constant array size.
++  // Returns true if both values are known and equal.
++  static bool loopBoundEqualsArraySize(const Expr *BoundExpr,
++                                       const Expr *ArrayBase,
++                                       ASTContext &Ctx) {
++    llvm::APInt ArrSize(64, 0);
++    if (!getConstantArraySizeFromBase(ArrayBase, ArrSize))
++      return false; // Not a constant-sized array: avoid reporting.
++
++    llvm::APSInt BoundVal;
++    if (!evaluateExprToAPSInt(BoundExpr, Ctx, BoundVal))
++      return false; // Non-constant bound: avoid reporting.
++
++    uint64_t ArrSz = ArrSize.getLimitedValue(UINT64_MAX);
++    uint64_t BVal = BoundVal.getLimitedValue(UINT64_MAX);
++    return ArrSz == BVal;
++  }
++
+   void analyzeForStmt(const ForStmt *FS, ASTContext &Ctx,
+                       BugReporter &BR) const {
+     if (!FS)
+@@ -438,9 +505,11 @@     bool IsStrictUpper = false;
+     bool IsMinusOneAdjusted = false;
+     const Expr *Cond = FS->getCond();
++    const Expr *BoundExpr = nullptr;
+     if (!Cond)
+       return;
+-    if (!analyzeLoopCondition(Cond, IVar, IsStrictUpper, IsMinusOneAdjusted))
++    if (!analyzeLoopCondition(Cond, IVar, IsStrictUpper, IsMinusOneAdjusted,
++                              BoundExpr))
+       return;
+
+     // Skip loops that already use (bound - 1).
+@@ -463,11 +532,13 @@       ASTContext &Ctx;
+       BugReporter &BR;
+       const BugType &BT;
++      const Expr *BoundExpr;
+
+       BodyVisitor(const SAGenTestChecker *Checker, const ForStmt *FS,
+                   const VarDecl *IVar, ASTContext &Ctx, BugReporter &BR,
+-                  const BugType &BT)
+-          : Checker(Checker), FS(FS), IVar(IVar), Ctx(Ctx), BR(BR), BT(BT) {}
++                  const BugType &BT, const Expr *BoundExpr)
++          : Checker(Checker), FS(FS), IVar(IVar), Ctx(Ctx), BR(BR), BT(BT),
++            BoundExpr(BoundExpr) {}
+
+       bool VisitArraySubscriptExpr(ArraySubscriptExpr *ASE) {
+         if (!ASE)
+@@ -480,13 +551,20 @@         // Check for a local guard like "if (i + 1 < X)" or "if (i < X - 1)".
+         if (Checker->hasLocalGuardForASE(Ctx, ASE, FS, IVar))
+           return true;
++
++        // Additional FP filter: ensure the loop bound is the actual size of this array base.
++        const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
++        if (!Base || !BoundExpr)
++          return true;
++
++        if (!loopBoundEqualsArraySize(BoundExpr, Base, Ctx))
++          return true; // The loop bound doesn't tie to this array's size; likely false positive.
+
+         // Only warn if the same base array is also accessed with index [i]
+         // within the same loop body (matches the target bug pattern and
+         // suppresses stencil-style code accessing neighbor elements).
+         const Stmt *Body = FS->getBody();
+-        const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
+-        if (!Body || !Base)
++        if (!Body)
+           return true;
+
+         if (!Checker->hasPairedIndexAccessToSameBase(Body, Base, IVar, ASE))
+@@ -513,7 +591,7 @@       }
+     };
+
+-    BodyVisitor V(this, FS, IVar, Ctx, BR, *BT);
++    BodyVisitor V(this, FS, IVar, Ctx, BR, *BT, BoundExpr);
+     if (const Stmt *Body = FS->getBody())
+       V.TraverseStmt(const_cast<Stmt *>(Body));
+   }

@@ -1,0 +1,429 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -53,8 +53,9 @@       bool isLockAcquire(const CallEvent &Call, CheckerContext &C) const;
+       bool isLockRelease(const CallEvent &Call, CheckerContext &C) const;
+
+-      const MemRegion* extractNullCheckedPointer(const Expr *Cond, CheckerContext &C) const;
++      const MemRegion* extractNegatedNullCheckedPointer(const Expr *Cond, CheckerContext &C) const;
+       bool thenHasEarlyExit(const Stmt *Then, CheckerContext &C) const;
++      bool thenContainsLoggingCall(const Stmt *Then, CheckerContext &C) const;
+
+       const MemRegion* getBaseRegionFromExpr(const Expr *E, CheckerContext &C) const;
+
+@@ -67,16 +68,106 @@
+
+
++// ---------------- Utility Functions from prompt ----------------
++
++// Going upward in an AST tree, and find the Stmt of a specific type
++template <typename T>
++const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
++
++// Going downward in an AST tree, and find the Stmt of a secific type
++// Only return one of the statements if there are many
++template <typename T>
++const T* findSpecificTypeInChildren(const Stmt *S);
++
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C) {
++  Expr::EvalResult ExprRes;
++  if (expr->EvaluateAsInt(ExprRes, C.getASTContext())) {
++    EvalRes = ExprRes.Val.getInt();
++    return true;
++  }
++  return false;
++}
++
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C) {
++  ProgramStateRef State = C.getState();
++  const llvm::APSInt *maxVal = State->getConstraintManager().getSymMaxVal(State, Sym);
++  return maxVal;
++}
++
++// The expression should be the DeclRefExpr of the array
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E) {
++  if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E->IgnoreImplicit())) {
++    if (const VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++      QualType QT = VD->getType();
++      if (const ConstantArrayType *ArrayType = dyn_cast<ConstantArrayType>(QT.getTypePtr())) {
++        ArraySize = ArrayType->getSize();
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool getStringSize(llvm::APInt &StringSize, const Expr *E) {
++  if (const auto *SL = dyn_cast<StringLiteral>(E->IgnoreImpCasts())) {
++    StringSize = llvm::APInt(32, SL->getLength());
++    return true;
++  }
++  return false;
++}
++
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C) {
++  ProgramStateRef State = C.getState();
++  return State->getSVal(E, C.getLocationContext()).getAsRegion();
++}
++
++struct KnownDerefFunction {
++  const char *Name;                    ///< The function name.
++  llvm::SmallVector<unsigned, 4> Params; ///< The parameter indices that get dereferenced.
++};
++
++// Dummy Decl to avoid undefined symbol - In real checker, an external table would be defined.
++static const KnownDerefFunction DerefTable[] = {
++  // Populate if needed; left empty for this checker
++  // Provide a harmless sentinel to avoid zero-sized array compilation error.
++  {"", {}}
++};
++
++bool functionKnownToDeref(const CallEvent &Call,
++                                 llvm::SmallVectorImpl<unsigned> &DerefParams) {
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    StringRef FnName = ID->getName();
++
++    for (const auto &Entry : DerefTable) {
++      if (FnName.equals(Entry.Name)) {
++        DerefParams.append(Entry.Params.begin(), Entry.Params.end());
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C) {
++  if (!E)
++    return false;
++
++  const SourceManager &SM = C.getSourceManager();
++  const LangOptions &LangOpts = C.getLangOpts();
++  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());
++  StringRef ExprText = Lexer::getSourceText(Range, SM, LangOpts);
++
++  return ExprText.contains(Name);
++}
++
+ // ---------------- Helper Implementations ----------------
+
+ static bool isNullLikeExpr(const Expr *E, CheckerContext &C) {
+   if (!E) return false;
+   E = E->IgnoreParenImpCasts();
+-  // Check for null pointer constant per AST utilities
+   if (E->isNullPointerConstant(C.getASTContext(), Expr::NPC_ValueDependentIsNull))
+     return true;
+
+-  // Also try constant-evaluated integer 0
+   llvm::APSInt Val;
+   if (EvaluateExprToInt(Val, E, C)) {
+     if (Val == 0)
+@@ -92,17 +183,17 @@   return MR->getBaseRegion();
+ }
+
+-const MemRegion* SAGenTestChecker::extractNullCheckedPointer(const Expr *Cond, CheckerContext &C) const {
++// Only extract pointers that are checked to be NULL (negative check), not positive checks like "if (ptr)".
++const MemRegion* SAGenTestChecker::extractNegatedNullCheckedPointer(const Expr *Cond, CheckerContext &C) const {
+   if (!Cond) return nullptr;
+   const Expr *E = Cond->IgnoreParenImpCasts();
+
+   if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+     BinaryOperator::Opcode Op = BO->getOpcode();
+     if (Op == BO_LOr || Op == BO_LAnd) {
+-      // Recurse into both sides, prefer LHS first
+-      if (const MemRegion *R = extractNullCheckedPointer(BO->getLHS(), C))
++      if (const MemRegion *R = extractNegatedNullCheckedPointer(BO->getLHS(), C))
+         return R;
+-      return extractNullCheckedPointer(BO->getRHS(), C);
++      return extractNegatedNullCheckedPointer(BO->getRHS(), C);
+     }
+
+     if (Op == BO_EQ || Op == BO_NE) {
+@@ -112,18 +203,14 @@       bool LHSNull = isNullLikeExpr(LHS, C);
+       bool RHSNull = isNullLikeExpr(RHS, C);
+
+-      // Look for (ptr == NULL) or (ptr != NULL)
+-      if (LHSNull && !RHSNull) {
+-        // RHS should be pointer DeclRefExpr
+-        if (RHS->getType()->isAnyPointerType()) {
+-          if (isa<DeclRefExpr>(RHS))
+-            return getBaseRegionFromExpr(RHS, C);
+-        }
+-      } else if (RHSNull && !LHSNull) {
+-        if (LHS->getType()->isAnyPointerType()) {
+-          if (isa<DeclRefExpr>(LHS))
+-            return getBaseRegionFromExpr(LHS, C);
+-        }
++      // Look for (ptr == NULL) or (ptr != NULL) etc.
++      // We treat both == and != because the full condition may wrap it in a negation or combine with others.
++      if (LHSNull && !RHSNull && RHS->getType()->isAnyPointerType()) {
++        if (isa<DeclRefExpr>(RHS))
++          return getBaseRegionFromExpr(RHS, C);
++      } else if (RHSNull && !LHSNull && LHS->getType()->isAnyPointerType()) {
++        if (isa<DeclRefExpr>(LHS))
++          return getBaseRegionFromExpr(LHS, C);
+       }
+     }
+   } else if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+@@ -133,12 +220,8 @@         return getBaseRegionFromExpr(Sub, C);
+       }
+     }
+-  } else if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+-    // In conditions like "if (ptr)" treat it as a null-check too.
+-    if (DRE->getType()->isAnyPointerType())
+-      return getBaseRegionFromExpr(DRE, C);
+-  }
+-
++  }
++  // Do NOT consider bare "if (ptr)" as a null-check to avoid false positives.
+   return nullptr;
+ }
+
+@@ -153,11 +236,50 @@   return false;
+ }
+
++static bool isLoggingLikeName(StringRef S) {
++  // Heuristic set of kernel-style logging/debug helpers.
++  return S.startswith("pr_") ||
++         S.startswith("dev_") ||
++         S.equals("printk") ||
++         S.endswith("_dbg") ||
++         S.startswith("WARN") ||  // WARN, WARN_ON, WARN_ON_ONCE
++         S.startswith("pr_warn") ||
++         S.startswith("pr_err") ||
++         S.startswith("pr_info") ||
++         S.startswith("pr_notice");
++}
++
++bool SAGenTestChecker::thenContainsLoggingCall(const Stmt *Then, CheckerContext &C) const {
++  if (!Then) return false;
++
++  // Walk children to find any call expression with a logging-like name
++  struct Finder : public RecursiveASTVisitor<Finder> {
++    CheckerContext &Ctx;
++    bool Found = false;
++    Finder(CheckerContext &C) : Ctx(C) {}
++    bool VisitCallExpr(const CallExpr *CE) {
++      if (Found) return true;
++      // Try callee identifier first
++      if (const FunctionDecl *FD = CE->getDirectCallee()) {
++        if (isLoggingLikeName(FD->getName()))
++          { Found = true; return true; }
++      }
++      // Also try textual match to support macros
++      if (ExprHasName(CE, "pr_", Ctx) || ExprHasName(CE, "dev_", Ctx) ||
++          ExprHasName(CE, "printk", Ctx) || ExprHasName(CE, "_dbg", Ctx) ||
++          ExprHasName(CE, "WARN", Ctx))
++        { Found = true; return true; }
++      return true;
++    }
++  } V(C);
++  V.TraverseStmt(const_cast<Stmt*>(Then));
++  return V.Found;
++}
++
+ bool SAGenTestChecker::isLockAcquire(const CallEvent &Call, CheckerContext &C) const {
+   const Expr *OE = Call.getOriginExpr();
+   if (!OE) return false;
+
+-  // Common Linux locking APIs
+   static const char *LockNames[] = {
+     "spin_lock", "spin_lock_irq", "spin_lock_irqsave", "spin_lock_bh",
+     "mutex_lock", "rt_mutex_lock", "raw_spin_lock"
+@@ -191,6 +313,14 @@                                             const MemRegion *&TrackedPtrOut) const {
+   TrackedPtrOut = nullptr;
+   if (!S) return false;
++
++  auto isTracked = [&](const MemRegion *MR) -> bool {
++    if (!MR) return false;
++    auto Set = State->get<SuspiciousAfterLockSet>();
++    for (auto I = Set.begin(), E = Set.end(); I != E; ++I)
++      if (*I == MR) return true;
++    return false;
++  };
+
+   // Look for "ptr->field"
+   if (const auto *ME = findSpecificTypeInChildren<MemberExpr>(S)) {
+@@ -198,14 +328,9 @@       const Expr *Base = ME->getBase();
+       if (const auto *DRE = dyn_cast<DeclRefExpr>(Base->IgnoreParenImpCasts())) {
+         const MemRegion *MR = getBaseRegionFromExpr(DRE, C);
+-        if (MR) {
+-          auto Set = State->get<SuspiciousAfterLockSet>();
+-          for (auto I = Set.begin(), E = Set.end(); I != E; ++I) {
+-            if (*I == MR) {
+-              TrackedPtrOut = MR;
+-              return true;
+-            }
+-          }
++        if (isTracked(MR)) {
++          TrackedPtrOut = MR;
++          return true;
+         }
+       }
+     }
+@@ -217,14 +342,9 @@       const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
+       if (const auto *DRE = dyn_cast<DeclRefExpr>(Sub)) {
+         const MemRegion *MR = getBaseRegionFromExpr(DRE, C);
+-        if (MR) {
+-          auto Set = State->get<SuspiciousAfterLockSet>();
+-          for (auto I = Set.begin(), E = Set.end(); I != E; ++I) {
+-            if (*I == MR) {
+-              TrackedPtrOut = MR;
+-              return true;
+-            }
+-          }
++        if (isTracked(MR)) {
++          TrackedPtrOut = MR;
++          return true;
+         }
+       }
+     }
+@@ -235,14 +355,9 @@     const Expr *Base = ASE->getBase()->IgnoreParenImpCasts();
+     if (const auto *DRE = dyn_cast<DeclRefExpr>(Base)) {
+       const MemRegion *MR = getBaseRegionFromExpr(DRE, C);
+-      if (MR) {
+-        auto Set = State->get<SuspiciousAfterLockSet>();
+-        for (auto I = Set.begin(), E = Set.end(); I != E; ++I) {
+-          if (*I == MR) {
+-            TrackedPtrOut = MR;
+-            return true;
+-          }
+-        }
++      if (isTracked(MR)) {
++        TrackedPtrOut = MR;
++        return true;
+       }
+     }
+   }
+@@ -277,22 +392,50 @@     return;
+
+   const Stmt *Then = IS->getThen();
+-  // Identify the pointer that is being null-checked in the condition
+-  const MemRegion *R = extractNullCheckedPointer(Cond, C);
++
++  // Identify the pointer that is being negatively null-checked in the condition
++  const MemRegion *R = extractNegatedNullCheckedPointer(Cond, C);
+   if (!R)
+     return;
+
+-  // If then-branch contains early exit, it's OK (no log-and-continue)
+-  if (thenHasEarlyExit(Then, C))
+-    return;
+-
+   ProgramStateRef State = C.getState();
+   int Depth = State->get<LockDepth>();
+-  // We only care if the validation is happening outside the lock
+-  if (Depth > 0)
+-    return;
+-
+-  // Mark this pointer as suspicious: invalid-checked, no abort, and not under lock.
++
++  // If inside a lock and the then-branch early-exits, clear any after-lock suspicion on this pointer.
++  if (Depth > 0) {
++    if (thenHasEarlyExit(Then, C)) {
++      // Validation inside lock with early exit => safe; clear if present.
++      auto After = State->get<SuspiciousAfterLockSet>();
++      for (auto I = After.begin(), E = After.end(); I != E; ++I) {
++        if (*I == R) {
++          State = State->remove<SuspiciousAfterLockSet>(R);
++          break;
++        }
++      }
++      C.addTransition(State);
++    }
++    return;
++  }
++
++  // Outside lock:
++  // If then-branch contains early exit, it's OK (no log-and-continue) -> also clear any stale pre-lock suspect.
++  if (thenHasEarlyExit(Then, C)) {
++    auto NoLock = State->get<SuspiciousNoLockSet>();
++    for (auto I = NoLock.begin(), E = NoLock.end(); I != E; ++I) {
++      if (*I == R) {
++        State = State->remove<SuspiciousNoLockSet>(R);
++        C.addTransition(State);
++        break;
++      }
++    }
++    return;
++  }
++
++  // Require logging in the then-branch to match the intended pattern.
++  if (!thenContainsLoggingCall(Then, C))
++    return;
++
++  // Mark this pointer as suspicious: invalid-checked, logged, no abort, and not under lock.
+   State = State->add<SuspiciousNoLockSet>(R);
+   C.addTransition(State);
+ }
+@@ -325,6 +468,16 @@       State = State->set<LockDepth>(Depth - 1);
+     else
+       State = State->set<LockDepth>(0);
++
++    // If we fully released all locks, clear the after-lock set to avoid stale reports.
++    int NewDepth = State->get<LockDepth>();
++    if (NewDepth == 0) {
++      auto After = State->get<SuspiciousAfterLockSet>();
++      for (auto I = After.begin(), E = After.end(); I != E; ++I) {
++        State = State->remove<SuspiciousAfterLockSet>(*I);
++      }
++    }
++
+     C.addTransition(State);
+     return;
+   }
+@@ -338,6 +491,10 @@     return;
+
+   ProgramStateRef State = C.getState();
++  int Depth = State->get<LockDepth>();
++  if (Depth <= 0)
++    return; // only report while under lock
++
+   for (unsigned Idx : DerefParams) {
+     if (Idx >= Call.getNumArgs())
+       continue;
+@@ -353,7 +510,6 @@     if (!MR)
+       continue;
+
+-    // Is this pointer in the "after-lock" suspicious set?
+     auto After = State->get<SuspiciousAfterLockSet>();
+     bool Found = false;
+     for (auto I = After.begin(), E = After.end(); I != E; ++I) {
+@@ -365,16 +521,17 @@       // Remove to avoid duplicate reports.
+       State = State->remove<SuspiciousAfterLockSet>(MR);
+       C.addTransition(State);
+-      // do not return early; check other params as well
++      // proceed to check other params as well
+     }
+   }
+ }
+
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+-
+-  // Heuristic: for members like ir->intr_num or deref *ir or arr like ir[idx],
+-  // extract the base DeclRefExpr and see if it matches our tracked pointer.
++  int Depth = State->get<LockDepth>();
++  if (Depth <= 0)
++    return; // We only care about deref under lock
++
+   const MemRegion *TrackedR = nullptr;
+   if (stmtDerefsTrackedPtr(S, C, State, TrackedR) && TrackedR) {
+     reportDerefBug(S, TrackedR, C);
+@@ -384,11 +541,18 @@ }
+
+ void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+-  // Best-effort cleanup of lock depth; sets will be discarded with state anyway.
++  // Cleanup lock depth and tracked sets at function end.
+   ProgramStateRef State = C.getState();
+   State = State->set<LockDepth>(0);
+
+-  // We don't strictly need to clear the sets; analysis state ends at function end.
++  auto After = State->get<SuspiciousAfterLockSet>();
++  for (auto I = After.begin(), E = After.end(); I != E; ++I)
++    State = State->remove<SuspiciousAfterLockSet>(*I);
++
++  auto NoLock = State->get<SuspiciousNoLockSet>();
++  for (auto I = NoLock.begin(), E = NoLock.end(); I != E; ++I)
++    State = State->remove<SuspiciousNoLockSet>(*I);
++
+   C.addTransition(State);
+ }

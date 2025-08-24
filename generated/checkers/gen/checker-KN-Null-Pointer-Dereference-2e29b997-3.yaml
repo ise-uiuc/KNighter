@@ -1,0 +1,442 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 2e29b9971ac54dec88baa58856a230ec2f2a2dff
+commit_type: Null-Pointer-Dereference
+index: 3
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/StmtVisitor.h\"\n#include \"clang/AST/ParentMapContext.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Program state traits to track the most recent allocation\
+  \ and its context\nREGISTER_TRAIT_WITH_PROGRAMSTATE(LastAllocRegion, const MemRegion\
+  \ *)\nREGISTER_TRAIT_WITH_PROGRAMSTATE(LastAllocBlock, const Stmt *)\nREGISTER_TRAIT_WITH_PROGRAMSTATE(LastAllocExpr,\
+  \ const Expr *)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<\n\
+  \        check::BeginFunction,\n        check::PostCall,\n        check::BranchCondition>\
+  \ {\n\n  mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \      : BT(new BugType(this,\n                       \"Mismatched NULL check after\
+  \ allocation\",\n                       \"API Misuse\")) {}\n\n  void checkBeginFunction(CheckerContext\
+  \ &C) const;\n  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\n\
+  private:\n  // Helpers\n  static bool isAllocCall(const CallEvent &Call, CheckerContext\
+  \ &C);\n\n  // Try to obtain the lvalue region assigned by the allocation call,\
+  \ and the LHS Expr\n  static const MemRegion *getAssignedRegionOfCall(const CallEvent\
+  \ &Call,\n                                                  const Expr *&OutLHSExpr,\n\
+  \                                                  CheckerContext &C);\n\n  static\
+  \ const CompoundStmt *getEnclosingBlock(const Stmt *S, CheckerContext &C);\n\n \
+  \ static bool isNullLiteralExpr(const Expr *E, CheckerContext &C);\n\n  // Identify\
+  \ negative NULL checks, extracting the pointer expression being checked.\n  // Returns\
+  \ true for \"!ptr\" or \"ptr == NULL\". Sets PtrExpr to the pointer operand.\n \
+  \ static bool isNegativeNullCheck(const Stmt *Cond, const Expr *&PtrExpr,\n    \
+  \                              CheckerContext &C);\n\n  // Check if the 'then' branch\
+  \ of the IfStmt returns -ENOMEM\n  static bool thenBranchReturnsENOMEM(const IfStmt\
+  \ *IS, CheckerContext &C);\n\n  static StringRef getExprText(const Expr *E, CheckerContext\
+  \ &C);\n\n  static ProgramStateRef clearLastAlloc(ProgramStateRef State) {\n   \
+  \ State = State->remove<LastAllocRegion>();\n    State = State->remove<LastAllocBlock>();\n\
+  \    State = State->remove<LastAllocExpr>();\n    return State;\n  }\n};\n\n// ---------------------\
+  \ Helper Implementations ---------------------\n\nbool SAGenTestChecker::isAllocCall(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E)\n    return false;\n\n  // Use source-text name matching for robustness\n\
+  \  static const char *AllocNames[] = {\n      \"kzalloc\", \"kmalloc\", \"kcalloc\"\
+  , \"kvzalloc\", \"kvmalloc\",\n      \"kzalloc_node\", \"kmalloc_node\", \"krealloc\"\
+  , \"kmemdup\",\n      \"devm_kzalloc\", \"devm_kmalloc\"\n  };\n\n  for (const char\
+  \ *Name : AllocNames) {\n    if (ExprHasName(E, Name, C))\n      return true;\n\
+  \  }\n  return false;\n}\n\nconst MemRegion *SAGENTestChecker_getMemRegionFromVarDecl(const\
+  \ VarDecl *VD,\n                                                          CheckerContext\
+  \ &C) {\n  if (!VD)\n    return nullptr;\n  SVal LVal = C.getSValBuilder().getLValue(VD,\
+  \ C.getLocationContext());\n  if (const MemRegion *MR = LVal.getAsRegion())\n  \
+  \  return MR;\n  return nullptr;\n}\n\nconst MemRegion *SAGENTestChecker_getRegionFromLHSExpr(const\
+  \ Expr *LHS,\n                                                       CheckerContext\
+  \ &C) {\n  if (!LHS)\n    return nullptr;\n  // Do not strip implicit casts before\
+  \ querying region as per guidance\n  const MemRegion *MR = getMemRegionFromExpr(LHS,\
+  \ C);\n  return MR;\n}\n\nconst MemRegion *SAGENTestChecker_getVarRegionFromDeclStmtInit(const\
+  \ DeclStmt *DS,\n                                                              \
+  \ const CallExpr *CE,\n                                                        \
+  \       const Expr *&OutLHSExpr,\n                                             \
+  \                  CheckerContext &C) {\n  if (!DS || !CE)\n    return nullptr;\n\
+  \  for (const Decl *D : DS->decls()) {\n    const auto *VD = dyn_cast<VarDecl>(D);\n\
+  \    if (!VD || !VD->hasInit())\n      continue;\n    const Expr *Init = VD->getInit();\n\
+  \    if (!Init)\n      continue;\n\n    // Search children of Init for the CallExpr\
+  \ 'CE'\n    const CallExpr *FoundCE = findSpecificTypeInChildren<CallExpr>(Init);\n\
+  \    if (FoundCE == CE) {\n      // We matched a declaration like: T var = alloc(...);\n\
+  \      const MemRegion *MR = SAGENTestChecker_getMemRegionFromVarDecl(VD, C);\n\
+  \      // For message readability, try to produce a declref text \"var\"\n     \
+  \ OutLHSExpr = Init; // We will fallback to variable name if needed\n      return\
+  \ MR;\n    }\n  }\n  return nullptr;\n}\n\nconst MemRegion *SAGenTestChecker::getAssignedRegionOfCall(const\
+  \ CallEvent &Call,\n                                                           const\
+  \ Expr *&OutLHSExpr,\n                                                         \
+  \  CheckerContext &C) {\n  OutLHSExpr = nullptr;\n  const CallExpr *CE = dyn_cast_or_null<CallExpr>(Call.getOriginExpr());\n\
+  \  if (!CE)\n    return nullptr;\n\n  // Case 1: Parent is a BinaryOperator assignment:\
+  \ LHS = call(...)\n  if (const auto *BO = findSpecificTypeInParents<BinaryOperator>(CE,\
+  \ C)) {\n    if (BO->getOpcode() == BO_Assign) {\n      const Expr *LHS = BO->getLHS();\n\
+  \      OutLHSExpr = LHS;\n      const MemRegion *MR = SAGENTestChecker_getRegionFromLHSExpr(LHS,\
+  \ C);\n      return MR;\n    }\n  }\n\n  // Case 2: Parent is a DeclStmt with initializer:\
+  \ T var = call(...);\n  if (const auto *DS = findSpecificTypeInParents<DeclStmt>(CE,\
+  \ C)) {\n    const MemRegion *MR = SAGENTestChecker_getVarRegionFromDeclStmtInit(DS,\
+  \ CE, OutLHSExpr, C);\n    if (MR)\n      return MR;\n  }\n\n  return nullptr;\n\
+  }\n\nconst CompoundStmt *SAGenTestChecker_getEnclosingBlockImpl(const Stmt *S, CheckerContext\
+  \ &C) {\n  return findSpecificTypeInParents<CompoundStmt>(S, C);\n}\n\nconst CompoundStmt\
+  \ *SAGenTestChecker::getEnclosingBlock(const Stmt *S, CheckerContext &C) {\n  return\
+  \ SAGENTestChecker_getEnclosingBlockImpl(S, C);\n}\n\nbool SAGenTestChecker::isNullLiteralExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return false;\n  const Expr *IE\
+  \ = E->IgnoreParenImpCasts();\n  // Use Clang's null-pointer constant check\n  if\
+  \ (IE->isNullPointerConstant(C.getASTContext(),\n                              \
+  \  Expr::NPC_ValueDependentIsNull))\n    return true;\n\n  // Fallbacks: check textual\
+  \ \"NULL\"\n  if (ExprHasName(IE, \"NULL\", C))\n    return true;\n\n  // Integer\
+  \ literal 0\n  if (const auto *IL = dyn_cast<IntegerLiteral>(IE)) {\n    if (IL->getValue()\
+  \ == 0)\n      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isNegativeNullCheck(const\
+  \ Stmt *Cond,\n                                           const Expr *&PtrExpr,\n\
+  \                                           CheckerContext &C) {\n  PtrExpr = nullptr;\n\
+  \  const Expr *E = dyn_cast_or_null<Expr>(Cond);\n  if (!E)\n    return false;\n\
+  \n  E = E->IgnoreParenImpCasts();\n\n  // if (!ptr)\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      PtrExpr = UO->getSubExpr()->IgnoreParenImpCasts();\n\
+  \      return true;\n    }\n  }\n\n  // if (ptr == NULL)\n  if (const auto *BO =\
+  \ dyn_cast<BinaryOperator>(E)) {\n    if (BO->getOpcode() == BO_EQ) {\n      const\
+  \ Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n      const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \      if (isNullLiteralExpr(L, C) && !isNullLiteralExpr(R, C)) {\n        PtrExpr\
+  \ = R;\n        return true;\n      }\n      if (isNullLiteralExpr(R, C) && !isNullLiteralExpr(L,\
+  \ C)) {\n        PtrExpr = L;\n        return true;\n      }\n    }\n  }\n\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::thenBranchReturnsENOMEM(const IfStmt *IS,\
+  \ CheckerContext &C) {\n  if (!IS)\n    return false;\n  const Stmt *Then = IS->getThen();\n\
+  \  if (!Then)\n    return false;\n\n  const ReturnStmt *RS = findSpecificTypeInChildren<ReturnStmt>(Then);\n\
+  \  if (!RS)\n    return false;\n  const Expr *RetE = RS->getRetValue();\n  if (!RetE)\n\
+  \    return false;\n\n  // Look for \"ENOMEM\" in the return expression (covers\
+  \ -ENOMEM as well)\n  return ExprHasName(RetE, \"ENOMEM\", C);\n}\n\nStringRef SAGenTestChecker::getExprText(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return StringRef();\n  const SourceManager\
+  \ &SM = C.getSourceManager();\n  const LangOptions &LO = C.getLangOpts();\n  CharSourceRange\
+  \ R = CharSourceRange::getTokenRange(E->getSourceRange());\n  return Lexer::getSourceText(R,\
+  \ SM, LO);\n}\n\n// --------------------- Checker Callbacks ---------------------\n\
+  \nvoid SAGenTestChecker::checkBeginFunction(CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  State = clearLastAlloc(State);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (!isAllocCall(Call, C))\n    return;\n\n  const Expr *LHSExpr\
+  \ = nullptr;\n  const MemRegion *AssignedReg = getAssignedRegionOfCall(Call, LHSExpr,\
+  \ C);\n  if (!AssignedReg)\n    return;\n\n  const CallExpr *CE = dyn_cast_or_null<CallExpr>(Call.getOriginExpr());\n\
+  \  if (!CE)\n    return;\n\n  const CompoundStmt *Block = getEnclosingBlock(CE,\
+  \ C);\n  if (!Block)\n    return;\n\n  ProgramStateRef State = C.getState();\n \
+  \ // Record the exact region of the assigned lvalue (field/var), and its context\n\
+  \  State = State->set<LastAllocRegion>(AssignedReg);\n  State = State->set<LastAllocBlock>(Block);\n\
+  \  State = State->set<LastAllocExpr>(LHSExpr);\n  C.addTransition(State);\n}\n\n\
+  void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *AllocReg\
+  \ = State->get<LastAllocRegion>();\n  const Stmt *AllocBlk = State->get<LastAllocBlock>();\n\
+  \  const Expr *AllocLHS = State->get<LastAllocExpr>();\n\n  if (!AllocReg || !AllocBlk)\
+  \ {\n    // Nothing tracked; continue path\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  const IfStmt *IS = findSpecificTypeInParents<IfStmt>(Condition, C);\n\
+  \  if (!IS) {\n    // Not an if condition we care about\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Ensure proximity: same enclosing compound statement\n\
+  \  const CompoundStmt *CB = getEnclosingBlock(IS, C);\n  if (CB != AllocBlk) {\n\
+  \    State = clearLastAlloc(State);\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  // Must be a negative NULL check leading to error/ENOMEM\n  const Expr\
+  \ *CheckedPtr = nullptr;\n  if (!isNegativeNullCheck(Condition, CheckedPtr, C) ||\n\
+  \      !thenBranchReturnsENOMEM(IS, C)) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  // Determine the region of the checked pointer (keep the precise region\
+  \ for field distinction)\n  const MemRegion *CheckedReg = getMemRegionFromExpr(CheckedPtr,\
+  \ C);\n  if (!CheckedReg) {\n    C.addTransition(State);\n    return;\n  }\n\n \
+  \ // If they checked the same lvalue that received allocation, it's fine; clear\
+  \ and continue.\n  if (CheckedReg == AllocReg) {\n    State = clearLastAlloc(State);\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  // Mismatch: allocated one pointer\
+  \ but checked a different one for NULL.\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) {\n    // Still clear to avoid duplicate later\n    State = clearLastAlloc(State);\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  StringRef AllocText = getExprText(AllocLHS,\
+  \ C);\n  StringRef CheckText = getExprText(CheckedPtr, C);\n\n  SmallString<256>\
+  \ Msg;\n  if (!AllocText.empty() && !CheckText.empty()) {\n    Msg = \"Allocated\
+  \ '\";\n    Msg += AllocText;\n    Msg += \"' but checked '\";\n    Msg += CheckText;\n\
+  \    Msg += \"' for NULL\";\n  } else {\n    Msg = \"Allocated one pointer but checked\
+  \ a different pointer for NULL\";\n  }\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  R->addRange(Condition->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  \n  // Clear tracking to avoid duplicate reports\n  State = clearLastAlloc(State);\n\
+  \  C.addTransition(State);\n}\n\n} // end anonymous namespace\n\nextern \"C\" void\
+  \ clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects checking a different pointer\
+  \ for NULL right after allocation\",\n      \"\");\n}\n\nextern \"C\" const char\
+  \ clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\narm64/sme: Fix NULL check after kzalloc\n\nFix following\
+  \ coccicheck error:\n./arch/arm64/kernel/process.c:322:2-23: alloc with no test,\
+  \ possible model on line 326\n\nHere should be dst->thread.sve_state.\n\nFixes:\
+  \ 8bd7f91c03d8 (\"arm64/sme: Implement traps and syscall handling for SME\")\nSigned-off-by:\
+  \ Wan Jiabing <wanjiabing@vivo.com>\nReviwed-by: Mark Brown <broonie@kernel.org>\n\
+  Link: https://lore.kernel.org/r/20220426113054.630983-1-wanjiabing@vivo.com\nSigned-off-by:\
+  \ Catalin Marinas <catalin.marinas@arm.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ arch_dup_task_struct in arch/arm64/kernel/process.c\nint arch_dup_task_struct(struct\
+  \ task_struct *dst, struct task_struct *src)\n{\n\tif (current->mm)\n\t\tfpsimd_preserve_current_state();\n\
+  \t*dst = *src;\n\n\t/* We rely on the above assignment to initialize dst's thread_flags:\
+  \ */\n\tBUILD_BUG_ON(!IS_ENABLED(CONFIG_THREAD_INFO_IN_TASK));\n\n\t/*\n\t * Detach\
+  \ src's sve_state (if any) from dst so that it does not\n\t * get erroneously used\
+  \ or freed prematurely.  dst's copies\n\t * will be allocated on demand later on\
+  \ if dst uses SVE.\n\t * For consistency, also clear TIF_SVE here: this could be\
+  \ done\n\t * later in copy_process(), but to avoid tripping up future\n\t * maintainers\
+  \ it is best not to leave TIF flags and buffers in\n\t * an inconsistent state,\
+  \ even temporarily.\n\t */\n\tdst->thread.sve_state = NULL;\n\tclear_tsk_thread_flag(dst,\
+  \ TIF_SVE);\n\n\t/*\n\t * In the unlikely event that we create a new thread with\
+  \ ZA\n\t * enabled we should retain the ZA state so duplicate it here.\n\t * This\
+  \ may be shortly freed if we exec() or if CLONE_SETTLS\n\t * but it's simpler to\
+  \ do it here. To avoid confusing the rest\n\t * of the code ensure that we have\
+  \ a sve_state allocated\n\t * whenever za_state is allocated.\n\t */\n\tif (thread_za_enabled(&src->thread))\
+  \ {\n\t\tdst->thread.sve_state = kzalloc(sve_state_size(src),\n\t\t\t\t\t\tGFP_KERNEL);\n\
+  \t\tif (!dst->thread.za_state)\n\t\t\treturn -ENOMEM;\n\t\tdst->thread.za_state\
+  \ = kmemdup(src->thread.za_state,\n\t\t\t\t\t       za_state_size(src),\n\t\t\t\t\
+  \t       GFP_KERNEL);\n\t\tif (!dst->thread.za_state) {\n\t\t\tkfree(dst->thread.sve_state);\n\
+  \t\t\tdst->thread.sve_state = NULL;\n\t\t\treturn -ENOMEM;\n\t\t}\n\t} else {\n\t\
+  \tdst->thread.za_state = NULL;\n\t\tclear_tsk_thread_flag(dst, TIF_SME);\n\t}\n\n\
+  \t/* clear any pending asynchronous tag fault raised by the parent */\n\tclear_tsk_thread_flag(dst,\
+  \ TIF_MTE_ASYNC_FAULT);\n\n\treturn 0;\n}\n```\n\n## Bug Fix Patch\n\n```diff\n\
+  diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c\nindex 99c293513817..9734c9fb1a32\
+  \ 100644\n--- a/arch/arm64/kernel/process.c\n+++ b/arch/arm64/kernel/process.c\n\
+  @@ -321,7 +321,7 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct\
+  \ *src)\n \tif (thread_za_enabled(&src->thread)) {\n \t\tdst->thread.sve_state =\
+  \ kzalloc(sve_state_size(src),\n \t\t\t\t\t\tGFP_KERNEL);\n-\t\tif (!dst->thread.za_state)\n\
+  +\t\tif (!dst->thread.sve_state)\n \t\t\treturn -ENOMEM;\n \t\tdst->thread.za_state\
+  \ = kmemdup(src->thread.za_state,\n \t\t\t\t\t       za_state_size(src),\n```\n"
+pattern: "## Bug Pattern\n\nAllocating one pointer but checking a different pointer\
+  \ for NULL.\n\nExample pattern:\nptrA = kzalloc(size, GFP_KERNEL);\nif (!ptrB)\n\
+  \    return -ENOMEM;\n\nHere, the allocation result (ptrA) is not validated, while\
+  \ an unrelated pointer (ptrB) is checked. This misses allocation failures of ptrA,\
+  \ violating invariants and risking later NULL dereference or inconsistent state."
+plan: "```\nGoal\nDetect the pattern \u201Callocate pointer A but immediately check\
+  \ pointer B for NULL,\u201D e.g.:\n  A = kzalloc(...);\n  if (!B)\n    return -ENOMEM;\n\
+  The fix should be to check A rather than B.\n\n1) Program state customization\n\
+  - Keep the checker simple and precise around the immediate post-allocation NULL-check:\n\
+  \  - REGISTER_TRAIT_WITH_PROGRAMSTATE(LastAllocRegion, const MemRegion *)\n    -\
+  \ The lvalue region receiving the result of the last allocation call.\n  - REGISTER_TRAIT_WITH_PROGRAMSTATE(LastAllocBlock,\
+  \ const Stmt *)\n    - The nearest parent CompoundStmt (lexical block) containing\
+  \ the allocation. Used to ensure proximity.\n  - REGISTER_TRAIT_WITH_PROGRAMSTATE(LastAllocExpr,\
+  \ const Expr *)\n    - The LHS expression used at the allocation assignment (for\
+  \ printing a useful name in the report).\n\nNo alias map is used to keep the checker\
+  \ simple. (It can be extended later if needed.)\n\n2) Helper utilities (internal\
+  \ to the checker)\n- bool isAllocCall(const CallEvent &Call)\n  - Returns true for\
+  \ common kernel allocators whose return can be NULL:\n    - \"kzalloc\", \"kmalloc\"\
+  , \"kcalloc\", \"kvzalloc\", \"kvmalloc\", \"kzalloc_node\",\n      \"kmalloc_node\"\
+  , \"krealloc\", \"kmemdup\", \"devm_kzalloc\", \"devm_kmalloc\"\n    - Extendable\
+  \ by name if needed.\n- const MemRegion *getAssignedRegionOfCall(const CallEvent\
+  \ &Call, CheckerContext &C)\n  - For Call.getOriginExpr() (CallExpr CE):\n    -\
+  \ Try parent BinaryOperator (findSpecificTypeInParents<BinaryOperator>(CE, C)):\n\
+  \      - If BO_Assign, return getMemRegionFromExpr(BO->getLHS(), C).\n    - Else\
+  \ try parent DeclStmt (findSpecificTypeInParents<DeclStmt>(CE, C)):\n      - For\
+  \ a single VarDecl with an initializer containing CE, return the MemRegion of that\
+  \ variable (getMemRegionFromExpr on its DeclRefExpr).\n    - Else return nullptr\
+  \ (no direct assignment; ignore).\n- const CompoundStmt *getEnclosingBlock(const\
+  \ Stmt *S, CheckerContext &C)\n  - Use findSpecificTypeInParents<CompoundStmt>(S,\
+  \ C).\n- bool isNullLiteralExpr(const Expr *E, CheckerContext &C)\n  - After IgnoreParenImpCasts:\n\
+  \    - Return true if E is: GNUNullExpr, CXXNullPtrLiteralExpr, or IntegerLiteral(0)\
+  \ or contains \"NULL\" via ExprHasName(E, \"NULL\", C).\n- bool isNegativeNullCheck(const\
+  \ Stmt *Cond, const Expr *&PtrExpr, CheckerContext &C)\n  - Extract the pointer\
+  \ expression being checked for NULL:\n    - If UnaryOperator with UO_LNot: PtrExpr\
+  \ = subexpr; return true.\n    - If BinaryOperator with BO_EQ and one side is null-literal:\
+  \ PtrExpr = other side; return true.\n    - If plain pointer (if (ptr)) or BO_NE:\
+  \ return false (not a failure-path NULL check).\n- bool thenBranchReturnsENOMEM(const\
+  \ IfStmt *IS, CheckerContext &C)\n  - From IS->getThen(), findSpecificTypeInChildren<ReturnStmt>.\n\
+  \  - If found and return expression contains \"ENOMEM\" (ExprHasName(retExpr, \"\
+  ENOMEM\", C)), return true; else false.\n- StringRef getExprText(const Expr *E,\
+  \ CheckerContext &C)\n  - Use SourceManager+Lexer similarly to ExprHasName to extract\
+  \ source text for messages.\n\n3) Callback selection and detailed behavior\n- checkBeginFunction(CheckerContext\
+  \ &C)\n  - Clear LastAllocRegion/LastAllocBlock/LastAllocExpr at function entry.\n\
+  \n- checkPostCall(const CallEvent &Call, CheckerContext &C)\n  - If !isAllocCall(Call),\
+  \ return.\n  - Find the assigned region: R = getAssignedRegionOfCall(Call, C).\n\
+  \    - If R is nullptr, ignore (allocation result not stored to an lvalue).\n  -\
+  \ Compute the enclosing block of CE: B = getEnclosingBlock(Call.getOriginExpr(),\
+  \ C).\n  - Record in state:\n    - LastAllocRegion = R\n    - LastAllocBlock = B\n\
+  \    - LastAllocExpr = the LHS Expr of the assignment (BO->getLHS() or the VarDecl\u2019\
+  s DeclRefExpr).\n  - Overwrite any previous recorded allocation (we only care about\
+  \ the most recent allocation).\n\n- checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C)\n  - Retrieve LastAllocRegion (AR), LastAllocBlock (AB), LastAllocExpr\
+  \ (AE). If any is null, return.\n  - Find the IfStmt owning this condition:\n  \
+  \  - const IfStmt *IS = findSpecificTypeInParents<IfStmt>(Condition, C). If null,\
+  \ return.\n  - Ensure proximity: Let CB = getEnclosingBlock(IS, C). If CB != AB:\n\
+  \    - Not in the same lexical block anymore; clear LastAllocRegion/LastAllocBlock/LastAllocExpr\
+  \ and return, to avoid stale state.\n  - Extract the pointer expr checked for NULL:\n\
+  \    - const Expr *CheckedPtr = nullptr;\n    - If !isNegativeNullCheck(Condition,\
+  \ CheckedPtr, C), return (we only match the failure-path NULL check).\n  - Additional\
+  \ filter for precision:\n    - If !thenBranchReturnsENOMEM(IS, C), return (we focus\
+  \ on the pattern \u201Cif (!ptr) return -ENOMEM;\u201D).\n  - Compute the region\
+  \ of the checked pointer: const MemRegion *CR = getMemRegionFromExpr(CheckedPtr,\
+  \ C).\n    - If CR == nullptr, return.\n    - If CR == AR:\n      - This is a correct\
+  \ NULL check for the recent allocation. Clear LastAllocRegion/LastAllocBlock/LastAllocExpr\
+  \ and return.\n    - Else:\n      - This matches the target bug pattern:\n     \
+  \   - An allocation stored into AR was followed by a failure-path NULL check on\
+  \ a different pointer CR.\n      - Report:\n        - Generate a non-fatal error\
+  \ node.\n        - Build a short message, preferably including both expressions\u2019\
+  \ texts:\n          - Allocated pointer not NULL-checked; different pointer checked\
+  \ after allocation\n          - or \"Allocated '<AE text>' but checked '<CheckedPtr\
+  \ text>' for NULL\"\n        - Create PathSensitiveBugReport and emit.\n      -\
+  \ Clear LastAllocRegion/LastAllocBlock/LastAllocExpr to avoid duplicate reports.\n\
+  \n- Optional cleanup:\n  - On any subsequent allocation (handled in checkPostCall),\
+  \ the recorded state will be overwritten.\n  - No need for checkEndFunction.\n\n\
+  4) Notes on false positives and scope control\n- Proximity is controlled by requiring:\n\
+  \  - The check happens in the same CompoundStmt as the allocation.\n  - The check\
+  \ is a negative NULL check and the then-branch returns ENOMEM.\n- This mirrors the\
+  \ kernel pattern \u201Cif (!ptr) return -ENOMEM;\u201D immediately after allocation,\
+  \ significantly reducing noise.\n- The checker purposefully does not implement alias\
+  \ tracking to stay simple; it targets the straightforward and most harmful pattern\
+  \ as in the provided patch.\n\n5) Bug report\n- Use a single BugType, e.g., \u201C\
+  Mismatched NULL check after allocation\u201D.\n- Message (short and clear):\n  -\
+  \ \u201CAllocated one pointer but checked a different pointer for NULL\u201D\n \
+  \ - If including names: \u201CAllocated \u2018<alloc-lhs>\u2019 but checked \u2018\
+  <checked-expr>\u2019 for NULL\u201D\n- Use generateNonFatalErrorNode and std::make_unique<PathSensitiveBugReport>(...).\n\
+  \n```"
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/StmtVisitor.h\"\n#include \"clang/AST/ParentMapContext.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/SmallString.h\"\n#include\
+  \ <memory>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\
+  \n// Program state traits to track the most recent allocation and its context\n\
+  REGISTER_TRAIT_WITH_PROGRAMSTATE(LastAllocRegion, const MemRegion *)\nREGISTER_TRAIT_WITH_PROGRAMSTATE(LastAllocBlock,\
+  \ const Stmt *)\nREGISTER_TRAIT_WITH_PROGRAMSTATE(LastAllocExpr, const Expr *)\n\
+  \nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<\n        check::BeginFunction,\n\
+  \        check::PostCall,\n        check::BranchCondition> {\n\n  mutable std::unique_ptr<BugType>\
+  \ BT;\n\npublic:\n  SAGenTestChecker()\n      : BT(new BugType(this,\n         \
+  \              \"Mismatched NULL check after allocation\",\n                   \
+  \    \"API Misuse\")) {}\n\n  void checkBeginFunction(CheckerContext &C) const;\n\
+  \  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n  void checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  static\
+  \ bool isAllocCall(const CallEvent &Call, CheckerContext &C);\n\n  // Try to obtain\
+  \ the lvalue region assigned by the allocation call, and the LHS Expr\n  static\
+  \ const MemRegion *getAssignedRegionOfCall(const CallEvent &Call,\n            \
+  \                                      const Expr *&OutLHSExpr,\n              \
+  \                                    CheckerContext &C);\n\n  static const CompoundStmt\
+  \ *getEnclosingBlock(const Stmt *S, CheckerContext &C);\n\n  static bool isNullLiteralExpr(const\
+  \ Expr *E, CheckerContext &C);\n\n  // Identify negative NULL checks, extracting\
+  \ the pointer expression being checked.\n  // Returns true for \"!ptr\" or \"ptr\
+  \ == NULL\". Sets PtrExpr to the pointer operand.\n  static bool isNegativeNullCheck(const\
+  \ Stmt *Cond, const Expr *&PtrExpr,\n                                  CheckerContext\
+  \ &C);\n\n  // Check if the 'then' branch of the IfStmt returns -ENOMEM\n  static\
+  \ bool thenBranchReturnsENOMEM(const IfStmt *IS, CheckerContext &C);\n\n  static\
+  \ StringRef getExprText(const Expr *E, CheckerContext &C);\n\n  static ProgramStateRef\
+  \ clearLastAlloc(ProgramStateRef State) {\n    State = State->remove<LastAllocRegion>();\n\
+  \    State = State->remove<LastAllocBlock>();\n    State = State->remove<LastAllocExpr>();\n\
+  \    return State;\n  }\n};\n\n// --------------------- Helper Implementations ---------------------\n\
+  \nbool SAGenTestChecker::isAllocCall(const CallEvent &Call, CheckerContext &C) {\n\
+  \  const Expr *E = Call.getOriginExpr();\n  if (!E)\n    return false;\n\n  // Use\
+  \ source-text name matching for robustness\n  static const char *AllocNames[] =\
+  \ {\n      \"kzalloc\", \"kmalloc\", \"kcalloc\", \"kvzalloc\", \"kvmalloc\",\n\
+  \      \"kzalloc_node\", \"kmalloc_node\", \"krealloc\", \"kmemdup\",\n      \"\
+  devm_kzalloc\", \"devm_kmalloc\"\n  };\n\n  for (const char *Name : AllocNames)\
+  \ {\n    if (ExprHasName(E, Name, C))\n      return true;\n  }\n  return false;\n\
+  }\n\nconst MemRegion *SAGENTestChecker_getMemRegionFromVarDecl(const VarDecl *VD,\n\
+  \                                                          CheckerContext &C) {\n\
+  \  if (!VD)\n    return nullptr;\n  // Use the RegionManager to obtain the variable's\
+  \ region.\n  const MemRegion *MR =\n      C.getSValBuilder().getRegionManager().getVarRegion(VD,\
+  \ C.getLocationContext());\n  return MR;\n}\n\nconst MemRegion *SAGENTestChecker_getRegionFromLHSExpr(const\
+  \ Expr *LHS,\n                                                       CheckerContext\
+  \ &C) {\n  if (!LHS)\n    return nullptr;\n  // Do not strip implicit casts before\
+  \ querying region as per guidance\n  const MemRegion *MR = getMemRegionFromExpr(LHS,\
+  \ C);\n  return MR;\n}\n\nconst MemRegion *SAGENTestChecker_getVarRegionFromDeclStmtInit(const\
+  \ DeclStmt *DS,\n                                                              \
+  \ const CallExpr *CE,\n                                                        \
+  \       const Expr *&OutLHSExpr,\n                                             \
+  \                  CheckerContext &C) {\n  if (!DS || !CE)\n    return nullptr;\n\
+  \  for (const Decl *D : DS->decls()) {\n    const auto *VD = dyn_cast<VarDecl>(D);\n\
+  \    if (!VD || !VD->hasInit())\n      continue;\n    const Expr *Init = VD->getInit();\n\
+  \    if (!Init)\n      continue;\n\n    // Search children of Init for the CallExpr\
+  \ 'CE'\n    const CallExpr *FoundCE = findSpecificTypeInChildren<CallExpr>(Init);\n\
+  \    if (FoundCE == CE) {\n      // We matched a declaration like: T var = alloc(...);\n\
+  \      const MemRegion *MR = SAGENTestChecker_getMemRegionFromVarDecl(VD, C);\n\
+  \      // For message readability, try to produce a declref text \"var\"\n     \
+  \ OutLHSExpr = Init; // We will fallback to variable name if needed\n      return\
+  \ MR;\n    }\n  }\n  return nullptr;\n}\n\nconst MemRegion *SAGenTestChecker::getAssignedRegionOfCall(const\
+  \ CallEvent &Call,\n                                                           const\
+  \ Expr *&OutLHSExpr,\n                                                         \
+  \  CheckerContext &C) {\n  OutLHSExpr = nullptr;\n  const CallExpr *CE = dyn_cast_or_null<CallExpr>(Call.getOriginExpr());\n\
+  \  if (!CE)\n    return nullptr;\n\n  // Case 1: Parent is a BinaryOperator assignment:\
+  \ LHS = call(...)\n  if (const auto *BO = findSpecificTypeInParents<BinaryOperator>(CE,\
+  \ C)) {\n    if (BO->getOpcode() == BO_Assign) {\n      const Expr *LHS = BO->getLHS();\n\
+  \      OutLHSExpr = LHS;\n      const MemRegion *MR = SAGENTestChecker_getRegionFromLHSExpr(LHS,\
+  \ C);\n      return MR;\n    }\n  }\n\n  // Case 2: Parent is a DeclStmt with initializer:\
+  \ T var = call(...);\n  if (const auto *DS = findSpecificTypeInParents<DeclStmt>(CE,\
+  \ C)) {\n    const MemRegion *MR = SAGENTestChecker_getVarRegionFromDeclStmtInit(DS,\
+  \ CE, OutLHSExpr, C);\n    if (MR)\n      return MR;\n  }\n\n  return nullptr;\n\
+  }\n\nconst CompoundStmt *SAGenTestChecker_getEnclosingBlockImpl(const Stmt *S, CheckerContext\
+  \ &C) {\n  return findSpecificTypeInParents<CompoundStmt>(S, C);\n}\n\nconst CompoundStmt\
+  \ *SAGenTestChecker::getEnclosingBlock(const Stmt *S, CheckerContext &C) {\n  return\
+  \ SAGenTestChecker_getEnclosingBlockImpl(S, C);\n}\n\nbool SAGenTestChecker::isNullLiteralExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return false;\n  const Expr *IE\
+  \ = E->IgnoreParenImpCasts();\n  // Use Clang's null-pointer constant check\n  if\
+  \ (IE->isNullPointerConstant(C.getASTContext(),\n                              \
+  \  Expr::NPC_ValueDependentIsNull))\n    return true;\n\n  // Fallbacks: check textual\
+  \ \"NULL\"\n  if (ExprHasName(IE, \"NULL\", C))\n    return true;\n\n  // Integer\
+  \ literal 0\n  if (const auto *IL = dyn_cast<IntegerLiteral>(IE)) {\n    if (IL->getValue().isZero())\n\
+  \      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isNegativeNullCheck(const\
+  \ Stmt *Cond,\n                                           const Expr *&PtrExpr,\n\
+  \                                           CheckerContext &C) {\n  PtrExpr = nullptr;\n\
+  \  const Expr *E = dyn_cast_or_null<Expr>(Cond);\n  if (!E)\n    return false;\n\
+  \n  E = E->IgnoreParenImpCasts();\n\n  // if (!ptr)\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      PtrExpr = UO->getSubExpr()->IgnoreParenImpCasts();\n\
+  \      return true;\n    }\n  }\n\n  // if (ptr == NULL)\n  if (const auto *BO =\
+  \ dyn_cast<BinaryOperator>(E)) {\n    if (BO->getOpcode() == BO_EQ) {\n      const\
+  \ Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n      const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \      if (isNullLiteralExpr(L, C) && !isNullLiteralExpr(R, C)) {\n        PtrExpr\
+  \ = R;\n        return true;\n      }\n      if (isNullLiteralExpr(R, C) && !isNullLiteralExpr(L,\
+  \ C)) {\n        PtrExpr = L;\n        return true;\n      }\n    }\n  }\n\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::thenBranchReturnsENOMEM(const IfStmt *IS,\
+  \ CheckerContext &C) {\n  if (!IS)\n    return false;\n  const Stmt *Then = IS->getThen();\n\
+  \  if (!Then)\n    return false;\n\n  const ReturnStmt *RS = findSpecificTypeInChildren<ReturnStmt>(Then);\n\
+  \  if (!RS)\n    return false;\n  const Expr *RetE = RS->getRetValue();\n  if (!RetE)\n\
+  \    return false;\n\n  // Look for \"ENOMEM\" in the return expression (covers\
+  \ -ENOMEM as well)\n  return ExprHasName(RetE, \"ENOMEM\", C);\n}\n\nStringRef SAGenTestChecker::getExprText(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return StringRef();\n  const SourceManager\
+  \ &SM = C.getSourceManager();\n  const LangOptions &LO = C.getASTContext().getLangOpts();\n\
+  \  CharSourceRange R = CharSourceRange::getTokenRange(E->getSourceRange());\n  return\
+  \ Lexer::getSourceText(R, SM, LO);\n}\n\n// --------------------- Checker Callbacks\
+  \ ---------------------\n\nvoid SAGenTestChecker::checkBeginFunction(CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  State = clearLastAlloc(State);\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  if (!isAllocCall(Call, C))\n    return;\n\
+  \n  const Expr *LHSExpr = nullptr;\n  const MemRegion *AssignedReg = getAssignedRegionOfCall(Call,\
+  \ LHSExpr, C);\n  if (!AssignedReg)\n    return;\n\n  const CallExpr *CE = dyn_cast_or_null<CallExpr>(Call.getOriginExpr());\n\
+  \  if (!CE)\n    return;\n\n  const CompoundStmt *Block = getEnclosingBlock(CE,\
+  \ C);\n  if (!Block)\n    return;\n\n  ProgramStateRef State = C.getState();\n \
+  \ // Record the exact region of the assigned lvalue (field/var), and its context\n\
+  \  State = State->set<LastAllocRegion>(AssignedReg);\n  State = State->set<LastAllocBlock>(Block);\n\
+  \  State = State->set<LastAllocExpr>(LHSExpr);\n  C.addTransition(State);\n}\n\n\
+  void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *AllocReg\
+  \ = State->get<LastAllocRegion>();\n  const Stmt *AllocBlk = State->get<LastAllocBlock>();\n\
+  \  const Expr *AllocLHS = State->get<LastAllocExpr>();\n\n  if (!AllocReg || !AllocBlk)\
+  \ {\n    // Nothing tracked; continue path\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  const IfStmt *IS = findSpecificTypeInParents<IfStmt>(Condition, C);\n\
+  \  if (!IS) {\n    // Not an if condition we care about\n    C.addTransition(State);\n\
+  \    return;\n  }\n\n  // Ensure proximity: same enclosing compound statement\n\
+  \  const CompoundStmt *CB = getEnclosingBlock(IS, C);\n  if (CB != AllocBlk) {\n\
+  \    State = clearLastAlloc(State);\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  // Must be a negative NULL check leading to error/ENOMEM\n  const Expr\
+  \ *CheckedPtr = nullptr;\n  if (!isNegativeNullCheck(Condition, CheckedPtr, C) ||\n\
+  \      !thenBranchReturnsENOMEM(IS, C)) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n\n  // Determine the region of the checked pointer (keep the precise region\
+  \ for field distinction)\n  const MemRegion *CheckedReg = getMemRegionFromExpr(CheckedPtr,\
+  \ C);\n  if (!CheckedReg) {\n    C.addTransition(State);\n    return;\n  }\n\n \
+  \ // If they checked the same lvalue that received allocation, it's fine; clear\
+  \ and continue.\n  if (CheckedReg == AllocReg) {\n    State = clearLastAlloc(State);\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  // Mismatch: allocated one pointer\
+  \ but checked a different one for NULL.\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) {\n    // Still clear to avoid duplicate later\n    State = clearLastAlloc(State);\n\
+  \    C.addTransition(State);\n    return;\n  }\n\n  StringRef AllocText = getExprText(AllocLHS,\
+  \ C);\n  StringRef CheckText = getExprText(CheckedPtr, C);\n\n  llvm::SmallString<256>\
+  \ Msg;\n  if (!AllocText.empty() && !CheckText.empty()) {\n    Msg = \"Allocated\
+  \ '\";\n    Msg += AllocText;\n    Msg += \"' but checked '\";\n    Msg += CheckText;\n\
+  \    Msg += \"' for NULL\";\n  } else {\n    Msg = \"Allocated one pointer but checked\
+  \ a different pointer for NULL\";\n  }\n\n  StringRef MsgRef(Msg.data(), Msg.size());\n\
+  \  auto R = std::make_unique<PathSensitiveBugReport>(*BT, MsgRef, N);\n  R->addRange(Condition->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n\n  // Clear tracking to avoid duplicate reports\n\
+  \  State = clearLastAlloc(State);\n  C.addTransition(State);\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects checking a different pointer for NULL right after allocation\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

@@ -1,0 +1,454 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ef307bc6ef04e8c1ea843231db58e3afaafa9fa6
+commit_type: Concurrency
+index: 6
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"llvm/ADT/DenseMap.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track held\
+  \ locks by their ValueDecl (VarDecl for standalone lock vars,\n// FieldDecl for\
+  \ struct-member locks).\nREGISTER_SET_WITH_PROGRAMSTATE(HeldLockKeys, const ValueDecl*)\n\
+  \nnamespace {\nclass SAGenTestChecker\n  : public Checker<\n      check::PreCall,\n\
+  \      check::BranchCondition,\n      check::Location,\n      check::Bind> {\n \
+  \ mutable std::unique_ptr<BugType> BT;\n\n  // Cross-function map: for each pointer\
+  \ FieldDecl, remember which locks\n  // (by ValueDecl) we observed being held when\
+  \ the field was used/checked.\n  mutable llvm::DenseMap<const FieldDecl*, llvm::SmallPtrSet<const\
+  \ ValueDecl*, 2>> FieldProtectingLocks;\n\npublic:\n  SAGenTestChecker()\n     \
+  \ : BT(std::make_unique<BugType>(this,\n            \"Lock-protected pointer cleared\
+  \ without holding lock\",\n            \"Concurrency\")) {}\n\n  void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  void checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const;\n  void checkLocation(SVal Loc, bool\
+  \ IsLoad, const Stmt *S, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal\
+  \ Val, const Stmt *S, CheckerContext &C) const;\n\nprivate:\n  // Helper functions\n\
+  \  static const ValueDecl *extractLockKeyFromExpr(const Expr *E);\n  static const\
+  \ MemberExpr *findPointerMemberInExpr(const Expr *E);\n  static const MemberExpr\
+  \ *findPointerMemberInStmtPreferLHS(const Stmt *S);\n  static bool isZeroSVal(SVal\
+  \ V);\n\n  static bool isLockAcquire(const CallEvent &Call, CheckerContext &C);\n\
+  \  static bool isLockRelease(const CallEvent &Call, CheckerContext &C);\n\n  void\
+  \ recordProtectedFieldUnderHeldLocks(const MemberExpr *ME, ProgramStateRef State)\
+  \ const;\n  bool holdsAnyProtectingLockForField(const FieldDecl *FD, ProgramStateRef\
+  \ State) const;\n\n  void reportUnlockClear(const Stmt *S, CheckerContext &C,\n\
+  \                         const FieldDecl *FD,\n                         const ValueDecl\
+  \ *OneLockVD) const;\n};\n\n// -------------------- Helper Implementations --------------------\n\
+  \nconst ValueDecl *SAGEN_NO_SANITIZE_ADDRESS extractDeclFromBaseExpr(const Expr\
+  \ *E) {\n  if (!E) return nullptr;\n  E = E->IgnoreParenImpCasts();\n\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    return dyn_cast<ValueDecl>(DRE->getDecl());\n\
+  \  }\n  if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    return dyn_cast<ValueDecl>(ME->getMemberDecl());\n\
+  \  }\n  return nullptr;\n}\n\nconst ValueDecl *SAGenTestChecker::extractLockKeyFromExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  E = E->IgnoreParenImpCasts();\n\n  //\
+  \ Handle &expr\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode()\
+  \ == UO_AddrOf) {\n      return extractDeclFromBaseExpr(UO->getSubExpr());\n   \
+  \ }\n  }\n\n  // Direct DeclRefExpr or MemberExpr\n  return extractDeclFromBaseExpr(E);\n\
+  }\n\nconst MemberExpr *SAGenTestChecker::findPointerMemberInExpr(const Expr *E)\
+  \ {\n  if (!E) return nullptr;\n  // Try direct member first\n  if (const auto *ME\
+  \ = dyn_cast<MemberExpr>(E->IgnoreParenImpCasts())) {\n    if (ME->getType()->isPointerType())\n\
+  \      return ME;\n  }\n\n  // Search children for any MemberExpr\n  if (const auto\
+  \ *Found = findSpecificTypeInChildren<MemberExpr>(E)) {\n    if (Found->getType()->isPointerType())\n\
+  \      return Found;\n  }\n  return nullptr;\n}\n\nconst MemberExpr *SAGenTestChecker::findPointerMemberInStmtPreferLHS(const\
+  \ Stmt *S) {\n  if (!S) return nullptr;\n\n  if (const auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n    if (BO->isAssignmentOp()) {\n      const Expr *LHS = BO->getLHS();\n  \
+  \    if (const auto *ME = findPointerMemberInExpr(LHS))\n        return ME;\n  \
+  \  }\n  }\n  // Fallback: any MemberExpr in S\n  if (const auto *Found = findSpecificTypeInChildren<MemberExpr>(S))\
+  \ {\n    if (Found->getType()->isPointerType())\n      return Found;\n  }\n  return\
+  \ nullptr;\n}\n\nbool SAGenTestChecker::isZeroSVal(SVal V) {\n  return V.isZeroConstant();\n\
+  }\n\nstatic bool CallNameIs(const CallEvent &Call, CheckerContext &C, StringRef\
+  \ Name) {\n  const Expr *OE = Call.getOriginExpr();\n  if (!OE) return false;\n\
+  \  return ExprHasName(OE, Name, C);\n}\n\nbool SAGenTestChecker::isLockAcquire(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  return CallNameIs(Call, C, \"spin_lock\"\
+  ) ||\n         CallNameIs(Call, C, \"spin_lock_irqsave\") ||\n         CallNameIs(Call,\
+  \ C, \"raw_spin_lock\") ||\n         CallNameIs(Call, C, \"raw_spin_lock_irqsave\"\
+  );\n}\n\nbool SAGenTestChecker::isLockRelease(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  return CallNameIs(Call, C, \"spin_unlock\") ||\n         CallNameIs(Call,\
+  \ C, \"spin_unlock_irqrestore\") ||\n         CallNameIs(Call, C, \"raw_spin_unlock\"\
+  ) ||\n         CallNameIs(Call, C, \"raw_spin_unlock_irqrestore\");\n}\n\nvoid SAGenTestChecker::recordProtectedFieldUnderHeldLocks(const\
+  \ MemberExpr *ME,\n                                                          ProgramStateRef\
+  \ State) const {\n  if (!ME) return;\n  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FD) return;\n  if (!ME->getType()->isPointerType()) return;\n\n  auto LockSet\
+  \ = State->get<HeldLockKeys>();\n  if (LockSet.isEmpty()) return;\n\n  auto &LockBucket\
+  \ = FieldProtectingLocks[FD]; // creates if absent\n  for (auto I = LockSet.begin();\
+  \ I != LockSet.end(); ++I) {\n    if (*I)\n      LockBucket.insert(*I);\n  }\n}\n\
+  \nbool SAGenTestChecker::holdsAnyProtectingLockForField(const FieldDecl *FD,\n \
+  \                                                     ProgramStateRef State) const\
+  \ {\n  auto It = FieldProtectingLocks.find(FD);\n  if (It == FieldProtectingLocks.end())\n\
+  \    return false; // No known protecting locks recorded.\n\n  const auto &Protecting\
+  \ = It->second;\n\n  auto LockSet = State->get<HeldLockKeys>();\n  if (LockSet.isEmpty())\n\
+  \    return false;\n\n  for (auto I = LockSet.begin(); I != LockSet.end(); ++I)\
+  \ {\n    if (Protecting.count(*I))\n      return true;\n  }\n  return false;\n}\n\
+  \nvoid SAGenTestChecker::reportUnlockClear(const Stmt *S, CheckerContext &C,\n \
+  \                                        const FieldDecl *FD,\n                \
+  \                         const ValueDecl *OneLockVD) const {\n  ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n  if (!N) return;\n\n  SmallString<128> Msg;\n\
+  \  Msg += \"Clearing a lock-protected pointer without holding its lock\";\n  if\
+  \ (OneLockVD && OneLockVD->getIdentifier()) {\n    Msg += \" ('\";\n    Msg += OneLockVD->getName();\n\
+  \    Msg += \"')\";\n  }\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg.str(), N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  if (FD && FD->getLocation().isValid())\n\
+  \    R->addNote(\"Field is used under lock elsewhere\", FD->getLocation());\n  C.emitReport(std::move(R));\n\
+  }\n\n// -------------------- Checker Callbacks --------------------\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Handle lock acquisition\n  if (isLockAcquire(Call, C)) {\n    if (Call.getNumArgs()\
+  \ >= 1) {\n      if (const Expr *Arg0 = Call.getArgExpr(0)) {\n        if (const\
+  \ ValueDecl *LockVD = extractLockKeyFromExpr(Arg0)) {\n          State = State->add<HeldLockKeys>(LockVD);\n\
+  \          C.addTransition(State);\n          return;\n        }\n      }\n    }\n\
+  \  }\n\n  // Handle lock release\n  if (isLockRelease(Call, C)) {\n    if (Call.getNumArgs()\
+  \ >= 1) {\n      if (const Expr *Arg0 = Call.getArgExpr(0)) {\n        if (const\
+  \ ValueDecl *LockVD = extractLockKeyFromExpr(Arg0)) {\n          State = State->remove<HeldLockKeys>(LockVD);\n\
+  \          C.addTransition(State);\n          return;\n        }\n      }\n    }\n\
+  \  }\n\n  // For other calls, if we currently hold locks, record pointer-field args\n\
+  \  auto LockSet = State->get<HeldLockKeys>();\n  if (!LockSet.isEmpty()) {\n   \
+  \ for (unsigned i = 0; i < Call.getNumArgs(); ++i) {\n      const Expr *Arg = Call.getArgExpr(i);\n\
+  \      if (!Arg) continue;\n      if (const auto *ME = findPointerMemberInExpr(Arg))\
+  \ {\n        recordProtectedFieldUnderHeldLocks(ME, State);\n      }\n    }\n  }\n\
+  \  // Even if we didn't change State, adding a transition is not necessary.\n}\n\
+  \nvoid SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  if (!Condition) {\n  \
+  \  C.addTransition(State);\n    return;\n  }\n\n  // Record pointer-field checks\
+  \ under lock.\n  auto LockSet = State->get<HeldLockKeys>();\n  if (!LockSet.isEmpty())\
+  \ {\n    if (const auto *CondE = dyn_cast<Expr>(Condition)) {\n      if (const auto\
+  \ *ME = findPointerMemberInExpr(CondE)) {\n        recordProtectedFieldUnderHeldLocks(ME,\
+  \ State);\n      }\n    }\n  }\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {\n  if (!IsLoad ||\
+  \ !S) return;\n\n  ProgramStateRef State = C.getState();\n  auto LockSet = State->get<HeldLockKeys>();\n\
+  \  if (LockSet.isEmpty()) return;\n\n  // Attempt to record loads of pointer fields\
+  \ under lock as \"protected\".\n  if (const auto *ME = findPointerMemberInStmtPreferLHS(S))\
+  \ {\n    recordProtectedFieldUnderHeldLocks(ME, State);\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  if (!S) return;\n\n\
+  \  // We are interested in writes like: some_struct->ptr_field = NULL;\n  if (!isZeroSVal(Val))\n\
+  \    return;\n\n  const MemberExpr *ME = findPointerMemberInStmtPreferLHS(S);\n\
+  \  if (!ME) return;\n\n  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FD) return;\n\n  if (!ME->getType()->isPointerType())\n    return;\n\n \
+  \ // If this field has never been observed as lock-protected elsewhere, skip.\n\
+  \  auto It = FieldProtectingLocks.find(FD);\n  if (It == FieldProtectingLocks.end()\
+  \ || It->second.empty())\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  // If currently not holding any of its protecting locks, report.\n  if (!holdsAnyProtectingLockForField(FD,\
+  \ State)) {\n    // Pick one lock to mention if available\n    const ValueDecl *MentionVD\
+  \ = nullptr;\n    if (!It->second.empty())\n      MentionVD = *It->second.begin();\n\
+  \    reportUnlockClear(S, C, FD, MentionVD);\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects clearing of lock-protected\
+  \ pointer fields outside their protecting lock\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nusb: dwc2: fix possible NULL pointer dereference caused\
+  \ by driver concurrency\n\nIn _dwc2_hcd_urb_enqueue(), \"urb->hcpriv = NULL\" is\
+  \ executed without\nholding the lock \"hsotg->lock\". In _dwc2_hcd_urb_dequeue():\n\
+  \n    spin_lock_irqsave(&hsotg->lock, flags);\n    ...\n\tif (!urb->hcpriv) {\n\t\
+  \tdev_dbg(hsotg->dev, \"## urb->hcpriv is NULL ##\\n\");\n\t\tgoto out;\n\t}\n \
+  \   rc = dwc2_hcd_urb_dequeue(hsotg, urb->hcpriv); // Use urb->hcpriv\n    ...\n\
+  out:\n    spin_unlock_irqrestore(&hsotg->lock, flags);\n\nWhen _dwc2_hcd_urb_enqueue()\
+  \ and _dwc2_hcd_urb_dequeue() are\nconcurrently executed, the NULL check of \"urb->hcpriv\"\
+  \ can be executed\nbefore \"urb->hcpriv = NULL\". After urb->hcpriv is NULL, it\
+  \ can be used\nin the function call to dwc2_hcd_urb_dequeue(), which can cause a\
+  \ NULL\npointer dereference.\n\nThis possible bug is found by an experimental static\
+  \ analysis tool\ndeveloped by myself. This tool analyzes the locking APIs to extract\n\
+  function pairs that can be concurrently executed, and then analyzes the\ninstructions\
+  \ in the paired functions to identify possible concurrency\nbugs including data\
+  \ races and atomicity violations. The above possible\nbug is reported, when my tool\
+  \ analyzes the source code of Linux 6.5.\n\nTo fix this possible bug, \"urb->hcpriv\
+  \ = NULL\" should be executed with\nholding the lock \"hsotg->lock\". After using\
+  \ this patch, my tool never\nreports the possible bug, with the kernelconfiguration\
+  \ allyesconfig for\nx86_64. Because I have no associated hardware, I cannot test\
+  \ the patch\nin runtime testing, and just verify it according to the code logic.\n\
+  \nFixes: 33ad261aa62b (\"usb: dwc2: host: spinlock urb_enqueue\")\nSigned-off-by:\
+  \ Jia-Ju Bai <baijiaju@buaa.edu.cn>\nLink: https://lore.kernel.org/r/20230926024404.832096-1-baijiaju@buaa.edu.cn\n\
+  Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>\n\n## Buggy Code\n\
+  \n```c\n// Function: _dwc2_hcd_urb_enqueue in drivers/usb/dwc2/hcd.c\nstatic int\
+  \ _dwc2_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,\n\t\t\t\t gfp_t mem_flags)\n\
+  {\n\tstruct dwc2_hsotg *hsotg = dwc2_hcd_to_hsotg(hcd);\n\tstruct usb_host_endpoint\
+  \ *ep = urb->ep;\n\tstruct dwc2_hcd_urb *dwc2_urb;\n\tint i;\n\tint retval;\n\t\
+  int alloc_bandwidth = 0;\n\tu8 ep_type = 0;\n\tu32 tflags = 0;\n\tvoid *buf;\n\t\
+  unsigned long flags;\n\tstruct dwc2_qh *qh;\n\tbool qh_allocated = false;\n\tstruct\
+  \ dwc2_qtd *qtd;\n\tstruct dwc2_gregs_backup *gr;\n\n\tgr = &hsotg->gr_backup;\n\
+  \n\tif (dbg_urb(urb)) {\n\t\tdev_vdbg(hsotg->dev, \"DWC OTG HCD URB Enqueue\\n\"\
+  );\n\t\tdwc2_dump_urb_info(hcd, urb, \"urb_enqueue\");\n\t}\n\n\tif (hsotg->hibernated)\
+  \ {\n\t\tif (gr->gotgctl & GOTGCTL_CURMODE_HOST)\n\t\t\tretval = dwc2_exit_hibernation(hsotg,\
+  \ 0, 0, 1);\n\t\telse\n\t\t\tretval = dwc2_exit_hibernation(hsotg, 0, 0, 0);\n\n\
+  \t\tif (retval)\n\t\t\tdev_err(hsotg->dev,\n\t\t\t\t\"exit hibernation failed.\\\
+  n\");\n\t}\n\n\tif (hsotg->in_ppd) {\n\t\tretval = dwc2_exit_partial_power_down(hsotg,\
+  \ 0, true);\n\t\tif (retval)\n\t\t\tdev_err(hsotg->dev,\n\t\t\t\t\"exit partial_power_down\
+  \ failed\\n\");\n\t}\n\n\tif (hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE\
+  \ &&\n\t    hsotg->bus_suspended) {\n\t\tif (dwc2_is_device_mode(hsotg))\n\t\t\t\
+  dwc2_gadget_exit_clock_gating(hsotg, 0);\n\t\telse\n\t\t\tdwc2_host_exit_clock_gating(hsotg,\
+  \ 0);\n\t}\n\n\tif (!ep)\n\t\treturn -EINVAL;\n\n\tif (usb_pipetype(urb->pipe) ==\
+  \ PIPE_ISOCHRONOUS ||\n\t    usb_pipetype(urb->pipe) == PIPE_INTERRUPT) {\n\t\t\
+  spin_lock_irqsave(&hsotg->lock, flags);\n\t\tif (!dwc2_hcd_is_bandwidth_allocated(hsotg,\
+  \ ep))\n\t\t\talloc_bandwidth = 1;\n\t\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\
+  \t}\n\n\tswitch (usb_pipetype(urb->pipe)) {\n\tcase PIPE_CONTROL:\n\t\tep_type =\
+  \ USB_ENDPOINT_XFER_CONTROL;\n\t\tbreak;\n\tcase PIPE_ISOCHRONOUS:\n\t\tep_type\
+  \ = USB_ENDPOINT_XFER_ISOC;\n\t\tbreak;\n\tcase PIPE_BULK:\n\t\tep_type = USB_ENDPOINT_XFER_BULK;\n\
+  \t\tbreak;\n\tcase PIPE_INTERRUPT:\n\t\tep_type = USB_ENDPOINT_XFER_INT;\n\t\tbreak;\n\
+  \t}\n\n\tdwc2_urb = dwc2_hcd_urb_alloc(hsotg, urb->number_of_packets,\n\t\t\t\t\
+  \      mem_flags);\n\tif (!dwc2_urb)\n\t\treturn -ENOMEM;\n\n\tdwc2_hcd_urb_set_pipeinfo(hsotg,\
+  \ dwc2_urb, usb_pipedevice(urb->pipe),\n\t\t\t\t  usb_pipeendpoint(urb->pipe), ep_type,\n\
+  \t\t\t\t  usb_pipein(urb->pipe),\n\t\t\t\t  usb_endpoint_maxp(&ep->desc),\n\t\t\t\
+  \t  usb_endpoint_maxp_mult(&ep->desc));\n\n\tbuf = urb->transfer_buffer;\n\n\tif\
+  \ (hcd_uses_dma(hcd)) {\n\t\tif (!buf && (urb->transfer_dma & 3)) {\n\t\t\tdev_err(hsotg->dev,\n\
+  \t\t\t\t\"%s: unaligned transfer with no transfer_buffer\",\n\t\t\t\t__func__);\n\
+  \t\t\tretval = -EINVAL;\n\t\t\tgoto fail0;\n\t\t}\n\t}\n\n\tif (!(urb->transfer_flags\
+  \ & URB_NO_INTERRUPT))\n\t\ttflags |= URB_GIVEBACK_ASAP;\n\tif (urb->transfer_flags\
+  \ & URB_ZERO_PACKET)\n\t\ttflags |= URB_SEND_ZERO_PACKET;\n\n\tdwc2_urb->priv =\
+  \ urb;\n\tdwc2_urb->buf = buf;\n\tdwc2_urb->dma = urb->transfer_dma;\n\tdwc2_urb->length\
+  \ = urb->transfer_buffer_length;\n\tdwc2_urb->setup_packet = urb->setup_packet;\n\
+  \tdwc2_urb->setup_dma = urb->setup_dma;\n\tdwc2_urb->flags = tflags;\n\tdwc2_urb->interval\
+  \ = urb->interval;\n\tdwc2_urb->status = -EINPROGRESS;\n\n\tfor (i = 0; i < urb->number_of_packets;\
+  \ ++i)\n\t\tdwc2_hcd_urb_set_iso_desc_params(dwc2_urb, i,\n\t\t\t\t\t\t urb->iso_frame_desc[i].offset,\n\
+  \t\t\t\t\t\t urb->iso_frame_desc[i].length);\n\n\turb->hcpriv = dwc2_urb;\n\tqh\
+  \ = (struct dwc2_qh *)ep->hcpriv;\n\t/* Create QH for the endpoint if it doesn't\
+  \ exist */\n\tif (!qh) {\n\t\tqh = dwc2_hcd_qh_create(hsotg, dwc2_urb, mem_flags);\n\
+  \t\tif (!qh) {\n\t\t\tretval = -ENOMEM;\n\t\t\tgoto fail0;\n\t\t}\n\t\tep->hcpriv\
+  \ = qh;\n\t\tqh_allocated = true;\n\t}\n\n\tqtd = kzalloc(sizeof(*qtd), mem_flags);\n\
+  \tif (!qtd) {\n\t\tretval = -ENOMEM;\n\t\tgoto fail1;\n\t}\n\n\tspin_lock_irqsave(&hsotg->lock,\
+  \ flags);\n\tretval = usb_hcd_link_urb_to_ep(hcd, urb);\n\tif (retval)\n\t\tgoto\
+  \ fail2;\n\n\tretval = dwc2_hcd_urb_enqueue(hsotg, dwc2_urb, qh, qtd);\n\tif (retval)\n\
+  \t\tgoto fail3;\n\n\tif (alloc_bandwidth) {\n\t\tdwc2_allocate_bus_bandwidth(hcd,\n\
+  \t\t\t\tdwc2_hcd_get_ep_bandwidth(hsotg, ep),\n\t\t\t\turb);\n\t}\n\n\tspin_unlock_irqrestore(&hsotg->lock,\
+  \ flags);\n\n\treturn 0;\n\nfail3:\n\tdwc2_urb->priv = NULL;\n\tusb_hcd_unlink_urb_from_ep(hcd,\
+  \ urb);\n\tif (qh_allocated && qh->channel && qh->channel->qh == qh)\n\t\tqh->channel->qh\
+  \ = NULL;\nfail2:\n\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\turb->hcpriv\
+  \ = NULL;\n\tkfree(qtd);\nfail1:\n\tif (qh_allocated) {\n\t\tstruct dwc2_qtd *qtd2,\
+  \ *qtd2_tmp;\n\n\t\tep->hcpriv = NULL;\n\t\tdwc2_hcd_qh_unlink(hsotg, qh);\n\t\t\
+  /* Free each QTD in the QH's QTD list */\n\t\tlist_for_each_entry_safe(qtd2, qtd2_tmp,\
+  \ &qh->qtd_list,\n\t\t\t\t\t qtd_list_entry)\n\t\t\tdwc2_hcd_qtd_unlink_and_free(hsotg,\
+  \ qtd2, qh);\n\t\tdwc2_hcd_qh_free(hsotg, qh);\n\t}\nfail0:\n\tkfree(dwc2_urb);\n\
+  \n\treturn retval;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/usb/dwc2/hcd.c\
+  \ b/drivers/usb/dwc2/hcd.c\nindex 657f1f659ffa..35c7a4df8e71 100644\n--- a/drivers/usb/dwc2/hcd.c\n\
+  +++ b/drivers/usb/dwc2/hcd.c\n@@ -4769,8 +4769,8 @@ static int _dwc2_hcd_urb_enqueue(struct\
+  \ usb_hcd *hcd, struct urb *urb,\n \tif (qh_allocated && qh->channel && qh->channel->qh\
+  \ == qh)\n \t\tqh->channel->qh = NULL;\n fail2:\n-\tspin_unlock_irqrestore(&hsotg->lock,\
+  \ flags);\n \turb->hcpriv = NULL;\n+\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\
+  \ \tkfree(qtd);\n fail1:\n \tif (qh_allocated) {\n```\n"
+pattern: "## Bug Pattern\n\nInconsistent locking on a shared pointer: one path reads/checks\
+  \ and uses a shared pointer field (urb->hcpriv) while holding a lock (hsotg->lock),\
+  \ but another path writes/clears that same field without holding the same lock (or\
+  \ after unlocking). This lock mismatch causes a race where the reader\u2019s \u201C\
+  check-then-use\u201D inside the critical section can become invalid if the writer\
+  \ clears the pointer concurrently, leading to a NULL pointer dereference.\n\nTypical\
+  \ form:\n- Reader:\n  spin_lock(&lock);\n  if (ptr)\n      use(ptr);  // assumes\
+  \ ptr won\u2019t change while lock is held\n  spin_unlock(&lock);\n\n- Writer (buggy):\n\
+  \  // no lock held (or after unlocking)\n  ptr = NULL;  // updates shared state\
+  \ without the protecting lock\n\nRoot cause: Modifying a lock-protected shared pointer\
+  \ outside its protecting lock, breaking the atomicity assumed by code that checks\
+  \ and uses it under the lock."
+plan: "Plan\n\n1. Program state and per-checker data\n- Register a lightweight program\
+  \ state to track the current set of held locks by their declaration identity:\n\
+  \  - REGISTER_SET_WITH_PROGRAMSTATE(HeldLockKeys, const ValueDecl*)\n    - Each\
+  \ entry is the ValueDecl of the lock object passed to spin_lock* (either a FieldDecl\
+  \ for struct-member locks like hsotg->lock, or a VarDecl for a global/local lock\
+  \ like foo_lock).\n- Maintain a per-checker, cross-function database to associate\
+  \ pointer fields with the locks under which they are used:\n  - mutable DenseMap<const\
+  \ FieldDecl*, SmallPtrSet<const ValueDecl*, 2>> FieldProtectingLocks\n    - Key:\
+  \ the field being accessed (e.g., urb->hcpriv \u2192 the FieldDecl of hcpriv).\n\
+  \    - Value: the set of locks\u2019 ValueDecls observed as being held while this\
+  \ field is checked/used.\n  - This is not stored in ProgramState; it persists across\
+  \ functions for the entire TU, allowing us to correlate \u201Cwriter function\u201D\
+  \ and \u201Creader function\u201D.\n\n2. Recognize lock and unlock calls (checkPreCall)\n\
+  - Purpose: Maintain the HeldLockKeys set in ProgramState as the analyzer symbolically\
+  \ executes each function, and also detect field \u201Cuses under lock\u201D at function-call\
+  \ sites.\n\n- Detect lock acquisition:\n  - If callee name equals any of:\n    -\
+  \ spin_lock\n    - spin_lock_irqsave\n    - raw_spin_lock\n    - raw_spin_lock_irqsave\n\
+  \  - Extract the first argument (the lock expression). Compute LockKey as:\n   \
+  \ - If arg is UnaryOperator(&) over:\n      - MemberExpr \u2192 use MemberExpr->getMemberDecl()\
+  \ (FieldDecl*) as ValueDecl*.\n      - DeclRefExpr \u2192 use DeclRefExpr->getDecl()\
+  \ (VarDecl*) as ValueDecl*.\n    - If arg is directly DeclRefExpr or MemberExpr\
+  \ (rare), handle similarly.\n  - Add LockKey to HeldLockKeys.\n\n- Detect lock release:\n\
+  \  - If callee name equals any of:\n    - spin_unlock\n    - spin_unlock_irqrestore\n\
+  \    - raw_spin_unlock\n    - raw_spin_unlock_irqrestore\n  - Extract LockKey from\
+  \ the first argument as above and remove it from HeldLockKeys.\n\n- While visiting\
+  \ any other function call:\n  - If HeldLockKeys is non-empty, iterate over the call\u2019\
+  s arguments:\n    - For each argument, if it is or contains a MemberExpr of a pointer-typed\
+  \ field (MemberExpr->getType()->isPointerType()), get its FieldDecl* F.\n      -\
+  \ Record protection: For every lock key currently in HeldLockKeys, insert it into\
+  \ FieldProtectingLocks[F].\n      - Note: Getting the MemberExpr: dyn_cast<MemberExpr>(Arg->IgnoreParenImpCasts())\
+  \ is enough in most cases; if not, use findSpecificTypeInChildren<MemberExpr>(Arg).\n\
+  \n3. Detect pointer checks under lock (checkBranchCondition)\n- Purpose: Recognize\
+  \ that a pointer field is vetted/checked under a lock, which implies it is intended\
+  \ to be lock-protected.\n- If HeldLockKeys is non-empty:\n  - Obtain a MemberExpr\
+  \ inside the condition (e.g., if (urb->hcpriv), if (!urb->hcpriv), if (urb->hcpriv\
+  \ == NULL), etc.) using findSpecificTypeInChildren<MemberExpr>(Condition).\n  -\
+  \ If found, and the field type is a pointer, get FieldDecl* F and record all currently\
+  \ held lock keys in FieldProtectingLocks[F].\n\n4. Optional: detect general loads\
+  \ under lock (checkLocation)\n- Purpose: Robustly capture \u201Cfield is used under\
+  \ lock\u201D even if not in a call or condition.\n- On IsLoad == true and HeldLockKeys\
+  \ is non-empty:\n  - From the Stmt S, try findSpecificTypeInChildren<MemberExpr>(S).\n\
+  \  - If a pointer-typed MemberExpr is found, record FieldDecl* F and all current\
+  \ HeldLockKeys in FieldProtectingLocks[F].\n\n5. Detect unsafe writes: clearing\
+  \ a lock-protected pointer outside its protecting lock (checkBind)\n- Purpose: Find\
+  \ assignments like urb->hcpriv = NULL that occur while the protecting lock is not\
+  \ held (or a different lock is held).\n- When binding a value to a location:\n \
+  \ - Check that Val represents a null/zero:\n    - Use SVal API: Val.isZeroConstant().\n\
+  \  - Identify the LHS as a pointer field:\n    - From Stmt S (the assignment), locate\
+  \ a MemberExpr using findSpecificTypeInChildren<MemberExpr>(S).\n    - Confirm MemberExpr->getType()->isPointerType(),\
+  \ and retrieve FieldDecl* F.\n  - Decide if this field is known to be lock-protected\
+  \ elsewhere:\n    - Lookup F in FieldProtectingLocks. If not present or empty, do\
+  \ nothing (we didn\u2019t observe it used under lock anywhere, so no mismatch to\
+  \ report).\n  - Check currently held locks:\n    - Read HeldLockKeys from state.\
+  \ If HeldLockKeys has no intersection with FieldProtectingLocks[F], then we are\
+  \ not holding a protecting lock for this field at this write site.\n  - If no protecting\
+  \ lock is currently held, report a bug:\n    - Message: \u201CClearing a lock-protected\
+  \ pointer without holding its lock (possible race).\u201D\n    - Optionally, mention\
+  \ the lock\u2019s name using one ValueDecl* from FieldProtectingLocks[F] (e.g.,\
+  \ VD->getName()) for clarity.\n    - Use generateNonFatalErrorNode and std::make_unique<PathSensitiveBugReport>.\n\
+  \n6. Utility extraction details\n- Extracting LockKey from an expression:\n  - Strip\
+  \ implicit/paren casts, then:\n    - If UnaryOperator with opcode UO_AddrOf:\n \
+  \     - If its subexpr is MemberExpr \u2192 FieldDecl*.\n      - If its subexpr\
+  \ is DeclRefExpr \u2192 VarDecl*.\n    - Else if MemberExpr or DeclRefExpr directly,\
+  \ use their decls.\n- Extracting FieldDecl from an expression:\n  - For a MemberExpr,\
+  \ FieldDecl* is MemberExpr->getMemberDecl().\n- Only consider pointer-typed fields\
+  \ for both \u201Cuse-under-lock\u201D and \u201Cclear-to-NULL\u201D events to focus\
+  \ on the target pattern.\n\n7. Chosen callbacks summary\n- checkPreCall:\n  - Handle\
+  \ spin_lock* and spin_unlock* to maintain HeldLockKeys.\n  - For non-lock calls,\
+  \ if HeldLockKeys is non-empty, record any MemberExpr pointer args as protected\
+  \ fields.\n- checkBranchCondition:\n  - If HeldLockKeys is non-empty, record pointer\
+  \ MemberExprs in conditions as protected fields.\n- checkLocation (optional but\
+  \ helpful):\n  - If IsLoad and HeldLockKeys is non-empty, record pointer MemberExprs\
+  \ as protected fields.\n- checkBind:\n  - Detect writes of NULL to MemberExpr pointer\
+  \ fields.\n  - If the field is known to be protected elsewhere but no protecting\
+  \ lock is held now, report.\n\n8. Notes and scope\n- This checker is intra-TU and\
+  \ cross-function: FieldProtectingLocks is accumulated globally across all analyzed\
+  \ functions, enabling mismatch detection between different functions (e.g., one\
+  \ function reads under hsotg->lock, another clears without any lock).\n- Intersection\
+  \ test allows detection even if a different lock is held at the write site (still\
+  \ a mismatch if the protecting lock is not held).\n- Focused on Linux-style spin_lock/spin_unlock\
+  \ APIs; more variants can be added similarly if needed.\n- The report message should\
+  \ be short and clear as requested."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"llvm/ADT/DenseMap.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\n#include\
+  \ \"llvm/ADT/SmallString.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Track held locks by their ValueDecl (VarDecl for standalone\
+  \ lock vars,\n// FieldDecl for struct-member locks).\nREGISTER_SET_WITH_PROGRAMSTATE(HeldLockKeys,\
+  \ const ValueDecl*)\n\nnamespace {\nclass SAGenTestChecker\n  : public Checker<\n\
+  \      check::PreCall,\n      check::BranchCondition,\n      check::Location,\n\
+  \      check::Bind> {\n  mutable std::unique_ptr<BugType> BT;\n\n  // Cross-function\
+  \ map: for each pointer FieldDecl, remember which locks\n  // (by ValueDecl) we\
+  \ observed being held when the field was used/checked.\n  mutable llvm::DenseMap<const\
+  \ FieldDecl*, llvm::SmallPtrSet<const ValueDecl*, 2>> FieldProtectingLocks;\n\n\
+  public:\n  SAGenTestChecker()\n      : BT(std::make_unique<BugType>(this,\n    \
+  \        \"Lock-protected pointer cleared without holding lock\",\n            \"\
+  Concurrency\")) {}\n\n  void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const;\n  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n\nprivate:\n  // Helper functions\n  static const ValueDecl *extractLockKeyFromExpr(const\
+  \ Expr *E);\n  static const MemberExpr *findPointerMemberInExpr(const Expr *E);\n\
+  \  static const MemberExpr *findPointerMemberInStmtPreferLHS(const Stmt *S);\n \
+  \ static bool isZeroSVal(SVal V);\n\n  static bool isLockAcquire(const CallEvent\
+  \ &Call, CheckerContext &C);\n  static bool isLockRelease(const CallEvent &Call,\
+  \ CheckerContext &C);\n\n  void recordProtectedFieldUnderHeldLocks(const MemberExpr\
+  \ *ME, ProgramStateRef State) const;\n  bool holdsAnyProtectingLockForField(const\
+  \ FieldDecl *FD, ProgramStateRef State) const;\n\n  void reportUnlockClear(const\
+  \ Stmt *S, CheckerContext &C,\n                         const FieldDecl *FD,\n \
+  \                        const ValueDecl *OneLockVD) const;\n};\n\n// --------------------\
+  \ Helper Implementations --------------------\n\nstatic const ValueDecl *extractDeclFromBaseExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  E = E->IgnoreParenImpCasts();\n\n  if\
+  \ (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    return dyn_cast<ValueDecl>(DRE->getDecl());\n\
+  \  }\n  if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    return dyn_cast<ValueDecl>(ME->getMemberDecl());\n\
+  \  }\n  return nullptr;\n}\n\nconst ValueDecl *SAGenTestChecker::extractLockKeyFromExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  E = E->IgnoreParenImpCasts();\n\n  //\
+  \ Handle &expr\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode()\
+  \ == UO_AddrOf) {\n      return extractDeclFromBaseExpr(UO->getSubExpr());\n   \
+  \ }\n  }\n\n  // Direct DeclRefExpr or MemberExpr\n  return extractDeclFromBaseExpr(E);\n\
+  }\n\nconst MemberExpr *SAGenTestChecker::findPointerMemberInExpr(const Expr *E)\
+  \ {\n  if (!E) return nullptr;\n  // Try direct member first\n  if (const auto *ME\
+  \ = dyn_cast<MemberExpr>(E->IgnoreParenImpCasts())) {\n    if (ME->getType()->isPointerType())\n\
+  \      return ME;\n  }\n\n  // Search children for any MemberExpr\n  if (const auto\
+  \ *Found = findSpecificTypeInChildren<MemberExpr>(E)) {\n    if (Found->getType()->isPointerType())\n\
+  \      return Found;\n  }\n  return nullptr;\n}\n\nconst MemberExpr *SAGenTestChecker::findPointerMemberInStmtPreferLHS(const\
+  \ Stmt *S) {\n  if (!S) return nullptr;\n\n  if (const auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n    if (BO->isAssignmentOp()) {\n      const Expr *LHS = BO->getLHS();\n  \
+  \    if (const auto *ME = findPointerMemberInExpr(LHS))\n        return ME;\n  \
+  \  }\n  }\n  // Fallback: any MemberExpr in S\n  if (const auto *Found = findSpecificTypeInChildren<MemberExpr>(S))\
+  \ {\n    if (Found->getType()->isPointerType())\n      return Found;\n  }\n  return\
+  \ nullptr;\n}\n\nbool SAGenTestChecker::isZeroSVal(SVal V) {\n  return V.isZeroConstant();\n\
+  }\n\nstatic bool CallNameIs(const CallEvent &Call, CheckerContext &C, StringRef\
+  \ Name) {\n  const Expr *OE = Call.getOriginExpr();\n  if (!OE) return false;\n\
+  \  return ExprHasName(OE, Name, C);\n}\n\nbool SAGenTestChecker::isLockAcquire(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  return CallNameIs(Call, C, \"spin_lock\"\
+  ) ||\n         CallNameIs(Call, C, \"spin_lock_irqsave\") ||\n         CallNameIs(Call,\
+  \ C, \"raw_spin_lock\") ||\n         CallNameIs(Call, C, \"raw_spin_lock_irqsave\"\
+  );\n}\n\nbool SAGenTestChecker::isLockRelease(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  return CallNameIs(Call, C, \"spin_unlock\") ||\n         CallNameIs(Call,\
+  \ C, \"spin_unlock_irqrestore\") ||\n         CallNameIs(Call, C, \"raw_spin_unlock\"\
+  ) ||\n         CallNameIs(Call, C, \"raw_spin_unlock_irqrestore\");\n}\n\nvoid SAGenTestChecker::recordProtectedFieldUnderHeldLocks(const\
+  \ MemberExpr *ME,\n                                                          ProgramStateRef\
+  \ State) const {\n  if (!ME) return;\n  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FD) return;\n  if (!ME->getType()->isPointerType()) return;\n\n  auto LockSet\
+  \ = State->get<HeldLockKeys>();\n  if (LockSet.isEmpty()) return;\n\n  auto &LockBucket\
+  \ = FieldProtectingLocks[FD]; // creates if absent\n  for (auto I = LockSet.begin();\
+  \ I != LockSet.end(); ++I) {\n    if (*I)\n      LockBucket.insert(*I);\n  }\n}\n\
+  \nbool SAGenTestChecker::holdsAnyProtectingLockForField(const FieldDecl *FD,\n \
+  \                                                     ProgramStateRef State) const\
+  \ {\n  auto It = FieldProtectingLocks.find(FD);\n  if (It == FieldProtectingLocks.end())\n\
+  \    return false; // No known protecting locks recorded.\n\n  const auto &Protecting\
+  \ = It->second;\n\n  auto LockSet = State->get<HeldLockKeys>();\n  if (LockSet.isEmpty())\n\
+  \    return false;\n\n  for (auto I = LockSet.begin(); I != LockSet.end(); ++I)\
+  \ {\n    if (Protecting.count(*I))\n      return true;\n  }\n  return false;\n}\n\
+  \nvoid SAGenTestChecker::reportUnlockClear(const Stmt *S, CheckerContext &C,\n \
+  \                                        const FieldDecl *FD,\n                \
+  \                         const ValueDecl *OneLockVD) const {\n  ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n  if (!N) return;\n\n  llvm::SmallString<128>\
+  \ Msg;\n  Msg += \"Clearing a lock-protected pointer without holding its lock\"\
+  ;\n  if (OneLockVD && OneLockVD->getIdentifier()) {\n    Msg += \" ('\";\n    Msg\
+  \ += OneLockVD->getName();\n    Msg += \"')\";\n  }\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg.str(), N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  if (FD)\n \
+  \   R->addNote(\"Field is used under lock elsewhere\",\n               PathDiagnosticLocation::createBegin(FD,\
+  \ C.getSourceManager()));\n  C.emitReport(std::move(R));\n}\n\n// --------------------\
+  \ Checker Callbacks --------------------\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Handle lock acquisition\n  if (isLockAcquire(Call, C)) {\n    if (Call.getNumArgs()\
+  \ >= 1) {\n      if (const Expr *Arg0 = Call.getArgExpr(0)) {\n        if (const\
+  \ ValueDecl *LockVD = extractLockKeyFromExpr(Arg0)) {\n          State = State->add<HeldLockKeys>(LockVD);\n\
+  \          C.addTransition(State);\n          return;\n        }\n      }\n    }\n\
+  \  }\n\n  // Handle lock release\n  if (isLockRelease(Call, C)) {\n    if (Call.getNumArgs()\
+  \ >= 1) {\n      if (const Expr *Arg0 = Call.getArgExpr(0)) {\n        if (const\
+  \ ValueDecl *LockVD = extractLockKeyFromExpr(Arg0)) {\n          State = State->remove<HeldLockKeys>(LockVD);\n\
+  \          C.addTransition(State);\n          return;\n        }\n      }\n    }\n\
+  \  }\n\n  // For other calls, if we currently hold locks, record pointer-field args\n\
+  \  auto LockSet = State->get<HeldLockKeys>();\n  if (!LockSet.isEmpty()) {\n   \
+  \ for (unsigned i = 0; i < Call.getNumArgs(); ++i) {\n      const Expr *Arg = Call.getArgExpr(i);\n\
+  \      if (!Arg) continue;\n      if (const auto *ME = findPointerMemberInExpr(Arg))\
+  \ {\n        recordProtectedFieldUnderHeldLocks(ME, State);\n      }\n    }\n  }\n\
+  \  // Even if we didn't change State, adding a transition is not necessary.\n}\n\
+  \nvoid SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  if (!Condition) {\n  \
+  \  C.addTransition(State);\n    return;\n  }\n\n  // Record pointer-field checks\
+  \ under lock.\n  auto LockSet = State->get<HeldLockKeys>();\n  if (!LockSet.isEmpty())\
+  \ {\n    if (const auto *CondE = dyn_cast<Expr>(Condition)) {\n      if (const auto\
+  \ *ME = findPointerMemberInExpr(CondE)) {\n        recordProtectedFieldUnderHeldLocks(ME,\
+  \ State);\n      }\n    }\n  }\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {\n  if (!IsLoad ||\
+  \ !S) return;\n\n  ProgramStateRef State = C.getState();\n  auto LockSet = State->get<HeldLockKeys>();\n\
+  \  if (LockSet.isEmpty()) return;\n\n  // Attempt to record loads of pointer fields\
+  \ under lock as \"protected\".\n  if (const auto *ME = findPointerMemberInStmtPreferLHS(S))\
+  \ {\n    recordProtectedFieldUnderHeldLocks(ME, State);\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  if (!S) return;\n\n\
+  \  // We are interested in writes like: some_struct->ptr_field = NULL;\n  if (!isZeroSVal(Val))\n\
+  \    return;\n\n  const MemberExpr *ME = findPointerMemberInStmtPreferLHS(S);\n\
+  \  if (!ME) return;\n\n  const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n\
+  \  if (!FD) return;\n\n  if (!ME->getType()->isPointerType())\n    return;\n\n \
+  \ // If this field has never been observed as lock-protected elsewhere, skip.\n\
+  \  auto It = FieldProtectingLocks.find(FD);\n  if (It == FieldProtectingLocks.end()\
+  \ || It->second.empty())\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  // If currently not holding any of its protecting locks, report.\n  if (!holdsAnyProtectingLockForField(FD,\
+  \ State)) {\n    // Pick one lock to mention if available\n    const ValueDecl *MentionVD\
+  \ = nullptr;\n    if (!It->second.empty())\n      MentionVD = *It->second.begin();\n\
+  \    reportUnlockClear(S, C, FD, MentionVD);\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects clearing of lock-protected\
+  \ pointer fields outside their protecting lock\",\n      \"\");\n}\n\nextern \"\
+  C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

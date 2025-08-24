@@ -1,0 +1,462 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 7d42e097607c4d246d99225bf2b195b6167a210c
+commit_type: Concurrency
+index: 4
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// Program state customizations\n\n// Map: return\
+  \ Symbol of wait_for_completion_timeout() -> context MemRegion (container of struct\
+  \ with completion)\nREGISTER_MAP_WITH_PROGRAMSTATE(WaitRetSymToContainer, SymbolRef,\
+  \ const MemRegion*)\n\n// Set: context MemRegions that are in the timeout branch\
+  \ (wait_for_completion_timeout returned 0)\nREGISTER_SET_WITH_PROGRAMSTATE(TimeoutContainers,\
+  \ const MemRegion*)\n\n// Set: context MemRegions whose work items were enqueued/scheduled\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(EnqueuedWorkContainers, const MemRegion*)\n\n// Set:\
+  \ context MemRegions whose work items have been canceled/flushed and are safe to\
+  \ free\nREGISTER_SET_WITH_PROGRAMSTATE(SafeToFreeContainers, const MemRegion*)\n\
+  \n// Map: pointer aliasing (lhs region -> rhs region it aliases)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n\nnamespace {\n/* The checker callbacks are\
+  \ to be decided. */\nclass SAGenTestChecker\n  : public Checker<\n        check::PostCall,\n\
+  \        check::PreCall,\n        check::Bind,\n        eval::Assume> {\n\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Work context freed on timeout\", \"Concurrency\")) {}\n\n    \
+  \  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n      void\
+  \ checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n      void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n      ProgramStateRef\
+  \ evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const;\n\n   private:\n\
+  \n      // Helpers to recognize functions\n      bool isWaitTimeout(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      bool isWorkQueueSubmit(const CallEvent\
+  \ &Call, unsigned &WorkArgIndex, CheckerContext &C) const;\n      bool isWorkCancelOrFlush(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n      bool isFreeCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\n      // Extract context (container) region\
+  \ from common expressions\n      const MemRegion *getContextRegionFromMemberAddressArg(const\
+  \ Expr *Arg, CheckerContext &C) const;\n      const MemRegion *getContextRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) const;\n\n      // Alias resolution\n      const MemRegion\
+  \ *resolveAlias(const MemRegion *R, ProgramStateRef State) const;\n\n      // Reporting\n\
+  \      void reportUAF(const CallEvent &Call, CheckerContext &C, const MemRegion\
+  \ *CtxR) const;\n};\n\n// Implementation\n\nbool SAGenTestChecker::isWaitTimeout(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  return E && ExprHasName(E, \"wait_for_completion_timeout\", C);\n}\n\nbool SAGenTestChecker::isWorkQueueSubmit(const\
+  \ CallEvent &Call, unsigned &WorkArgIndex, CheckerContext &C) const {\n  WorkArgIndex\
+  \ = 0;\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n\n  if\
+  \ (ExprHasName(E, \"schedule_work\", C)) { WorkArgIndex = 0; return true; }\n  if\
+  \ (ExprHasName(E, \"queue_work_on\", C)) { WorkArgIndex = 2; return true; }\n  if\
+  \ (ExprHasName(E, \"queue_work\", C)) { WorkArgIndex = 1; return true; }\n  if (ExprHasName(E,\
+  \ \"queue_delayed_work_on\", C)) { WorkArgIndex = 2; return true; }\n  if (ExprHasName(E,\
+  \ \"queue_delayed_work\", C)) { WorkArgIndex = 1; return true; }\n  if (ExprHasName(E,\
+  \ \"schedule_delayed_work_on\", C)) { WorkArgIndex = 1; return true; }\n  if (ExprHasName(E,\
+  \ \"schedule_delayed_work\", C)) { WorkArgIndex = 0; return true; }\n\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::isWorkCancelOrFlush(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n  if (!E)\
+  \ return false;\n  return ExprHasName(E, \"cancel_work_sync\", C) ||\n         ExprHasName(E,\
+  \ \"cancel_delayed_work_sync\", C) ||\n         ExprHasName(E, \"flush_work\", C)\
+  \ ||\n         ExprHasName(E, \"flush_delayed_work\", C);\n}\n\nbool SAGenTestChecker::isFreeCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"kfree\", C) || ExprHasName(E,\
+  \ \"kvfree\", C) || ExprHasName(E, \"vfree\", C);\n}\n\nconst MemRegion *SAGenTestChecker::getContextRegionFromMemberAddressArg(const\
+  \ Expr *Arg, CheckerContext &C) const {\n  if (!Arg) return nullptr;\n\n  const\
+  \ Expr *AE = Arg;\n  // Expect &ctx->member\n  if (const auto *UO = dyn_cast<UnaryOperator>(AE))\
+  \ {\n    if (UO->getOpcode() == UO_AddrOf) {\n      const Expr *Sub = UO->getSubExpr();\n\
+  \      if (const auto *ME = dyn_cast<MemberExpr>(Sub)) {\n        const Expr *BaseE\
+  \ = ME->getBase();\n        if (!BaseE) return nullptr;\n        const MemRegion\
+  \ *BR = getMemRegionFromExpr(BaseE, C);\n        if (!BR) return nullptr;\n    \
+  \    BR = BR->getBaseRegion();\n        return BR;\n      }\n    }\n  }\n  return\
+  \ nullptr;\n}\n\nconst MemRegion *SAGenTestChecker::getContextRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E) return nullptr;\n  const MemRegion\
+  \ *R = getMemRegionFromExpr(E, C);\n  if (!R) return nullptr;\n  return R->getBaseRegion();\n\
+  }\n\nconst MemRegion *SAGenTestChecker::resolveAlias(const MemRegion *R, ProgramStateRef\
+  \ State) const {\n  if (!R) return nullptr;\n  const MemRegion *Cur = R->getBaseRegion();\n\
+  \  llvm::SmallPtrSet<const MemRegion*, 8> Visited;\n  while (Cur) {\n    if (!Visited.insert(Cur).second)\n\
+  \      break; // cycle\n    const MemRegion *Next = State->get<PtrAliasMap>(Cur);\n\
+  \    if (!Next) break;\n    Cur = Next->getBaseRegion();\n  }\n  return Cur;\n}\n\
+  \nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  ProgramStateRef State = C.getState();\n\n  // Track wait_for_completion_timeout:\
+  \ map its return symbol to the context (container) region.\n  if (isWaitTimeout(Call,\
+  \ C)) {\n    const Expr *Arg0 = Call.getArgExpr(0);\n    const MemRegion *CtxR =\
+  \ getContextRegionFromMemberAddressArg(Arg0, C);\n    SymbolRef RetSym = Call.getReturnValue().getAsSymbol();\n\
+  \    if (CtxR && RetSym) {\n      State = State->set<WaitRetSymToContainer>(RetSym,\
+  \ CtxR->getBaseRegion());\n      C.addTransition(State);\n      return;\n    }\n\
+  \  }\n\n  // Track work submissions\n  unsigned WorkIdx = 0;\n  if (isWorkQueueSubmit(Call,\
+  \ WorkIdx, C)) {\n    if (Call.getNumArgs() > WorkIdx) {\n      const Expr *WArg\
+  \ = Call.getArgExpr(WorkIdx);\n      const MemRegion *CtxR = getContextRegionFromMemberAddressArg(WArg,\
+  \ C);\n      if (CtxR) {\n        State = State->add<EnqueuedWorkContainers>(CtxR->getBaseRegion());\n\
+  \        C.addTransition(State);\n        return;\n      }\n    }\n  }\n\n  // Track\
+  \ work cancel/flush => safe to free\n  if (isWorkCancelOrFlush(Call, C)) {\n   \
+  \ if (Call.getNumArgs() > 0) {\n      const Expr *WArg = Call.getArgExpr(0);\n \
+  \     const MemRegion *CtxR = getContextRegionFromMemberAddressArg(WArg, C);\n \
+  \     if (CtxR) {\n        CtxR = CtxR->getBaseRegion();\n        State = State->add<SafeToFreeContainers>(CtxR);\n\
+  \        State = State->remove<EnqueuedWorkContainers>(CtxR);\n        C.addTransition(State);\n\
+  \        return;\n      }\n    }\n  }\n}\n\nProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef\
+  \ State, SVal Cond, bool Assumption) const {\n  const SymExpr *SE = Cond.getAsSymExpr();\n\
+  \  if (!SE)\n    return State;\n\n  auto Map = State->get<WaitRetSymToContainer>();\n\
+  \  if (Map.isEmpty())\n    return State;\n\n  // For each tracked wait return symbol,\
+  \ if the current condition references it,\n  // decide if this assumption corresponds\
+  \ to \"return == 0\" or \"return != 0\".\n  for (auto I = Map.begin(), E = Map.end();\
+  \ I != E; ++I) {\n    SymbolRef RetSym = I->first;\n    const MemRegion *CtxR =\
+  \ I->second;\n\n    if (!SE->containsSymbol(RetSym))\n      continue;\n\n    bool\
+  \ ZeroBranch = false;\n    bool NonZeroBranch = false;\n\n    if (const SymIntExpr\
+  \ *SIE = dyn_cast<SymIntExpr>(SE)) {\n      // Only handle comparisons against zero.\n\
+  \      bool RHSIsZero = SIE->getRHS().isZero();\n      if (RHSIsZero) {\n      \
+  \  BinaryOperator::Opcode Op = SIE->getOpcode();\n        if (Op == BO_EQ) {\n \
+  \         // (RetSym == 0) is true on ZeroBranch\n          ZeroBranch = Assumption;\n\
+  \          NonZeroBranch = !Assumption;\n        } else if (Op == BO_NE) {\n   \
+  \       // (RetSym != 0) is true on NonZeroBranch\n          ZeroBranch = !Assumption;\n\
+  \          NonZeroBranch = Assumption;\n        }\n      }\n    } else {\n     \
+  \ // Condition is just 'RetSym' (truthiness). True means non-zero, false means zero.\n\
+  \      ZeroBranch = !Assumption;\n      NonZeroBranch = Assumption;\n    }\n\n \
+  \   if (ZeroBranch) {\n      State = State->add<TimeoutContainers>(CtxR->getBaseRegion());\n\
+  \    } else if (NonZeroBranch) {\n      State = State->remove<TimeoutContainers>(CtxR->getBaseRegion());\n\
+  \    }\n  }\n\n  return State;\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  if (!isFreeCall(Call, C))\n    return;\n\n\
+  \  ProgramStateRef State = C.getState();\n\n  if (Call.getNumArgs() < 1)\n    return;\n\
+  \n  const Expr *Arg0 = Call.getArgExpr(0);\n  const MemRegion *PtrR = getContextRegionFromExpr(Arg0,\
+  \ C);\n  if (!PtrR)\n    return;\n  PtrR = PtrR->getBaseRegion();\n\n  const MemRegion\
+  \ *Resolved = resolveAlias(PtrR, State);\n  if (!Resolved)\n    Resolved = PtrR;\n\
+  \n  bool TimedOut = State->contains<TimeoutContainers>(Resolved);\n  bool Enqueued\
+  \ = State->contains<EnqueuedWorkContainers>(Resolved);\n  bool Safe = State->contains<SafeToFreeContainers>(Resolved);\n\
+  \n  if (TimedOut && Enqueued && !Safe) {\n    reportUAF(Call, C, Resolved);\n  }\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *LHS\
+  \ = Loc.getAsRegion();\n  if (!LHS) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n  LHS = LHS->getBaseRegion();\n\n  if (const MemRegion *RHS = Val.getAsRegion())\
+  \ {\n    RHS = RHS->getBaseRegion();\n    if (RHS) {\n      // Track alias in both\
+  \ directions\n      State = State->set<PtrAliasMap>(LHS, RHS);\n      State = State->set<PtrAliasMap>(RHS,\
+  \ LHS);\n    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::reportUAF(const\
+  \ CallEvent &Call, CheckerContext &C, const MemRegion *CtxR) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Freeing work context after completion timeout; worker may still use\
+  \ it (possible UAF).\", N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect freeing work context after wait_for_completion_timeout() timeout\
+  \ while work may still run\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ncrypto: qat - resolve race condition during AER recovery\n\
+  \nDuring the PCI AER system's error recovery process, the kernel driver\nmay encounter\
+  \ a race condition with freeing the reset_data structure's\nmemory. If the device\
+  \ restart will take more than 10 seconds the function\nscheduling that restart will\
+  \ exit due to a timeout, and the reset_data\nstructure will be freed. However, this\
+  \ data structure is used for\ncompletion notification after the restart is completed,\
+  \ which leads\nto a UAF bug.\n\nThis results in a KFENCE bug notice.\n\n  BUG: KFENCE:\
+  \ use-after-free read in adf_device_reset_worker+0x38/0xa0 [intel_qat]\n  Use-after-free\
+  \ read at 0x00000000bc56fddf (in kfence-#142):\n  adf_device_reset_worker+0x38/0xa0\
+  \ [intel_qat]\n  process_one_work+0x173/0x340\n\nTo resolve this race condition,\
+  \ the memory associated to the container\nof the work_struct is freed on the worker\
+  \ if the timeout expired,\notherwise on the function that schedules the worker.\n\
+  The timeout detection can be done by checking if the caller is\nstill waiting for\
+  \ completion or not by using completion_done() function.\n\nFixes: d8cba25d2c68\
+  \ (\"crypto: qat - Intel(R) QAT driver framework\")\nCc: <stable@vger.kernel.org>\n\
+  Signed-off-by: Damian Muszynski <damian.muszynski@intel.com>\nReviewed-by: Giovanni\
+  \ Cabiddu <giovanni.cabiddu@intel.com>\nSigned-off-by: Herbert Xu <herbert@gondor.apana.org.au>\n\
+  \n## Buggy Code\n\n```c\n// Function: adf_device_reset_worker in drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  static void adf_device_reset_worker(struct work_struct *work)\n{\n\tstruct adf_reset_dev_data\
+  \ *reset_data =\n\t\t  container_of(work, struct adf_reset_dev_data, reset_work);\n\
+  \tstruct adf_accel_dev *accel_dev = reset_data->accel_dev;\n\tunsigned long wait_jiffies\
+  \ = msecs_to_jiffies(10000);\n\tstruct adf_sriov_dev_data sriov_data;\n\n\tadf_dev_restarting_notify(accel_dev);\n\
+  \tif (adf_dev_restart(accel_dev)) {\n\t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n\t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n\t\t\tkfree(reset_data);\n\
+  \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\n\");\n\t\treturn;\n\
+  \t}\n\n\tsriov_data.accel_dev = accel_dev;\n\tinit_completion(&sriov_data.compl);\n\
+  \tINIT_WORK(&sriov_data.sriov_work, adf_device_sriov_worker);\n\tqueue_work(device_sriov_wq,\
+  \ &sriov_data.sriov_work);\n\tif (wait_for_completion_timeout(&sriov_data.compl,\
+  \ wait_jiffies))\n\t\tadf_pf2vf_notify_restarted(accel_dev);\n\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\n\t/* The dev is back\
+  \ alive. Notify the caller if in sync mode */\n\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n\
+  \t\tcomplete(&reset_data->compl);\n\telse\n\t\tkfree(reset_data);\n}\n```\n\n```c\n\
+  // Function: adf_slot_reset in drivers/crypto/intel/qat/qat_common/adf_aer.c\nstatic\
+  \ pci_ers_result_t adf_slot_reset(struct pci_dev *pdev)\n{\n\tstruct adf_accel_dev\
+  \ *accel_dev = adf_devmgr_pci_to_accel_dev(pdev);\n\tint res = 0;\n\n\tif (!accel_dev)\
+  \ {\n\t\tpr_err(\"QAT: Can't find acceleration device\\n\");\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\
+  \t}\n\n\tif (!pdev->is_busmaster)\n\t\tpci_set_master(pdev);\n\tpci_restore_state(pdev);\n\
+  \tpci_save_state(pdev);\n\tres = adf_dev_up(accel_dev, false);\n\tif (res && res\
+  \ != -EALREADY)\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\n\tadf_reenable_sriov(accel_dev);\n\
+  \tadf_pf2vf_notify_restarted(accel_dev);\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\treturn PCI_ERS_RESULT_RECOVERED;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/crypto/intel/qat/qat_common/adf_aer.c\
+  \ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\nindex 3597e7605a14..9da2278bd5b7\
+  \ 100644\n--- a/drivers/crypto/intel/qat/qat_common/adf_aer.c\n+++ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  @@ -130,7 +130,8 @@ static void adf_device_reset_worker(struct work_struct *work)\n\
+  \ \tif (adf_dev_restart(accel_dev)) {\n \t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n \t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n-\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n+\t\tif (reset_data->mode\
+  \ == ADF_DEV_RESET_ASYNC ||\n+\t\t    completion_done(&reset_data->compl))\n \t\t\
+  \tkfree(reset_data);\n \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\\
+  n\");\n \t\treturn;\n@@ -146,11 +147,19 @@ static void adf_device_reset_worker(struct\
+  \ work_struct *work)\n \tadf_dev_restarted_notify(accel_dev);\n \tclear_bit(ADF_STATUS_RESTARTING,\
+  \ &accel_dev->status);\n \n-\t/* The dev is back alive. Notify the caller if in\
+  \ sync mode */\n-\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n-\t\tcomplete(&reset_data->compl);\n\
+  -\telse\n+\t/*\n+\t * The dev is back alive. Notify the caller if in sync mode\n\
+  +\t *\n+\t * If device restart will take a more time than expected,\n+\t * the schedule_reset()\
+  \ function can timeout and exit. This can be\n+\t * detected by calling the completion_done()\
+  \ function. In this case\n+\t * the reset_data structure needs to be freed here.\n\
+  +\t */\n+\tif (reset_data->mode == ADF_DEV_RESET_ASYNC ||\n+\t    completion_done(&reset_data->compl))\n\
+  \ \t\tkfree(reset_data);\n+\telse\n+\t\tcomplete(&reset_data->compl);\n }\n \n static\
+  \ int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n@@ -183,8 +192,9\
+  \ @@ static int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n \t\
+  \t\tdev_err(&GET_DEV(accel_dev),\n \t\t\t\t\"Reset device timeout expired\\n\");\n\
+  \ \t\t\tret = -EFAULT;\n+\t\t} else {\n+\t\t\tkfree(reset_data);\n \t\t}\n-\t\t\
+  kfree(reset_data);\n \t\treturn ret;\n \t}\n \treturn 0;\n```\n"
+pattern: "## Bug Pattern\n\nFreeing a work item\u2019s context (container of struct\
+  \ work_struct) from the submitter after a wait_for_completion_timeout() expires,\
+  \ while the work function still uses that same context (e.g., to call complete()\
+  \ or perform final notifications). This unsynchronized dual ownership of the context\
+  \ causes a use-after-free when the worker later accesses the freed memory. The correct\
+  \ pattern is to free the context in exactly one place based on completion state\
+  \ (e.g., use completion_done() so the worker frees it if the caller timed out; otherwise\
+  \ the caller frees it after successful completion)."
+plan: "1) Program state customizations\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(WaitRetSymToContainer,\
+  \ SymbolRef, const MemRegion*)\n  - Maps the symbolic return value of wait_for_completion_timeout()\
+  \ to the \u201Ccontext\u201D pointer (the container of the completion field) used\
+  \ in that call.\n\n- REGISTER_SET_WITH_PROGRAMSTATE(TimeoutContainers, const MemRegion*)\n\
+  \  - Set of context pointers that are known (along the current path) to be in the\
+  \ timeout branch (i.e., wait_for_completion_timeout() returned 0).\n\n- REGISTER_SET_WITH_PROGRAMSTATE(EnqueuedWorkContainers,\
+  \ const MemRegion*)\n  - Context pointers whose work item has been queued/scheduled\
+  \ (queue_work(), queue_delayed_work(), schedule_work(), etc.).\n\n- REGISTER_SET_WITH_PROGRAMSTATE(SafeToFreeContainers,\
+  \ const MemRegion*)\n  - Context pointers that have had their work canceled/flushed\
+  \ (cancel_work_sync(), cancel_delayed_work_sync(), flush_work(), flush_delayed_work()),\
+  \ meaning the work item is guaranteed not running anymore and the context is safe\
+  \ to free.\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const\
+  \ MemRegion*)\n  - Tracks pointer-to-pointer aliases for the context pointer to\
+  \ recognize kfree(ptr_alias) is the same as kfree(original_context).\n\n\n2) Helper\
+  \ predicates and extractors\n\n- isWaitTimeout(const CallEvent&):\n  - Returns true\
+  \ if callee is \"wait_for_completion_timeout\".\n\n- isWorkQueueSubmit(const CallEvent&):\n\
+  \  - Returns true if callee is one of {\"queue_work\", \"queue_work_on\", \"schedule_work\"\
+  , \"queue_delayed_work\", \"queue_delayed_work_on\"}.\n\n- isWorkCancelOrFlush(const\
+  \ CallEvent&):\n  - Returns true if callee is one of {\"cancel_work_sync\", \"cancel_delayed_work_sync\"\
+  , \"flush_work\", \"flush_delayed_work\"}.\n\n- isFreeCall(const CallEvent&):\n\
+  \  - Returns true if callee is one of {\"kfree\", \"kvfree\", \"vfree\"}.\n\n- getContextRegionFromMemberAddressArg(const\
+  \ Expr*):\n  - For an argument that is typically &ctx->member (UnaryOperator '&'\
+  \ of MemberExpr), return the MemRegion of the base expression (ctx). Handle both\
+  \ arrow/dot MemberExpr. Use getMemRegionFromExpr on the MemberExpr base. Return\
+  \ null if not matched.\n\n- getContextRegionFromExpr(const Expr*):\n  - For expressions\
+  \ like ctx (DeclRefExpr), return its MemRegion using getMemRegionFromExpr.\n\n-\
+  \ resolveAlias(const MemRegion*, ProgramStateRef):\n  - Walk PtrAliasMap to find\
+  \ the ultimate root context region for a pointer. If not found, return the same\
+  \ input region.\n\n\n3) Callbacks and their logic\n\nA) checkPostCall\n\n- wait_for_completion_timeout\n\
+  \  - Extract the first argument and derive the context region:\n    - Arg0 is expected\
+  \ to be &ctx->compl. Use getContextRegionFromMemberAddressArg(Arg0) to get ctxRegion.\
+  \ If it fails, do nothing.\n  - Obtain the symbolic return value of the call: Call.getReturnValue().getAsSymbol()\n\
+  \  - If both retSym and ctxRegion exist, set WaitRetSymToContainer[retSym] = ctxRegion.\n\
+  \n- Work submission (queue_work*, schedule_work)\n  - Identify the work item argument:\n\
+  \    - For queue_work*, relevant pointer is the work_struct pointer usually &ctx->work_field\
+  \ (2nd param for queue_work, 1st for schedule_work). Use getContextRegionFromMemberAddressArg\
+  \ to get ctxRegion.\n  - If ctxRegion found, add ctxRegion to EnqueuedWorkContainers.\n\
+  \n- Work cancel/flush (cancel_work_sync, cancel_delayed_work_sync, flush_work, flush_delayed_work)\n\
+  \  - Extract ctxRegion from the single work argument (&ctx->work_field) using getContextRegionFromMemberAddressArg.\n\
+  \  - If found:\n    - Add ctxRegion to SafeToFreeContainers.\n    - Optionally remove\
+  \ from EnqueuedWorkContainers (not strictly required, but helps reduce false positives).\n\
+  \nB) evalAssume\n\n- Purpose: recognize when the current path assumes wait_for_completion_timeout()\
+  \ returned 0 (timeout).\n- If Cond contains or equals a SymbolRef S that exists\
+  \ in WaitRetSymToContainer:\n  - Let ctxRegion = WaitRetSymToContainer[S].\n  -\
+  \ Interpret the branch:\n    - If Assumption == false, treat this as Sym == 0 branch\
+  \ (timeout). Add ctxRegion to TimeoutContainers in the returned state for that branch.\n\
+  \    - If Assumption == true, treat this as Sym != 0 (no timeout). Ensure ctxRegion\
+  \ is removed from TimeoutContainers in that branch\u2019s state (if present).\n\
+  - Handle SymIntExpr and logical-not cases generically:\n  - If Cond is a SymExpr\
+  \ involving only S (e.g., S, !S, S==0, S!=0), the core will pass both branches through\
+  \ evalAssume; using the Assumption boolean as above is sufficient.\n\nC) checkPreCall\n\
+  \n- Free calls (kfree/kvfree/vfree)\n  - Extract the pointer argument region P via\
+  \ getContextRegionFromExpr(Call.getArgExpr(0)).\n  - Compute R = resolveAlias(P).\n\
+  \  - If all hold:\n    - R is in TimeoutContainers (we\u2019re on the branch where\
+  \ wait_for_completion_timeout timed out),\n    - R is in EnqueuedWorkContainers\
+  \ (we actually queued the work for this context),\n    - R is not in SafeToFreeContainers\
+  \ (we did not cancel/flush the work before freeing),\n  - Then report: this is the\
+  \ risky pattern \u201Cfree context after timeout while worker may still use it\u201D\
+  \ (possible UAF).\n\n- Optional: If you want to be stricter, also check that there\
+  \ is no completion_done() usage for this context before the free (but this usually\
+  \ appears in the worker, not here, so skip for simplicity).\n\nD) checkBind\n\n\
+  - Track pointer aliasing:\n  - If Loc is a region of a pointer variable L and Val\
+  \ is a Loc SVal of another pointer region R:\n    - Record PtrAliasMap[L] = resolveAlias(R).\n\
+  \  - If Val is unknown/undefined, skip.\n  - If Val is a call return binding or\
+  \ a direct reference to an existing context pointer, treat similarly (if you can\
+  \ obtain its region as Loc).\n\nE) Optional: checkBranchCondition (lightweight AST-path\
+  \ fallback)\n\n- As a supplemental heuristic (in case evalAssume cannot connect):\
+  \ detect conditions of the form:\n  - if (!ret) {... kfree(ctx) ...} where ret was\
+  \ bound from wait_for_completion_timeout(&ctx->compl, ...), or\n  - if (wait_for_completion_timeout(&ctx->compl,\
+  \ ...)) ... else { ... kfree(ctx) ... }\n- You can detect the presence of wait_for_completion_timeout\
+  \ in the condition using findSpecificTypeInChildren<CallExpr>(), and if so, remember\
+  \ the enclosing IfStmt* and its ctxRegion into a temporary set. Then, when a free\
+  \ call is visited within the else branch subtree, and the ctxRegion matches, issue\
+  \ the same report. This is optional; prefer the path-sensitive evalAssume approach\
+  \ above.\n\n\n4) Bug reporting\n\n- Create a BugType once, e.g., \"Work context\
+  \ freed on timeout\".\n- When the kfree is about to happen in checkPreCall and all\
+  \ three conditions match (TimeoutContainers contains R, EnqueuedWorkContainers contains\
+  \ R, SafeToFreeContainers does not contain R), generate a non-fatal error node and\
+  \ emit a PathSensitiveBugReport with a concise message:\n  - \"Freeing work context\
+  \ after completion timeout; worker may still use it (possible UAF).\"\n- Optionally\
+  \ add path notes:\n  - At the wait_for_completion_timeout call: \"wait_for_completion_timeout\
+  \ may have timed out here\".\n  - At the queue_work call: \"work item for this context\
+  \ was queued here\".\n\n\n5) Notes on minimizing false positives\n\n- Require that\
+  \ the context was actually enqueued via a work queue call before the wait/timeout\
+  \ (EnqueuedWorkContainers).\n- Suppress the report if the work was canceled/flushed\
+  \ before the free (SafeToFreeContainers).\n- If you want an even stricter check,\
+  \ only report if the completion argument to wait_for_completion_timeout is &ctx->compl\
+  \ (ExprHasName(MemberExpr, \"compl\") can be used to ensure we\u2019re tracking\
+  \ a completion field typical for this pattern).\n\n\n6) Summary of chosen callbacks\n\
+  \n- checkPostCall:\n  - Track wait_for_completion_timeout return symbol -> context\
+  \ pointer.\n  - Record enqueued work contexts (queue_work*, schedule_work).\n  -\
+  \ Record cancel/flush to mark contexts as safe-to-free.\n\n- evalAssume:\n  - Mark/unmark\
+  \ the current path as the timeout branch for a specific context.\n\n- checkPreCall:\n\
+  \  - On kfree/kvfree/vfree, if context is being freed on a timeout branch while\
+  \ work is still enqueued and not canceled/flushed, report.\n\n- checkBind:\n  -\
+  \ Track pointer-to-pointer aliasing so frees via aliases are recognized.\n\n- (Optional)\
+  \ checkBranchCondition:\n  - AST fallback to detect inline if (wait_for_completion_timeout(...))\
+  \ patterns and free in else-branch if path-sensitive approach is insufficient."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/SymbolManager.h\"\
+  \n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/AST/RecursiveASTVisitor.h\"\
+  \n#include \"clang/AST/StmtVisitor.h\"\n#include \"llvm/Support/raw_ostream.h\"\n\
+  #include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/Expr.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\n#include \"\
+  llvm/ADT/SmallVector.h\"\n#include <memory>\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// Program state customizations\n\n// Map: return\
+  \ Symbol of wait_for_completion_timeout() -> context MemRegion (container of struct\
+  \ with completion)\nREGISTER_MAP_WITH_PROGRAMSTATE(WaitRetSymToContainer, SymbolRef,\
+  \ const MemRegion*)\n\n// Set: context MemRegions that are in the timeout branch\
+  \ (wait_for_completion_timeout returned 0)\nREGISTER_SET_WITH_PROGRAMSTATE(TimeoutContainers,\
+  \ const MemRegion*)\n\n// Set: context MemRegions whose work items were enqueued/scheduled\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(EnqueuedWorkContainers, const MemRegion*)\n\n// Set:\
+  \ context MemRegions whose work items have been canceled/flushed and are safe to\
+  \ free\nREGISTER_SET_WITH_PROGRAMSTATE(SafeToFreeContainers, const MemRegion*)\n\
+  \n// Map: pointer aliasing (lhs region -> rhs region it aliases)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n\nnamespace {\n/* The checker callbacks are\
+  \ to be decided. */\nclass SAGenTestChecker\n  : public Checker<\n        check::PostCall,\n\
+  \        check::PreCall,\n        check::Bind,\n        eval::Assume> {\n\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Work context freed on timeout\", \"Concurrency\")) {}\n\n    \
+  \  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n      void\
+  \ checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n      void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n      ProgramStateRef\
+  \ evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const;\n\n   private:\n\
+  \n      // Helpers to recognize functions\n      bool isWaitTimeout(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      bool isWorkQueueSubmit(const CallEvent\
+  \ &Call, unsigned &WorkArgIndex, CheckerContext &C) const;\n      bool isWorkCancelOrFlush(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n      bool isFreeCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\n      // Extract context (container) region\
+  \ from common expressions\n      const MemRegion *getContextRegionFromMemberAddressArg(const\
+  \ Expr *Arg, CheckerContext &C) const;\n      const MemRegion *getContextRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) const;\n\n      // Alias resolution\n      const MemRegion\
+  \ *resolveAlias(const MemRegion *R, ProgramStateRef State) const;\n\n      // Reporting\n\
+  \      void reportUAF(const CallEvent &Call, CheckerContext &C, const MemRegion\
+  \ *CtxR) const;\n};\n\n// Implementation\n\nbool SAGenTestChecker::isWaitTimeout(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  return E && ExprHasName(E, \"wait_for_completion_timeout\", C);\n}\n\nbool SAGenTestChecker::isWorkQueueSubmit(const\
+  \ CallEvent &Call, unsigned &WorkArgIndex, CheckerContext &C) const {\n  WorkArgIndex\
+  \ = 0;\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n\n  if\
+  \ (ExprHasName(E, \"schedule_work\", C)) { WorkArgIndex = 0; return true; }\n  if\
+  \ (ExprHasName(E, \"queue_work_on\", C)) { WorkArgIndex = 2; return true; }\n  if\
+  \ (ExprHasName(E, \"queue_work\", C)) { WorkArgIndex = 1; return true; }\n  if (ExprHasName(E,\
+  \ \"queue_delayed_work_on\", C)) { WorkArgIndex = 2; return true; }\n  if (ExprHasName(E,\
+  \ \"queue_delayed_work\", C)) { WorkArgIndex = 1; return true; }\n  if (ExprHasName(E,\
+  \ \"schedule_delayed_work_on\", C)) { WorkArgIndex = 1; return true; }\n  if (ExprHasName(E,\
+  \ \"schedule_delayed_work\", C)) { WorkArgIndex = 0; return true; }\n\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::isWorkCancelOrFlush(const CallEvent &Call,\
+  \ CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n  if (!E)\
+  \ return false;\n  return ExprHasName(E, \"cancel_work_sync\", C) ||\n         ExprHasName(E,\
+  \ \"cancel_delayed_work_sync\", C) ||\n         ExprHasName(E, \"flush_work\", C)\
+  \ ||\n         ExprHasName(E, \"flush_delayed_work\", C);\n}\n\nbool SAGenTestChecker::isFreeCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E) return false;\n  return ExprHasName(E, \"kfree\", C) || ExprHasName(E,\
+  \ \"kvfree\", C) || ExprHasName(E, \"vfree\", C);\n}\n\nconst MemRegion *SAGenTestChecker::getContextRegionFromMemberAddressArg(const\
+  \ Expr *Arg, CheckerContext &C) const {\n  if (!Arg) return nullptr;\n\n  const\
+  \ Expr *AE = Arg;\n  // Expect &ctx->member\n  if (const auto *UO = dyn_cast<UnaryOperator>(AE))\
+  \ {\n    if (UO->getOpcode() == UO_AddrOf) {\n      const Expr *Sub = UO->getSubExpr();\n\
+  \      if (const auto *ME = dyn_cast<MemberExpr>(Sub)) {\n        const Expr *BaseE\
+  \ = ME->getBase();\n        if (!BaseE) return nullptr;\n        const MemRegion\
+  \ *BR = getMemRegionFromExpr(BaseE, C);\n        if (!BR) return nullptr;\n    \
+  \    BR = BR->getBaseRegion();\n        return BR;\n      }\n    }\n  }\n  return\
+  \ nullptr;\n}\n\nconst MemRegion *SAGenTestChecker::getContextRegionFromExpr(const\
+  \ Expr *E, CheckerContext &C) const {\n  if (!E) return nullptr;\n  const MemRegion\
+  \ *R = getMemRegionFromExpr(E, C);\n  if (!R) return nullptr;\n  return R->getBaseRegion();\n\
+  }\n\nconst MemRegion *SAGenTestChecker::resolveAlias(const MemRegion *R, ProgramStateRef\
+  \ State) const {\n  if (!R) return nullptr;\n  const MemRegion *Cur = R->getBaseRegion();\n\
+  \  llvm::SmallPtrSet<const MemRegion*, 8> Visited;\n  while (Cur) {\n    if (!Visited.insert(Cur).second)\n\
+  \      break; // cycle\n    const MemRegion *const *NextPtr = State->get<PtrAliasMap>(Cur);\n\
+  \    if (!NextPtr) break;\n    const MemRegion *Next = *NextPtr;\n    Cur = Next\
+  \ ? Next->getBaseRegion() : nullptr;\n  }\n  return Cur;\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Track wait_for_completion_timeout: map its return symbol to the context (container)\
+  \ region.\n  if (isWaitTimeout(Call, C)) {\n    const Expr *Arg0 = Call.getArgExpr(0);\n\
+  \    const MemRegion *CtxR = getContextRegionFromMemberAddressArg(Arg0, C);\n  \
+  \  SymbolRef RetSym = Call.getReturnValue().getAsSymbol();\n    if (CtxR && RetSym)\
+  \ {\n      State = State->set<WaitRetSymToContainer>(RetSym, CtxR->getBaseRegion());\n\
+  \      C.addTransition(State);\n      return;\n    }\n  }\n\n  // Track work submissions\n\
+  \  unsigned WorkIdx = 0;\n  if (isWorkQueueSubmit(Call, WorkIdx, C)) {\n    if (Call.getNumArgs()\
+  \ > WorkIdx) {\n      const Expr *WArg = Call.getArgExpr(WorkIdx);\n      const\
+  \ MemRegion *CtxR = getContextRegionFromMemberAddressArg(WArg, C);\n      if (CtxR)\
+  \ {\n        State = State->add<EnqueuedWorkContainers>(CtxR->getBaseRegion());\n\
+  \        C.addTransition(State);\n        return;\n      }\n    }\n  }\n\n  // Track\
+  \ work cancel/flush => safe to free\n  if (isWorkCancelOrFlush(Call, C)) {\n   \
+  \ if (Call.getNumArgs() > 0) {\n      const Expr *WArg = Call.getArgExpr(0);\n \
+  \     const MemRegion *CtxR = getContextRegionFromMemberAddressArg(WArg, C);\n \
+  \     if (CtxR) {\n        CtxR = CtxR->getBaseRegion();\n        State = State->add<SafeToFreeContainers>(CtxR);\n\
+  \        State = State->remove<EnqueuedWorkContainers>(CtxR);\n        C.addTransition(State);\n\
+  \        return;\n      }\n    }\n  }\n}\n\nProgramStateRef SAGenTestChecker::evalAssume(ProgramStateRef\
+  \ State, SVal Cond, bool Assumption) const {\n  SymbolRef SE = Cond.getAsSymbol();\n\
+  \  if (!SE)\n    return State;\n\n  auto Map = State->get<WaitRetSymToContainer>();\n\
+  \  if (Map.isEmpty())\n    return State;\n\n  // For each tracked wait return symbol,\
+  \ if the current condition references it,\n  // decide if this assumption corresponds\
+  \ to \"return == 0\" or \"return != 0\".\n  for (auto I = Map.begin(), E = Map.end();\
+  \ I != E; ++I) {\n    SymbolRef RetSym = I->first;\n    const MemRegion *CtxR =\
+  \ I->second;\n\n    bool MentionsRetSym = false;\n    bool ZeroBranch = false;\n\
+  \    bool NonZeroBranch = false;\n\n    // Helper to unwrap casts\n    auto UnwrapCasts\
+  \ = [](const SymExpr *S) -> const SymExpr * {\n      const SymExpr *Cur = S;\n \
+  \     while (const auto *CE = dyn_cast<SymbolCast>(Cur))\n        Cur = CE->getOperand();\n\
+  \      return Cur;\n    };\n\n    if (SE == RetSym) {\n      MentionsRetSym = true;\n\
+  \      ZeroBranch = !Assumption;\n      NonZeroBranch = Assumption;\n    } else\
+  \ if (const auto *SIE = dyn_cast<SymIntExpr>(SE)) {\n      const SymExpr *Inner\
+  \ = UnwrapCasts(SIE->getLHS());\n      if (Inner == RetSym && SIE->getRHS().isZero())\
+  \ {\n        MentionsRetSym = true;\n        BinaryOperator::Opcode Op = SIE->getOpcode();\n\
+  \        if (Op == BO_EQ) {\n          ZeroBranch = Assumption;\n          NonZeroBranch\
+  \ = !Assumption;\n        } else if (Op == BO_NE) {\n          ZeroBranch = !Assumption;\n\
+  \          NonZeroBranch = Assumption;\n        }\n      }\n    } else if (const\
+  \ auto *ISE = dyn_cast<IntSymExpr>(SE)) {\n      const SymExpr *Inner = UnwrapCasts(ISE->getRHS());\n\
+  \      if (Inner == RetSym && ISE->getLHS().isZero()) {\n        MentionsRetSym\
+  \ = true;\n        BinaryOperator::Opcode Op = ISE->getOpcode();\n        if (Op\
+  \ == BO_EQ) {\n          ZeroBranch = Assumption;\n          NonZeroBranch = !Assumption;\n\
+  \        } else if (Op == BO_NE) {\n          ZeroBranch = !Assumption;\n      \
+  \    NonZeroBranch = Assumption;\n        }\n      }\n    }\n\n    if (!MentionsRetSym)\n\
+  \      continue;\n\n    if (ZeroBranch) {\n      State = State->add<TimeoutContainers>(CtxR->getBaseRegion());\n\
+  \    } else if (NonZeroBranch) {\n      State = State->remove<TimeoutContainers>(CtxR->getBaseRegion());\n\
+  \    }\n  }\n\n  return State;\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  if (!isFreeCall(Call, C))\n    return;\n\n\
+  \  ProgramStateRef State = C.getState();\n\n  if (Call.getNumArgs() < 1)\n    return;\n\
+  \n  const Expr *Arg0 = Call.getArgExpr(0);\n  const MemRegion *PtrR = getContextRegionFromExpr(Arg0,\
+  \ C);\n  if (!PtrR)\n    return;\n  PtrR = PtrR->getBaseRegion();\n\n  const MemRegion\
+  \ *Resolved = resolveAlias(PtrR, State);\n  if (!Resolved)\n    Resolved = PtrR;\n\
+  \n  bool TimedOut = State->contains<TimeoutContainers>(Resolved);\n  bool Enqueued\
+  \ = State->contains<EnqueuedWorkContainers>(Resolved);\n  bool Safe = State->contains<SafeToFreeContainers>(Resolved);\n\
+  \n  if (TimedOut && Enqueued && !Safe) {\n    reportUAF(Call, C, Resolved);\n  }\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *LHS\
+  \ = Loc.getAsRegion();\n  if (!LHS) {\n    C.addTransition(State);\n    return;\n\
+  \  }\n  LHS = LHS->getBaseRegion();\n\n  if (const MemRegion *RHS = Val.getAsRegion())\
+  \ {\n    RHS = RHS->getBaseRegion();\n    if (RHS) {\n      // Track alias in both\
+  \ directions\n      State = State->set<PtrAliasMap>(LHS, RHS);\n      State = State->set<PtrAliasMap>(RHS,\
+  \ LHS);\n    }\n  }\n\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::reportUAF(const\
+  \ CallEvent &Call, CheckerContext &C, const MemRegion *CtxR) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Freeing work context after completion timeout; worker may still use\
+  \ it (possible UAF).\", N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect freeing work context after wait_for_completion_timeout() timeout\
+  \ while work may still run\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

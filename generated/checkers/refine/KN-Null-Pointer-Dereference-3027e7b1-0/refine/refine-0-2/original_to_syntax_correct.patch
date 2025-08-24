@@ -1,0 +1,295 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -138,6 +138,7 @@       static ProgramStateRef setChecked(ProgramStateRef State, SymbolRef Sym);
+       static bool isUncheckedPossiblyNull(ProgramStateRef State, SymbolRef Sym);
+       static ProgramStateRef bindRegionToSymbol(ProgramStateRef State, const MemRegion *Dst, SymbolRef Sym);
++      static ProgramStateRef clearRegionBinding(ProgramStateRef State, const MemRegion *Dst);
+       static SymbolRef getSymbolFromRegion(ProgramStateRef State, const MemRegion *R);
+       void report(CheckerContext &C, const Stmt *UseSite, StringRef Why) const;
+
+@@ -147,8 +148,16 @@                                      llvm::SmallVectorImpl<unsigned> &Params);
+
+       // Specialized detection for dev_* and printk* to reduce FPs:
+-      // Consider deref only if a literal format contains "%s".
+-      static bool loggingFormatDereferencesString(const CallEvent &Call, CheckerContext &C, unsigned &FormatIndex);
++      // Consider deref only if a literal format contains "%s", and only
++      // as many arguments as "%s" occurrences.
++      static bool loggingFormatDereferencesString(const CallEvent &Call, CheckerContext &C,
++                                                  unsigned &FormatIndex, unsigned &NumStrArgs);
++
++      // Strip common wrappers in conditions, e.g., likely/unlikely calls.
++      static const Expr *stripConditionWrappers(const Expr *E, CheckerContext &C);
++
++      // Handle IS_ERR / IS_ERR_OR_NULL wrappers to mark checks.
++      static bool isIS_ERR_LikeCall(const Expr *E, CheckerContext &C, const Expr *&PtrArg);
+
+       // Light-weight FP guard
+       static bool isFalsePositiveContext(const Stmt *S);
+@@ -206,6 +215,11 @@   return State->set<Region2SymMap>(Dst, Sym);
+ }
+
++ProgramStateRef SAGenTestChecker::clearRegionBinding(ProgramStateRef State, const MemRegion *Dst) {
++  if (!Dst) return State;
++  return State->remove<Region2SymMap>(Dst);
++}
++
+ SymbolRef SAGenTestChecker::getSymbolFromRegion(ProgramStateRef State, const MemRegion *R) {
+   if (!R) return nullptr;
+   if (SymbolRef const *PS = State->get<Region2SymMap>(R))
+@@ -227,9 +241,28 @@   C.emitReport(std::move(Rpt));
+ }
+
++static unsigned countPercentS(StringRef S) {
++  unsigned Cnt = 0;
++  for (size_t i = 0; i + 1 < S.size(); ++i) {
++    if (S[i] == '%') {
++      if (S[i + 1] == '%') { // escaped percent
++        ++i;
++        continue;
++      }
++      // Very lightweight: specifically look for "%s"
++      if (S[i + 1] == 's')
++        ++Cnt;
++      // skip next char anyway
++      ++i;
++    }
++  }
++  return Cnt;
++}
++
+ bool SAGenTestChecker::loggingFormatDereferencesString(const CallEvent &Call,
+                                                        CheckerContext &C,
+-                                                       unsigned &FormatIndex) {
++                                                       unsigned &FormatIndex,
++                                                       unsigned &NumStrArgs) {
+   const Expr *Origin = Call.getOriginExpr();
+   if (!Origin)
+     return false;
+@@ -256,17 +289,17 @@
+   if (const auto *SL = dyn_cast<StringLiteral>(FmtE->IgnoreImpCasts())) {
+     StringRef S = SL->getString();
+-    // If format contains "%s", string arguments are dereferenced.
+-    return S.contains("%s");
++    unsigned Cnt = countPercentS(S);
++    if (Cnt == 0)
++      return false;
++    NumStrArgs = Cnt;
++    return true;
+   }
+
+   // Non-literal format: be conservative and RETURN FALSE to reduce FPs.
+-  // Kernel logs almost always use string literals for formats.
+-  return false;
+-}
+-
+-// Heuristic: determine known-deref functions and which argument indices are dereferenced.
+-// We use source-text matching (ExprHasName) and limited format parsing for logs.
++  return false;
++}
++
+ bool SAGenTestChecker::callIsKnownToDeref(const CallEvent &Call,
+                                           CheckerContext &C,
+                                           llvm::SmallVectorImpl<unsigned> &Params) {
+@@ -285,14 +318,12 @@   if (ExprHasName(Origin, "strncat", C)) { Params.push_back(1); return true; }
+
+   // Kernel logging helpers: consider deref only if format literal contains "%s"
+-  unsigned FmtIdx = 0;
+-  if (loggingFormatDereferencesString(Call, C, FmtIdx)) {
++  unsigned FmtIdx = 0, NumS = 0;
++  if (loggingFormatDereferencesString(Call, C, FmtIdx, NumS)) {
+     unsigned N = Call.getNumArgs();
+-    // For dev_*: index 1 is format, >=2 are varargs.
+-    // For printk/pr_*: first arg is format, varargs follow.
+     unsigned StartIdx = FmtIdx + 1;
+-    for (unsigned i = StartIdx; i < N; ++i)
+-      Params.push_back(i);
++    for (unsigned i = 0; i < NumS && (StartIdx + i) < N; ++i)
++      Params.push_back(StartIdx + i);
+     return !Params.empty();
+   }
+
+@@ -311,27 +342,77 @@     if (Call.getNumArgs() >= 3) {
+       const Expr *FmtE = Call.getArgExpr(2);
+       if (const auto *SL = FmtE ? dyn_cast<StringLiteral>(FmtE->IgnoreImpCasts()) : nullptr) {
+-        if (SL->getString().contains("%s")) {
+-          Params.push_back(2);
+-          for (unsigned i = 3; i < Call.getNumArgs(); ++i)
+-            Params.push_back(i);
+-          return true;
++        unsigned NumSfmt = countPercentS(SL->getString());
++        if (NumSfmt > 0) {
++          for (unsigned i = 0; i < NumSfmt; ++i) {
++            unsigned Idx = 3 + i;
++            if (Idx < Call.getNumArgs())
++              Params.push_back(Idx);
++          }
++          return !Params.empty();
+         }
+       }
+     }
+   }
+
+-  // Allow external knowledge table if provided by user (disabled in this build).
+   if (functionKnownToDeref(Call, Params))
+     return true;
+
+   return false;
+ }
+
++bool SAGenTestChecker::isIS_ERR_LikeCall(const Expr *E, CheckerContext &C, const Expr *&PtrArg) {
++  PtrArg = nullptr;
++  E = E ? E->IgnoreParenCasts() : nullptr;
++  const auto *CE = dyn_cast_or_null<CallExpr>(E);
++  if (!CE)
++    return false;
++
++  const Expr *Origin = CE->getCallee();
++  if (!Origin)
++    return false;
++
++  // Match common wrappers used in the kernel.
++  if (ExprHasName(Origin, "IS_ERR_OR_NULL", C) || ExprHasName(Origin, "IS_ERR", C)) {
++    if (CE->getNumArgs() >= 1) {
++      PtrArg = CE->getArg(0)->IgnoreParenCasts();
++      return true;
++    }
++  }
++  return false;
++}
++
++const Expr *SAGenTestChecker::stripConditionWrappers(const Expr *E, CheckerContext &C) {
++  if (!E) return E;
++
++  // Strip parens, implicit casts, cleanups.
++  const Expr *Cur = E->IgnoreParenImpCasts();
++
++  // Strip likely/unlikely/__builtin_expect wrappers: likely/unlikely are macros,
++  // often result in a call expression with a single argument.
++  while (true) {
++    Cur = Cur->IgnoreParenImpCasts();
++    const auto *CE = dyn_cast<CallExpr>(Cur);
++    if (!CE)
++      break;
++    const Expr *Callee = CE->getCallee();
++    if (!Callee)
++      break;
++    if (ExprHasName(Callee, "likely", C) || ExprHasName(Callee, "unlikely", C) ||
++        ExprHasName(Callee, "__builtin_expect", C)) {
++      if (CE->getNumArgs() >= 1) {
++        Cur = CE->getArg(0)->IgnoreParenImpCasts();
++        continue;
++      }
++    }
++    // Not a known wrapper
++    break;
++  }
++  return Cur;
++}
++
+ // Very small FP guard: currently unused but kept for extensibility.
+ bool SAGenTestChecker::isFalsePositiveContext(const Stmt *S) {
+-  // We could ignore contexts that are control-only and can't deref,
+-  // but we've already restricted deref reporting elsewhere.
+   (void)S;
+   return false;
+ }
+@@ -392,17 +473,26 @@     return;
+   }
+
+-  CondE = CondE->IgnoreParenCasts();
+-
+-  // Pattern: if (!ptr)
++  // Normalize condition: strip wrappers and casts.
++  CondE = stripConditionWrappers(CondE, C);
++
++  // Pattern: if (!ptr) or if (!IS_ERR_OR_NULL(ptr))
+   if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {
+     if (UO->getOpcode() == UO_LNot) {
+-      const Expr *SubE = UO->getSubExpr();
+-      if (SubE) {
+-        SVal SubSV = State->getSVal(SubE, C.getLocationContext());
+-        SymbolRef Sym = getSymbolFromSValOrExpr(SubSV, SubE, C);
++      const Expr *SubE = stripConditionWrappers(UO->getSubExpr()->IgnoreParenCasts(), C);
++      const Expr *PtrFromISERR = nullptr;
++      if (isIS_ERR_LikeCall(SubE, C, PtrFromISERR) && PtrFromISERR) {
++        SVal SubSV = State->getSVal(PtrFromISERR, C.getLocationContext());
++        SymbolRef Sym = getSymbolFromSValOrExpr(SubSV, PtrFromISERR, C);
+         if (Sym)
+           State = setChecked(State, Sym);
++      } else {
++        if (SubE) {
++          SVal SubSV = State->getSVal(SubE, C.getLocationContext());
++          SymbolRef Sym = getSymbolFromSValOrExpr(SubSV, SubE, C);
++          if (Sym)
++            State = setChecked(State, Sym);
++        }
+       }
+     }
+   }
+@@ -410,8 +500,8 @@   else if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {
+     BinaryOperator::Opcode Op = BO->getOpcode();
+     if (Op == BO_EQ || Op == BO_NE) {
+-      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();
+-      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();
++      const Expr *LHS = stripConditionWrappers(BO->getLHS()->IgnoreParenCasts(), C);
++      const Expr *RHS = stripConditionWrappers(BO->getRHS()->IgnoreParenCasts(), C);
+       ASTContext &ACtx = C.getASTContext();
+
+       bool LHSIsNull = LHS && LHS->isNullPointerConstant(ACtx, Expr::NPC_ValueDependentIsNull);
+@@ -426,6 +516,23 @@         SymbolRef Sym = getSymbolFromSValOrExpr(PSV, PtrE, C);
+         if (Sym)
+           State = setChecked(State, Sym);
++      }
++    }
++  }
++  // Pattern: if (IS_ERR_OR_NULL(ptr)) or if (IS_ERR(ptr))
++  else if (const auto *CE = dyn_cast<CallExpr>(CondE)) {
++    const Expr *PtrE = nullptr;
++    if (isIS_ERR_LikeCall(CE, C, PtrE) && PtrE) {
++      SVal PSV = State->getSVal(PtrE, C.getLocationContext());
++      SymbolRef Sym = getSymbolFromSValOrExpr(PSV, PtrE, C);
++      if (Sym)
++        State = setChecked(State, Sym);
++    } else {
++      // Pattern: if (ptr)
++      SVal CSV = State->getSVal(CondE, C.getLocationContext());
++      SymbolRef Sym = getSymbolFromSValOrExpr(CSV, CondE, C);
++      if (Sym) {
++        State = setChecked(State, Sym);
+       }
+     }
+   }
+@@ -496,12 +603,30 @@               RHSym = S;
+           }
+         }
+-      }
+-    }
+-  }
+-
+-  if (LHS && RHSym) {
+-    State = bindRegionToSymbol(State, LHS, RHSym);
++      } else if (const auto *DS = dyn_cast<DeclStmt>(E)) {
++        // Initializer in a declaration: handle "T x = y;" case
++        for (const Decl *D : DS->decls()) {
++          if (const auto *VD = dyn_cast<VarDecl>(D)) {
++            if (const Expr *Init = VD->getInit()) {
++              const MemRegion *RHSRegion = getMemRegionFromExpr(Init, C);
++              if (RHSRegion) {
++                if (SymbolRef S = getSymbolFromRegion(State, RHSRegion))
++                  RHSym = S;
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++
++  if (LHS) {
++    if (RHSym) {
++      State = bindRegionToSymbol(State, LHS, RHSym);
++    } else {
++      // Clearing binding on non-symbol assignments (e.g., string literal, NULL, other constants)
++      State = clearRegionBinding(State, LHS);
++    }
+   }
+
+   C.addTransition(State);

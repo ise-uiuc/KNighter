@@ -1,0 +1,559 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 5aa2184e29081665f915594bc6de9b7fee6e4883
+commit_type: Double-Free
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/ParentMapContext.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\
+  \n#include \"llvm/ADT/StringMap.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include\
+  \ \"llvm/ADT/STLExtras.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing\
+  \ namespace taint;\n\n// No custom program state for this checker.\n\nnamespace\
+  \ {\n\nstruct FreedTarget {\n  std::string LabelName;\n  const CallExpr *FreeCallCE;\
+  \     // The free call statement (for diagnostics)\n  const Expr *FreedExpr;   \
+  \       // The expression passed to free (arg0)\n  std::string CalleeName;     \
+  \    // Name of free function (kfree, etc.)\n};\n\nclass SAGenTestChecker : public\
+  \ Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Suspicious cleanup free in early\
+  \ error path\", \"Memory Management\")) {}\n\n      void checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const;\n\n   private:\n\n    \
+  \  // Helpers\n      static bool isKnownFreeName(StringRef Name) {\n        return\
+  \ Name.equals(\"kfree\") || Name.equals(\"kvfree\") || Name.equals(\"vfree\");\n\
+  \      }\n\n      static const CallExpr *findFirstCallIn(const Stmt *S) {\n    \
+  \    if (!S) return nullptr;\n        if (const auto *CE = dyn_cast<CallExpr>(S))\n\
+  \          return CE;\n        for (const Stmt *Child : S->children()) {\n     \
+  \     if (!Child) continue;\n          if (const CallExpr *Found = findFirstCallIn(Child))\n\
+  \            return Found;\n        }\n        return nullptr;\n      }\n\n    \
+  \  static void collectAllCallsIn(const Stmt *S, llvm::SmallVectorImpl<const CallExpr*>\
+  \ &Out) {\n        if (!S) return;\n        if (const auto *CE = dyn_cast<CallExpr>(S))\n\
+  \          Out.push_back(CE);\n        for (const Stmt *Child : S->children()) {\n\
+  \          if (!Child) continue;\n          collectAllCallsIn(Child, Out);\n   \
+  \     }\n      }\n\n      static const GotoStmt *findFirstGotoIn(const Stmt *S)\
+  \ {\n        if (!S) return nullptr;\n        if (const auto *GS = dyn_cast<GotoStmt>(S))\n\
+  \          return GS;\n        for (const Stmt *Child : S->children()) {\n     \
+  \     if (!Child) continue;\n          if (const GotoStmt *Found = findFirstGotoIn(Child))\n\
+  \            return Found;\n        }\n        return nullptr;\n      }\n\n    \
+  \  static const Expr *getFreedExprFromCall(const CallExpr *CE) {\n        if (!CE\
+  \ || CE->getNumArgs() == 0) return nullptr;\n        return CE->getArg(0)->IgnoreParenImpCasts();\n\
+  \      }\n\n      static StringRef getLabelName(const LabelStmt *LS) {\n       \
+  \ if (!LS) return StringRef();\n        if (const LabelDecl *LD = LS->getDecl())\
+  \ {\n          if (const IdentifierInfo *II = LD->getIdentifier())\n           \
+  \ return II->getName();\n        }\n        return StringRef();\n      }\n\n   \
+  \   static StringRef getLabelNameFromGoto(const GotoStmt *GS) {\n        if (!GS)\
+  \ return StringRef();\n        if (const LabelDecl *LD = GS->getLabel()) {\n   \
+  \       if (const IdentifierInfo *II = LD->getIdentifier())\n            return\
+  \ II->getName();\n        }\n        return StringRef();\n      }\n\n      static\
+  \ bool getEnclosingCompoundAndIndex(const Stmt *S, ASTContext &Ctx,\n          \
+  \                                     const CompoundStmt *&OutCS, unsigned &OutIdx)\
+  \ {\n        if (!S) return false;\n        ParentMapContext &PMC = Ctx.getParentMapContext();\n\
+  \        const Stmt *Cur = S;\n        // Limit the search depth to avoid pathological\
+  \ cases.\n        for (int Depth = 0; Depth < 64 && Cur; ++Depth) {\n          auto\
+  \ Parents = PMC.getParents(*Cur);\n          if (Parents.empty())\n            return\
+  \ false;\n          const Stmt *Next = nullptr;\n          for (const auto &P :\
+  \ Parents) {\n            if (const auto *CS = P.get<CompoundStmt>()) {\n      \
+  \        // Find the index of Cur in CS\n              unsigned I = 0;\n       \
+  \       for (const Stmt *Child : CS->body()) {\n                if (Child == Cur)\
+  \ {\n                  OutCS = CS;\n                  OutIdx = I;\n            \
+  \      return true;\n                }\n                ++I;\n              }\n\
+  \              // Even if parent is CS but Cur isn't direct child (shouldn't happen),\
+  \ continue.\n            }\n            if (const auto *PS = P.get<Stmt>()) {\n\
+  \              Next = PS;\n              // Keep searching upwards until we hit\
+  \ a CompoundStmt that directly contains Cur.\n            } else {\n           \
+  \   // Parent is not a Stmt, likely a Decl - stop this branch.\n            }\n\
+  \          }\n          Cur = Next;\n        }\n        return false;\n      }\n\
+  \n      static const CallExpr *getCallFromAssignment(const Stmt *S) {\n        if\
+  \ (!S) return nullptr;\n        const auto *BO = dyn_cast<BinaryOperator>(S);\n\
+  \        if (!BO || !BO->isAssignmentOp())\n          return nullptr;\n        const\
+  \ Expr *RHS = BO->getRHS();\n        return dyn_cast_or_null<CallExpr>(RHS ? RHS->IgnoreParenImpCasts()\
+  \ : nullptr);\n      }\n\n      static const CallExpr *getCallFromDeclInit(const\
+  \ Stmt *S) {\n        const auto *DS = dyn_cast<DeclStmt>(S);\n        if (!DS)\
+  \ return nullptr;\n        for (const Decl *Di : DS->decls()) {\n          if (const\
+  \ auto *VD = dyn_cast<VarDecl>(Di)) {\n            if (const Expr *Init = VD->getInit())\
+  \ {\n              if (const auto *CE = dyn_cast<CallExpr>(Init->IgnoreParenImpCasts()))\n\
+  \                return CE;\n            }\n          }\n        }\n        return\
+  \ nullptr;\n      }\n\n      static const CallExpr *findCallBeforeIf(const IfStmt\
+  \ *IfS, ASTContext &Ctx) {\n        if (!IfS) return nullptr;\n        // Case 1:\
+  \ condition is a call\n        if (const Expr *Cond = IfS->getCond()) {\n      \
+  \    if (const auto *CE = dyn_cast<CallExpr>(Cond->IgnoreParenImpCasts()))\n   \
+  \         return CE;\n        }\n\n        // Case 2: previous sibling contains\
+  \ the call (assignment or decl-init)\n        const CompoundStmt *CS = nullptr;\n\
+  \        unsigned Idx = 0;\n        if (!getEnclosingCompoundAndIndex(IfS, Ctx,\
+  \ CS, Idx) || !CS)\n          return nullptr;\n\n        if (Idx == 0)\n       \
+  \   return nullptr;\n\n        const Stmt *Prev = CS->body()[Idx - 1];\n       \
+  \ if (!Prev) return nullptr;\n\n        if (const CallExpr *CE = getCallFromAssignment(Prev))\n\
+  \          return CE;\n        if (const CallExpr *CE = getCallFromDeclInit(Prev))\n\
+  \          return CE;\n\n        // Also consider if the previous statement is directly\
+  \ a call.\n        if (const auto *CE = dyn_cast<CallExpr>(Prev))\n          return\
+  \ CE;\n\n        // Or contains a call anywhere (less strict)\n        return findFirstCallIn(Prev);\n\
+  \      }\n\n      static void collectStructPtrArgs(const CallExpr *CE,\n       \
+  \                                llvm::SmallVectorImpl<const VarDecl*> &Out) {\n\
+  \        if (!CE) return;\n        for (unsigned i = 0; i < CE->getNumArgs(); ++i)\
+  \ {\n          const Expr *Arg = CE->getArg(i)->IgnoreParenImpCasts();\n       \
+  \   const auto *DRE = dyn_cast<DeclRefExpr>(Arg);\n          if (!DRE) continue;\n\
+  \          const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());\n          if (!VD)\
+  \ continue;\n          QualType T = DRE->getType();\n          if (const auto *PT\
+  \ = T->getAs<PointerType>()) {\n            QualType Pointee = PT->getPointeeType();\n\
+  \            if (Pointee->getAs<RecordType>()) {\n              Out.push_back(VD);\n\
+  \            }\n          }\n        }\n      }\n\n      static bool isMemberOfVar(const\
+  \ Expr *E, const VarDecl *V, std::string &FieldNameOut) {\n        if (!E) return\
+  \ false;\n        const auto *ME = dyn_cast<MemberExpr>(E->IgnoreParenImpCasts());\n\
+  \        if (!ME) return false;\n        const Expr *Base = ME->getBase();\n   \
+  \     if (!Base) return false;\n        const auto *DRE = dyn_cast<DeclRefExpr>(Base->IgnoreParenImpCasts());\n\
+  \        if (!DRE) return false;\n        const auto *BVD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \        if (!BVD || BVD != V) return false;\n        if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl()))\
+  \ {\n          FieldNameOut = FD->getNameAsString();\n          return true;\n \
+  \       }\n        if (const auto *ND = dyn_cast<NamedDecl>(ME->getMemberDecl()))\
+  \ {\n          FieldNameOut = ND->getNameAsString();\n          return true;\n \
+  \       }\n        return false;\n      }\n\n      static bool stmtContainsAssignmentToMember(const\
+  \ Stmt *S,\n                                                 const VarDecl *Base,\n\
+  \                                                 StringRef Field) {\n        if\
+  \ (!S) return false;\n\n        // Check if S is an assignment to the target member\n\
+  \        if (const auto *BO = dyn_cast<BinaryOperator>(S)) {\n          if (BO->isAssignmentOp())\
+  \ {\n            const Expr *LHS = BO->getLHS();\n            const auto *ME = dyn_cast<MemberExpr>(LHS\
+  \ ? LHS->IgnoreParenImpCasts() : nullptr);\n            if (ME) {\n            \
+  \  const Expr *BaseE = ME->getBase();\n              const auto *DRE = dyn_cast<DeclRefExpr>(BaseE\
+  \ ? BaseE->IgnoreParenImpCasts() : nullptr);\n              const auto *BVD = DRE\
+  \ ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;\n              if (BVD == Base)\
+  \ {\n                std::string Name;\n                if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl()))\n\
+  \                  Name = FD->getNameAsString();\n                else if (const\
+  \ auto *ND = dyn_cast<NamedDecl>(ME->getMemberDecl()))\n                  Name =\
+  \ ND->getNameAsString();\n                if (!Name.empty() && Field.equals(Name))\n\
+  \                  return true;\n              }\n            }\n          }\n \
+  \       }\n\n        // Recurse into children\n        for (const Stmt *Child :\
+  \ S->children()) {\n          if (!Child) continue;\n          if (stmtContainsAssignmentToMember(Child,\
+  \ Base, Field))\n            return true;\n        }\n        return false;\n  \
+  \    }\n\n      static void buildCleanupMap(const Stmt *Body, ASTContext &Ctx,\n\
+  \                                  llvm::StringMap<llvm::SmallVector<FreedTarget,\
+  \ 4>> &OutMap) {\n        if (!Body) return;\n\n        // Traverse the body to\
+  \ find all LabelStmt\n        llvm::SmallVector<const LabelStmt*, 16> Labels;\n\
+  \        // Collect labels\n        std::function<void(const Stmt*)> CollectLabels\
+  \ = [&](const Stmt *S){\n          if (!S) return;\n          if (const auto *LS\
+  \ = dyn_cast<LabelStmt>(S))\n            Labels.push_back(LS);\n          for (const\
+  \ Stmt *Child : S->children()) {\n            if (Child) CollectLabels(Child);\n\
+  \          }\n        };\n        CollectLabels(Body);\n\n        // For each label,\
+  \ scan forward in the enclosing compound to collect free-like calls\n        for\
+  \ (const LabelStmt *LS : Labels) {\n          StringRef LName = getLabelName(LS);\n\
+  \          if (LName.empty()) continue;\n\n          const CompoundStmt *CS = nullptr;\n\
+  \          unsigned Idx = 0;\n          if (!getEnclosingCompoundAndIndex(LS, Ctx,\
+  \ CS, Idx) || !CS)\n            continue;\n\n          // Scan forward from the\
+  \ statement just after the LabelStmt\n          for (unsigned I = Idx + 1; I < CS->size();\
+  \ ++I) {\n            const Stmt *Cur = CS->body()[I];\n            if (!Cur) continue;\n\
+  \n            if (isa<LabelStmt>(Cur)) {\n              // Another label signals\
+  \ end of this cleanup region\n              break;\n            }\n\n          \
+  \  // Collect known free calls within this statement\n            llvm::SmallVector<const\
+  \ CallExpr*, 8> Calls;\n            collectAllCallsIn(Cur, Calls);\n           \
+  \ for (const CallExpr *CE : Calls) {\n              const FunctionDecl *FD = CE->getDirectCallee();\n\
+  \              if (!FD) continue;\n              const IdentifierInfo *II = FD->getIdentifier();\n\
+  \              if (!II) continue;\n              StringRef Name = II->getName();\n\
+  \              if (!isKnownFreeName(Name)) continue;\n\n              const Expr\
+  \ *Arg0 = getFreedExprFromCall(CE);\n              if (!Arg0) continue;\n\n    \
+  \          FreedTarget FT;\n              FT.LabelName = LName.str();\n        \
+  \      FT.FreeCallCE = CE;\n              FT.FreedExpr = Arg0;\n              FT.CalleeName\
+  \ = Name.str();\n              OutMap[LName].push_back(FT);\n            }\n\n \
+  \           // Stop at control-flow ending constructs, typical for cleanup regions\n\
+  \            if (isa<ReturnStmt>(Cur) || isa<GotoStmt>(Cur) || isa<BreakStmt>(Cur)\
+  \ || isa<ContinueStmt>(Cur))\n              break;\n          }\n        }\n   \
+  \   }\n\n      static void collectIfStmts(const Stmt *Body, llvm::SmallVectorImpl<const\
+  \ IfStmt*> &Out) {\n        if (!Body) return;\n        if (const auto *IS = dyn_cast<IfStmt>(Body))\n\
+  \          Out.push_back(IS);\n        for (const Stmt *Child : Body->children())\
+  \ {\n          if (!Child) continue;\n          collectIfStmts(Child, Out);\n  \
+  \      }\n      }\n\n      static bool sawPriorLocalAssignmentTo(const IfStmt *IfS,\
+  \ ASTContext &Ctx,\n                                            const VarDecl *Base,\
+  \ StringRef Field) {\n        if (!IfS || !Base) return false;\n        const CompoundStmt\
+  \ *CS = nullptr;\n        unsigned IfIdx = 0;\n        if (!getEnclosingCompoundAndIndex(IfS,\
+  \ Ctx, CS, IfIdx) || !CS)\n          return false;\n\n        // Search in siblings\
+  \ before IfS\n        for (unsigned I = 0; I < IfIdx; ++I) {\n          const Stmt\
+  \ *Cur = CS->body()[I];\n          if (!Cur) continue;\n          if (stmtContainsAssignmentToMember(Cur,\
+  \ Base, Field))\n            return true;\n        }\n        return false;\n  \
+  \    }\n};\n\nvoid SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD) return;\n  const Stmt *Body = FD->getBody();\n  if (!Body) return;\n\
+  \n  ASTContext &Ctx = BR.getContext();\n\n  // Step B: Build label -> cleanup free\
+  \ targets map\n  llvm::StringMap<llvm::SmallVector<FreedTarget, 4>> CleanupMap;\n\
+  \  buildCleanupMap(Body, Ctx, CleanupMap);\n\n  if (CleanupMap.empty())\n    return;\n\
+  \n  // Step C: Find IfStmts with early goto in then-branch and calls right before\
+  \ them\n  llvm::SmallVector<const IfStmt*, 32> Ifs;\n  collectIfStmts(Body, Ifs);\n\
+  \n  AnalysisDeclContext *ADC = Mgr.getAnalysisDeclContext(D);\n\n  for (const IfStmt\
+  \ *IfS : Ifs) {\n    const Stmt *Then = IfS->getThen();\n    if (!Then) continue;\n\
+  \n    const GotoStmt *GS = findFirstGotoIn(Then);\n    if (!GS) continue;\n\n  \
+  \  StringRef TargetLabel = getLabelNameFromGoto(GS);\n    if (TargetLabel.empty())\
+  \ continue;\n\n    auto It = CleanupMap.find(TargetLabel);\n    if (It == CleanupMap.end())\
+  \ continue;\n\n    const CallExpr *FailingCall = findCallBeforeIf(IfS, Ctx);\n \
+  \   if (!FailingCall) continue;\n\n    // Collect struct* arguments of the failing\
+  \ call\n    llvm::SmallVector<const VarDecl*, 8> StructArgs;\n    collectStructPtrArgs(FailingCall,\
+  \ StructArgs);\n    if (StructArgs.empty()) continue;\n\n    // Step D: For each\
+  \ free in the cleanup region, see if it's freeing a member of any struct arg\n \
+  \   for (const FreedTarget &FT : It->second) {\n      const Expr *E = FT.FreedExpr;\n\
+  \      const auto *ME = dyn_cast<MemberExpr>(E ? E->IgnoreParenImpCasts() : nullptr);\n\
+  \      if (!ME) continue;\n\n      const Expr *Base = ME->getBase();\n      const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(Base ? Base->IgnoreParenImpCasts() : nullptr);\n\
+  \      if (!DRE) continue;\n\n      const auto *BVD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \      if (!BVD) continue;\n\n      // Check if Base is among failing call's struct\
+  \ pointer args\n      bool IsStructArg = llvm::is_contained(StructArgs, BVD);\n\
+  \      if (!IsStructArg) continue;\n\n      // Extract member field name\n     \
+  \ std::string FieldName;\n      if (!isMemberOfVar(E, BVD, FieldName))\n       \
+  \ continue;\n\n      // Check whether this member was assigned earlier in this function\
+  \ before the IfS\n      if (sawPriorLocalAssignmentTo(IfS, Ctx, BVD, FieldName))\n\
+  \        continue; // Locally initialized; skip warning\n\n      // Step E: Report\n\
+  \      PathDiagnosticLocation Loc = PathDiagnosticLocation::createBegin(FT.FreeCallCE,\
+  \ BR.getSourceManager(), ADC);\n      auto R = std::make_unique<BasicBugReport>(\n\
+  \          *BT,\n          \"Suspicious free of 'param->field' in early error path;\
+  \ may double free or free uninitialized memory\",\n          Loc);\n      R->addRange(FT.FreeCallCE->getSourceRange());\n\
+  \      BR.emitReport(std::move(R));\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects goto-based early error cleanup\
+  \ that frees struct fields not initialized in the current function\",\n      \"\"\
+  );\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nnet/mlx5: HWS, fixed double free in error flow of\
+  \ definer layout\n\nFix error flow bug that could lead to double free of a buffer\n\
+  during a failure to calculate a suitable definer layout.\n\nFixes: 74a778b4a63f\
+  \ (\"net/mlx5: HWS, added definers handling\")\nSigned-off-by: Yevgeny Kliteynik\
+  \ <kliteyn@nvidia.com>\nReviewed-by: Itamar Gozlan <igozlan@nvidia.com>\nSigned-off-by:\
+  \ Tariq Toukan <tariqt@nvidia.com>\nSigned-off-by: Paolo Abeni <pabeni@redhat.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: mlx5hws_definer_calc_layout in drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\n\
+  int\nmlx5hws_definer_calc_layout(struct mlx5hws_context *ctx,\n\t\t\t    struct\
+  \ mlx5hws_match_template *mt,\n\t\t\t    struct mlx5hws_definer *match_definer)\n\
+  {\n\tu8 *match_hl;\n\tint ret;\n\n\t/* Union header-layout (hl) is used for creating\
+  \ a single definer\n\t * field layout used with different bitmasks for hash and\
+  \ match.\n\t */\n\tmatch_hl = kzalloc(MLX5_ST_SZ_BYTES(definer_hl), GFP_KERNEL);\n\
+  \tif (!match_hl)\n\t\treturn -ENOMEM;\n\n\t/* Convert all mt items to header layout\
+  \ (hl)\n\t * and allocate the match and range field copy array (fc & fcr).\n\t */\n\
+  \tret = hws_definer_conv_match_params_to_hl(ctx, mt, match_hl);\n\tif (ret) {\n\t\
+  \tmlx5hws_err(ctx, \"Failed to convert items to header layout\\n\");\n\t\tgoto free_fc;\n\
+  \t}\n\n\t/* Find the match definer layout for header layout match union */\n\tret\
+  \ = hws_definer_find_best_match_fit(ctx, match_definer, match_hl);\n\tif (ret) {\n\
+  \t\tif (ret == -E2BIG)\n\t\t\tmlx5hws_dbg(ctx,\n\t\t\t\t    \"Failed to create match\
+  \ definer from header layout - E2BIG\\n\");\n\t\telse\n\t\t\tmlx5hws_err(ctx,\n\t\
+  \t\t\t    \"Failed to create match definer from header layout (%d)\\n\",\n\t\t\t\
+  \t    ret);\n\t\tgoto free_fc;\n\t}\n\n\tkfree(match_hl);\n\treturn 0;\n\nfree_fc:\n\
+  \tkfree(mt->fc);\n\n\tkfree(match_hl);\n\treturn ret;\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\
+  \ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\nindex\
+  \ d566d2ddf424..3f4c58bada37 100644\n--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\n\
+  +++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/hws/mlx5hws_definer.c\n@@\
+  \ -1925,7 +1925,7 @@ mlx5hws_definer_calc_layout(struct mlx5hws_context *ctx,\n\
+  \ \tret = hws_definer_conv_match_params_to_hl(ctx, mt, match_hl);\n \tif (ret) {\n\
+  \ \t\tmlx5hws_err(ctx, \"Failed to convert items to header layout\\n\");\n-\t\t\
+  goto free_fc;\n+\t\tgoto free_match_hl;\n \t}\n \n \t/* Find the match definer layout\
+  \ for header layout match union */\n@@ -1946,7 +1946,7 @@ mlx5hws_definer_calc_layout(struct\
+  \ mlx5hws_context *ctx,\n \n free_fc:\n \tkfree(mt->fc);\n-\n+free_match_hl:\n \t\
+  kfree(match_hl);\n \treturn ret;\n }\n```\n"
+pattern: '## Bug Pattern
+
+
+  Using a single error cleanup path that frees resources unconditionally, even when
+  the failure occurred before those resources were successfully allocated or when
+  the callee already freed them. Specifically, after hws_definer_conv_match_params_to_hl()
+  fails, jumping to a label that kfree(mt->fc) can double-free mt->fc (or free an
+  uninitialized pointer), because the callee may have already freed/not allocated
+  it. The fix separates cleanup labels so only the memory definitely owned at that
+  point (match_hl) is freed on that path.'
+plan: "Plan\n\n1. Program state\n- No custom program state is necessary. We will implement\
+  \ this checker as a single AST-body pass that matches a specific error-cleanup-with-goto\
+  \ anti-pattern.\n\n2. Callbacks\n- Use only checkASTCodeBody. We will:\n  - Walk\
+  \ the function body to collect:\n    - All label-based cleanup regions and the free()\
+  \ operations in them.\n    - All if-statements that perform a goto-based early-exit\
+  \ after a failing call.\n  - Correlate these two to warn if the early-exit path\
+  \ frees a member field of a struct argument that the current function did not initialize\
+  \ before the failing call (likely callee-owned), which indicates possible double-free\
+  \ or invalid free.\n\n3. Implementation steps in checkASTCodeBody\n\nStep A: Prepare\
+  \ helpers and constants\n- Known free functions: maintain a small set: {\"kfree\"\
+  , \"kvfree\", \"vfree\"}.\n- Helper: isKnownFreeCall(const CallExpr* CE)\n  - Get\
+  \ callee IdentifierInfo; return true if in known set.\n- Helper: getFreedExpr(const\
+  \ CallExpr* CE)\n  - Return CE->getArg(0)->IgnoreImpCasts().\n- Helper: isMemberOfVar(const\
+  \ Expr* E, const VarDecl* V, std::string* FieldNameOut)\n  - If E is a MemberExpr\
+  \ (E->IgnoreImpCasts()), base is a DeclRefExpr to VarDecl == V, return true and\
+  \ optionally store the field name.\n- Helper: findEnclosingCompound(const Stmt*\
+  \ S, CheckerContext &C)\n  - Use findSpecificTypeInParents<CompoundStmt>(S, C) to\
+  \ get nearest enclosing compound block.\n- Helper: getIndexInCompound(const CompoundStmt*\
+  \ CS, const Stmt* S)\n  - Walk CS->body(); find index of S.\n- Helper: findFirstGotoInThen(const\
+  \ IfStmt* IfS)\n  - If Then is a GotoStmt, return it; if Then is a CompoundStmt,\
+  \ linearly scan children and return the first GotoStmt found; otherwise nullptr.\n\
+  - Helper: getTargetLabelName(const GotoStmt* GS)\n  - GS->getLabel()->getName().\n\
+  - Helper: findCallBeforeIf(const IfStmt* IfS, CheckerContext &C)\n  - Strategy (in\
+  \ order):\n    - If IfS->getCond() is a CallExpr, return it (failing call is in\
+  \ condition).\n    - Else, find enclosing CompoundStmt CS and the previous sibling\
+  \ statement Prev before IfS:\n      - If Prev is a BinaryOperator assignment and\
+  \ RHS is CallExpr, return that CallExpr.\n      - If Prev is a DeclStmt with one\
+  \ declarator initialized by a CallExpr, return that CallExpr.\n    - Else nullptr.\n\
+  - Helper: collectStructPtrArgs(const CallExpr* CE, SmallVector<const VarDecl*, 4>&\
+  \ Out)\n  - For each CE arg: if it\u2019s a DeclRefExpr whose type is a pointer\
+  \ to a RecordType (struct/union), collect its VarDecl.\n- Helper: stmtContainsAssignmentToMember(const\
+  \ Stmt* S, const VarDecl* Base, StringRef Field)\n  - Return true if within S there\
+  \ exists a BinaryOperator assignment where LHS is a MemberExpr with base DeclRefExpr\
+  \ to Base and member name matches Field.\n\nStep B: Build label-to-cleanup map\n\
+  - Iterate the function body to record cleanup regions:\n  - For every LabelStmt\
+  \ L:\n    - Find its enclosing CompoundStmt CS and the index Idx of L in CS.\n \
+  \   - Walk forward in CS from Idx:\n      - For the current statement St:\n    \
+  \    - If it is another LabelStmt and not the first statement (i.e., Idx2 > Idx),\
+  \ stop (cleanup region ends).\n        - If it is a ReturnStmt, BreakStmt, or GotoStmt\
+  \ (a control terminator), include it if at Idx (LabelStmt\u2019s own child), then\
+  \ stop after processing current.\n        - For each statement in this linear region,\
+  \ try to find a CallExpr using findSpecificTypeInChildren<CallExpr>(St).\n     \
+  \     - If it is a known free call, record a FreedTarget:\n            - Fields:\
+  \ LabelName, FreeCallStmt (for report range), CalleeName, FreedExpr (argument 0,\
+  \ ignoring casts).\n      - Continue to next statement until one of the above stopping\
+  \ conditions or end of CS.\n  - Maintain a map LabelName -> vector<FreedTarget>\
+  \ CleanupMap.\n\nStep C: Detect early-error goto after failing call\n- Walk all\
+  \ IfStmt nodes:\n  - Obtain the first then-branch GotoStmt GS = findFirstGotoInThen(IfS);\
+  \ if none, continue.\n  - Identify the failing call CE = findCallBeforeIf(IfS, C);\
+  \ if none, continue.\n  - Collect struct pointer arguments of CE into StructArgs\
+  \ (VarDecl pointers).\n  - If StructArgs is empty, continue.\n  - Get target label\
+  \ name L = getTargetLabelName(GS); look up CleanupMap[L]. If none, continue.\n\n\
+  Step D: Determine suspicious frees in the label\u2019s cleanup region\n- For each\
+  \ FreedTarget FT in CleanupMap[L]:\n  - If FT.FreedExpr is a MemberExpr ME and its\
+  \ base is a DeclRefExpr whose VarDecl is one of StructArgs (call\u2019s struct pointer\
+  \ parameters), then we suspect that we are freeing callee-owned (or not-initialized-by-this-function)\
+  \ memory on the early error path.\n  - To reduce false positives, check if this\
+  \ field was assigned within this function before the IfStmt:\n    - Let ME\u2019\
+  s member field name be FieldName.\n    - Find enclosing CompoundStmt CS of IfS and\
+  \ its index IdxIf.\n    - For all sibling statements in CS with index < IdxIf:\n\
+  \      - If stmtContainsAssignmentToMember(S, BaseVarDecl, FieldName) returns true\
+  \ for any, then consider this free as locally-initialized (skip warning for this\
+  \ FT).\n  - If no prior local assignment found, emit a warning.\n\nStep E: Bug reporting\n\
+  - For each suspicious FT (no prior assignment), create a BasicBugReport:\n  - Short\
+  \ message: \"Suspicious free of 'param->field' in early error path; may double free\
+  \ or free uninitialized memory\"\n  - Primary location/range: the free call site\
+  \ (FT.FreeCallStmt).\n  - Optionally, add a note with the failing call location\
+  \ (CE) to aid understanding.\n- Only one report per FT.\n\n4. Notes and simplifications\n\
+  - This checker is intentionally heuristic and scoped:\n  - It flags when the early-error\
+  \ goto after a failing call leads to a cleanup region that frees a member of a struct\
+  \ pointer argument to that failing call, but the member was never assigned in the\
+  \ current function prior to the IfStmt. This mirrors the target bug where mt->fc\
+  \ is freed in the early error path even though it is managed by the callee hws_definer_conv_match_params_to_hl().\n\
+  \  - It handles common C kernel patterns:\n    - if (ret) goto out;\n    - if (func(...))\
+  \ goto out;\n    - Label-based cleanup with linear sequence of kfree() calls.\n\
+  - Utility usage:\n  - Use findSpecificTypeInParents<CompoundStmt> to locate enclosing\
+  \ blocks.\n  - Use findSpecificTypeInChildren<CallExpr>/BinaryOperator to search\
+  \ inside statements.\n  - Use ExprHasName for simple name checks when matching member\
+  \ fields if desired, though MemberExpr inspection is preferred.\n- No interprocedural\
+  \ modeling or taint/state tracking is required for this pattern."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/ParentMapContext.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Decl.h\"\
+  \n#include \"llvm/ADT/StringMap.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include\
+  \ \"llvm/ADT/STLExtras.h\"\n#include <string>\n#include <memory>\n#include <functional>\n\
+  \nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// No\
+  \ custom program state for this checker.\n\nnamespace {\n\nstruct FreedTarget {\n\
+  \  std::string LabelName;\n  const CallExpr *FreeCallCE;     // The free call statement\
+  \ (for diagnostics)\n  const Expr *FreedExpr;          // The expression passed\
+  \ to free (arg0)\n  std::string CalleeName;         // Name of free function (kfree,\
+  \ etc.)\n};\n\nclass SAGenTestChecker : public Checker<check::ASTCodeBody> {\n \
+  \  mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Suspicious cleanup free in early error path\", \"Memory\
+  \ Management\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n\n   private:\n\n      // Helpers\n      static\
+  \ bool isKnownFreeName(StringRef Name) {\n        return Name.equals(\"kfree\")\
+  \ || Name.equals(\"kvfree\") || Name.equals(\"vfree\");\n      }\n\n      static\
+  \ const CallExpr *findFirstCallIn(const Stmt *S) {\n        if (!S) return nullptr;\n\
+  \        if (const auto *CE = dyn_cast<CallExpr>(S))\n          return CE;\n   \
+  \     for (const Stmt *Child : S->children()) {\n          if (!Child) continue;\n\
+  \          if (const CallExpr *Found = findFirstCallIn(Child))\n            return\
+  \ Found;\n        }\n        return nullptr;\n      }\n\n      static void collectAllCallsIn(const\
+  \ Stmt *S, llvm::SmallVectorImpl<const CallExpr*> &Out) {\n        if (!S) return;\n\
+  \        if (const auto *CE = dyn_cast<CallExpr>(S))\n          Out.push_back(CE);\n\
+  \        for (const Stmt *Child : S->children()) {\n          if (!Child) continue;\n\
+  \          collectAllCallsIn(Child, Out);\n        }\n      }\n\n      static const\
+  \ GotoStmt *findFirstGotoIn(const Stmt *S) {\n        if (!S) return nullptr;\n\
+  \        if (const auto *GS = dyn_cast<GotoStmt>(S))\n          return GS;\n   \
+  \     for (const Stmt *Child : S->children()) {\n          if (!Child) continue;\n\
+  \          if (const GotoStmt *Found = findFirstGotoIn(Child))\n            return\
+  \ Found;\n        }\n        return nullptr;\n      }\n\n      static const Expr\
+  \ *getFreedExprFromCall(const CallExpr *CE) {\n        if (!CE || CE->getNumArgs()\
+  \ == 0) return nullptr;\n        return CE->getArg(0)->IgnoreParenImpCasts();\n\
+  \      }\n\n      static StringRef getLabelName(const LabelStmt *LS) {\n       \
+  \ if (!LS) return StringRef();\n        if (const LabelDecl *LD = LS->getDecl())\
+  \ {\n          if (const IdentifierInfo *II = LD->getIdentifier())\n           \
+  \ return II->getName();\n        }\n        return StringRef();\n      }\n\n   \
+  \   static StringRef getLabelNameFromGoto(const GotoStmt *GS) {\n        if (!GS)\
+  \ return StringRef();\n        if (const LabelDecl *LD = GS->getLabel()) {\n   \
+  \       if (const IdentifierInfo *II = LD->getIdentifier())\n            return\
+  \ II->getName();\n        }\n        return StringRef();\n      }\n\n      static\
+  \ bool getEnclosingCompoundAndIndex(const Stmt *S, ASTContext &Ctx,\n          \
+  \                                     const CompoundStmt *&OutCS, unsigned &OutIdx)\
+  \ {\n        if (!S) return false;\n        ParentMapContext &PMC = Ctx.getParentMapContext();\n\
+  \        const Stmt *Cur = S;\n        // Limit the search depth to avoid pathological\
+  \ cases.\n        for (int Depth = 0; Depth < 64 && Cur; ++Depth) {\n          auto\
+  \ Parents = PMC.getParents(*Cur);\n          if (Parents.empty())\n            return\
+  \ false;\n          const Stmt *Next = nullptr;\n          for (const auto &P :\
+  \ Parents) {\n            if (const auto *CS = P.get<CompoundStmt>()) {\n      \
+  \        // Find the index of Cur in CS\n              unsigned I = 0;\n       \
+  \       for (const Stmt *Child : CS->body()) {\n                if (Child == Cur)\
+  \ {\n                  OutCS = CS;\n                  OutIdx = I;\n            \
+  \      return true;\n                }\n                ++I;\n              }\n\
+  \              // Even if parent is CS but Cur isn't direct child (shouldn't happen),\
+  \ continue.\n            }\n            if (const auto *PS = P.get<Stmt>()) {\n\
+  \              Next = PS;\n              // Keep searching upwards until we hit\
+  \ a CompoundStmt that directly contains Cur.\n            } else {\n           \
+  \   // Parent is not a Stmt, likely a Decl - stop this branch.\n            }\n\
+  \          }\n          Cur = Next;\n        }\n        return false;\n      }\n\
+  \n      static const CallExpr *getCallFromAssignment(const Stmt *S) {\n        if\
+  \ (!S) return nullptr;\n        const auto *BO = dyn_cast<BinaryOperator>(S);\n\
+  \        if (!BO || !BO->isAssignmentOp())\n          return nullptr;\n        const\
+  \ Expr *RHS = BO->getRHS();\n        return dyn_cast_or_null<CallExpr>(RHS ? RHS->IgnoreParenImpCasts()\
+  \ : nullptr);\n      }\n\n      static const CallExpr *getCallFromDeclInit(const\
+  \ Stmt *S) {\n        const auto *DS = dyn_cast<DeclStmt>(S);\n        if (!DS)\
+  \ return nullptr;\n        for (const Decl *Di : DS->decls()) {\n          if (const\
+  \ auto *VD = dyn_cast<VarDecl>(Di)) {\n            if (const Expr *Init = VD->getInit())\
+  \ {\n              if (const auto *CE = dyn_cast<CallExpr>(Init->IgnoreParenImpCasts()))\n\
+  \                return CE;\n            }\n          }\n        }\n        return\
+  \ nullptr;\n      }\n\n      static const CallExpr *findCallBeforeIf(const IfStmt\
+  \ *IfS, ASTContext &Ctx) {\n        if (!IfS) return nullptr;\n        // Case 1:\
+  \ condition is a call\n        if (const Expr *Cond = IfS->getCond()) {\n      \
+  \    if (const auto *CE = dyn_cast<CallExpr>(Cond->IgnoreParenImpCasts()))\n   \
+  \         return CE;\n        }\n\n        // Case 2: previous sibling contains\
+  \ the call (assignment or decl-init)\n        const CompoundStmt *CS = nullptr;\n\
+  \        unsigned Idx = 0;\n        if (!getEnclosingCompoundAndIndex(IfS, Ctx,\
+  \ CS, Idx) || !CS)\n          return nullptr;\n\n        if (Idx == 0)\n       \
+  \   return nullptr;\n\n        const Stmt *Prev = getStmtAtIndex(CS, Idx - 1);\n\
+  \        if (!Prev) return nullptr;\n\n        if (const CallExpr *CE = getCallFromAssignment(Prev))\n\
+  \          return CE;\n        if (const CallExpr *CE = getCallFromDeclInit(Prev))\n\
+  \          return CE;\n\n        // Also consider if the previous statement is directly\
+  \ a call.\n        if (const auto *CE = dyn_cast<CallExpr>(Prev))\n          return\
+  \ CE;\n\n        // Or contains a call anywhere (less strict)\n        return findFirstCallIn(Prev);\n\
+  \      }\n\n      static void collectStructPtrArgs(const CallExpr *CE,\n       \
+  \                                llvm::SmallVectorImpl<const VarDecl*> &Out) {\n\
+  \        if (!CE) return;\n        for (unsigned i = 0; i < CE->getNumArgs(); ++i)\
+  \ {\n          const Expr *Arg = CE->getArg(i)->IgnoreParenImpCasts();\n       \
+  \   const auto *DRE = dyn_cast<DeclRefExpr>(Arg);\n          if (!DRE) continue;\n\
+  \          const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());\n          if (!VD)\
+  \ continue;\n          QualType T = DRE->getType();\n          if (const auto *PT\
+  \ = T->getAs<PointerType>()) {\n            QualType Pointee = PT->getPointeeType();\n\
+  \            if (Pointee->getAs<RecordType>()) {\n              Out.push_back(VD);\n\
+  \            }\n          }\n        }\n      }\n\n      static bool isMemberOfVar(const\
+  \ Expr *E, const VarDecl *V, std::string &FieldNameOut) {\n        if (!E) return\
+  \ false;\n        const auto *ME = dyn_cast<MemberExpr>(E->IgnoreParenImpCasts());\n\
+  \        if (!ME) return false;\n        const Expr *Base = ME->getBase();\n   \
+  \     if (!Base) return false;\n        const auto *DRE = dyn_cast<DeclRefExpr>(Base->IgnoreParenImpCasts());\n\
+  \        if (!DRE) return false;\n        const auto *BVD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \        if (!BVD || BVD != V) return false;\n        if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl()))\
+  \ {\n          FieldNameOut = FD->getNameAsString();\n          return true;\n \
+  \       }\n        if (const auto *ND = dyn_cast<NamedDecl>(ME->getMemberDecl()))\
+  \ {\n          FieldNameOut = ND->getNameAsString();\n          return true;\n \
+  \       }\n        return false;\n      }\n\n      static bool stmtContainsAssignmentToMember(const\
+  \ Stmt *S,\n                                                 const VarDecl *Base,\n\
+  \                                                 StringRef Field) {\n        if\
+  \ (!S) return false;\n\n        // Check if S is an assignment to the target member\n\
+  \        if (const auto *BO = dyn_cast<BinaryOperator>(S)) {\n          if (BO->isAssignmentOp())\
+  \ {\n            const Expr *LHS = BO->getLHS();\n            const auto *ME = dyn_cast<MemberExpr>(LHS\
+  \ ? LHS->IgnoreParenImpCasts() : nullptr);\n            if (ME) {\n            \
+  \  const Expr *BaseE = ME->getBase();\n              const auto *DRE = dyn_cast<DeclRefExpr>(BaseE\
+  \ ? BaseE->IgnoreParenImpCasts() : nullptr);\n              const auto *BVD = DRE\
+  \ ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;\n              if (BVD == Base)\
+  \ {\n                std::string Name;\n                if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl()))\n\
+  \                  Name = FD->getNameAsString();\n                else if (const\
+  \ auto *ND = dyn_cast<NamedDecl>(ME->getMemberDecl()))\n                  Name =\
+  \ ND->getNameAsString();\n                if (!Name.empty() && Field.equals(Name))\n\
+  \                  return true;\n              }\n            }\n          }\n \
+  \       }\n\n        // Recurse into children\n        for (const Stmt *Child :\
+  \ S->children()) {\n          if (!Child) continue;\n          if (stmtContainsAssignmentToMember(Child,\
+  \ Base, Field))\n            return true;\n        }\n        return false;\n  \
+  \    }\n\n      // Helper to get the number of statements in a CompoundStmt in a\
+  \ version-agnostic way.\n      static unsigned getCompoundBodySize(const CompoundStmt\
+  \ *CS) {\n        unsigned N = 0;\n        for (const Stmt *Child : CS->body())\
+  \ {\n          (void)Child;\n          ++N;\n        }\n        return N;\n    \
+  \  }\n\n      // Helper to get the statement at a given index in a CompoundStmt.\n\
+  \      static const Stmt *getStmtAtIndex(const CompoundStmt *CS, unsigned Index)\
+  \ {\n        unsigned I = 0;\n        for (const Stmt *Child : CS->body()) {\n \
+  \         if (I == Index)\n            return Child;\n          ++I;\n        }\n\
+  \        return nullptr;\n      }\n\n      static void buildCleanupMap(const Stmt\
+  \ *Body, ASTContext &Ctx,\n                                  llvm::StringMap<llvm::SmallVector<FreedTarget,\
+  \ 4>> &OutMap) {\n        if (!Body) return;\n\n        // Traverse the body to\
+  \ find all LabelStmt\n        llvm::SmallVector<const LabelStmt*, 16> Labels;\n\
+  \        // Collect labels\n        std::function<void(const Stmt*)> CollectLabels\
+  \ = [&](const Stmt *S){\n          if (!S) return;\n          if (const auto *LS\
+  \ = dyn_cast<LabelStmt>(S))\n            Labels.push_back(LS);\n          for (const\
+  \ Stmt *Child : S->children()) {\n            if (Child) CollectLabels(Child);\n\
+  \          }\n        };\n        CollectLabels(Body);\n\n        // For each label,\
+  \ scan forward in the enclosing compound to collect free-like calls\n        for\
+  \ (const LabelStmt *LS : Labels) {\n          StringRef LName = getLabelName(LS);\n\
+  \          if (LName.empty()) continue;\n\n          const CompoundStmt *CS = nullptr;\n\
+  \          unsigned Idx = 0;\n          if (!getEnclosingCompoundAndIndex(LS, Ctx,\
+  \ CS, Idx) || !CS)\n            continue;\n\n          // Scan forward from the\
+  \ statement just after the LabelStmt\n          unsigned CSSize = getCompoundBodySize(CS);\n\
+  \          for (unsigned I = Idx + 1; I < CSSize; ++I) {\n            const Stmt\
+  \ *Cur = getStmtAtIndex(CS, I);\n            if (!Cur) continue;\n\n           \
+  \ if (isa<LabelStmt>(Cur)) {\n              // Another label signals end of this\
+  \ cleanup region\n              break;\n            }\n\n            // Collect\
+  \ known free calls within this statement\n            llvm::SmallVector<const CallExpr*,\
+  \ 8> Calls;\n            collectAllCallsIn(Cur, Calls);\n            for (const\
+  \ CallExpr *CE : Calls) {\n              const FunctionDecl *FD = CE->getDirectCallee();\n\
+  \              if (!FD) continue;\n              const IdentifierInfo *II = FD->getIdentifier();\n\
+  \              if (!II) continue;\n              StringRef Name = II->getName();\n\
+  \              if (!isKnownFreeName(Name)) continue;\n\n              const Expr\
+  \ *Arg0 = getFreedExprFromCall(CE);\n              if (!Arg0) continue;\n\n    \
+  \          FreedTarget FT;\n              FT.LabelName = LName.str();\n        \
+  \      FT.FreeCallCE = CE;\n              FT.FreedExpr = Arg0;\n              FT.CalleeName\
+  \ = Name.str();\n              OutMap[LName].push_back(FT);\n            }\n\n \
+  \           // Stop at control-flow ending constructs, typical for cleanup regions\n\
+  \            if (isa<ReturnStmt>(Cur) || isa<GotoStmt>(Cur) || isa<BreakStmt>(Cur)\
+  \ || isa<ContinueStmt>(Cur))\n              break;\n          }\n        }\n   \
+  \   }\n\n      static void collectIfStmts(const Stmt *Body, llvm::SmallVectorImpl<const\
+  \ IfStmt*> &Out) {\n        if (!Body) return;\n        if (const auto *IS = dyn_cast<IfStmt>(Body))\n\
+  \          Out.push_back(IS);\n        for (const Stmt *Child : Body->children())\
+  \ {\n          if (!Child) continue;\n          collectIfStmts(Child, Out);\n  \
+  \      }\n      }\n\n      static bool sawPriorLocalAssignmentTo(const IfStmt *IfS,\
+  \ ASTContext &Ctx,\n                                            const VarDecl *Base,\
+  \ StringRef Field) {\n        if (!IfS || !Base) return false;\n        const CompoundStmt\
+  \ *CS = nullptr;\n        unsigned IfIdx = 0;\n        if (!getEnclosingCompoundAndIndex(IfS,\
+  \ Ctx, CS, IfIdx) || !CS)\n          return false;\n\n        // Search in siblings\
+  \ before IfS\n        for (unsigned I = 0; I < IfIdx; ++I) {\n          const Stmt\
+  \ *Cur = getStmtAtIndex(CS, I);\n          if (!Cur) continue;\n          if (stmtContainsAssignmentToMember(Cur,\
+  \ Base, Field))\n            return true;\n        }\n        return false;\n  \
+  \    }\n};\n\nvoid SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD) return;\n  const Stmt *Body = FD->getBody();\n  if (!Body) return;\n\
+  \n  ASTContext &Ctx = BR.getContext();\n\n  // Step B: Build label -> cleanup free\
+  \ targets map\n  llvm::StringMap<llvm::SmallVector<FreedTarget, 4>> CleanupMap;\n\
+  \  buildCleanupMap(Body, Ctx, CleanupMap);\n\n  if (CleanupMap.empty())\n    return;\n\
+  \n  // Step C: Find IfStmts with early goto in then-branch and calls right before\
+  \ them\n  llvm::SmallVector<const IfStmt*, 32> Ifs;\n  collectIfStmts(Body, Ifs);\n\
+  \n  AnalysisDeclContext *ADC = Mgr.getAnalysisDeclContext(D);\n\n  for (const IfStmt\
+  \ *IfS : Ifs) {\n    const Stmt *Then = IfS->getThen();\n    if (!Then) continue;\n\
+  \n    const GotoStmt *GS = findFirstGotoIn(Then);\n    if (!GS) continue;\n\n  \
+  \  StringRef TargetLabel = getLabelNameFromGoto(GS);\n    if (TargetLabel.empty())\
+  \ continue;\n\n    auto It = CleanupMap.find(TargetLabel);\n    if (It == CleanupMap.end())\
+  \ continue;\n\n    const CallExpr *FailingCall = findCallBeforeIf(IfS, Ctx);\n \
+  \   if (!FailingCall) continue;\n\n    // Collect struct* arguments of the failing\
+  \ call\n    llvm::SmallVector<const VarDecl*, 8> StructArgs;\n    collectStructPtrArgs(FailingCall,\
+  \ StructArgs);\n    if (StructArgs.empty()) continue;\n\n    // Step D: For each\
+  \ free in the cleanup region, see if it's freeing a member of any struct arg\n \
+  \   for (const FreedTarget &FT : It->second) {\n      const Expr *E = FT.FreedExpr;\n\
+  \      const auto *ME = dyn_cast<MemberExpr>(E ? E->IgnoreParenImpCasts() : nullptr);\n\
+  \      if (!ME) continue;\n\n      const Expr *Base = ME->getBase();\n      const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(Base ? Base->IgnoreParenImpCasts() : nullptr);\n\
+  \      if (!DRE) continue;\n\n      const auto *BVD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \      if (!BVD) continue;\n\n      // Check if Base is among failing call's struct\
+  \ pointer args\n      bool IsStructArg = llvm::is_contained(StructArgs, BVD);\n\
+  \      if (!IsStructArg) continue;\n\n      // Extract member field name\n     \
+  \ std::string FieldName;\n      if (!isMemberOfVar(E, BVD, FieldName))\n       \
+  \ continue;\n\n      // Check whether this member was assigned earlier in this function\
+  \ before the IfS\n      if (sawPriorLocalAssignmentTo(IfS, Ctx, BVD, FieldName))\n\
+  \        continue; // Locally initialized; skip warning\n\n      // Step E: Report\n\
+  \      PathDiagnosticLocation Loc = PathDiagnosticLocation::createBegin(FT.FreeCallCE,\
+  \ BR.getSourceManager(), ADC);\n      auto R = std::make_unique<BasicBugReport>(\n\
+  \          *BT,\n          \"Suspicious free of 'param->field' in early error path;\
+  \ may double free or free uninitialized memory\",\n          Loc);\n      R->addRange(FT.FreeCallCE->getSourceRange());\n\
+  \      BR.emitReport(std::move(R));\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects goto-based early error cleanup\
+  \ that frees struct fields not initialized in the current function\",\n      \"\"\
+  );\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

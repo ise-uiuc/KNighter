@@ -1,0 +1,412 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: a97de7bff13b1cc825c1b1344eaed8d6c2d3e695
+commit_type: Misuse
+index: 5
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"clang/Basic/SourceManager.h\"\n#include \"clang/Basic/LangOptions.h\"\
+  \n#include <cstdint>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Map: per-function optlen parameter -> greatest known lower bound\
+  \ on current path\nREGISTER_MAP_WITH_PROGRAMSTATE(OptlenLBMap, const ParmVarDecl*,\
+  \ uint64_t)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<\n    \
+  \    check::PreCall,\n        check::BranchCondition\n      > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Unsafe copy_from_sockptr\
+  \ in setsockopt\", \"Security\")) {}\n\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n\n   private:\n      // Helper utilities per plan\n\
+  \      static bool isSetSockoptHandler(const FunctionDecl *FD);\n      static const\
+  \ ParmVarDecl *findOptlenParam(const FunctionDecl *FD);\n      static bool isCopyFromSockptrLike(const\
+  \ CallEvent &Call, CheckerContext &C, unsigned &SizeArgIndex);\n      static bool\
+  \ getConstSizeFromExpr(const Expr *E, CheckerContext &C, uint64_t &Out);\n\n   \
+  \   static bool extractOptlenCompare(const Stmt *Cond,\n                       \
+  \                const ParmVarDecl *OptlenPVD,\n                               \
+  \        const Expr *&SizeExpr,\n                                       BinaryOperatorKind\
+  \ &Op,\n                                       bool &OptlenOnLHS);\n\n      static\
+  \ ProgramStateRef setLBMax(ProgramStateRef State,\n                            \
+  \          const ParmVarDecl *PVD,\n                                      uint64_t\
+  \ NewLB);\n\n      void reportUnsafeCopy(const CallEvent &Call, const Expr *SizeArg,\
+  \ CheckerContext &C) const;\n};\n\n// ---- Helper implementations ----\n\nbool SAGenTestChecker::isSetSockoptHandler(const\
+  \ FunctionDecl *FD) {\n  if (!FD)\n    return false;\n  StringRef Name = FD->getName();\n\
+  \  if (!Name.contains(\"setsockopt\"))\n    return false;\n\n  const ParmVarDecl\
+  \ *Optlen = nullptr;\n  const ParmVarDecl *Optval = nullptr;\n  for (const ParmVarDecl\
+  \ *P : FD->parameters()) {\n    if (!P || !P->getIdentifier()) continue;\n    StringRef\
+  \ PName = P->getName();\n    if (PName == \"optlen\")\n      Optlen = P;\n    else\
+  \ if (PName == \"optval\")\n      Optval = P;\n  }\n  if (!Optlen || !Optval)\n\
+  \    return false;\n\n  // Basic integer type check for optlen\n  QualType QT =\
+  \ Optlen->getType();\n  if (!QT->isIntegerType())\n    return false;\n\n  return\
+  \ true;\n}\n\nconst ParmVarDecl *SAGenTestChecker::findOptlenParam(const FunctionDecl\
+  \ *FD) {\n  if (!FD) return nullptr;\n  for (const ParmVarDecl *P : FD->parameters())\
+  \ {\n    if (!P || !P->getIdentifier()) continue;\n    if (P->getName() == \"optlen\"\
+  \ && P->getType()->isIntegerType())\n      return P;\n  }\n  return nullptr;\n}\n\
+  \nbool SAGenTestChecker::isCopyFromSockptrLike(const CallEvent &Call, CheckerContext\
+  \ &C, unsigned &SizeArgIndex) {\n  SizeArgIndex = 0;\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // Ignore the safe helper\n  if (ExprHasName(Origin,\
+  \ \"bt_copy_from_sockptr\", C))\n    return false;\n\n  // Match the unsafe helpers\n\
+  \  if (ExprHasName(Origin, \"copy_from_sockptr_offset\", C)) {\n    // Per plan:\
+  \ size index = 3 (0-based). Some kernels have size at index 2,\n    // but we follow\
+  \ the plan and guard with bounds below.\n    if (Call.getNumArgs() > 3) {\n    \
+  \  SizeArgIndex = 3;\n    } else if (Call.getNumArgs() > 2) {\n      // Fallback\
+  \ for alternate signature (size at index 2)\n      SizeArgIndex = 2;\n    } else\
+  \ {\n      return false;\n    }\n    return true;\n  }\n  if (ExprHasName(Origin,\
+  \ \"copy_from_sockptr\", C)) {\n    if (Call.getNumArgs() > 2) {\n      SizeArgIndex\
+  \ = 2;\n      return true;\n    }\n  }\n\n  return false;\n}\n\nbool SAGenTestChecker::getConstSizeFromExpr(const\
+  \ Expr *E, CheckerContext &C, uint64_t &Out) {\n  if (!E)\n    return false;\n \
+  \ llvm::APSInt Val;\n  if (!EvaluateExprToInt(Val, E, C))\n    return false;\n \
+  \ Out = Val.getZExtValue();\n  return true;\n}\n\nbool SAGenTestChecker::extractOptlenCompare(const\
+  \ Stmt *Cond,\n                                            const ParmVarDecl *OptlenPVD,\n\
+  \                                            const Expr *&SizeExpr,\n          \
+  \                                  BinaryOperatorKind &Op,\n                   \
+  \                         bool &OptlenOnLHS) {\n  SizeExpr = nullptr;\n  OptlenOnLHS\
+  \ = false;\n\n  const Expr *E = dyn_cast_or_null<Expr>(Cond);\n  if (!E)\n    return\
+  \ false;\n\n  E = E->IgnoreParenImpCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(E);\n\
+  \  if (!BO)\n    return false;\n\n  BinaryOperatorKind Opc = BO->getOpcode();\n\
+  \  switch (Opc) {\n    case BO_LT:\n    case BO_LE:\n    case BO_GT:\n    case BO_GE:\n\
+  \    case BO_EQ:\n    case BO_NE:\n      break;\n    default:\n      return false;\n\
+  \  }\n\n  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n  const Expr *RHS\
+  \ = BO->getRHS()->IgnoreParenImpCasts();\n\n  auto IsOptlenRef = [&](const Expr\
+  \ *X) -> bool {\n    const auto *DRE = dyn_cast<DeclRefExpr>(X);\n    if (!DRE)\
+  \ return false;\n    const auto *VD = dyn_cast<ParmVarDecl>(DRE->getDecl());\n \
+  \   if (!VD) return false;\n    return VD == OptlenPVD;\n  };\n\n  if (IsOptlenRef(LHS))\
+  \ {\n    // optlen <something>\n    OptlenOnLHS = true;\n    SizeExpr = RHS;\n \
+  \   Op = Opc;\n    return true;\n  }\n  if (IsOptlenRef(RHS)) {\n    // <something>\
+  \ opt optlen\n    OptlenOnLHS = false;\n    SizeExpr = LHS;\n    Op = Opc;\n   \
+  \ return true;\n  }\n\n  return false;\n}\n\nProgramStateRef SAGenTestChecker::setLBMax(ProgramStateRef\
+  \ State,\n                                           const ParmVarDecl *PVD,\n \
+  \                                          uint64_t NewLB) {\n  if (!State || !PVD)\n\
+  \    return State;\n  const uint64_t *Old = State->get<OptlenLBMap>(PVD);\n  if\
+  \ (!Old || *Old < NewLB)\n    State = State->set<OptlenLBMap>(PVD, NewLB);\n  return\
+  \ State;\n}\n\n// ---- Main logic ----\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());\n\
+  \  if (!isSetSockoptHandler(FD))\n    return;\n\n  const ParmVarDecl *OptlenPVD\
+  \ = findOptlenParam(FD);\n  if (!OptlenPVD)\n    return;\n\n  const Expr *SizeExpr\
+  \ = nullptr;\n  BinaryOperatorKind Op;\n  bool OptlenOnLHS = false;\n\n  if (!extractOptlenCompare(Condition,\
+  \ OptlenPVD, SizeExpr, Op, OptlenOnLHS))\n    return;\n\n  uint64_t S = 0;\n  if\
+  \ (!getConstSizeFromExpr(SizeExpr, C, S))\n    return;\n\n  // If optlen is on RHS,\
+  \ flip operator to canonical form \"optlen ? S\"\n  auto FlipOpForRHS = [](BinaryOperatorKind\
+  \ O) {\n    switch (O) {\n      case BO_LT: return BO_GT;   // S < optlen  -> optlen\
+  \ > S\n      case BO_LE: return BO_GE;   // S <= optlen -> optlen >= S\n      case\
+  \ BO_GT: return BO_LT;   // S > optlen  -> optlen < S\n      case BO_GE: return\
+  \ BO_LE;   // S >= optlen -> optlen <= S\n      case BO_EQ: return BO_EQ;\n    \
+  \  case BO_NE: return BO_NE;\n      default:    return O;\n    }\n  };\n\n  BinaryOperatorKind\
+  \ CanonOp = Op;\n  if (!OptlenOnLHS)\n    CanonOp = FlipOpForRHS(Op);\n\n  // Determine\
+  \ bounds for true/false branches\n  bool HasTrue = false, HasFalse = false;\n  uint64_t\
+  \ LBTrue = 0, LBFalse = 0;\n\n  switch (CanonOp) {\n    case BO_GE:\n      // optlen\
+  \ >= S : true -> LB >= S\n      HasTrue = true; LBTrue = S;\n      break;\n    case\
+  \ BO_GT:\n      // optlen > S : true -> LB >= S+1\n      HasTrue = true; LBTrue\
+  \ = S + 1;\n      break;\n    case BO_LT:\n      // optlen < S : false -> optlen\
+  \ >= S\n      HasFalse = true; LBFalse = S;\n      break;\n    case BO_LE:\n   \
+  \   // optlen <= S : false -> optlen >= S+1\n      HasFalse = true; LBFalse = S\
+  \ + 1;\n      break;\n    case BO_EQ:\n      // optlen == S : true -> LB >= S\n\
+  \      HasTrue = true; LBTrue = S;\n      break;\n    case BO_NE:\n      // optlen\
+  \ != S : no guaranteed LB\n      break;\n    default:\n      break;\n  }\n\n  if\
+  \ (!HasTrue && !HasFalse)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  ProgramStateRef StateT = State, StateF = State;\n\n  if (HasTrue)\n    StateT\
+  \ = setLBMax(StateT, OptlenPVD, LBTrue);\n  if (HasFalse)\n    StateF = setLBMax(StateF,\
+  \ OptlenPVD, LBFalse);\n\n  if (HasTrue)\n    C.addTransition(StateT);\n  if (HasFalse)\n\
+  \    C.addTransition(StateF);\n}\n\nvoid SAGenTestChecker::reportUnsafeCopy(const\
+  \ CallEvent &Call, const Expr *SizeArg, CheckerContext &C) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"copy_from_sockptr uses fixed size without validating optlen\", N);\n\
+  \n  if (SizeArg)\n    R->addRange(SizeArg->getSourceRange());\n\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  unsigned SizeIdx = 0;\n  if (!isCopyFromSockptrLike(Call, C, SizeIdx))\n\
+  \    return;\n\n  const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());\n\
+  \  if (!isSetSockoptHandler(FD))\n    return;\n\n  const ParmVarDecl *OptlenPVD\
+  \ = findOptlenParam(FD);\n  if (!OptlenPVD)\n    return;\n\n  if (SizeIdx >= Call.getNumArgs())\n\
+  \    return;\n\n  const Expr *SizeArg = Call.getArgExpr(SizeIdx);\n  if (!SizeArg)\n\
+  \    return;\n\n  uint64_t CopySize = 0;\n  if (!getConstSizeFromExpr(SizeArg, C,\
+  \ CopySize))\n    return; // Do not warn if size is not a constant we can evaluate.\n\
+  \n  ProgramStateRef State = C.getState();\n  uint64_t LB = 0;\n  if (const uint64_t\
+  \ *KnownLB = State->get<OptlenLBMap>(OptlenPVD))\n    LB = *KnownLB;\n\n  if (LB\
+  \ >= CopySize)\n    return; // validated on this path\n\n  // No sufficient prior\
+  \ validation\n  reportUnsafeCopy(Call, SizeArg, C);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects unsafe fixed-size copy_from_sockptr\
+  \ in setsockopt without validating optlen\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nBluetooth: RFCOMM: Fix not validating setsockopt user\
+  \ input\n\nsyzbot reported rfcomm_sock_setsockopt_old() is copying data without\n\
+  checking user input length.\n\nBUG: KASAN: slab-out-of-bounds in copy_from_sockptr_offset\n\
+  include/linux/sockptr.h:49 [inline]\nBUG: KASAN: slab-out-of-bounds in copy_from_sockptr\n\
+  include/linux/sockptr.h:55 [inline]\nBUG: KASAN: slab-out-of-bounds in rfcomm_sock_setsockopt_old\n\
+  net/bluetooth/rfcomm/sock.c:632 [inline]\nBUG: KASAN: slab-out-of-bounds in rfcomm_sock_setsockopt+0x893/0xa70\n\
+  net/bluetooth/rfcomm/sock.c:673\nRead of size 4 at addr ffff8880209a8bc3 by task\
+  \ syz-executor632/5064\n\nFixes: 9f2c8a03fbb3 (\"Bluetooth: Replace RFCOMM link\
+  \ mode with security level\")\nFixes: bb23c0ab8246 (\"Bluetooth: Add support for\
+  \ deferring RFCOMM connection setup\")\nReported-by: syzbot <syzkaller@googlegroups.com>\n\
+  Signed-off-by: Eric Dumazet <edumazet@google.com>\nSigned-off-by: Luiz Augusto von\
+  \ Dentz <luiz.von.dentz@intel.com>\n\n## Buggy Code\n\n```c\n// Function: rfcomm_sock_setsockopt\
+  \ in net/bluetooth/rfcomm/sock.c\nstatic int rfcomm_sock_setsockopt(struct socket\
+  \ *sock, int level, int optname,\n\t\tsockptr_t optval, unsigned int optlen)\n{\n\
+  \tstruct sock *sk = sock->sk;\n\tstruct bt_security sec;\n\tint err = 0;\n\tsize_t\
+  \ len;\n\tu32 opt;\n\n\tBT_DBG(\"sk %p\", sk);\n\n\tif (level == SOL_RFCOMM)\n\t\
+  \treturn rfcomm_sock_setsockopt_old(sock, optname, optval, optlen);\n\n\tif (level\
+  \ != SOL_BLUETOOTH)\n\t\treturn -ENOPROTOOPT;\n\n\tlock_sock(sk);\n\n\tswitch (optname)\
+  \ {\n\tcase BT_SECURITY:\n\t\tif (sk->sk_type != SOCK_STREAM) {\n\t\t\terr = -EINVAL;\n\
+  \t\t\tbreak;\n\t\t}\n\n\t\tsec.level = BT_SECURITY_LOW;\n\n\t\tlen = min_t(unsigned\
+  \ int, sizeof(sec), optlen);\n\t\tif (copy_from_sockptr(&sec, optval, len)) {\n\t\
+  \t\terr = -EFAULT;\n\t\t\tbreak;\n\t\t}\n\n\t\tif (sec.level > BT_SECURITY_HIGH)\
+  \ {\n\t\t\terr = -EINVAL;\n\t\t\tbreak;\n\t\t}\n\n\t\trfcomm_pi(sk)->sec_level =\
+  \ sec.level;\n\t\tbreak;\n\n\tcase BT_DEFER_SETUP:\n\t\tif (sk->sk_state != BT_BOUND\
+  \ && sk->sk_state != BT_LISTEN) {\n\t\t\terr = -EINVAL;\n\t\t\tbreak;\n\t\t}\n\n\
+  \t\tif (copy_from_sockptr(&opt, optval, sizeof(u32))) {\n\t\t\terr = -EFAULT;\n\t\
+  \t\tbreak;\n\t\t}\n\n\t\tif (opt)\n\t\t\tset_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags);\n\
+  \t\telse\n\t\t\tclear_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags);\n\n\t\tbreak;\n\
+  \n\tdefault:\n\t\terr = -ENOPROTOOPT;\n\t\tbreak;\n\t}\n\n\trelease_sock(sk);\n\t\
+  return err;\n}\n```\n\n```c\n// Function: rfcomm_sock_setsockopt_old in net/bluetooth/rfcomm/sock.c\n\
+  static int rfcomm_sock_setsockopt_old(struct socket *sock, int optname,\n\t\tsockptr_t\
+  \ optval, unsigned int optlen)\n{\n\tstruct sock *sk = sock->sk;\n\tint err = 0;\n\
+  \tu32 opt;\n\n\tBT_DBG(\"sk %p\", sk);\n\n\tlock_sock(sk);\n\n\tswitch (optname)\
+  \ {\n\tcase RFCOMM_LM:\n\t\tif (copy_from_sockptr(&opt, optval, sizeof(u32))) {\n\
+  \t\t\terr = -EFAULT;\n\t\t\tbreak;\n\t\t}\n\n\t\tif (opt & RFCOMM_LM_FIPS) {\n\t\
+  \t\terr = -EINVAL;\n\t\t\tbreak;\n\t\t}\n\n\t\tif (opt & RFCOMM_LM_AUTH)\n\t\t\t\
+  rfcomm_pi(sk)->sec_level = BT_SECURITY_LOW;\n\t\tif (opt & RFCOMM_LM_ENCRYPT)\n\t\
+  \t\trfcomm_pi(sk)->sec_level = BT_SECURITY_MEDIUM;\n\t\tif (opt & RFCOMM_LM_SECURE)\n\
+  \t\t\trfcomm_pi(sk)->sec_level = BT_SECURITY_HIGH;\n\n\t\trfcomm_pi(sk)->role_switch\
+  \ = (opt & RFCOMM_LM_MASTER);\n\t\tbreak;\n\n\tdefault:\n\t\terr = -ENOPROTOOPT;\n\
+  \t\tbreak;\n\t}\n\n\trelease_sock(sk);\n\treturn err;\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/net/bluetooth/rfcomm/sock.c b/net/bluetooth/rfcomm/sock.c\n\
+  index b54e8a530f55..29aa07e9db9d 100644\n--- a/net/bluetooth/rfcomm/sock.c\n+++\
+  \ b/net/bluetooth/rfcomm/sock.c\n@@ -629,7 +629,7 @@ static int rfcomm_sock_setsockopt_old(struct\
+  \ socket *sock, int optname,\n \n \tswitch (optname) {\n \tcase RFCOMM_LM:\n-\t\t\
+  if (copy_from_sockptr(&opt, optval, sizeof(u32))) {\n+\t\tif (bt_copy_from_sockptr(&opt,\
+  \ sizeof(opt), optval, optlen)) {\n \t\t\terr = -EFAULT;\n \t\t\tbreak;\n \t\t}\n\
+  @@ -664,7 +664,6 @@ static int rfcomm_sock_setsockopt(struct socket *sock, int level,\
+  \ int optname,\n \tstruct sock *sk = sock->sk;\n \tstruct bt_security sec;\n \t\
+  int err = 0;\n-\tsize_t len;\n \tu32 opt;\n \n \tBT_DBG(\"sk %p\", sk);\n@@ -686,11\
+  \ +685,9 @@ static int rfcomm_sock_setsockopt(struct socket *sock, int level, int\
+  \ optname,\n \n \t\tsec.level = BT_SECURITY_LOW;\n \n-\t\tlen = min_t(unsigned int,\
+  \ sizeof(sec), optlen);\n-\t\tif (copy_from_sockptr(&sec, optval, len)) {\n-\t\t\
+  \terr = -EFAULT;\n+\t\terr = bt_copy_from_sockptr(&sec, sizeof(sec), optval, optlen);\n\
+  +\t\tif (err)\n \t\t\tbreak;\n-\t\t}\n \n \t\tif (sec.level > BT_SECURITY_HIGH)\
+  \ {\n \t\t\terr = -EINVAL;\n@@ -706,10 +703,9 @@ static int rfcomm_sock_setsockopt(struct\
+  \ socket *sock, int level, int optname,\n \t\t\tbreak;\n \t\t}\n \n-\t\tif (copy_from_sockptr(&opt,\
+  \ optval, sizeof(u32))) {\n-\t\t\terr = -EFAULT;\n+\t\terr = bt_copy_from_sockptr(&opt,\
+  \ sizeof(opt), optval, optlen);\n+\t\tif (err)\n \t\t\tbreak;\n-\t\t}\n \n \t\t\
+  if (opt)\n \t\t\tset_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags);\n```\n"
+pattern: '## Bug Pattern
+
+
+  In a setsockopt handler, copying a fixed-size object from user space with copy_from_sockptr(...,
+  sizeof(T)) without first validating that optlen is at least sizeof(T) (or otherwise
+  enforcing the expected size). This allows callers to pass a shorter optlen, causing
+  an out-of-bounds read during the copy. Correct pattern is to check optlen >= sizeof(T)
+  or use a helper like bt_copy_from_sockptr(&dst, sizeof(dst), optval, optlen) that
+  validates and copies safely.'
+plan: "Plan to detect unsafe copy_from_sockptr in setsockopt handlers\n\n1) Program\
+  \ state\n- REGISTER_MAP_WITH_PROGRAMSTATE(OptlenLBMap, const VarDecl*, uint64_t)\n\
+  \  - Tracks, per optlen parameter (ParmVarDecl*), the greatest proven lower bound\
+  \ for optlen on the current path.\n  - We only store the lower bound value; if LB\
+  \ >= size used in copy_from_sockptr, the path is considered validated.\n\n2) Helper\
+  \ identification utilities\n- isSetSockoptHandler(const FunctionDecl *FD)\n  - Return\
+  \ true if FD->getNameAsString() contains \"setsockopt\".\n  - Additionally require\
+  \ that the function has a ParmVarDecl named \"optlen\" and a ParmVarDecl named \"\
+  optval\" to reduce noise.\n\n- findOptlenParam(const FunctionDecl *FD)\n  - Return\
+  \ the ParmVarDecl* for the parameter named \"optlen\" (must be integer type). Return\
+  \ nullptr if not present.\n\n- isCopyFromSockptrLike(const CallEvent &Call, unsigned\
+  \ &SizeArgIndex)\n  - Return true if callee name is \"copy_from_sockptr\" (SizeArgIndex\
+  \ = 2) or \"copy_from_sockptr_offset\" (SizeArgIndex = 3).\n  - Return false for\
+  \ \"bt_copy_from_sockptr\" (explicitly ignore the safe helper).\n\n- getConstSizeFromExpr(const\
+  \ Expr *E, CheckerContext &C, uint64_t &Out)\n  - Use EvaluateExprToInt to resolve\
+  \ the size expression into a concrete constant.\n  - Return true on success.\n\n\
+  - extractOptlenCompare(const Stmt *Cond, const FunctionDecl *EnclosingFD, const\
+  \ ParmVarDecl *&OptlenPVD, const Expr *&SizeExpr, BinaryOperatorKind &Op, bool &OptlenOnLHS)\n\
+  \  - Parse the condition (ignoring implicit casts/paren) as BinaryOperator with\
+  \ op in {<, <=, >=, >, ==, !=}.\n  - Identify if one side is a DeclRefExpr to the\
+  \ optlen ParmVarDecl and the other side is any integral expression.\n  - Return\
+  \ true on success and fill outputs. We will later try to evaluate SizeExpr into\
+  \ a constant. Handle both orderings (optlen on LHS or RHS).\n\n3) Branch reasoning\
+  \ (checkBranchCondition)\n- Goal: Learn path-sensitive lower bounds for optlen derived\
+  \ from comparisons with sizeof(...) (or other integer constants).\n- Steps:\n  -\
+  \ Obtain the current enclosing FunctionDecl via Ctx.getLocationContext()->getDecl().\n\
+  \  - If not isSetSockoptHandler(FD), return.\n  - Find optlen ParmVarDecl via findOptlenParam(FD).\
+  \ If null, return.\n  - Attempt extractOptlenCompare(Condition, FD, OptlenPVD, SizeExpr,\
+  \ Op, OptlenOnLHS). If it fails, return.\n  - Evaluate SizeExpr to constant uint64_t\
+  \ S using getConstSizeFromExpr. If it fails, return.\n  - Decide which branch implies\
+  \ optlen >= bound:\n    - If the comparison is:\n      - optlen >= S (optlen on\
+  \ LHS): true branch implies LB >= S.\n      - optlen > S: true branch implies LB\
+  \ >= S+1.\n      - optlen < S: false branch implies LB >= S.\n      - optlen <=\
+  \ S: false branch implies LB >= S+1.\n      - optlen == S: true branch implies LB\
+  \ >= S.\n      - optlen != S: neither branch guarantees a lower bound; ignore.\n\
+  \    - If optlen is on RHS, invert appropriately (e.g., S <= optlen is same as optlen\
+  \ >= S).\n  - Create up to two successor states:\n    - StateTrue = C.getState();\
+  \ if true branch implies LB >= K, then set OptlenLBMap[OptlenPVD] = max(oldLB, K)\
+  \ in StateTrue.\n    - StateFalse = C.getState(); if false branch implies LB >=\
+  \ K, then set OptlenLBMap[OptlenPVD] = max(oldLB, K) in StateFalse.\n  - Emit both\
+  \ transitions with C.addTransition(StateTrue) and C.addTransition(StateFalse). If\
+  \ neither branch yields information, return without adding transitions (the engine\
+  \ will handle default splitting).\n\n4) Detect unsafe copies (checkPreCall)\n- Purpose:\
+  \ Flag calls that copy a fixed-size object from user without validating optlen or\
+  \ using the safe helper.\n- Steps:\n  - If not isCopyFromSockptrLike(Call, SizeArgIndex),\
+  \ return.\n  - Retrieve the enclosing FunctionDecl (getLocationContext()->getDecl()).\
+  \ If not isSetSockoptHandler(FD), return.\n  - Find optlen ParmVarDecl via findOptlenParam(FD).\
+  \ If null, return.\n  - Extract size argument expression: const Expr *SizeArg =\
+  \ Call.getArgExpr(SizeArgIndex). Attempt getConstSizeFromExpr(SizeArg, C, CopySize).\
+  \ If fails, return (be conservative).\n  - Retrieve current LB from OptlenLBMap\
+  \ for OptlenPVD. If no entry, treat LB = 0.\n  - If LB >= CopySize, it is validated\
+  \ on this path; return.\n  - Otherwise, report a bug:\n    - Create a non-fatal\
+  \ error node (generateNonFatalErrorNode).\n    - Message: \"copy_from_sockptr uses\
+  \ fixed size without validating optlen\"\n    - Point to SizeArg source range. Optionally\
+  \ add a note if FD name contains \"setsockopt\": \"Validate optlen >= sizeof(...)\
+  \ or use bt_copy_from_sockptr()\".\n    - Emit PathSensitiveBugReport.\n\n5) Optional\
+  \ minimal noise control\n- Only run this checker logic inside functions whose name\
+  \ contains \"setsockopt\" and that have both \"optval\" and \"optlen\" parameters.\
+  \ This keeps focus on the intended kernel handler pattern.\n- Explicitly ignore\
+  \ calls to the safe helper \"bt_copy_from_sockptr\".\n\n6) Callbacks summary and\
+  \ implementation notes\n- checkBranchCondition\n  - Parse relational conditions\
+  \ comparing the optlen parameter to a constant or sizeof expression.\n  - Update\
+  \ OptlenLBMap on the corresponding branch using two addTransition calls.\n- checkPreCall\n\
+  \  - Identify calls to copy_from_sockptr-like functions.\n  - Evaluate the size\
+  \ argument to a constant.\n  - Compare with current LB in OptlenLBMap; if insufficient,\
+  \ emit a report.\n- No other callbacks required.\n\n7) Utility Functions used\n\
+  - EvaluateExprToInt to obtain the constant size from sizeof(T) or sizeof(var) in\
+  \ conditions and call arguments.\n- Optionally, ExprHasName if you prefer to match\
+  \ function names, but using FD->getNameAsString() is sufficient here.\n\n8) Report\
+  \ text\n- Keep it short and clear:\n  - Title: Unsafe copy_from_sockptr in setsockopt\n\
+  \  - Body: \"copy_from_sockptr uses fixed size without validating optlen\"\n  -\
+  \ Suggestion note (optional): \"Check optlen >= sizeof(...) or use bt_copy_from_sockptr()\"\
+  \n\nThis plan detects the core bug pattern: a fixed-size copy_from_sockptr within\
+  \ a setsockopt handler without a preceding path constraint guaranteeing optlen >=\
+  \ that size. It remains conservative, path-sensitive, and avoids false positives\
+  \ when proper validation is present."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\
+  \n#include \"clang/Basic/SourceManager.h\"\n#include \"clang/Basic/LangOptions.h\"\
+  \n#include <cstdint>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Map: per-function optlen parameter -> greatest known lower bound\
+  \ on current path\nREGISTER_MAP_WITH_PROGRAMSTATE(OptlenLBMap, const ParmVarDecl*,\
+  \ uint64_t)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<\n    \
+  \    check::PreCall,\n        check::BranchCondition\n      > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Unsafe copy_from_sockptr\
+  \ in setsockopt\", \"Security\")) {}\n\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n\n   private:\n      // Helper utilities per plan\n\
+  \      static bool isSetSockoptHandler(const FunctionDecl *FD);\n      static const\
+  \ ParmVarDecl *findOptlenParam(const FunctionDecl *FD);\n      static bool isCopyFromSockptrLike(const\
+  \ CallEvent &Call, CheckerContext &C, unsigned &SizeArgIndex);\n      static bool\
+  \ getConstSizeFromExpr(const Expr *E, CheckerContext &C, uint64_t &Out);\n\n   \
+  \   static bool extractOptlenCompare(const Stmt *Cond,\n                       \
+  \                const ParmVarDecl *OptlenPVD,\n                               \
+  \        const Expr *&SizeExpr,\n                                       BinaryOperatorKind\
+  \ &Op,\n                                       bool &OptlenOnLHS);\n\n      static\
+  \ ProgramStateRef setLBMax(ProgramStateRef State,\n                            \
+  \          const ParmVarDecl *PVD,\n                                      uint64_t\
+  \ NewLB);\n\n      void reportUnsafeCopy(const CallEvent &Call, const Expr *SizeArg,\
+  \ CheckerContext &C) const;\n};\n\n// ---- Helper implementations ----\n\nbool SAGenTestChecker::isSetSockoptHandler(const\
+  \ FunctionDecl *FD) {\n  if (!FD)\n    return false;\n  StringRef Name = FD->getName();\n\
+  \  if (!Name.contains(\"setsockopt\"))\n    return false;\n\n  const ParmVarDecl\
+  \ *Optlen = nullptr;\n  const ParmVarDecl *Optval = nullptr;\n  for (const ParmVarDecl\
+  \ *P : FD->parameters()) {\n    if (!P || !P->getIdentifier()) continue;\n    StringRef\
+  \ PName = P->getName();\n    if (PName == \"optlen\")\n      Optlen = P;\n    else\
+  \ if (PName == \"optval\")\n      Optval = P;\n  }\n  if (!Optlen || !Optval)\n\
+  \    return false;\n\n  // Basic integer type check for optlen\n  QualType QT =\
+  \ Optlen->getType();\n  if (!QT->isIntegerType())\n    return false;\n\n  return\
+  \ true;\n}\n\nconst ParmVarDecl *SAGenTestChecker::findOptlenParam(const FunctionDecl\
+  \ *FD) {\n  if (!FD) return nullptr;\n  for (const ParmVarDecl *P : FD->parameters())\
+  \ {\n    if (!P || !P->getIdentifier()) continue;\n    if (P->getName() == \"optlen\"\
+  \ && P->getType()->isIntegerType())\n      return P;\n  }\n  return nullptr;\n}\n\
+  \nbool SAGenTestChecker::isCopyFromSockptrLike(const CallEvent &Call, CheckerContext\
+  \ &C, unsigned &SizeArgIndex) {\n  SizeArgIndex = 0;\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // Ignore the safe helper\n  if (ExprHasName(Origin,\
+  \ \"bt_copy_from_sockptr\", C))\n    return false;\n\n  // Match the unsafe helpers\n\
+  \  if (ExprHasName(Origin, \"copy_from_sockptr_offset\", C)) {\n    // Per plan:\
+  \ size index = 3 (0-based). Some kernels have size at index 2,\n    // but we follow\
+  \ the plan and guard with bounds below.\n    if (Call.getNumArgs() > 3) {\n    \
+  \  SizeArgIndex = 3;\n    } else if (Call.getNumArgs() > 2) {\n      // Fallback\
+  \ for alternate signature (size at index 2)\n      SizeArgIndex = 2;\n    } else\
+  \ {\n      return false;\n    }\n    return true;\n  }\n  if (ExprHasName(Origin,\
+  \ \"copy_from_sockptr\", C)) {\n    if (Call.getNumArgs() > 2) {\n      SizeArgIndex\
+  \ = 2;\n      return true;\n    }\n  }\n\n  return false;\n}\n\nbool SAGenTestChecker::getConstSizeFromExpr(const\
+  \ Expr *E, CheckerContext &C, uint64_t &Out) {\n  if (!E)\n    return false;\n \
+  \ llvm::APSInt Val;\n  if (!EvaluateExprToInt(Val, E, C))\n    return false;\n \
+  \ Out = Val.getZExtValue();\n  return true;\n}\n\nbool SAGenTestChecker::extractOptlenCompare(const\
+  \ Stmt *Cond,\n                                            const ParmVarDecl *OptlenPVD,\n\
+  \                                            const Expr *&SizeExpr,\n          \
+  \                                  BinaryOperatorKind &Op,\n                   \
+  \                         bool &OptlenOnLHS) {\n  SizeExpr = nullptr;\n  OptlenOnLHS\
+  \ = false;\n\n  const Expr *E = dyn_cast_or_null<Expr>(Cond);\n  if (!E)\n    return\
+  \ false;\n\n  E = E->IgnoreParenImpCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(E);\n\
+  \  if (!BO)\n    return false;\n\n  BinaryOperatorKind Opc = BO->getOpcode();\n\
+  \  switch (Opc) {\n    case BO_LT:\n    case BO_LE:\n    case BO_GT:\n    case BO_GE:\n\
+  \    case BO_EQ:\n    case BO_NE:\n      break;\n    default:\n      return false;\n\
+  \  }\n\n  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();\n  const Expr *RHS\
+  \ = BO->getRHS()->IgnoreParenImpCasts();\n\n  auto IsOptlenRef = [&](const Expr\
+  \ *X) -> bool {\n    const auto *DRE = dyn_cast<DeclRefExpr>(X);\n    if (!DRE)\
+  \ return false;\n    const auto *VD = dyn_cast<ParmVarDecl>(DRE->getDecl());\n \
+  \   if (!VD) return false;\n    return VD == OptlenPVD;\n  };\n\n  if (IsOptlenRef(LHS))\
+  \ {\n    // optlen <something>\n    OptlenOnLHS = true;\n    SizeExpr = RHS;\n \
+  \   Op = Opc;\n    return true;\n  }\n  if (IsOptlenRef(RHS)) {\n    // <something>\
+  \ opt optlen\n    OptlenOnLHS = false;\n    SizeExpr = LHS;\n    Op = Opc;\n   \
+  \ return true;\n  }\n\n  return false;\n}\n\nProgramStateRef SAGenTestChecker::setLBMax(ProgramStateRef\
+  \ State,\n                                           const ParmVarDecl *PVD,\n \
+  \                                          uint64_t NewLB) {\n  if (!State || !PVD)\n\
+  \    return State;\n  const uint64_t *Old = State->get<OptlenLBMap>(PVD);\n  if\
+  \ (!Old || *Old < NewLB)\n    State = State->set<OptlenLBMap>(PVD, NewLB);\n  return\
+  \ State;\n}\n\n// ---- Main logic ----\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());\n\
+  \  if (!isSetSockoptHandler(FD))\n    return;\n\n  const ParmVarDecl *OptlenPVD\
+  \ = findOptlenParam(FD);\n  if (!OptlenPVD)\n    return;\n\n  const Expr *SizeExpr\
+  \ = nullptr;\n  BinaryOperatorKind Op;\n  bool OptlenOnLHS = false;\n\n  if (!extractOptlenCompare(Condition,\
+  \ OptlenPVD, SizeExpr, Op, OptlenOnLHS))\n    return;\n\n  uint64_t S = 0;\n  if\
+  \ (!getConstSizeFromExpr(SizeExpr, C, S))\n    return;\n\n  // If optlen is on RHS,\
+  \ flip operator to canonical form \"optlen ? S\"\n  auto FlipOpForRHS = [](BinaryOperatorKind\
+  \ O) {\n    switch (O) {\n      case BO_LT: return BO_GT;   // S < optlen  -> optlen\
+  \ > S\n      case BO_LE: return BO_GE;   // S <= optlen -> optlen >= S\n      case\
+  \ BO_GT: return BO_LT;   // S > optlen  -> optlen < S\n      case BO_GE: return\
+  \ BO_LE;   // S >= optlen -> optlen <= S\n      case BO_EQ: return BO_EQ;\n    \
+  \  case BO_NE: return BO_NE;\n      default:    return O;\n    }\n  };\n\n  BinaryOperatorKind\
+  \ CanonOp = Op;\n  if (!OptlenOnLHS)\n    CanonOp = FlipOpForRHS(Op);\n\n  // Determine\
+  \ bounds for true/false branches\n  bool HasTrue = false, HasFalse = false;\n  uint64_t\
+  \ LBTrue = 0, LBFalse = 0;\n\n  switch (CanonOp) {\n    case BO_GE:\n      // optlen\
+  \ >= S : true -> LB >= S\n      HasTrue = true; LBTrue = S;\n      break;\n    case\
+  \ BO_GT:\n      // optlen > S : true -> LB >= S+1\n      HasTrue = true; LBTrue\
+  \ = S + 1;\n      break;\n    case BO_LT:\n      // optlen < S : false -> optlen\
+  \ >= S\n      HasFalse = true; LBFalse = S;\n      break;\n    case BO_LE:\n   \
+  \   // optlen <= S : false -> optlen >= S+1\n      HasFalse = true; LBFalse = S\
+  \ + 1;\n      break;\n    case BO_EQ:\n      // optlen == S : true -> LB >= S\n\
+  \      HasTrue = true; LBTrue = S;\n      break;\n    case BO_NE:\n      // optlen\
+  \ != S : no guaranteed LB\n      break;\n    default:\n      break;\n  }\n\n  if\
+  \ (!HasTrue && !HasFalse)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  ProgramStateRef StateT = State, StateF = State;\n\n  if (HasTrue)\n    StateT\
+  \ = setLBMax(StateT, OptlenPVD, LBTrue);\n  if (HasFalse)\n    StateF = setLBMax(StateF,\
+  \ OptlenPVD, LBFalse);\n\n  if (HasTrue)\n    C.addTransition(StateT);\n  if (HasFalse)\n\
+  \    C.addTransition(StateF);\n}\n\nvoid SAGenTestChecker::reportUnsafeCopy(const\
+  \ CallEvent &Call, const Expr *SizeArg, CheckerContext &C) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"copy_from_sockptr uses fixed size without validating optlen\", N);\n\
+  \n  if (SizeArg)\n    R->addRange(SizeArg->getSourceRange());\n\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  unsigned SizeIdx = 0;\n  if (!isCopyFromSockptrLike(Call, C, SizeIdx))\n\
+  \    return;\n\n  const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());\n\
+  \  if (!isSetSockoptHandler(FD))\n    return;\n\n  const ParmVarDecl *OptlenPVD\
+  \ = findOptlenParam(FD);\n  if (!OptlenPVD)\n    return;\n\n  if (SizeIdx >= Call.getNumArgs())\n\
+  \    return;\n\n  const Expr *SizeArg = Call.getArgExpr(SizeIdx);\n  if (!SizeArg)\n\
+  \    return;\n\n  uint64_t CopySize = 0;\n  if (!getConstSizeFromExpr(SizeArg, C,\
+  \ CopySize))\n    return; // Do not warn if size is not a constant we can evaluate.\n\
+  \n  ProgramStateRef State = C.getState();\n  uint64_t LB = 0;\n  if (const uint64_t\
+  \ *KnownLB = State->get<OptlenLBMap>(OptlenPVD))\n    LB = *KnownLB;\n\n  if (LB\
+  \ >= CopySize)\n    return; // validated on this path\n\n  // No sufficient prior\
+  \ validation\n  reportUnsafeCopy(Call, SizeArg, C);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects unsafe fixed-size copy_from_sockptr\
+  \ in setsockopt without validating optlen\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

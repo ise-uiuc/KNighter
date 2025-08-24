@@ -1,0 +1,2 @@
+- Decision: NotABug
+- Reason: The code copies from userspace into a fixed-size stack buffer using a constant length equal to the buffer size: u8 buf[MAX_INSN_SIZE]; followed by copy_from_user_nmi(buf, (void __user *)from, MAX_INSN_SIZE). The length is not user-controlled; it is exactly the size of buf, so the copy is bounded and cannot overflow. The data is used as instruction bytes (not as a string), so NUL-termination is irrelevant. This does not match the target bug pattern of copying a user-supplied length without bounding it to the destination buffer size.

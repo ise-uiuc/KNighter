@@ -1,0 +1,419 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 78ec6f9df6642418411c534683da6133e0962ec7
+commit_type: Concurrency
+index: 6
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Type.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track which MemRegions\
+  \ are per-CPU pointers.\n// Value: 1 = from this_cpu_ptr(), 2 = from per_cpu_ptr().\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrMap, const MemRegion*, unsigned)\n\nnamespace\
+  \ {\nclass SAGenTestChecker : public Checker<check::Bind> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Non-atomic\
+  \ per-CPU access\", \"Concurrency\")) {}\n\n      void checkBind(SVal Loc, SVal\
+  \ Val, const Stmt *S, CheckerContext &C) const;\n\n   private:\n      // Helpers\n\
+  \      static bool isPerCpuCtorName(StringRef N);\n      static bool isPerCpuType(QualType\
+  \ QT);\n      static bool isConstInt(const Expr *E, CheckerContext &C, llvm::APSInt\
+  \ &Out);\n      static bool isPerCpuCtorCall(const Expr *E, CheckerContext &C, unsigned\
+  \ &Kind);\n      static bool isPerCpuBaseExpr(const Expr *Base, CheckerContext &C);\n\
+  \      static bool sameFieldRegion(const MemberExpr *E1, const MemberExpr *E2, CheckerContext\
+  \ &C);\n      static bool rhsReadsSameField(const MemberExpr *LHSME, const Expr\
+  \ *RHS, CheckerContext &C);\n      void reportAtME(const MemberExpr *ME, StringRef\
+  \ Msg, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isPerCpuCtorName(StringRef\
+  \ N) {\n  return N.equals(\"this_cpu_ptr\") || N.equals(\"per_cpu_ptr\");\n}\n\n\
+  bool SAGenTestChecker::isPerCpuCtorCall(const Expr *E, CheckerContext &C, unsigned\
+  \ &Kind) {\n  if (!E) return false;\n  const Expr *EE = E;\n  // We avoid IgnoreImplicit()\
+  \ as per suggestions when extracting regions,\n  // but for name check it's fine\
+  \ to just use the original expression text helper.\n  if (ExprHasName(EE, \"this_cpu_ptr\"\
+  , C)) {\n    Kind = 1;\n    return true;\n  }\n  if (ExprHasName(EE, \"per_cpu_ptr\"\
+  , C)) {\n    Kind = 2;\n    return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isPerCpuType(QualType\
+  \ QT) {\n  if (QT.isNull())\n    return false;\n  if (!QT->isPointerType())\n  \
+  \  return false;\n\n  QualType Pointee = QT->getPointeeType();\n  if (Pointee.isNull())\n\
+  \    return false;\n\n  if (const RecordType *RT = dyn_cast<RecordType>(Pointee.getTypePtr()))\
+  \ {\n    const RecordDecl *RD = RT->getDecl();\n    if (!RD)\n      return false;\n\
+  \    StringRef Name = RD->getName();\n    if (Name.empty())\n      return false;\n\
+  \    // Heuristic: struct name contains \"percpu\" (case-insensitive)\n    if (Name.contains_insensitive(\"\
+  percpu\"))\n      return true;\n    // Or ends with \"_percpu\" (case-sensitive)\n\
+  \    if (Name.endswith(\"_percpu\"))\n      return true;\n  }\n  return false;\n\
+  }\n\nbool SAGenTestChecker::isPerCpuBaseExpr(const Expr *Base, CheckerContext &C)\
+  \ {\n  if (!Base)\n    return false;\n\n  // First, see if we tracked it as per-CPU\
+  \ pointer.\n  if (const MemRegion *MR = getMemRegionFromExpr(Base, C)) {\n    MR\
+  \ = MR->getBaseRegion();\n    if (MR) {\n      ProgramStateRef State = C.getState();\n\
+  \      if (State->get<PerCpuPtrMap>(MR))\n        return true;\n    }\n  }\n\n \
+  \ // Fallback: heuristic via type name.\n  QualType T = Base->getType();\n  if (isPerCpuType(T))\n\
+  \    return true;\n\n  return false;\n}\n\nbool SAGenTestChecker::isConstInt(const\
+  \ Expr *E, CheckerContext &C, llvm::APSInt &Out) {\n  if (!E)\n    return false;\n\
+  \  return EvaluateExprToInt(Out, E, C);\n}\n\nbool SAGenTestChecker::sameFieldRegion(const\
+  \ MemberExpr *E1, const MemberExpr *E2, CheckerContext &C) {\n  if (!E1 || !E2)\n\
+  \    return false;\n\n  const ValueDecl *MD1 = E1->getMemberDecl();\n  const ValueDecl\
+  \ *MD2 = E2->getMemberDecl();\n  if (!MD1 || !MD2)\n    return false;\n\n  // Compare\
+  \ the base regions for aliasing and the member declarations for the exact field.\n\
+  \  const MemRegion *R1 = getMemRegionFromExpr(E1, C);\n  const MemRegion *R2 = getMemRegionFromExpr(E2,\
+  \ C);\n  if (!R1 || !R2)\n    return false;\n\n  R1 = R1->getBaseRegion();\n  R2\
+  \ = R2->getBaseRegion();\n  if (!R1 || !R2)\n    return false;\n\n  if (R1 != R2)\n\
+  \    return false;\n\n  return MD1 == MD2;\n}\n\nbool SAGenTestChecker::rhsReadsSameField(const\
+  \ MemberExpr *LHSME, const Expr *RHS, CheckerContext &C) {\n  if (!LHSME || !RHS)\n\
+  \    return false;\n  const MemberExpr *Found = findSpecificTypeInChildren<MemberExpr>(RHS);\n\
+  \  if (!Found)\n    return false;\n  return sameFieldRegion(LHSME, Found, C);\n\
+  }\n\nvoid SAGenTestChecker::reportAtME(const MemberExpr *ME, StringRef Msg, CheckerContext\
+  \ &C) const {\n  if (!ME) return;\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg,\
+  \ N);\n  R->addRange(ME->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n\
+  void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  if (!S)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  // 1) Detect Compound Assignments on per-CPU fields:\
+  \ x += ..., x -= ..., etc.\n  if (const auto *CAO = dyn_cast<CompoundAssignOperator>(S))\
+  \ {\n    const Expr *LHS = CAO->getLHS();\n    const MemberExpr *LHSME = dyn_cast<MemberExpr>(LHS\
+  \ ? LHS->IgnoreParenCasts() : nullptr);\n    if (LHSME && isPerCpuBaseExpr(LHSME->getBase(),\
+  \ C)) {\n      reportAtME(LHSME, \"Non-atomic read-modify-write on per-CPU field;\
+  \ use READ_ONCE()/WRITE_ONCE().\", C);\n      return;\n    }\n  }\n\n  // 2) Detect\
+  \ ++/-- on per-CPU fields.\n  if (const auto *UO = dyn_cast<UnaryOperator>(S)) {\n\
+  \    if (UO->isIncrementDecrementOp()) {\n      const Expr *Sub = UO->getSubExpr();\n\
+  \      const MemberExpr *MEM = dyn_cast<MemberExpr>(Sub ? Sub->IgnoreParenCasts()\
+  \ : nullptr);\n      if (MEM && isPerCpuBaseExpr(MEM->getBase(), C)) {\n       \
+  \ reportAtME(MEM, \"Non-atomic read-modify-write on per-CPU field; use READ_ONCE()/WRITE_ONCE().\"\
+  , C);\n        return;\n      }\n    }\n  }\n\n  // 3) Assignments: track per-CPU\
+  \ pointers and detect writes to per-CPU fields.\n  if (const auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n    if (BO->getOpcode() == BO_Assign) {\n      const Expr *LHS = BO->getLHS();\n\
+  \      const Expr *RHS = BO->getRHS();\n\n      // 3.A) Track per-CPU pointers:\
+  \ LHS = this_cpu_ptr(...) or per_cpu_ptr(...)\n      if (LHS && RHS) {\n       \
+  \ unsigned Kind = 0;\n        if (isPerCpuCtorCall(RHS, C, Kind)) {\n          if\
+  \ (const MemRegion *LHSReg = getMemRegionFromExpr(LHS, C)) {\n            LHSReg\
+  \ = LHSReg->getBaseRegion();\n            if (LHSReg) {\n              State = State->set<PerCpuPtrMap>(LHSReg,\
+  \ Kind);\n              Changed = true;\n            }\n          }\n        } else\
+  \ {\n          // 3.B) Pointer alias propagation: LHS = RHS (both pointers)\n  \
+  \        QualType LHSTy = LHS->getType();\n          QualType RHSTy = RHS->getType();\n\
+  \          if (!LHSTy.isNull() && !RHSTy.isNull() &&\n              LHSTy->isPointerType()\
+  \ && RHSTy->isPointerType()) {\n            const MemRegion *LHSReg = getMemRegionFromExpr(LHS,\
+  \ C);\n            const MemRegion *RHSReg = getMemRegionFromExpr(RHS, C);\n   \
+  \         if (LHSReg && RHSReg) {\n              LHSReg = LHSReg->getBaseRegion();\n\
+  \              RHSReg = RHSReg->getBaseRegion();\n              if (LHSReg && RHSReg)\
+  \ {\n                if (const unsigned *RHSKind = State->get<PerCpuPtrMap>(RHSReg))\
+  \ {\n                  State = State->set<PerCpuPtrMap>(LHSReg, *RHSKind);\n   \
+  \               Changed = true;\n                }\n              }\n          \
+  \  }\n          }\n        }\n      }\n\n      // 3.C) Detect writes to per-CPU\
+  \ fields:\n      const MemberExpr *LHSME = dyn_cast<MemberExpr>(LHS ? LHS->IgnoreParenCasts()\
+  \ : nullptr);\n      if (LHSME && isPerCpuBaseExpr(LHSME->getBase(), C)) {\n   \
+  \     // Case 1: RMW via x = x + ...\n        if (rhsReadsSameField(LHSME, RHS,\
+  \ C)) {\n          reportAtME(LHSME, \"Non-atomic read-modify-write on per-CPU field;\
+  \ use READ_ONCE()/WRITE_ONCE().\", C);\n          if (Changed) C.addTransition(State);\n\
+  \          return;\n        }\n        // Case 2: Plain write/reset: x = 0 (or any\
+  \ integer constant)\n        llvm::APSInt ValInt;\n        if (isConstInt(RHS, C,\
+  \ ValInt)) {\n          reportAtME(LHSME, \"Plain write to per-CPU field; use WRITE_ONCE().\"\
+  , C);\n          if (Changed) C.addTransition(State);\n          return;\n     \
+  \   }\n      }\n    }\n  }\n\n  if (Changed)\n    C.addTransition(State);\n}\n\n\
+  } // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect non-atomic RMW or plain writes on per-CPU fields; suggest READ_ONCE()/WRITE_ONCE()\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nmemcg: fix data-race KCSAN bug in rstats\n\nA data-race\
+  \ issue in memcg rstat occurs when two distinct code paths\naccess the same 4-byte\
+  \ region concurrently.  KCSAN detection triggers the\nfollowing BUG as a result.\n\
+  \n\tBUG: KCSAN: data-race in __count_memcg_events / mem_cgroup_css_rstat_flush\n\
+  \n\twrite to 0xffffe8ffff98e300 of 4 bytes by task 5274 on cpu 17:\n\tmem_cgroup_css_rstat_flush\
+  \ (mm/memcontrol.c:5850)\n\tcgroup_rstat_flush_locked (kernel/cgroup/rstat.c:243\
+  \ (discriminator 7))\n\tcgroup_rstat_flush (./include/linux/spinlock.h:401 kernel/cgroup/rstat.c:278)\n\
+  \tmem_cgroup_flush_stats.part.0 (mm/memcontrol.c:767)\n\tmemory_numa_stat_show (mm/memcontrol.c:6911)\n\
+  <snip>\n\n\tread to 0xffffe8ffff98e300 of 4 bytes by task 410848 on cpu 27:\n\t\
+  __count_memcg_events (mm/memcontrol.c:725 mm/memcontrol.c:962)\n\tcount_memcg_event_mm.part.0\
+  \ (./include/linux/memcontrol.h:1097 ./include/linux/memcontrol.h:1120)\n\thandle_mm_fault\
+  \ (mm/memory.c:5483 mm/memory.c:5622)\n<snip>\n\n\tvalue changed: 0x00000029 ->\
+  \ 0x00000000\n\nThe race occurs because two code paths access the same \"stats_updates\"\
+  \nlocation.  Although \"stats_updates\" is a per-CPU variable, it is remotely\n\
+  accessed by another CPU at\ncgroup_rstat_flush_locked()->mem_cgroup_css_rstat_flush(),\
+  \ leading to the\ndata race mentioned.\n\nConsidering that memcg_rstat_updated()\
+  \ is in the hot code path, adding a\nlock to protect it may not be desirable, especially\
+  \ since this variable\npertains solely to statistics.\n\nTherefore, annotating accesses\
+  \ to stats_updates with READ/WRITE_ONCE() can\nprevent KCSAN splats and potential\
+  \ partial reads/writes.\n\nLink: https://lkml.kernel.org/r/20240424125940.2410718-1-leitao@debian.org\n\
+  Fixes: 9cee7e8ef3e3 (\"mm: memcg: optimize parent iteration in memcg_rstat_updated()\"\
+  )\nSigned-off-by: Breno Leitao <leitao@debian.org>\nSuggested-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Acked-by: Johannes Weiner <hannes@cmpxchg.org>\nAcked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Reviewed-by: Yosry Ahmed <yosryahmed@google.com>\nCc: Michal Hocko <mhocko@suse.com>\n\
+  Cc: Roman Gushchin <roman.gushchin@linux.dev>\nCc: Muchun Song <songmuchun@bytedance.com>\n\
+  Signed-off-by: Andrew Morton <akpm@linux-foundation.org>\n\n## Buggy Code\n\n```c\n\
+  // Function: memcg_rstat_updated in mm/memcontrol.c\nstatic inline void memcg_rstat_updated(struct\
+  \ mem_cgroup *memcg, int val)\n{\n\tstruct memcg_vmstats_percpu *statc;\n\tint cpu\
+  \ = smp_processor_id();\n\n\tif (!val)\n\t\treturn;\n\n\tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n\tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n\tfor (; statc; statc =\
+  \ statc->parent) {\n\t\tstatc->stats_updates += abs(val);\n\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n\t\t\tcontinue;\n\n\t\t/*\n\t\t * If @memcg is already\
+  \ flush-able, increasing stats_updates is\n\t\t * redundant. Avoid the overhead\
+  \ of the atomic update.\n\t\t */\n\t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  \t\t\tatomic64_add(statc->stats_updates,\n\t\t\t\t     &statc->vmstats->stats_updates);\n\
+  \t\tstatc->stats_updates = 0;\n\t}\n}\n```\n\n```c\n// Function: mem_cgroup_css_rstat_flush\
+  \ in mm/memcontrol.c\nstatic void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state\
+  \ *css, int cpu)\n{\n\tstruct mem_cgroup *memcg = mem_cgroup_from_css(css);\n\t\
+  struct mem_cgroup *parent = parent_mem_cgroup(memcg);\n\tstruct memcg_vmstats_percpu\
+  \ *statc;\n\tlong delta, delta_cpu, v;\n\tint i, nid;\n\n\tstatc = per_cpu_ptr(memcg->vmstats_percpu,\
+  \ cpu);\n\n\tfor (i = 0; i < MEMCG_NR_STAT; i++) {\n\t\t/*\n\t\t * Collect the aggregated\
+  \ propagation counts of groups\n\t\t * below us. We're in a per-cpu loop here and\
+  \ this is\n\t\t * a global counter, so the first cycle will get them.\n\t\t */\n\
+  \t\tdelta = memcg->vmstats->state_pending[i];\n\t\tif (delta)\n\t\t\tmemcg->vmstats->state_pending[i]\
+  \ = 0;\n\n\t\t/* Add CPU changes on this level since the last flush */\n\t\tdelta_cpu\
+  \ = 0;\n\t\tv = READ_ONCE(statc->state[i]);\n\t\tif (v != statc->state_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->state_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\t\
+  \tstatc->state_prev[i] = v;\n\t\t}\n\n\t\t/* Aggregate counts on this level and\
+  \ propagate upwards */\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->state_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->state[i] += delta;\n\t\
+  \t\tif (parent)\n\t\t\t\tparent->vmstats->state_pending[i] += delta;\n\t\t}\n\t\
+  }\n\n\tfor (i = 0; i < NR_MEMCG_EVENTS; i++) {\n\t\tdelta = memcg->vmstats->events_pending[i];\n\
+  \t\tif (delta)\n\t\t\tmemcg->vmstats->events_pending[i] = 0;\n\n\t\tdelta_cpu =\
+  \ 0;\n\t\tv = READ_ONCE(statc->events[i]);\n\t\tif (v != statc->events_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->events_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\
+  \t\tstatc->events_prev[i] = v;\n\t\t}\n\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->events_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->events[i] += delta;\n\
+  \t\t\tif (parent)\n\t\t\t\tparent->vmstats->events_pending[i] += delta;\n\t\t}\n\
+  \t}\n\n\tfor_each_node_state(nid, N_MEMORY) {\n\t\tstruct mem_cgroup_per_node *pn\
+  \ = memcg->nodeinfo[nid];\n\t\tstruct mem_cgroup_per_node *ppn = NULL;\n\t\tstruct\
+  \ lruvec_stats_percpu *lstatc;\n\n\t\tif (parent)\n\t\t\tppn = parent->nodeinfo[nid];\n\
+  \n\t\tlstatc = per_cpu_ptr(pn->lruvec_stats_percpu, cpu);\n\n\t\tfor (i = 0; i <\
+  \ NR_VM_NODE_STAT_ITEMS; i++) {\n\t\t\tdelta = pn->lruvec_stats.state_pending[i];\n\
+  \t\t\tif (delta)\n\t\t\t\tpn->lruvec_stats.state_pending[i] = 0;\n\n\t\t\tdelta_cpu\
+  \ = 0;\n\t\t\tv = READ_ONCE(lstatc->state[i]);\n\t\t\tif (v != lstatc->state_prev[i])\
+  \ {\n\t\t\t\tdelta_cpu = v - lstatc->state_prev[i];\n\t\t\t\tdelta += delta_cpu;\n\
+  \t\t\t\tlstatc->state_prev[i] = v;\n\t\t\t}\n\n\t\t\tif (delta_cpu)\n\t\t\t\tpn->lruvec_stats.state_local[i]\
+  \ += delta_cpu;\n\n\t\t\tif (delta) {\n\t\t\t\tpn->lruvec_stats.state[i] += delta;\n\
+  \t\t\t\tif (ppn)\n\t\t\t\t\tppn->lruvec_stats.state_pending[i] += delta;\n\t\t\t\
+  }\n\t\t}\n\t}\n\tstatc->stats_updates = 0;\n\t/* We are in a per-cpu loop here,\
+  \ only do the atomic write once */\n\tif (atomic64_read(&memcg->vmstats->stats_updates))\n\
+  \t\tatomic64_set(&memcg->vmstats->stats_updates, 0);\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 9095ab05d47a..a111e0d981ba\
+  \ 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -715,6 +715,7 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n {\n \tstruct\
+  \ memcg_vmstats_percpu *statc;\n \tint cpu = smp_processor_id();\n+\tunsigned int\
+  \ stats_updates;\n \n \tif (!val)\n \t\treturn;\n@@ -722,8 +723,9 @@ static inline\
+  \ void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n \tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n \tfor (; statc; statc\
+  \ = statc->parent) {\n-\t\tstatc->stats_updates += abs(val);\n-\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n+\t\tstats_updates = READ_ONCE(statc->stats_updates) +\
+  \ abs(val);\n+\t\tWRITE_ONCE(statc->stats_updates, stats_updates);\n+\t\tif (stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n \t\t\tcontinue;\n \n \t\t/*\n@@ -731,9 +733,9 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \t\t * redundant.\
+  \ Avoid the overhead of the atomic update.\n \t\t */\n \t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  -\t\t\tatomic64_add(statc->stats_updates,\n+\t\t\tatomic64_add(stats_updates,\n\
+  \ \t\t\t\t     &statc->vmstats->stats_updates);\n-\t\tstatc->stats_updates = 0;\n\
+  +\t\tWRITE_ONCE(statc->stats_updates, 0);\n \t}\n }\n \n@@ -5887,7 +5889,7 @@ static\
+  \ void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)\n \t\
+  \t\t}\n \t\t}\n \t}\n-\tstatc->stats_updates = 0;\n+\tWRITE_ONCE(statc->stats_updates,\
+  \ 0);\n \t/* We are in a per-cpu loop here, only do the atomic write once */\n \t\
+  if (atomic64_read(&memcg->vmstats->stats_updates))\n \t\tatomic64_set(&memcg->vmstats->stats_updates,\
+  \ 0);\n```\n"
+pattern: "## Bug Pattern\n\nPlain (non-atomic) reads/writes and read-modify-write\
+  \ operations on a per-CPU field that is also accessed by other CPUs (remote per-CPU\
+  \ access), i.e., treating a per-CPU variable as CPU-local when a flush path on another\
+  \ CPU can read/reset it. This causes a cross-CPU data race on a 4-byte field:\n\n\
+  - Using \u201Cx += \u2026\u201D and \u201Cx = 0\u201D on a per-CPU field\n- While\
+  \ another CPU concurrently reads/writes the same field\n\nFix: wrap all concurrent\
+  \ accesses in READ_ONCE()/WRITE_ONCE() (and avoid using the variable after a plain\
+  \ read) to prevent torn/partial reads/writes and KCSAN reports."
+plan: "Plan\n\n1) Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrMap, const\
+  \ MemRegion*, unsigned)\n  - Tracks which pointer variables are known to point to\
+  \ per-CPU storage.\n  - Value meaning: 1 = obtained via this_cpu_ptr(), 2 = obtained\
+  \ via per_cpu_ptr(), both are \u201Cper-CPU\u201D for our purposes. We only use\
+  \ the presence in the map to decide \u201Cper-CPU pointer\u201D.\n\nRationale: We\
+  \ keep it simple and intra-procedural. We track pointer variables directly initialized\
+  \ with this_cpu_ptr()/per_cpu_ptr() and propagate this attribute through simple\
+  \ pointer-to-pointer assignments via checkBind. No additional traits or sets are\
+  \ needed.\n\n2) Helper predicates/utilities (lightweight, local in the checker;\
+  \ use provided utility helpers where applicable)\n- isPerCpuCtorName(StringRef N):\
+  \ returns true if N is \"this_cpu_ptr\" or \"per_cpu_ptr\".\n- isPerCpuCtorCall(const\
+  \ CallEvent &Call): returns true if callee name matches isPerCpuCtorName.\n- isPerCpuType(QualType\
+  \ QT): if QT is a pointer to a record type, check the pointed-to record name; return\
+  \ true if the record name contains \"percpu\" (case-insensitive) or ends with \"\
+  _percpu\".\n- isPerCpuBaseExpr(const Expr *Base, CheckerContext &C):\n  - If Base\
+  \ has a MemRegion and is present in PerCpuPtrMap, return true.\n  - Else, check\
+  \ Base\u2019s type with isPerCpuType(). If true, return true.\n  - Else, false.\n\
+  - sameFieldRegion(const Expr *E1, const Expr *E2, CheckerContext &C):\n  - Use getMemRegionFromExpr(E1,\
+  \ C) and getMemRegionFromExpr(E2, C); return true if both non-null and equal.\n\
+  - rhsReadsSameField(const MemberExpr *LHSME, const Expr *RHS, CheckerContext &C):\n\
+  \  - Use findSpecificTypeInChildren<MemberExpr>(RHS). If found and sameFieldRegion(LHSME,\
+  \ that MemberExpr, C), return true; else false.\n- isConstInt(const Expr *E, CheckerContext\
+  \ &C, llvm::APSInt &Out):\n  - Use EvaluateExprToInt to decide if RHS is a compile-time\
+  \ integer constant; if true, set Out and return true.\n\n3) Bug types/messages\n\
+  - Create a single BugType: \"Non-atomic per-CPU access\"\n- Two short messages,\
+  \ depending on what we detect:\n  - \"Non-atomic read-modify-write on per-CPU field;\
+  \ use READ_ONCE()/WRITE_ONCE().\"\n  - \"Plain write to per-CPU field; use WRITE_ONCE().\"\
+  \n\n4) Chosen callbacks and their responsibilities\n\n4.1) checkBind(SVal Loc, SVal\
+  \ Val, const Stmt *S, CheckerContext &C)\nPurpose: both track per-CPU pointers and\
+  \ detect the target patterns because assignments/compound-assignments/inc/dec all\
+  \ end up binding a value to a location.\n\nA) Track per-CPU pointers\n- If S is\
+  \ a BinaryOperator with opcode BO_Assign:\n  - If the RHS is a CallExpr to this_cpu_ptr()/per_cpu_ptr():\n\
+  \    - Get the MemRegion of the LHS expression via getMemRegionFromExpr on the LHS\
+  \ Expr. If non-null, update PerCpuPtrMap[LHSRegion] = 1 (for this_cpu_ptr) or 2\
+  \ (for per_cpu_ptr).\n  - Else if both LHS and RHS are pointer-typed:\n    - Extract\
+  \ MemRegion of RHS and LHS. If RHSRegion is in PerCpuPtrMap, set PerCpuPtrMap[LHSRegion]\
+  \ = PerCpuPtrMap[RHSRegion].\n  - Do not attempt interprocedural propagation; intra-procedural\
+  \ aliasing via simple assignments is sufficient.\n\nB) Detect non-atomic read-modify-write\
+  \ (RMW) on per-CPU fields\n- If S is a CompoundAssignOperator:\n  - Check if its\
+  \ LHS is a MemberExpr (e.g., statc->stats_updates).\n  - Let Base = LHS->getBase();\
+  \ If isPerCpuBaseExpr(Base, C) is true, report:\n    - Create a non-fatal error\
+  \ node and emit \"Non-atomic read-modify-write on per-CPU field; use READ_ONCE()/WRITE_ONCE().\"\
+  \n- If S is a UnaryOperator that is ++ or --:\n  - If its sub-expression is a MemberExpr\
+  \ with per-CPU base (as above), report with the same message.\n\n- If S is a BinaryOperator\
+  \ with opcode BO_Assign (x = y):\n  - If LHS is a MemberExpr M and isPerCpuBaseExpr(M->getBase(),\
+  \ C):\n    - Let RHS be the RHS Expr of the assignment.\n    - Case 1 (RMW via x\
+  \ = x + ...): If rhsReadsSameField(M, RHS, C), report \"Non-atomic read-modify-write\
+  \ on per-CPU field; use READ_ONCE()/WRITE_ONCE().\"\n    - Case 2 (plain store/reset,\
+  \ e.g., x = 0): If isConstInt(RHS, C, Out) is true (any integer constant), report\
+  \ \"Plain write to per-CPU field; use WRITE_ONCE().\"\n    - Otherwise, do not report\
+  \ (to reduce noise).\n\nNotes:\n- We intentionally do not suppress based on READ_ONCE/WRITE_ONCE\
+  \ macros here because:\n  - CompoundAssign and ++/-- would not appear inside WRITE_ONCE.\n\
+  \  - If a developer used x = READ_ONCE(x) + ..., the write is still a plain \"=\"\
+  , which should be upgraded to WRITE_ONCE; we still warn on the write part (expected\
+  \ by the kernel fix).\n- We do not attempt to detect bare reads without READ_ONCE\
+  \ to minimize false positives. We focus on the risky patterns in the patch: RMW\
+  \ and reset writes.\n\n4.2) Optional: checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C)\nNot required for detection; however, we can opportunistically record per-CPU\
+  \ construction when a call result is immediately used in an initialization. It is\
+  \ simpler to keep all tracking in checkBind, so skip this.\n\n4.3) All other callbacks\n\
+  Not needed for this checker.\n\n5) Reporting\n- On each detection in checkBind:\n\
+  \  - Use auto N = C.generateNonFatalErrorNode();\n  - If N is null, return;\n  -\
+  \ Create a PathSensitiveBugReport with the shared BugType and the appropriate message.\n\
+  \  - Add the source range of the involved MemberExpr (the per-CPU field) to the\
+  \ report.\n  - Emit via C.emitReport(std::move(Report)).\n\n6) Heuristics and false-positive\
+  \ control\n- Per-CPU identification is primarily map-based (pointers created via\
+  \ this_cpu_ptr/per_cpu_ptr). If not in the map, we fallback to a naming heuristic\
+  \ on the pointee record type name containing \u201Cpercpu\u201D or ending in \u201C\
+  _percpu\u201D.\n- We only warn on:\n  - Compound assignments (+=, -=, etc.) and\
+  \ ++/-- on per-CPU fields.\n  - Assignments to per-CPU fields that read the same\
+  \ field on RHS (x = x + ...) or assign an integer constant (x = 0, x = 123).\n-\
+  \ We do not warn on other plain writes to reduce noise.\n- We do not attempt to\
+  \ reason about cross-CPU execution; experience and naming patterns in kernel code\
+  \ make this heuristic precise enough for the target bug.\n\n7) Utility functions\
+  \ used\n- getMemRegionFromExpr to associate expressions to regions for both pointer\
+  \ tracking and field equality detection.\n- findSpecificTypeInChildren to extract\
+  \ MemberExprs from complex RHSs for RMW detection.\n- EvaluateExprToInt to detect\
+  \ plain constant stores (e.g., \u201C= 0\u201D).\n- ExprHasName is not strictly\
+  \ necessary in this plan and can be omitted to keep it simple.\n\nSummary of flow\n\
+  - Track per-CPU pointer variables via assignments from this_cpu_ptr/per_cpu_ptr\
+  \ and propagate through simple pointer assignments (checkBind).\n- On each bind:\n\
+  \  - If it is a compound assignment (LHS per-CPU field), warn about RMW.\n  - If\
+  \ it is ++/-- on a per-CPU field, warn about RMW.\n  - If it is a plain assignment\
+  \ to a per-CPU field:\n    - If RHS reads the same field, warn about RMW.\n    -\
+  \ Else if RHS is an integer constant, warn to use WRITE_ONCE.\nThis directly catches\
+  \ the exact patterns fixed by the patch: \"x += ...\" and \"x = 0\" on per-CPU fields\
+  \ that can be accessed by other CPUs, and guides developers to use READ_ONCE/WRITE_ONCE."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Type.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Track which MemRegions\
+  \ are per-CPU pointers.\n// Value: 1 = from this_cpu_ptr(), 2 = from per_cpu_ptr().\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrMap, const MemRegion*, unsigned)\n\nnamespace\
+  \ {\nclass SAGenTestChecker : public Checker<check::Bind> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Non-atomic\
+  \ per-CPU access\", \"Concurrency\")) {}\n\n      void checkBind(SVal Loc, SVal\
+  \ Val, const Stmt *S, CheckerContext &C) const;\n\n   private:\n      // Helpers\n\
+  \      static bool isPerCpuCtorName(StringRef N);\n      static bool isPerCpuType(QualType\
+  \ QT);\n      static bool isConstInt(const Expr *E, CheckerContext &C, llvm::APSInt\
+  \ &Out);\n      static bool isPerCpuCtorCall(const Expr *E, CheckerContext &C, unsigned\
+  \ &Kind);\n      static bool isPerCpuBaseExpr(const Expr *Base, CheckerContext &C);\n\
+  \      static bool sameFieldRegion(const MemberExpr *E1, const MemberExpr *E2, CheckerContext\
+  \ &C);\n      static bool rhsReadsSameField(const MemberExpr *LHSME, const Expr\
+  \ *RHS, CheckerContext &C);\n      void reportAtME(const MemberExpr *ME, StringRef\
+  \ Msg, CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isPerCpuCtorName(StringRef\
+  \ N) {\n  return N.equals(\"this_cpu_ptr\") || N.equals(\"per_cpu_ptr\");\n}\n\n\
+  bool SAGenTestChecker::isPerCpuCtorCall(const Expr *E, CheckerContext &C, unsigned\
+  \ &Kind) {\n  if (!E) return false;\n  const Expr *EE = E;\n  // We avoid IgnoreImplicit()\
+  \ as per suggestions when extracting regions,\n  // but for name check it's fine\
+  \ to just use the original expression text helper.\n  if (ExprHasName(EE, \"this_cpu_ptr\"\
+  , C)) {\n    Kind = 1;\n    return true;\n  }\n  if (ExprHasName(EE, \"per_cpu_ptr\"\
+  , C)) {\n    Kind = 2;\n    return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isPerCpuType(QualType\
+  \ QT) {\n  if (QT.isNull())\n    return false;\n  if (!QT->isPointerType())\n  \
+  \  return false;\n\n  QualType Pointee = QT->getPointeeType();\n  if (Pointee.isNull())\n\
+  \    return false;\n\n  if (const RecordType *RT = dyn_cast<RecordType>(Pointee.getTypePtr()))\
+  \ {\n    const RecordDecl *RD = RT->getDecl();\n    if (!RD)\n      return false;\n\
+  \    StringRef Name = RD->getName();\n    if (Name.empty())\n      return false;\n\
+  \    // Heuristic: struct name contains \"percpu\" (case-insensitive)\n    if (Name.contains_insensitive(\"\
+  percpu\"))\n      return true;\n    // Or ends with \"_percpu\" (case-sensitive)\n\
+  \    if (Name.endswith(\"_percpu\"))\n      return true;\n  }\n  return false;\n\
+  }\n\nbool SAGenTestChecker::isPerCpuBaseExpr(const Expr *Base, CheckerContext &C)\
+  \ {\n  if (!Base)\n    return false;\n\n  // First, see if we tracked it as per-CPU\
+  \ pointer.\n  if (const MemRegion *MR = getMemRegionFromExpr(Base, C)) {\n    MR\
+  \ = MR->getBaseRegion();\n    if (MR) {\n      ProgramStateRef State = C.getState();\n\
+  \      if (State->get<PerCpuPtrMap>(MR))\n        return true;\n    }\n  }\n\n \
+  \ // Fallback: heuristic via type name.\n  QualType T = Base->getType();\n  if (isPerCpuType(T))\n\
+  \    return true;\n\n  return false;\n}\n\nbool SAGenTestChecker::isConstInt(const\
+  \ Expr *E, CheckerContext &C, llvm::APSInt &Out) {\n  if (!E)\n    return false;\n\
+  \  return EvaluateExprToInt(Out, E, C);\n}\n\nbool SAGenTestChecker::sameFieldRegion(const\
+  \ MemberExpr *E1, const MemberExpr *E2, CheckerContext &C) {\n  if (!E1 || !E2)\n\
+  \    return false;\n\n  const ValueDecl *MD1 = E1->getMemberDecl();\n  const ValueDecl\
+  \ *MD2 = E2->getMemberDecl();\n  if (!MD1 || !MD2)\n    return false;\n\n  // Compare\
+  \ the base regions for aliasing and the member declarations for the exact field.\n\
+  \  const MemRegion *R1 = getMemRegionFromExpr(E1, C);\n  const MemRegion *R2 = getMemRegionFromExpr(E2,\
+  \ C);\n  if (!R1 || !R2)\n    return false;\n\n  R1 = R1->getBaseRegion();\n  R2\
+  \ = R2->getBaseRegion();\n  if (!R1 || !R2)\n    return false;\n\n  if (R1 != R2)\n\
+  \    return false;\n\n  return MD1 == MD2;\n}\n\nbool SAGenTestChecker::rhsReadsSameField(const\
+  \ MemberExpr *LHSME, const Expr *RHS, CheckerContext &C) {\n  if (!LHSME || !RHS)\n\
+  \    return false;\n  const MemberExpr *Found = findSpecificTypeInChildren<MemberExpr>(RHS);\n\
+  \  if (!Found)\n    return false;\n  return sameFieldRegion(LHSME, Found, C);\n\
+  }\n\nvoid SAGenTestChecker::reportAtME(const MemberExpr *ME, StringRef Msg, CheckerContext\
+  \ &C) const {\n  if (!ME) return;\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg,\
+  \ N);\n  R->addRange(ME->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n\
+  void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  if (!S)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  // 1) Detect Compound Assignments on per-CPU fields:\
+  \ x += ..., x -= ..., etc.\n  if (const auto *CAO = dyn_cast<CompoundAssignOperator>(S))\
+  \ {\n    const Expr *LHS = CAO->getLHS();\n    const MemberExpr *LHSME = dyn_cast<MemberExpr>(LHS\
+  \ ? LHS->IgnoreParenCasts() : nullptr);\n    if (LHSME && isPerCpuBaseExpr(LHSME->getBase(),\
+  \ C)) {\n      reportAtME(LHSME, \"Non-atomic read-modify-write on per-CPU field;\
+  \ use READ_ONCE()/WRITE_ONCE().\", C);\n      return;\n    }\n  }\n\n  // 2) Detect\
+  \ ++/-- on per-CPU fields.\n  if (const auto *UO = dyn_cast<UnaryOperator>(S)) {\n\
+  \    if (UO->isIncrementDecrementOp()) {\n      const Expr *Sub = UO->getSubExpr();\n\
+  \      const MemberExpr *MEM = dyn_cast<MemberExpr>(Sub ? Sub->IgnoreParenCasts()\
+  \ : nullptr);\n      if (MEM && isPerCpuBaseExpr(MEM->getBase(), C)) {\n       \
+  \ reportAtME(MEM, \"Non-atomic read-modify-write on per-CPU field; use READ_ONCE()/WRITE_ONCE().\"\
+  , C);\n        return;\n      }\n    }\n  }\n\n  // 3) Assignments: track per-CPU\
+  \ pointers and detect writes to per-CPU fields.\n  if (const auto *BO = dyn_cast<BinaryOperator>(S))\
+  \ {\n    if (BO->getOpcode() == BO_Assign) {\n      const Expr *LHS = BO->getLHS();\n\
+  \      const Expr *RHS = BO->getRHS();\n\n      // 3.A) Track per-CPU pointers:\
+  \ LHS = this_cpu_ptr(...) or per_cpu_ptr(...)\n      if (LHS && RHS) {\n       \
+  \ unsigned Kind = 0;\n        if (isPerCpuCtorCall(RHS, C, Kind)) {\n          if\
+  \ (const MemRegion *LHSReg = getMemRegionFromExpr(LHS, C)) {\n            LHSReg\
+  \ = LHSReg->getBaseRegion();\n            if (LHSReg) {\n              State = State->set<PerCpuPtrMap>(LHSReg,\
+  \ Kind);\n              Changed = true;\n            }\n          }\n        } else\
+  \ {\n          // 3.B) Pointer alias propagation: LHS = RHS (both pointers)\n  \
+  \        QualType LHSTy = LHS->getType();\n          QualType RHSTy = RHS->getType();\n\
+  \          if (!LHSTy.isNull() && !RHSTy.isNull() &&\n              LHSTy->isPointerType()\
+  \ && RHSTy->isPointerType()) {\n            const MemRegion *LHSReg = getMemRegionFromExpr(LHS,\
+  \ C);\n            const MemRegion *RHSReg = getMemRegionFromExpr(RHS, C);\n   \
+  \         if (LHSReg && RHSReg) {\n              LHSReg = LHSReg->getBaseRegion();\n\
+  \              RHSReg = RHSReg->getBaseRegion();\n              if (LHSReg && RHSReg)\
+  \ {\n                if (const unsigned *RHSKind = State->get<PerCpuPtrMap>(RHSReg))\
+  \ {\n                  State = State->set<PerCpuPtrMap>(LHSReg, *RHSKind);\n   \
+  \               Changed = true;\n                }\n              }\n          \
+  \  }\n          }\n        }\n      }\n\n      // 3.C) Detect writes to per-CPU\
+  \ fields:\n      const MemberExpr *LHSME = dyn_cast<MemberExpr>(LHS ? LHS->IgnoreParenCasts()\
+  \ : nullptr);\n      if (LHSME && isPerCpuBaseExpr(LHSME->getBase(), C)) {\n   \
+  \     // Case 1: RMW via x = x + ...\n        if (rhsReadsSameField(LHSME, RHS,\
+  \ C)) {\n          reportAtME(LHSME, \"Non-atomic read-modify-write on per-CPU field;\
+  \ use READ_ONCE()/WRITE_ONCE().\", C);\n          if (Changed) C.addTransition(State);\n\
+  \          return;\n        }\n        // Case 2: Plain write/reset: x = 0 (or any\
+  \ integer constant)\n        llvm::APSInt ValInt;\n        if (isConstInt(RHS, C,\
+  \ ValInt)) {\n          reportAtME(LHSME, \"Plain write to per-CPU field; use WRITE_ONCE().\"\
+  , C);\n          if (Changed) C.addTransition(State);\n          return;\n     \
+  \   }\n      }\n    }\n  }\n\n  if (Changed)\n    C.addTransition(State);\n}\n\n\
+  } // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect non-atomic RMW or plain writes on per-CPU fields; suggest READ_ONCE()/WRITE_ONCE()\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

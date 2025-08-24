@@ -1,0 +1,105 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -74,6 +74,8 @@       enum ZeroKind { ZK_None = 0, ZK_Memset, ZK_MemzeroExplicit, ZK_Bzero };
+       static ZeroKind getZeroingKind(const CallEvent &Call, unsigned &PtrIdx, unsigned &LenIdx, CheckerContext &C);
+
++      // Padding detection
++      static QualType unwrapArrayElementBaseType(QualType T);
+       static bool hasImplicitPadding(QualType QT, ASTContext &Ctx);
+
+       void markZeroCleared(ProgramStateRef &State, const VarDecl *VD) const;
+@@ -229,10 +231,14 @@   return ZK_None;
+ }
+
+-// Recursively check if a type (record or arrays of records) has implicit padding.
+-// This version uses ASTRecordLayout's DataSize vs Size, detects inter-field gaps,
+-// bitfields, unions, and recurses into nested records and array element types.
+-static QualType unwrapArrayElementBaseType(QualType T) {
++static QualType getElementTypeIfArray(QualType T) {
++  if (const auto *AT = dyn_cast<ArrayType>(T.getTypePtr()))
++    return AT->getElementType();
++  return QualType();
++}
++
++// Follow element types down to the base, so arrays of records delegate to the record.
++QualType SAGenTestChecker::unwrapArrayElementBaseType(QualType T) {
+   const Type *Ty = T.getTypePtr();
+   while (const auto *AT = dyn_cast<ArrayType>(Ty)) {
+     T = cast<ArrayType>(Ty)->getElementType();
+@@ -241,6 +247,11 @@   return T;
+ }
+
++// Precise padding detection using ASTRecordLayout and bit-level coverage:
++// - Computes gaps between the end of one field and the start of the next,
++//   using bitfield widths where applicable.
++// - Detects tail padding if total size in bits exceeds the end of the last field.
++// - Recurses into nested records and arrays of records.
+ bool SAGenTestChecker::hasImplicitPadding(QualType QT, ASTContext &Ctx) {
+   QT = QT.getCanonicalType().getUnqualifiedType();
+
+@@ -264,39 +275,51 @@   if (!RD)
+     return false;
+
+-  if (RD->isUnion())
+-    return true; // conservative for unions
++  if (RD->isUnion()) {
++    // Exporting an entire union object may copy bytes from inactive members.
++    return true;
++  }
+
+   const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
+
+-  // Inter-field padding and nested record padding
+-  uint64_t PrevEndBits = 0;
++  uint64_t BitsCovered = 0;
+   unsigned Index = 0;
+
+   for (const FieldDecl *FD : RD->fields()) {
+-    if (FD->isBitField())
+-      return true;
+-
+-    QualType FT = FD->getType();
+     // Recurse into nested records/array-of-records
+     {
+-      QualType Base = unwrapArrayElementBaseType(FT);
++      QualType Base = unwrapArrayElementBaseType(FD->getType());
+       if (Base->isRecordType() && hasImplicitPadding(Base, Ctx))
+         return true;
+     }
+
+-    uint64_t FieldOffsetBits = Layout.getFieldOffset(Index);
+-    if (Index > 0 && FieldOffsetBits > PrevEndBits)
+-      return true; // gap between fields
+-
+-    uint64_t FieldSizeBits = Ctx.getTypeSize(FT);
+-    PrevEndBits = FieldOffsetBits + FieldSizeBits;
++    uint64_t Begin = Layout.getFieldOffset(Index);
++    // Compute the number of bits this field actually occupies in the layout.
++    uint64_t WidthBits = 0;
++    if (FD->isBitField()) {
++      const Expr *BW = FD->getBitWidth();
++      if (!BW)
++        return true; // conservative
++      if (BW->isValueDependent())
++        return true; // conservative
++      WidthBits = FD->getBitWidthValue(Ctx);
++    } else {
++      WidthBits = Ctx.getTypeSize(FD->getType());
++    }
++
++    if (Begin > BitsCovered)
++      return true; // gap (inter-field padding) detected
++
++    uint64_t End = Begin + WidthBits;
++    if (End > BitsCovered)
++      BitsCovered = End;
+
+     ++Index;
+   }
+
+-  // Tail padding check using DataSize vs Size (more robust than manual sum).
+-  if (Layout.getSize() > Layout.getDataSize())
++  // Tail padding: total allocated size vs bits covered by fields.
++  uint64_t TotalSizeBits = Layout.getSize().getQuantity() * 8ULL;
++  if (TotalSizeBits > BitsCovered)
+     return true;
+
+   return false;

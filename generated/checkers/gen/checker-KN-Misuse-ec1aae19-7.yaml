@@ -1,0 +1,327 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ec1aae190c7729ffdd3603de311dc00f7ff988f9
+commit_type: Misuse
+index: 7
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Attr.h\"\n#include \"clang/AST/Type.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state: whether\
+  \ the struct object (owner) is zero-initialized.\nREGISTER_MAP_WITH_PROGRAMSTATE(OwnerZeroedMap,\
+  \ const MemRegion*, bool)\n// Program state: whether the __counted_by length field\
+  \ has been initialized.\nREGISTER_MAP_WITH_PROGRAMSTATE(OwnerCountSetMap, const\
+  \ MemRegion*, bool)\n// Program state: cache the FieldDecl* of the length field\
+  \ for an owner.\nREGISTER_MAP_WITH_PROGRAMSTATE(OwnerCountFieldMap, const MemRegion*,\
+  \ const FieldDecl*)\n\nnamespace {\nclass SAGenTestChecker\n  : public Checker<\n\
+  \        check::PostCall,\n        check::PreCall,\n        check::Bind> {\n  mutable\
+  \ std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n      : BT(new\
+  \ BugType(this,\n                       \"Flexible-array access before __counted_by\
+  \ init\",\n                       \"Memory Safety\")) {}\n\n  void checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *StoreE, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  static bool calleeIs(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C);\n\n  static bool isZeroAllocFunction(const\
+  \ CallEvent &Call, CheckerContext &C);\n  static bool isMemsetZero(const CallEvent\
+  \ &Call, CheckerContext &C);\n  static bool isMemcpyLike(const CallEvent &Call,\
+  \ CheckerContext &C);\n\n  static const MemberExpr* getAsMember(const Expr *E);\n\
+  \  static bool isFlexibleArrayCountedBy(const FieldDecl *FlexFD, const FieldDecl\
+  \ *&CountFD);\n  static bool getFlexArrayAndOwner(const Expr *E,\n             \
+  \                      const MemberExpr *&FlexME,\n                            \
+  \       const FieldDecl *&FlexFD,\n                                   const FieldDecl\
+  \ *&CountFD,\n                                   const Expr *&OwnerBaseExpr);\n\n\
+  \  static const FieldDecl* findCountFieldFromOwnerRecord(const RecordDecl *RD);\n\
+  \n  static ProgramStateRef ensureOwnerCountFieldMapping(ProgramStateRef State,\n\
+  \                                                      const MemRegion *OwnerReg,\n\
+  \                                                      const FieldDecl *CountFD);\n\
+  };\n\n// Check if the call's callee matches the provided name.\n// Prefer using\
+  \ Call.getCalleeIdentifier(); fallback to source-text match.\nbool SAGenTestChecker::calleeIs(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C) {\n  if (const IdentifierInfo\
+  \ *ID = Call.getCalleeIdentifier()) {\n    if (ID->getName() == Name) return true;\n\
+  \  }\n  if (const Expr *OE = Call.getOriginExpr()) {\n    if (ExprHasName(OE, Name,\
+  \ C)) return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isZeroAllocFunction(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  // Known zero-initializing allocators\
+  \ in the kernel\n  static const char *Names[] = {\n      \"kzalloc\", \"kcalloc\"\
+  , \"kvzalloc\",\n      \"devm_kzalloc\", \"devm_kcalloc\",\n      \"kzalloc_node\"\
+  , \"kcalloc_node\"\n  };\n  for (auto *N : Names) {\n    if (calleeIs(Call, N, C))\n\
+  \      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isMemsetZero(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  if (!(calleeIs(Call, \"memset\", C) ||\
+  \ calleeIs(Call, \"__memset\", C)))\n    return false;\n\n  if (Call.getNumArgs()\
+  \ < 2)\n    return false;\n\n  const Expr *ValExpr = Call.getArgExpr(1);\n  if (!ValExpr)\n\
+  \    return false;\n\n  llvm::APSInt Res;\n  if (!EvaluateExprToInt(Res, ValExpr,\
+  \ C))\n    return false;\n\n  return Res.isZero();\n}\n\nbool SAGenTestChecker::isMemcpyLike(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  return calleeIs(Call, \"memcpy\", C)\
+  \ ||\n         calleeIs(Call, \"__memcpy\", C) ||\n         calleeIs(Call, \"memmove\"\
+  , C);\n}\n\nconst MemberExpr* SAGenTestChecker::getAsMember(const Expr *E) {\n \
+  \ if (!E) return nullptr;\n  const Expr *Cur = E->IgnoreParenImpCasts();\n  if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(Cur))\n    return ME;\n\n  if (const auto *UO\
+  \ = dyn_cast<UnaryOperator>(Cur)) {\n    if (UO->getOpcode() == UO_AddrOf || UO->getOpcode()\
+  \ == UO_Deref) {\n      const Expr *SE = UO->getSubExpr();\n      if (!SE) return\
+  \ nullptr;\n      return dyn_cast<MemberExpr>(SE->IgnoreParenImpCasts());\n    }\n\
+  \  }\n\n  if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(Cur)) {\n    const\
+  \ Expr *Base = ASE->getBase();\n    if (!Base) return nullptr;\n    return dyn_cast<MemberExpr>(Base->IgnoreParenImpCasts());\n\
+  \  }\n\n  return nullptr;\n}\n\nbool SAGenTestChecker::isFlexibleArrayCountedBy(const\
+  \ FieldDecl *FlexFD,\n                                                const FieldDecl\
+  \ *&CountFD) {\n  CountFD = nullptr;\n  if (!FlexFD)\n    return false;\n\n  //\
+  \ Must be a flexible array member.\n  bool IsFlex = FlexFD->isFlexibleArrayMember()\
+  \ ||\n                FlexFD->getType()->isIncompleteArrayType();\n  if (!IsFlex)\n\
+  \    return false;\n\n  if (const auto *CBA = FlexFD->getAttr<CountedByAttr>())\
+  \ {\n#if CLANG_VERSION_MAJOR >= 18\n    if (const FieldDecl *FD = CBA->getCountedByField())\
+  \ {\n      CountFD = FD;\n      return true;\n    }\n#else\n    // For older versions,\
+  \ we conservatively fail. However, per instruction, target Clang-18.\n    return\
+  \ false;\n#endif\n  }\n  return false;\n}\n\nbool SAGenTestChecker::getFlexArrayAndOwner(const\
+  \ Expr *E,\n                                            const MemberExpr *&FlexME,\n\
+  \                                            const FieldDecl *&FlexFD,\n       \
+  \                                     const FieldDecl *&CountFD,\n             \
+  \                               const Expr *&OwnerBaseExpr) {\n  FlexME = nullptr;\n\
+  \  FlexFD = nullptr;\n  CountFD = nullptr;\n  OwnerBaseExpr = nullptr;\n\n  const\
+  \ MemberExpr *ME = getAsMember(E);\n  if (!ME)\n    return false;\n\n  const FieldDecl\
+  \ *FD = dyn_cast<FieldDecl>(ME->getMemberDecl());\n  if (!FD)\n    return false;\n\
+  \n  const FieldDecl *CFD = nullptr;\n  if (!isFlexibleArrayCountedBy(FD, CFD))\n\
+  \    return false;\n\n  FlexME = ME;\n  FlexFD = FD;\n  CountFD = CFD;\n  OwnerBaseExpr\
+  \ = ME->getBase();\n  return true;\n}\n\nconst FieldDecl* SAGenTestChecker::findCountFieldFromOwnerRecord(const\
+  \ RecordDecl *RD) {\n  if (!RD)\n    return nullptr;\n\n  for (const FieldDecl *FD\
+  \ : RD->fields()) {\n    const FieldDecl *CountFD = nullptr;\n    if (isFlexibleArrayCountedBy(FD,\
+  \ CountFD) && CountFD)\n      return CountFD;\n  }\n  return nullptr;\n}\n\nProgramStateRef\
+  \ SAGenTestChecker::ensureOwnerCountFieldMapping(ProgramStateRef State,\n      \
+  \                                                         const MemRegion *OwnerReg,\n\
+  \                                                               const FieldDecl\
+  \ *CountFD) {\n  if (!State || !OwnerReg)\n    return State;\n\n  const FieldDecl\
+  \ *Mapped = State->get<OwnerCountFieldMap>(OwnerReg);\n  if (!Mapped && CountFD)\
+  \ {\n    State = State->set<OwnerCountFieldMap>(OwnerReg, CountFD);\n  }\n\n  //\
+  \ Initialize the \"count set\" flag to false if absent.\n  if (!State->get<OwnerCountSetMap>(OwnerReg))\
+  \ {\n    State = State->set<OwnerCountSetMap>(OwnerReg, false);\n  }\n\n  return\
+  \ State;\n}\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Zero-initializing\
+  \ allocators: mark the returned region as zeroed.\n  if (isZeroAllocFunction(Call,\
+  \ C)) {\n    const MemRegion *MR = Call.getReturnValue().getAsRegion();\n    if\
+  \ (MR) {\n      MR = MR->getBaseRegion();\n      State = State->set<OwnerZeroedMap>(MR,\
+  \ true);\n      // Initialize count-set flag to false if absent.\n      if (!State->get<OwnerCountSetMap>(MR))\
+  \ {\n        State = State->set<OwnerCountSetMap>(MR, false);\n      }\n      C.addTransition(State);\n\
+  \    }\n    return;\n  }\n\n  // memset(..., 0, ...): mark destination as zeroed.\n\
+  \  if (isMemsetZero(Call, C) && Call.getNumArgs() > 0) {\n    const Expr *DestE\
+  \ = Call.getArgExpr(0);\n    if (DestE) {\n      const MemRegion *MR = getMemRegionFromExpr(DestE,\
+  \ C);\n      if (MR) {\n        MR = MR->getBaseRegion();\n        State = State->set<OwnerZeroedMap>(MR,\
+  \ true);\n        if (!State->get<OwnerCountSetMap>(MR)) {\n          State = State->set<OwnerCountSetMap>(MR,\
+  \ false);\n        }\n        C.addTransition(State);\n      }\n    }\n    return;\n\
+  \  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  if (!isMemcpyLike(Call, C))\n    return;\n\n  if (Call.getNumArgs()\
+  \ < 1)\n    return;\n\n  const Expr *DestE = Call.getArgExpr(0);\n  if (!DestE)\n\
+  \    return;\n\n  const MemberExpr *FlexME = nullptr;\n  const FieldDecl *FlexFD\
+  \ = nullptr;\n  const FieldDecl *CountFD = nullptr;\n  const Expr *OwnerBaseExpr\
+  \ = nullptr;\n\n  if (!getFlexArrayAndOwner(DestE, FlexME, FlexFD, CountFD, OwnerBaseExpr))\n\
+  \    return;\n\n  // Resolve the owner region from the base expression (e.g., \"\
+  event\" in \"event->data\").\n  const MemRegion *OwnerReg = getMemRegionFromExpr(OwnerBaseExpr,\
+  \ C);\n  if (!OwnerReg)\n    return;\n  OwnerReg = OwnerReg->getBaseRegion();\n\n\
+  \  ProgramStateRef State = C.getState();\n\n  // Ensure we have mapping for this\
+  \ owner.\n  State = ensureOwnerCountFieldMapping(State, OwnerReg, CountFD);\n\n\
+  \  const bool *Zeroed = State->get<OwnerZeroedMap>(OwnerReg);\n  const bool *CountSet\
+  \ = State->get<OwnerCountSetMap>(OwnerReg);\n\n  // Only warn if we know it's zero-initialized\
+  \ and the counter hasn't been set yet.\n  if (Zeroed && *Zeroed && CountSet && !*CountSet)\
+  \ {\n    ExplodedNode *N = C.generateNonFatalErrorNode();\n    if (!N)\n      return;\n\
+  \n    auto R = std::make_unique<PathSensitiveBugReport>(\n        *BT, \"Write to\
+  \ __counted_by flexible array before setting its length\", N);\n    R->addRange(DestE->getSourceRange());\n\
+  \    C.emitReport(std::move(R));\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  const MemRegion\
+  \ *Reg = Loc.getAsRegion();\n  if (!Reg)\n    return;\n\n  // If writing to a field\
+  \ of a struct, see if it is the counted_by counter.\n  if (const auto *FR = dyn_cast<FieldRegion>(Reg))\
+  \ {\n    const FieldDecl *AssignedFD = FR->getDecl();\n    if (!AssignedFD)\n  \
+  \    return;\n\n    const MemRegion *OwnerReg = FR->getSuperRegion();\n    if (!OwnerReg)\n\
+  \      return;\n    OwnerReg = OwnerReg->getBaseRegion();\n\n    ProgramStateRef\
+  \ State = C.getState();\n\n    // Try to get or compute the CountFD for this owner.\n\
+  \    const FieldDecl *CountFD = State->get<OwnerCountFieldMap>(OwnerReg);\n    if\
+  \ (!CountFD) {\n      // Compute from the record declaration (owner's type).\n \
+  \     const RecordDecl *RD = dyn_cast<RecordDecl>(AssignedFD->getParent());\n  \
+  \    if (RD) {\n        if (const FieldDecl *CFD = findCountFieldFromOwnerRecord(RD))\
+  \ {\n          CountFD = CFD;\n          State = State->set<OwnerCountFieldMap>(OwnerReg,\
+  \ CountFD);\n        }\n      }\n      // Initialize CountSet flag to false if absent.\n\
+  \      if (!State->get<OwnerCountSetMap>(OwnerReg)) {\n        State = State->set<OwnerCountSetMap>(OwnerReg,\
+  \ false);\n      }\n    }\n\n    // If the assigned field equals the known counter\
+  \ field, mark it as set.\n    if (CountFD && AssignedFD == CountFD) {\n      State\
+  \ = State->set<OwnerCountSetMap>(OwnerReg, true);\n    }\n\n    C.addTransition(State);\n\
+  \  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects writes to __counted_by flexible arrays before initializing their\
+  \ length\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nwifi: brcmfmac: fweh: Fix boot crash on Raspberry\
+  \ Pi 4\n\nFix boot crash on Raspberry Pi by moving the update to `event->datalen`\n\
+  before data is copied into flexible-array member `data` via `memcpy()`.\n\nFlexible-array\
+  \ member `data` was annotated with `__counted_by(datalen)`\nin commit 62d19b358088\
+  \ (\"wifi: brcmfmac: fweh: Add __counted_by for\nstruct brcmf_fweh_queue_item and\
+  \ use struct_size()\"). The intention of\nthis is to gain visibility into the size\
+  \ of `data` at run-time through\nits _counter_ (in this case `datalen`), and with\
+  \ this have its accesses\nbounds-checked at run-time via CONFIG_FORTIFY_SOURCE and\n\
+  CONFIG_UBSAN_BOUNDS.\n\nTo effectively accomplish the above, we shall update the\
+  \ counter\n(`datalen`), before the first access to the flexible array (`data`),\n\
+  which was also done in the mentioned commit.\n\nHowever, commit edec42821911 (\"\
+  wifi: brcmfmac: allow per-vendor event\nhandling\") inadvertently caused a buffer\
+  \ overflow, detected by\nFORTIFY_SOURCE. It moved the `event->datalen = datalen;`\
+  \ update to after\nthe first `data` access, at which point `event->datalen` was\
+  \ not yet\nupdated from zero (after calling `kzalloc()`), leading to the overflow\n\
+  issue.\n\nThis fix repositions the `event->datalen = datalen;` update before\naccessing\
+  \ `data`, restoring the intended buffer overflow protection. :)\n\nFixes: edec42821911\
+  \ (\"wifi: brcmfmac: allow per-vendor event handling\")\nReported-by: Nathan Chancellor\
+  \ <nathan@kernel.org>\nCloses: https://gist.github.com/nathanchance/e22f681f3bfc467f15cdf6605021aaa6\n\
+  Tested-by: Nathan Chancellor <nathan@kernel.org>\nSigned-off-by: Gustavo A. R. Silva\
+  \ <gustavoars@kernel.org>\nReviewed-by: Kees Cook <keescook@chromium.org>\nAcked-by:\
+  \ Arend van Spriel <arend.vanspriel@broadcom.com>\nSigned-off-by: Kalle Valo <kvalo@kernel.org>\n\
+  Link: https://msgid.link/Zc+3PFCUvLoVlpg8@neat\n\n## Buggy Code\n\n```c\n// Function:\
+  \ brcmf_fweh_process_event in drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c\n\
+  void brcmf_fweh_process_event(struct brcmf_pub *drvr,\n\t\t\t      struct brcmf_event\
+  \ *event_packet,\n\t\t\t      u32 packet_len, gfp_t gfp)\n{\n\tu32 fwevt_idx;\n\t\
+  struct brcmf_fweh_info *fweh = drvr->fweh;\n\tstruct brcmf_fweh_queue_item *event;\n\
+  \tvoid *data;\n\tu32 datalen;\n\n\t/* get event info */\n\tfwevt_idx = get_unaligned_be32(&event_packet->msg.event_type);\n\
+  \tdatalen = get_unaligned_be32(&event_packet->msg.datalen);\n\tdata = &event_packet[1];\n\
+  \n\tif (fwevt_idx >= fweh->num_event_codes)\n\t\treturn;\n\n\tif (fwevt_idx != BRCMF_E_IF\
+  \ && !fweh->evt_handler[fwevt_idx])\n\t\treturn;\n\n\tif (datalen > BRCMF_DCMD_MAXLEN\
+  \ ||\n\t    datalen + sizeof(*event_packet) > packet_len)\n\t\treturn;\n\n\tevent\
+  \ = kzalloc(struct_size(event, data, datalen), gfp);\n\tif (!event)\n\t\treturn;\n\
+  \n\tevent->code = fwevt_idx;\n\tevent->ifidx = event_packet->msg.ifidx;\n\n\t/*\
+  \ use memcpy to get aligned event message */\n\tmemcpy(&event->emsg, &event_packet->msg,\
+  \ sizeof(event->emsg));\n\tmemcpy(event->data, data, datalen);\n\tevent->datalen\
+  \ = datalen;\n\tmemcpy(event->ifaddr, event_packet->eth.h_dest, ETH_ALEN);\n\n\t\
+  brcmf_fweh_queue_event(fweh, event);\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff\
+  \ --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c\n\
+  index 0774f6c59226..f0b6a7607f16 100644\n--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c\n\
+  +++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/fweh.c\n@@ -497,12 +497,12\
+  \ @@ void brcmf_fweh_process_event(struct brcmf_pub *drvr,\n \t\treturn;\n \n \t\
+  event->code = fwevt_idx;\n+\tevent->datalen = datalen;\n \tevent->ifidx = event_packet->msg.ifidx;\n\
+  \ \n \t/* use memcpy to get aligned event message */\n \tmemcpy(&event->emsg, &event_packet->msg,\
+  \ sizeof(event->emsg));\n \tmemcpy(event->data, data, datalen);\n-\tevent->datalen\
+  \ = datalen;\n \tmemcpy(event->ifaddr, event_packet->eth.h_dest, ETH_ALEN);\n \n\
+  \ \tbrcmf_fweh_queue_event(fweh, event);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Writing to a flexible-array member annotated with __counted_by(len_field) before
+  initializing its length field.
+
+
+  Typical form:
+
+  - A struct has: u32 len; u8 data[] __counted_by(len);
+
+  - The object is zero-initialized (e.g., via kzalloc), so len starts at 0.
+
+  - Code allocates with struct_size(..., len), but then does memcpy(obj->data, src,
+  len) before setting obj->len = len.
+
+  - Because len is still 0, FORTIFY/UBSAN bounds checks see data as size 0 and flag
+  a buffer overflow.
+
+
+  Correct sequence is to set the counter (len_field) before any access to the flexible
+  array.'
+plan: "1) Program state\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(OwnerZeroedMap, const\
+  \ MemRegion*, bool)\n  - Tracks whether a struct object (the \u201Cowner\u201D of\
+  \ the flexible-array member) is known to be zero-initialized.\n- REGISTER_MAP_WITH_PROGRAMSTATE(OwnerCountSetMap,\
+  \ const MemRegion*, bool)\n  - Tracks whether the struct\u2019s length field (the\
+  \ __counted_by counter) has been written/initialized at least once.\n- REGISTER_MAP_WITH_PROGRAMSTATE(OwnerCountFieldMap,\
+  \ const MemRegion*, const FieldDecl*)\n  - Caches, for a given owner region, which\
+  \ FieldDecl is the length counter referenced by the flexible-array\u2019s counted_by\
+  \ attribute.\n\nNotes:\n- We key everything by the MemRegion* of the struct object\
+  \ (the owner). CSA\u2019s region identity already handles aliases of the same allocation,\
+  \ so we don\u2019t need a separate alias map.\n\n\n2) Helper utilities\n\nImplement\
+  \ small internal helpers (pure utility, not callbacks):\n\n- static bool isZeroAllocFunction(const\
+  \ CallEvent &Call)\n  - Return true for allocators that guarantee zeroed memory\
+  \ (e.g., kzalloc, kcalloc, kvzalloc, devm_kzalloc, devm_kcalloc, kcalloc_node, etc.).\
+  \ Match via Call.getCalleeIdentifier()->getName().\n\n- static bool isMemsetZero(const\
+  \ CallEvent &Call, CheckerContext &C)\n  - Return true for memset-like calls whose\
+  \ second argument is 0.\n  - Check callee name is \u201Cmemset\u201D or \u201C__memset\u201D\
+  \ and use EvaluateExprToInt on arg1 to confirm zero.\n\n- static bool isMemcpyLike(const\
+  \ CallEvent &Call)\n  - Return true for memcpy-like functions we want to guard (e.g.,\
+  \ memcpy, __memcpy, memcpy_inline, memmove, kmemdup_from_user, etc.). Start with\
+  \ memcpy/memmove for simplicity.\n\n- static const MemberExpr* getAsMember(const\
+  \ Expr *E)\n  - Return the MemberExpr if E (after IgnoreParenImpCasts) is a member\
+  \ access.\n\n- static bool isFlexibleArrayCountedBy(const FieldDecl *FlexFD, const\
+  \ FieldDecl *&CountFD)\n  - Return true if FlexFD is a flexible-array member and\
+  \ has a counted_by attribute; set CountFD to the FieldDecl specified by the attribute.\n\
+  \  - Primary approach: use Clang\u2019s CountedByAttr on FlexFD (if available).\
+  \ Fallbacks are not required for the initial version.\n\n- static bool getFlexArrayAndOwner(const\
+  \ Expr *E, const MemberExpr *&FlexME, const FieldDecl *&FlexFD, const FieldDecl\
+  \ *&CountFD, const Expr *&OwnerBaseExpr)\n  - Given an expression (e.g., a memcpy\
+  \ destination), try to resolve it to a MemberExpr that refers to a flexible-array\
+  \ member with counted_by.\n  - If successful, also provide the base expression (owner)\
+  \ for region extraction via getMemRegionFromExpr.\n\n- static const FieldDecl* findCountFieldFromOwnerType(QualType\
+  \ OwnerQT)\n  - If we need the counter FieldDecl without first seeing the flexible-array\
+  \ access:\n    - Lookup the RecordDecl for the owner type.\n    - Iterate fields,\
+  \ find the flexible-array field that has counted_by; return its referenced counter\
+  \ FieldDecl. If multiple, pick the one present; this is a rare edge case.\n\n- static\
+  \ void ensureOwnerCountFieldMapping(const Expr *OwnerBaseExpr, const FieldDecl *CountFD,\
+  \ CheckerContext &C)\n  - Resolve owner region via getMemRegionFromExpr(OwnerBaseExpr,\
+  \ C).\n  - If not in OwnerCountFieldMap, insert mapping Owner->CountFD.\n  - If\
+  \ Owner not in OwnerCountSetMap, initialize to false.\n  - Do not change OwnerZeroedMap\
+  \ here.\n\n\n3) Callbacks and logic\n\nA) checkPostCall (detect zero-initialized\
+  \ allocations)\n\n- If isZeroAllocFunction(Call):\n  - Get the return value\u2019\
+  s MemRegion via getMemRegionFromExpr(Call.getOriginExpr(), C) or Call.getReturnValue().getAsRegion().\n\
+  \  - If region is non-null:\n    - Set OwnerZeroedMap[region] = true.\n    - Initialize\
+  \ OwnerCountSetMap[region] = false if absent.\n  - Rationale: we know the struct\u2019\
+  s fields are zero, including the counted_by length.\n\n- Else if isMemsetZero(Call,\
+  \ C):\n  - Extract the destination expression (arg0).\n  - Get owner region via\
+  \ getMemRegionFromExpr(destExpr, C).\n  - If non-null:\n    - Set OwnerZeroedMap[owner]\
+  \ = true.\n    - Initialize OwnerCountSetMap[owner] = false if absent.\n\nNo bug\
+  \ reporting here.\n\n\nB) checkBind (mark the length field as initialized when written)\n\
+  \n- If LHS of the bind is a MemberExpr:\n  - Let ME = LHS MemberExpr, FD = ME->getMemberDecl()\
+  \ as FieldDecl.\n  - Resolve OwnerBaseExpr = ME->getBase()->IgnoreParenImpCasts().\n\
+  \  - Determine the CountFD for this owner:\n    - First, try OwnerCountFieldMap[owner];\
+  \ if missing:\n      - Compute CountFD via findCountFieldFromOwnerType(OwnerBaseExpr->getType()).\n\
+  \      - If found, write OwnerCountFieldMap[owner] = CountFD and initialize OwnerCountSetMap[owner]\
+  \ = false if absent.\n  - If CountFD exists and FD == CountFD:\n    - Set OwnerCountSetMap[owner]\
+  \ = true.\n\nNotes:\n- We only need to mark \u201Cset at least once\u201D. We do\
+  \ not track the actual value.\n- If we cannot resolve owner region or count field,\
+  \ do nothing.\n\n\nC) checkPreCall (flag writes to flexible-array before length\
+  \ is set)\n\n- Handle memset zero as in PostCall if it appears here (some implementations\
+  \ prefer pre-call), but one place is enough. If you do the detection in checkPostCall,\
+  \ skip here.\n\n- If isMemcpyLike(Call):\n  - Extract destination expression (arg0).\n\
+  \  - Attempt to resolve dest to a flexible-array member with counted_by:\n    -\
+  \ Use getFlexArrayAndOwner(destExpr, FlexME, FlexFD, CountFD, OwnerBaseExpr).\n\
+  \    - If not a counted_by flexible array, return.\n  - Resolve owner region via\
+  \ getMemRegionFromExpr(OwnerBaseExpr, C).\n  - Call ensureOwnerCountFieldMapping(OwnerBaseExpr,\
+  \ CountFD, C) to make sure maps are initialized for this owner.\n  - Read OwnerZeroedMap[owner]\
+  \ and OwnerCountSetMap[owner].\n  - If OwnerZeroedMap[owner] == true AND OwnerCountSetMap[owner]\
+  \ == false:\n    - Report a bug: create a non-fatal error node and emit a PathSensitiveBugReport.\n\
+  \    - Message: \"Write to __counted_by flexible array before setting its length\"\
+  \n    - Add source range for the destination argument (memcpy arg0).\n  - Otherwise,\
+  \ no report.\n\nNotes:\n- This covers the typical memcpy-to-flex-array pattern as\
+  \ in the target patch.\n- Optional: Similarly check memmove, kmemdup, memcpy_toio,\
+  \ etc., as needed.\n\n\nD) Optional coverage for direct stores (simplify initially)\n\
+  \n- If desired, extend detection to direct stores like owner->data[i] = ...:\n \
+  \ - Implement in checkLocation: when IsLoad == false:\n    - From the Stmt* S, use\
+  \ findSpecificTypeInParents<MemberExpr>(S, C) or findSpecificTypeInChildren<MemberExpr>(S)\
+  \ to find a MemberExpr involved in the store.\n    - If the member is a flexible-array\
+  \ with counted_by and it\u2019s the base of the store, apply the same OwnerZeroedMap/OwnerCountSetMap\
+  \ logic as in memcpy.\n  - Keep this for a follow-up increment; the initial version\
+  \ can focus on memcpy-like calls.\n\n\n4) Reporting\n\n- Use a BugType member, created\
+  \ once: std::make_unique<BugType>(this, \"Flexible-array access before __counted_by\
+  \ init\", \"Memory Safety\").\n- On detection:\n  - ProgramStateRef State = C.getState();\n\
+  \  - ExplodedNode *N = C.generateNonFatalErrorNode(State);\n  - If N is null, return.\n\
+  \  - auto R = std::make_unique<PathSensitiveBugReport>(*BT, \"Write to __counted_by\
+  \ flexible array before setting its length\", N);\n  - Highlight the destination\
+  \ expression SourceRange.\n  - C.emitReport(std::move(R)).\n\n\n5) Implementation\
+  \ notes and simplifications\n\n- Attribute/querying:\n  - Prefer using Clang\u2019\
+  s CountedByAttr on the flexible-array FieldDecl to retrieve the counter FieldDecl.\
+  \ This avoids string heuristics.\n- Owner region:\n  - Always resolve from the base\
+  \ expression of the MemberExpr using getMemRegionFromExpr.\n- Minimizing false positives:\n\
+  \  - Only warn when OwnerZeroedMap[owner] is true (known zero-initialization) and\
+  \ OwnerCountSetMap[owner] is false (counter not yet set). This mirrors the real\
+  \ runtime overflow trigger (counter == 0).\n- Function name matching:\n  - Use Call.getCalleeIdentifier()->getName()\
+  \ and compare to the exact function names. You can extend the list as needed.\n\n\
+  \n6) Chosen callbacks summary\n\n- checkPostCall:\n  - Mark zero-initialized allocations\
+  \ (kzalloc-like).\n  - Optionally handle memset zero here instead of pre-call.\n\
+  - checkBind:\n  - Detect assignments to the counted_by counter field; set OwnerCountSetMap[owner]\
+  \ = true.\n- checkPreCall:\n  - For memcpy-like calls, if destination is a counted_by\
+  \ flexible-array and owner was zero-inited but count not set yet, report.\n  - Optionally\
+  \ detect memset zero here if not done in PostCall.\n\nThis minimal, path-sensitive\
+  \ approach directly detects the target bug pattern in the provided patch: memcpy\
+  \ to a flexible-array member annotated with __counted_by before the corresponding\
+  \ length field is initialized, after a zero-initializing allocation."
+refined_plan: null
+repaired_checker_code: null
+tn_score: -10
+tp_score: -10

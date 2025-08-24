@@ -1,0 +1,244 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -23,6 +23,10 @@ #include "llvm/ADT/SmallVector.h"
+ #include <optional>
+
++// Added for parent queries and dyn typed nodes
++#include "clang/AST/ASTTypeTraits.h"
++#include "clang/AST/ParentMapContext.h"
++
+ using namespace clang;
+ using namespace ento;
+ using namespace taint;
+@@ -41,10 +45,12 @@
+    private:
+       struct ArrayUseInfo {
+-        const ValueDecl *VD = nullptr;               // VarDecl or FieldDecl
+-        uint64_t Size = 0;                           // Constant array size
++        const ValueDecl *VD = nullptr;                  // VarDecl or FieldDecl
++        uint64_t Size = 0;                              // Constant array size
+         const ArraySubscriptExpr *ExampleUse = nullptr; // Example use site for diagnostics
+       };
++
++      enum class GuardKind { None, Lt, Le, Gt, Ge, Eq, Ne };
+
+       static bool evalToUInt64(const Expr *E, ASTContext &ACtx, uint64_t &Out);
+       static bool isSimpleIncreasingIncrement(const Stmt *Inc, const VarDecl *IVar, ASTContext &ACtx);
+@@ -57,6 +63,14 @@                                      llvm::DenseMap<const ValueDecl*, ArrayUseInfo> &Out) const;
+       bool hasGuardForBound(const Stmt *Body, const VarDecl *IVar, uint64_t SmallSize, ASTContext &ACtx) const;
+       static bool condHasIVarAgainstConst(const Expr *CondE, const VarDecl *IVar, uint64_t ConstVal, ASTContext &ACtx);
++
++      // New helpers to suppress false positives when the subscript is guarded by a branch.
++      static bool containsStmt(const Stmt *Parent, const Stmt *Target);
++      static bool parseCondOnIVar(const Expr *Cond, const VarDecl *IVar, uint64_t &Const, GuardKind &Kind, ASTContext &ACtx);
++      static bool branchImpliesIndexInRange(GuardKind Kind, uint64_t Const, bool BranchWhenCondTrue,
++                                            uint64_t SmallSize, uint64_t UB);
++      static bool isIndexUseGuardedByBranch(const ArraySubscriptExpr *ASE, const VarDecl *IVar,
++                                            uint64_t SmallSize, uint64_t UB, ASTContext &ACtx);
+ };
+
+ bool SAGenTestChecker::evalToUInt64(const Expr *E, ASTContext &ACtx, uint64_t &Out) {
+@@ -275,6 +289,184 @@   return false;
+ }
+
++// New: subtree containment helper.
++bool SAGenTestChecker::containsStmt(const Stmt *Parent, const Stmt *Target) {
++  if (!Parent || !Target) return false;
++  if (Parent == Target) return true;
++  for (const Stmt *Child : Parent->children()) {
++    if (!Child) continue;
++    if (containsStmt(Child, Target))
++      return true;
++  }
++  return false;
++}
++
++// New: parse a simple binary condition on the loop index into a normalized form.
++bool SAGenTestChecker::parseCondOnIVar(const Expr *Cond, const VarDecl *IVar, uint64_t &Const, GuardKind &Kind, ASTContext &ACtx) {
++  Kind = GuardKind::None;
++  if (!Cond) return false;
++  Cond = Cond->IgnoreParenImpCasts();
++  const auto *BO = dyn_cast<BinaryOperator>(Cond);
++  if (!BO) return false;
++
++  const Expr *L = BO->getLHS()->IgnoreParenImpCasts();
++  const Expr *R = BO->getRHS()->IgnoreParenImpCasts();
++
++  // i op Const
++  if (isVarRefTo(L, IVar)) {
++    uint64_t C;
++    if (!evalToUInt64(R, ACtx, C))
++      return false;
++    Const = C;
++    switch (BO->getOpcode()) {
++      case BO_LT: Kind = GuardKind::Lt; break;
++      case BO_LE: Kind = GuardKind::Le; break;
++      case BO_GT: Kind = GuardKind::Gt; break;
++      case BO_GE: Kind = GuardKind::Ge; break;
++      case BO_EQ: Kind = GuardKind::Eq; break;
++      case BO_NE: Kind = GuardKind::Ne; break;
++      default: return false;
++    }
++    return true;
++  }
++
++  // Const op i  => normalize to i op' Const
++  if (isVarRefTo(R, IVar)) {
++    uint64_t C;
++    if (!evalToUInt64(L, ACtx, C))
++      return false;
++    Const = C;
++    switch (BO->getOpcode()) {
++      case BO_LT: Kind = GuardKind::Gt; break; // Const < i  => i > Const
++      case BO_LE: Kind = GuardKind::Ge; break; // Const <= i => i >= Const
++      case BO_GT: Kind = GuardKind::Lt; break; // Const > i  => i < Const
++      case BO_GE: Kind = GuardKind::Le; break; // Const >= i => i <= Const
++      case BO_EQ: Kind = GuardKind::Eq; break;
++      case BO_NE: Kind = GuardKind::Ne; break;
++      default: return false;
++    }
++    return true;
++  }
++
++  return false;
++}
++
++// New: determine if a branch implies i within [0, SmallSize-1].
++bool SAGenTestChecker::branchImpliesIndexInRange(GuardKind Kind, uint64_t Const, bool BranchWhenCondTrue,
++                                                 uint64_t SmallSize, uint64_t UB) {
++  if (Kind == GuardKind::None) return false;
++
++  // We know from loop normalization that i starts at 0 and iterates up to UB-1.
++  // We check common sufficient patterns.
++
++  // Avoid underflow for SmallSize-1 checks.
++  auto hasSmallMinus1 = [](uint64_t S, uint64_t &Out) -> bool {
++    if (S == 0) return false;
++    Out = S - 1;
++    return true;
++  };
++
++  uint64_t S1 = 0;
++  switch (Kind) {
++    case GuardKind::Lt:
++      // i < Const ; true-branch safe if Const == SmallSize.
++      if (BranchWhenCondTrue && Const == SmallSize)
++        return true;
++      break;
++    case GuardKind::Le:
++      // i <= Const ; true-branch safe if Const == SmallSize - 1
++      if (BranchWhenCondTrue && hasSmallMinus1(SmallSize, S1) && Const == S1)
++        return true;
++      break;
++    case GuardKind::Ge:
++      // i >= Const ; false-branch safe if Const == SmallSize
++      if (!BranchWhenCondTrue && Const == SmallSize)
++        return true;
++      break;
++    case GuardKind::Gt:
++      // i > Const ; false-branch safe if Const == SmallSize - 1
++      if (!BranchWhenCondTrue && hasSmallMinus1(SmallSize, S1) && Const == S1)
++        return true;
++      break;
++    case GuardKind::Eq:
++      // i == Const ; false-branch safe if Const == SmallSize and UB == SmallSize + 1
++      if (!BranchWhenCondTrue && Const == SmallSize && UB == SmallSize + 1)
++        return true;
++      break;
++    case GuardKind::Ne:
++      // i != Const ; true-branch safe if Const == SmallSize and UB == SmallSize + 1
++      if (BranchWhenCondTrue && Const == SmallSize && UB == SmallSize + 1)
++        return true;
++      break;
++    default:
++      break;
++  }
++  return false;
++}
++
++// New: check if the actual array subscript is within a branch/conditional that keeps i in range.
++bool SAGenTestChecker::isIndexUseGuardedByBranch(const ArraySubscriptExpr *ASE, const VarDecl *IVar,
++                                                 uint64_t SmallSize, uint64_t UB, ASTContext &ACtx) {
++  if (!ASE) return false;
++
++  const Stmt *Node = ASE;
++  // Walk up the parent chain (limit depth defensively).
++  for (unsigned Depth = 0; Depth < 64 && Node; ++Depth) {
++    auto Parents = ACtx.getParents(*Node);
++    if (Parents.empty())
++      break;
++
++    const DynTypedNode &DN = Parents[0];
++    if (const auto *CO = DN.get<ConditionalOperator>()) {
++      uint64_t C = 0;
++      GuardKind GK = GuardKind::None;
++      if (!parseCondOnIVar(CO->getCond(), IVar, C, GK, ACtx)) {
++        Node = CO;
++        continue;
++      }
++      bool InTrue = containsStmt(CO->getTrueExpr(), ASE);
++      bool InFalse = containsStmt(CO->getFalseExpr(), ASE);
++      if (InTrue || InFalse) {
++        bool BranchWhenCondTrue = InTrue;
++        if (branchImpliesIndexInRange(GK, C, BranchWhenCondTrue, SmallSize, UB))
++          return true;
++      }
++      Node = CO;
++      continue;
++    }
++
++    if (const auto *IS = DN.get<IfStmt>()) {
++      uint64_t C = 0;
++      GuardKind GK = GuardKind::None;
++      if (!parseCondOnIVar(IS->getCond(), IVar, C, GK, ACtx)) {
++        Node = IS;
++        continue;
++      }
++      const Stmt *ThenS = IS->getThen();
++      const Stmt *ElseS = IS->getElse();
++      bool InThen = ThenS && containsStmt(ThenS, ASE);
++      bool InElse = ElseS && containsStmt(ElseS, ASE);
++      if (InThen || InElse) {
++        bool BranchWhenCondTrue = InThen; // then-branch executes when condition true
++        if (branchImpliesIndexInRange(GK, C, BranchWhenCondTrue, SmallSize, UB))
++          return true;
++      }
++      Node = IS;
++      continue;
++    }
++
++    if (const auto *ParentStmt = DN.get<Stmt>()) {
++      Node = ParentStmt;
++      continue;
++    } else {
++      // No more Stmt parents (could be Decl); stop.
++      break;
++    }
++  }
++
++  return false;
++}
++
+ void SAGenTestChecker::processForStmt(const ForStmt *FS, ASTContext &ACtx, BugReporter &BR) const {
+   if (!FS) return;
+
+@@ -298,7 +490,7 @@   if (!evalToUInt64(BO->getRHS(), ACtx, UB))
+     return;
+
+-  // Adjust for <= bound: effective iteration count
++  // Adjust for <= bound: effective iteration count (UB is the count of iterations).
+   if (Op == BO_LE)
+     UB = UB + 1;
+
+@@ -338,8 +530,13 @@   if (!Small)
+     return;
+
+-  // Suppress if there is a guard like: if (i >= SmallSize) break/return;
++  // Suppress if there is a loop-level guard like: if (i >= SmallSize) break/return;
+   if (hasGuardForBound(FS->getBody(), IVar, Small->Size, ACtx))
++    return;
++
++  // Suppress if the specific use site is guarded by a branch/conditional ensuring i < SmallSize.
++  if (Small->ExampleUse &&
++      isIndexUseGuardedByBranch(Small->ExampleUse, IVar, Small->Size, UB, ACtx))
+     return;
+
+   // Report bug at the smaller array access site (if available), otherwise at the for condition

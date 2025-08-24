@@ -1,0 +1,289 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -27,16 +27,41 @@ template <typename T>
+ const T* findSpecificTypeInChildren(const Stmt *S);
+
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C);
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C);
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E);
++bool getStringSize(llvm::APInt &StringSize, const Expr *E);
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C);
+ bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
+-const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C);
+-
++
++// Program state: priv(pointee base) -> dev(pointee base).
+ REGISTER_MAP_WITH_PROGRAMSTATE(Priv2DevMap, const MemRegion*, const MemRegion*)
++
++// Legacy set (unused after refinement but kept for compatibility, not removed).
+ REGISTER_SET_WITH_PROGRAMSTATE(FreedDevs, const MemRegion*)
+
+ // Directed map: pointer-typed storage region -> pointee region (optional tracking).
+ REGISTER_MAP_WITH_PROGRAMSTATE(PtrPointsTo, const MemRegion*, const MemRegion*)
+
++// Epoch-based lifetime tracking for dev objects.
++// DevEpochMap: current allocation epoch for a dev pointee region.
++// FreedEpochMap: last epoch at which the dev was freed.
++REGISTER_MAP_WITH_PROGRAMSTATE(DevEpochMap, const MemRegion*, unsigned)
++REGISTER_MAP_WITH_PROGRAMSTATE(FreedEpochMap, const MemRegion*, unsigned)
++
+ namespace {
++
++static bool containsStmt(const Stmt *Root, const Stmt *Target) {
++  if (!Root || !Target)
++    return false;
++  if (Root == Target)
++    return true;
++  for (const Stmt *Child : Root->children()) {
++    if (containsStmt(Child, Target))
++      return true;
++  }
++  return false;
++}
+
+ class SAGenTestChecker : public Checker<check::PostCall,
+                                         check::PreCall,
+@@ -60,35 +85,37 @@   static const MemRegion *exprToRegion(const Expr *E, CheckerContext &C);
+   static const MemRegion *exprToBaseRegion(const Expr *E, CheckerContext &C);
+
++  static unsigned getDevEpoch(ProgramStateRef State, const MemRegion *DevBase);
++  static unsigned getFreedEpoch(ProgramStateRef State, const MemRegion *DevBase);
+   static bool devIsFreed(ProgramStateRef State, const MemRegion *DevBase);
+
+-  // Return the dev region if R is within some priv region that maps to a dev.
+-  // OutPrivBase, if non-null, receives the matching priv base region.
+   static const MemRegion *findDevForPrivDerivedRegion(ProgramStateRef State,
+                                                       const MemRegion *R,
+                                                       const MemRegion **OutPrivBase = nullptr);
+
+-  // Known functions that synchronously deref work/timer structures.
+   static bool knownWorkOrTimerDeref(const CallEvent &Call, CheckerContext &C,
+                                     llvm::SmallVectorImpl<unsigned> &OutIdx);
+
+-  // AST-only variant used from checkLocation gating (no CallEvent available).
+   static bool knownWorkOrTimerDerefCE(const CallExpr *CE, CheckerContext &C,
+                                       llvm::SmallVectorImpl<unsigned> &OutIdx);
+
+   static bool isWithinRegion(const MemRegion *R, const MemRegion *Container);
+-
+-  // FP filter: accessing a pointer-typed lvalue (reading/writing the pointer
+-  // variable or field itself) is not a dereference of its pointee.
+   static bool isPointerLValueRegion(const MemRegion *R);
+
+-  // Returns true and fills OutCE+OutArgIdx if S is within argument OutArgIdx
+-  // of enclosing call expression.
+   static bool findEnclosingCallArg(const Stmt *S, CheckerContext &C,
+                                    const CallExpr *&OutCE, unsigned &OutArgIdx);
+
++  static bool isAllocNetdevLike(const CallEvent &Call, CheckerContext &C);
++
+   void reportUAFAtCall(const CallEvent &Call, CheckerContext &C, StringRef Msg) const;
+   void reportUAFAtStmt(const Stmt *S, CheckerContext &C, StringRef Msg) const;
++
++  // Optional FP guard hook.
++  static bool isFalsePositive(const Stmt *S, CheckerContext &C) {
++    // Currently unused placeholder for future fine-grained heuristics.
++    (void)S; (void)C;
++    return false;
++  }
+ };
+
+ bool SAGenTestChecker::callHasName(const CallEvent &Call, CheckerContext &C, StringRef Name) {
+@@ -123,9 +150,27 @@   return getBaseRegionOrSelf(MR);
+ }
+
++unsigned SAGenTestChecker::getDevEpoch(ProgramStateRef State, const MemRegion *DevBase) {
++  if (!DevBase) return 0;
++  if (const unsigned *E = State->get<DevEpochMap>(DevBase))
++    return *E;
++  return 0;
++}
++
++unsigned SAGenTestChecker::getFreedEpoch(ProgramStateRef State, const MemRegion *DevBase) {
++  if (!DevBase) return 0;
++  if (const unsigned *E = State->get<FreedEpochMap>(DevBase))
++    return *E;
++  return 0;
++}
++
+ bool SAGenTestChecker::devIsFreed(ProgramStateRef State, const MemRegion *DevBase) {
+-  if (!DevBase) return false;
+-  return State->contains<FreedDevs>(DevBase);
++  if (!DevBase)
++    return false;
++  unsigned Cur = getDevEpoch(State, DevBase);
++  unsigned Freed = getFreedEpoch(State, DevBase);
++  // The dev is considered freed only if the last freed epoch equals the current allocation epoch.
++  return (Cur != 0 || Freed != 0) && (Cur == Freed);
+ }
+
+ const MemRegion *SAGenTestChecker::findDevForPrivDerivedRegion(ProgramStateRef State,
+@@ -134,7 +179,6 @@   if (!R) return nullptr;
+
+   // Walk up ancestor chain from R, looking for a priv base that we recorded.
+-  // We intentionally do NOT follow arbitrary alias maps to avoid false positives.
+   const MemRegion *Cur = R;
+   llvm::SmallPtrSet<const MemRegion*, 8> Visited;
+   while (Cur && Visited.insert(Cur).second) {
+@@ -144,7 +188,6 @@       return *DevBase;
+     }
+
+-    // For subregions, climb to the super-region.
+     if (const auto *SR = dyn_cast<SubRegion>(Cur)) {
+       Cur = SR->getSuperRegion();
+       continue;
+@@ -260,34 +303,44 @@   if (!OutCE)
+     return false;
+
+-  const SourceManager &SM = C.getSourceManager();
+-  SourceRange SR = S->getSourceRange();
+-  SourceLocation SBegin = SR.getBegin();
+-  SourceLocation SEnd = SR.getEnd();
+-
+   unsigned NumArgs = OutCE->getNumArgs();
+   for (unsigned i = 0; i < NumArgs; ++i) {
+     const Expr *Arg = OutCE->getArg(i);
+-    if (!Arg) continue;
+-    SourceRange AR = Arg->getSourceRange();
+-    // Check if S is within the source range of this argument (best-effort).
+-    if (!AR.isValid())
++    if (!Arg)
+       continue;
+-
+-    SourceLocation ABegin = AR.getBegin();
+-    SourceLocation AEnd = AR.getEnd();
+-
+-    bool BeginInside = !SM.isBeforeInTranslationUnit(SBegin, ABegin) &&
+-                       !SM.isBeforeInTranslationUnit(AEnd, SBegin);
+-    bool EndInside = !SM.isBeforeInTranslationUnit(SEnd, ABegin) &&
+-                     !SM.isBeforeInTranslationUnit(AEnd, SEnd);
+-
+-    if (BeginInside || EndInside) {
++    // Precise structural containment check: is S inside the AST subtree of this argument?
++    if (containsStmt(Arg, S)) {
+       OutArgIdx = i;
+       return true;
+     }
+   }
+
++  return false;
++}
++
++bool SAGenTestChecker::isAllocNetdevLike(const CallEvent &Call, CheckerContext &C) {
++  // Common Linux netdev allocators. Keep conservative superset, harmless if missed.
++  static const char *Names[] = {
++      "alloc_netdev", "alloc_netdev_mqs",
++      "alloc_etherdev", "alloc_etherdev_mq",
++      "alloc_candev", "alloc_candev_mqs",
++      "alloc_fcdev",
++  };
++
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    StringRef Fn = ID->getName();
++    for (const char *N : Names) {
++      if (Fn.equals(N))
++        return true;
++    }
++  }
++
++  const Expr *E = Call.getOriginExpr();
++  if (!E) return false;
++  for (const char *N : Names) {
++    if (ExprHasName(E, N, C))
++      return true;
++  }
+   return false;
+ }
+
+@@ -317,6 +370,10 @@       const Expr *DevE = Call.getArgExpr(0);
+       const MemRegion *DevBase = exprToBaseRegion(DevE, C);
+       if (DevBase) {
++        unsigned CurEpoch = getDevEpoch(State, DevBase);
++        // Mark freed at current epoch.
++        State = State->set<FreedEpochMap>(DevBase, CurEpoch);
++        // Keep legacy set updated to avoid breaking any other logic accidentally relying on it.
+         State = State->add<FreedDevs>(DevBase);
+         C.addTransition(State);
+       }
+@@ -329,17 +386,16 @@     const Expr *DevE = (Call.getNumArgs() >= 1) ? Call.getArgExpr(0) : nullptr;
+     const MemRegion *DevBase = exprToBaseRegion(DevE, C);
+
+-    // Try to get the region representing the returned pointer's pointee.
+     const SVal RetV = Call.getReturnValue();
+-    const MemRegion *PrivReg = RetV.getAsRegion(); // Pointee region for pointer returns.
+-
+-    // Report if netdev_priv(dev) is called after free(dev)
++    const MemRegion *PrivReg = RetV.getAsRegion(); // pointee region for pointer return
++
++    // Report if netdev_priv(dev) is called after free(dev) (same epoch).
+     if (DevBase && devIsFreed(State, DevBase)) {
+       reportUAFAtCall(Call, C, "netdev_priv(dev) after free_netdev");
+       return;
+     }
+
+-    // Record mapping priv(pointee) -> dev
++    // Record mapping priv(pointee base) -> dev(pointee base).
+     if (PrivReg && DevBase) {
+       const MemRegion *PrivBase = getBaseRegionOrSelf(PrivReg);
+       State = State->set<Priv2DevMap>(PrivBase, DevBase);
+@@ -347,6 +403,24 @@     }
+     return;
+   }
++
++  // Detect netdev allocations and advance epoch for the returned dev region.
++  if (isAllocNetdevLike(Call, C)) {
++    const SVal RetV = Call.getReturnValue();
++    const MemRegion *DevReg = RetV.getAsRegion(); // pointee region of returned pointer
++    const MemRegion *DevBase = getBaseRegionOrSelf(DevReg);
++    if (DevBase) {
++      unsigned CurEpoch = getDevEpoch(State, DevBase);
++      unsigned NewEpoch = CurEpoch + 1;
++      State = State->set<DevEpochMap>(DevBase, NewEpoch);
++      // New allocation resets any stale freed marker for this region.
++      State = State->remove<FreedEpochMap>(DevBase);
++      // Also remove legacy FreedDevs entry if any.
++      State = State->remove<FreedDevs>(DevBase);
++      C.addTransition(State);
++    }
++    return;
++  }
+ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -371,17 +445,16 @@       continue;
+
+     if (devIsFreed(State, DevBase)) {
+-      reportUAFAtCall(Call, C, "Use of netdev priv after free_netdev");
++      if (!isFalsePositive(Call.getOriginExpr(), C))
++        reportUAFAtCall(Call, C, "Use of netdev priv after free_netdev");
+       return;
+     }
+   }
+ }
+
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+-  // To avoid false positives (e.g., loads from shared 'hw' objects that are
+-  // not inside netdev priv), only consider loads that happen as part of
+-  // arguments to functions that are known to synchronously dereference
+-  // work/timer objects (cancel_work_sync, etc.). All other loads are ignored.
++  // Only consider loads/stores that happen as part of arguments to functions
++  // that are known to synchronously dereference work/timer objects (cancel_work_sync, etc.).
+   const CallExpr *CE = nullptr;
+   unsigned ArgIdx = 0;
+   if (!findEnclosingCallArg(S, C, CE, ArgIdx))
+@@ -412,9 +485,9 @@   if (!DevBase || !PrivBase)
+     return;
+
+-  // If the dev is freed, report at the call site.
+   if (devIsFreed(State, DevBase)) {
+-    reportUAFAtStmt(CE, C, "Use of netdev priv after free_netdev");
++    if (!isFalsePositive(CE, C))
++      reportUAFAtStmt(CE, C, "Use of netdev priv after free_netdev");
+   }
+ }
+
+@@ -427,7 +500,6 @@   if (!LHS)
+     return;
+
+-  // Only track for pointer-typed lvalues.
+   const auto *TVR = dyn_cast<TypedValueRegion>(LHS);
+   if (!TVR || !TVR->getValueType()->isPointerType())
+     return;

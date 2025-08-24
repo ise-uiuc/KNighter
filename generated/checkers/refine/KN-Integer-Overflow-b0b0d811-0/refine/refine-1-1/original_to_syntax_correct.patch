@@ -1,0 +1,215 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -17,7 +17,9 @@ #include "clang/AST/Expr.h"
+ #include "clang/AST/Stmt.h"
+ #include "clang/AST/Type.h"
++#include "llvm/ADT/SmallString.h"
+ #include <algorithm>
++#include <memory>
+
+ using namespace clang;
+ using namespace ento;
+@@ -82,11 +84,30 @@   // Extract a variable/field identifier name from an expression if possible.
+   static std::string extractIdentifierLikeName(const Expr *E);
+
+-  // Semantic filters to reduce false positives.
++  static bool nameContains(StringRef TextLower,
++                           std::initializer_list<StringRef> Needles);
++
++  // Address/size-like LHS filter for intended bug surface (narrowed).
+   static bool isAddressOrSizeLikeLHS(const Expr *LHS);
++
++  // IRQ-like and jiffies contexts suppression.
+   static bool isIrqLikeContext(const Expr *Root, const Expr *LHS, CheckerContext &C);
+
+-  // Heuristic: detect known-timeout/jiffies contexts to avoid FPs.
++  // Kernel block/folio I/O math suppression helpers
++  static bool isShiftOfOne(const Expr *E);
++  static bool exprNameContains(const Expr *E, std::initializer_list<StringRef> Needles,
++                               CheckerContext &C);
++  static bool isBlockSizeLikeExpr(const Expr *E, CheckerContext &C);
++  static bool isAddSubChainRec(const Expr *E,
++                               std::initializer_list<StringRef> Needles,
++                               CheckerContext &C);
++  static bool isAddSubChainOfNames(const Expr *E,
++                                   std::initializer_list<StringRef> Needles,
++                                   CheckerContext &C);
++  static bool isBlockCountLikeExpr(const Expr *E, CheckerContext &C);
++  static bool isPageOrFolioContext(const Expr *Root, CheckerContext &C);
++
++  // Heuristic: detect known-timeout/jiffies/IRQ contexts to avoid FPs.
+   static bool isFalsePositiveContext(const Expr *Root,
+                                      const BinaryOperator *MulBO,
+                                      const Expr *LHSExpr,
+@@ -105,9 +126,6 @@                               const BinaryOperator *MulBO,
+                               const Expr *LHSExpr,
+                               CheckerContext &C);
+-
+-  static bool nameContains(StringRef TextLower,
+-                           std::initializer_list<StringRef> Needles);
+
+   void emitReport(const BinaryOperator *MulBO, QualType LHSType,
+                   CheckerContext &C) const;
+@@ -372,7 +390,8 @@   return false;
+ }
+
+-// Address/size-like LHS filter for intended bug surface.
++// Address/size-like LHS filter for intended bug surface (narrowed).
++// Focus on addr/size/pitch/stride-like sinks. Avoid generic "len", "offset" to reduce FPs.
+ bool SAGenTestChecker::isAddressOrSizeLikeLHS(const Expr *LHS) {
+   std::string Name = extractIdentifierLikeName(LHS);
+   if (Name.empty())
+@@ -383,8 +402,8 @@   // Heuristic keywords that map to memory/byte/size/address semantics.
+   return nameContains(Lower,
+                       {"addr", "address", "dma_addr",
+-                       "size", "len", "length", "bytes", "nbytes",
+-                       "count", "pitch", "stride", "offset", "ofs"});
++                       "size", "bytes", "nbytes",
++                       "pitch", "stride"});
+ }
+
+ // IRQ-like context suppression.
+@@ -415,7 +434,103 @@   return false;
+ }
+
+-// Secondary guard: filter known jiffies/timeout contexts to avoid false positives.
++// Returns true if expression is of the form (1 << X) or (1U << X).
++bool SAGenTestChecker::isShiftOfOne(const Expr *E) {
++  if (!E) return false;
++  E = E->IgnoreParenImpCasts();
++  const auto *BO = dyn_cast<BinaryOperator>(E);
++  if (!BO || BO->getOpcode() != BO_Shl)
++    return false;
++  const auto *LHS_IL = dyn_cast<IntegerLiteral>(BO->getLHS()->IgnoreParenImpCasts());
++  if (!LHS_IL) return false;
++  return LHS_IL->getValue() == 1;
++}
++
++bool SAGenTestChecker::exprNameContains(const Expr *E,
++                                        std::initializer_list<StringRef> Needles,
++                                        CheckerContext &C) {
++  if (!E) return false;
++  // Try identifier name first.
++  std::string Name = extractIdentifierLikeName(E);
++  std::string Lower = Name;
++  std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++  if (!Lower.empty() && nameContains(Lower, Needles))
++    return true;
++  // Fallback to source text.
++  for (StringRef N : Needles) {
++    if (ExprHasName(E, N, C))
++      return true;
++  }
++  return false;
++}
++
++// block-size-like: variable named block_size/blksize/bsize/fs_block_size
++// OR an expression like (1 << block_bits) or (1U << blkbits)
++bool SAGenTestChecker::isBlockSizeLikeExpr(const Expr *E, CheckerContext &C) {
++  if (!E) return false;
++  if (exprNameContains(E, {"block_size", "blksize", "bsize", "fs_block_size",
++                           "page_size", "blocksize"}, C))
++    return true;
++  if (isShiftOfOne(E))
++    return true;
++  // Also accept (1 << something) nested within parens/casts.
++  return false;
++}
++
++// recursively check if E is a +/- chain composed of names from Needles and integer literals
++bool SAGenTestChecker::isAddSubChainRec(const Expr *E,
++                                        std::initializer_list<StringRef> Needles,
++                                        CheckerContext &C) {
++  if (!E) return false;
++  E = E->IgnoreParenImpCasts();
++  if (isa<IntegerLiteral>(E))
++    return true;
++  if (exprNameContains(E, Needles, C))
++    return true;
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++    if (BO->getOpcode() == BO_Add || BO->getOpcode() == BO_Sub) {
++      return isAddSubChainRec(BO->getLHS(), Needles, C) &&
++             isAddSubChainRec(BO->getRHS(), Needles, C);
++    }
++  }
++  return false;
++}
++
++// count-like: combinations like (last - i + 1), (nr_blks), (blocks), etc.
++bool SAGenTestChecker::isAddSubChainOfNames(const Expr *E,
++                                            std::initializer_list<StringRef> Needles,
++                                            CheckerContext &C) {
++  return isAddSubChainRec(E, Needles, C);
++}
++
++bool SAGenTestChecker::isBlockCountLikeExpr(const Expr *E, CheckerContext &C) {
++  // Common identifiers in block/folio counting contexts.
++  return isAddSubChainOfNames(
++      E,
++      {"first", "last", "end", "i", "j", "k", "count", "nr", "nr_blks",
++       "nr_blocks", "blocks", "blks", "nblocks", "nblks", "block"},
++      C);
++}
++
++// Identify iomap/folio/page context from function name or expression text.
++bool SAGenTestChecker::isPageOrFolioContext(const Expr *Root, CheckerContext &C) {
++  const FunctionDecl *FD = nullptr;
++  if (const auto *LC = C.getLocationContext())
++    FD = dyn_cast_or_null<FunctionDecl>(LC->getDecl());
++  if (FD) {
++    std::string FName = FD->getNameAsString();
++    std::transform(FName.begin(), FName.end(), FName.begin(), ::tolower);
++    if (nameContains(FName, {"iomap", "folio", "readahead", "readpage"}))
++      return true;
++  }
++  // Fallback to textual hints.
++  if (ExprHasName(Root, "folio", C) || ExprHasName(Root, "iomap", C) ||
++      ExprHasName(Root, "page", C))
++    return true;
++  return false;
++}
++
++// Secondary guard: filter known benign contexts to avoid false positives.
+ bool SAGenTestChecker::isFalsePositiveContext(const Expr *Root,
+                                               const BinaryOperator *MulBO,
+                                               const Expr *LHSExpr,
+@@ -453,6 +568,17 @@   // 3) IRQ-like contexts.
+   if (LHS && isIrqLikeContext(Root, LHS, C))
+     return true;
++
++  // 4) Kernel iomap/folio math: count-like * block-size-like, in page/folio context.
++  if (MulBO && isPageOrFolioContext(Root, C)) {
++    const Expr *ML = MulBO->getLHS()->IgnoreParenImpCasts();
++    const Expr *MR = MulBO->getRHS()->IgnoreParenImpCasts();
++    bool IsBlockGeom =
++        (isBlockSizeLikeExpr(ML, C) && isBlockCountLikeExpr(MR, C)) ||
++        (isBlockSizeLikeExpr(MR, C) && isBlockCountLikeExpr(ML, C));
++    if (IsBlockGeom)
++      return true;
++  }
+
+   return false;
+ }
+@@ -482,7 +608,7 @@   if (!MulBO)
+     return true;
+
+-  // Suppress when LHS is not address/size-like (we target addr/size/len/offset/pitch/stride).
++  // Suppress when LHS is not address/size-like (we target addr/size/pitch/stride).
+   if (!isAddressOrSizeLikeLHS(LHSExpr))
+     return true;
+
+@@ -508,7 +634,7 @@   if (!N)
+     return;
+
+-  SmallString<128> Msg;
++  llvm::SmallString<128> Msg;
+   Msg += "Multiplication occurs in a narrower type and is widened after; ";
+   Msg += "possible overflow before assignment/addition to wide type";
+   auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);
+@@ -603,8 +729,8 @@       bool IsAddrSizeLike =
+           nameContains(Lower,
+                        {"addr", "address", "dma_addr",
+-                        "size", "len", "length", "bytes", "nbytes",
+-                        "count", "pitch", "stride", "offset", "ofs"});
++                        "size", "bytes", "nbytes",
++                        "pitch", "stride"});
+       if (!IsAddrSizeLike)
+         continue;

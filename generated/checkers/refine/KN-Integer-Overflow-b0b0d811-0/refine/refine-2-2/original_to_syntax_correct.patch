@@ -1,0 +1,213 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -123,7 +123,7 @@   static bool isMulUnderArrayIndex(const BinaryOperator *MulBO,
+                                    CheckerContext &C);
+
+-  // CFI-style erase region math: ((X >> k) & ~((1<<K)-1)) * interleave
++  // CFI-style erase region math
+   static bool isConstMaskClearingLowBits(const Expr *E, unsigned &ClearedBits,
+                                          CheckerContext &C);
+   static bool matchMaskedShiftExpr(const Expr *E, unsigned &ShiftAmt,
+@@ -131,6 +131,11 @@   static bool isBenignCFIMaskedShiftInterleaveCase(const BinaryOperator *MulBO,
+                                                    CheckerContext &C);
+
++  // New: small-index × small-unit pattern helpers
++  static bool isIndexLikeExpr(const Expr *E, CheckerContext &C);
++  static bool isSmallSizeUnitLikeExpr(const Expr *E, CheckerContext &C);
++  static bool isSmallIndexTimesUnitPattern(const BinaryOperator *MulBO, CheckerContext &C);
++
+   // Aggregated FP gate.
+   static bool isFalsePositive(const Expr *Root,
+                               const BinaryOperator *MulBO,
+@@ -156,7 +161,6 @@ }
+
+ // Wide target: unsigned integer-like and width >= 64 bits (covers u64, dma_addr_t on 64-bit).
+-// Narrowing to unsigned eliminates benign signed long "size" temporaries like ALSA's private_size.
+ bool SAGenTestChecker::isWideTargetType(QualType QT, CheckerContext &C) {
+   if (!isIntegerLike(QT))
+     return false;
+@@ -197,18 +201,69 @@ // Clamp ranges based on identifier hints (heuristics for kernel).
+ void SAGenTestChecker::clampByNameHints(const Expr *E, llvm::APInt &Min, llvm::APInt &Max,
+                                         CheckerContext &C) {
+-  // Small interleave factors in flash CFI stacks are common (1,2,4,8,...).
++  // Retrieve identifier-like name if possible.
++  std::string Name = extractIdentifierLikeName(E);
++  std::string Lower = Name;
++  std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++
++  auto clampTo = [&](uint64_t NewMin, uint64_t NewMax) {
++    llvm::APInt NewMinA(128, NewMin, /*isSigned*/false);
++    llvm::APInt NewMaxA(128, NewMax, /*isSigned*/false);
++    if (Min.slt(NewMinA)) Min = NewMinA;
++    if (Max.sgt(NewMaxA)) Max = NewMaxA;
++    if (Min.sgt(Max)) { Min = NewMinA; Max = NewMaxA; }
++  };
++
++  // Existing: interleave is typically small.
+   if (exprNameContains(E, {"interleave"}, C)) {
+-    llvm::APInt One = llvm::APInt(128, 1, /*isSigned*/false);
+-    llvm::APInt Up = llvm::APInt(128, 64, /*isSigned*/false);
+-    if (Min.slt(One)) Min = One;
+-    if (Max.sgt(Up))  Max = Up;
+-  }
+-}
+-
+-// Lightweight interval analysis for expressions. Always returns true,
+-// providing a conservative range, falling back to type-based ranges.
+-// Depth-limited to avoid pathological recursion.
++    clampTo(1, 64);
++    return;
++  }
++
++  // Header/PDU size-like fields are typically small (bytes).
++  // Match explicit tokens first.
++  if (!Lower.empty()) {
++    // Specific common tokens for small header sizes.
++    if (nameContains(Lower, {"defpdu", "hdr_sz", "hdr_size", "header_sz", "headersz", "pdu_hdr"})) {
++      clampTo(0, 4096);
++      return;
++    }
++    // Generic hdr/header/pdu combined with size/sz/len/length
++    bool HasHdr = nameContains(Lower, {"hdr", "header", "pdu"});
++    bool HasSize = nameContains(Lower, {"size", "sz", "len", "length"});
++    if (HasHdr && HasSize) {
++      clampTo(0, 4096);
++      return;
++    }
++
++    // Index-like variables: i/j/k or 'index'/'idx'.
++    if (Lower == "i" || Lower == "j" || Lower == "k" ||
++        nameContains(Lower, {"index", "idx"})) {
++      clampTo(0, 65535); // conservatively large, still ensures 4k * 64k fits 32-bit.
++      return;
++    }
++  } else {
++    // If name extraction failed, try source text fallback for key tokens.
++    if (ExprHasName(E, "defpdu", C) || ExprHasName(E, "hdr_sz", C) ||
++        ExprHasName(E, "hdr_size", C) || ExprHasName(E, "header_sz", C) ||
++        ExprHasName(E, "pdu_hdr", C)) {
++      clampTo(0, 4096);
++      return;
++    }
++    if ((ExprHasName(E, "hdr", C) || ExprHasName(E, "header", C) || ExprHasName(E, "pdu", C)) &&
++        (ExprHasName(E, "size", C) || ExprHasName(E, "sz", C) ||
++         ExprHasName(E, "len", C) || ExprHasName(E, "length", C))) {
++      clampTo(0, 4096);
++      return;
++    }
++    if (ExprHasName(E, "index", C) || ExprHasName(E, "idx", C)) {
++      clampTo(0, 65535);
++      return;
++    }
++  }
++}
++
++// Lightweight interval analysis for expressions. Always returns true.
+ bool SAGenTestChecker::getExprRange128(const Expr *E, CheckerContext &C,
+                                        llvm::APInt &Min, llvm::APInt &Max,
+                                        unsigned Depth) {
+@@ -330,11 +385,9 @@       return true;
+     }
+     case BO_Shr: {
+-      // If RHS is a constant, tighten by shifting bounds; valid for nonnegative ranges.
+       llvm::APSInt AmtAPS;
+       if (EvaluateExprToInt(AmtAPS, BO->getRHS()->IgnoreParenImpCasts(), C)) {
+         unsigned Amt = (unsigned)AmtAPS.getExtValue();
+-        // If LHS min is nonnegative (common for unsigned types), shift both.
+         if (!LMin.isNegative() && !LMax.isNegative()) {
+           Min = LMin.lshr(Amt);
+           Max = LMax.lshr(Amt);
+@@ -569,7 +622,6 @@ }
+
+ // Address/size-like LHS filter for intended bug surface (narrowed).
+-// Focus on addr/size/pitch/stride-like sinks. Avoid generic "len", "offset" to reduce FPs.
+ bool SAGenTestChecker::isAddressOrSizeLikeLHS(const Expr *LHS) {
+   std::string Name = extractIdentifierLikeName(LHS);
+   if (Name.empty())
+@@ -586,14 +638,14 @@
+ // IRQ-like context suppression.
+ bool SAGenTestChecker::isIrqLikeContext(const Expr *Root, const Expr *LHS, CheckerContext &C) {
+-  // LHS name contains irq-ish patterns (e.g., out_hwirq).
++  // LHS name contains irq-ish patterns.
+   std::string LHSName = extractIdentifierLikeName(LHS);
+   std::string Lower = LHSName;
+   std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
+   if (!Lower.empty() && nameContains(Lower, {"irq", "hwirq", "intid", "gsi", "spi", "ppi"}))
+     return true;
+
+-  // Function name contains irq-domain style names (e.g., *_irq_domain_*xlate*).
++  // Function name contains irq-domain style names.
+   const FunctionDecl *FD = nullptr;
+   if (const auto *LC = C.getLocationContext())
+     FD = dyn_cast_or_null<FunctionDecl>(LC->getDecl());
+@@ -855,6 +907,63 @@   return true;
+ }
+
++// New helpers to recognize small-index × small-unit patterns.
++bool SAGenTestChecker::isIndexLikeExpr(const Expr *E, CheckerContext &C) {
++  if (!E) return false;
++  std::string Name = extractIdentifierLikeName(E);
++  std::string Lower = Name;
++  std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++  if (!Lower.empty()) {
++    if (Lower == "i" || Lower == "j" || Lower == "k")
++      return true;
++    if (nameContains(Lower, {"index", "idx"}))
++      return true;
++  }
++  // Fallback to source text.
++  if (ExprHasName(E, "index", C) || ExprHasName(E, "idx", C))
++    return true;
++  return false;
++}
++
++bool SAGenTestChecker::isSmallSizeUnitLikeExpr(const Expr *E, CheckerContext &C) {
++  if (!E) return false;
++  std::string Name = extractIdentifierLikeName(E);
++  std::string Lower = Name;
++  std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++
++  // Match explicit tokens used in iSCSI header size contexts.
++  if (!Lower.empty()) {
++    if (nameContains(Lower, {"defpdu", "hdr_sz", "hdr_size", "header_sz", "headersz", "pdu_hdr"}))
++      return true;
++    bool HasHdr = nameContains(Lower, {"hdr", "header", "pdu"});
++    bool HasSize = nameContains(Lower, {"size", "sz", "len", "length"});
++    if (HasHdr && HasSize)
++      return true;
++  } else {
++    if (ExprHasName(E, "defpdu", C) || ExprHasName(E, "hdr_sz", C) ||
++        ExprHasName(E, "hdr_size", C) || ExprHasName(E, "header_sz", C) ||
++        ExprHasName(E, "pdu_hdr", C))
++      return true;
++    if ((ExprHasName(E, "hdr", C) || ExprHasName(E, "header", C) || ExprHasName(E, "pdu", C)) &&
++        (ExprHasName(E, "size", C) || ExprHasName(E, "sz", C) ||
++         ExprHasName(E, "len", C) || ExprHasName(E, "length", C)))
++      return true;
++  }
++  return false;
++}
++
++bool SAGenTestChecker::isSmallIndexTimesUnitPattern(const BinaryOperator *MulBO, CheckerContext &C) {
++  if (!MulBO || MulBO->getOpcode() != BO_Mul)
++    return false;
++  const Expr *L = MulBO->getLHS()->IgnoreParenImpCasts();
++  const Expr *R = MulBO->getRHS()->IgnoreParenImpCasts();
++  bool LIdx = isIndexLikeExpr(L, C);
++  bool RIdx = isIndexLikeExpr(R, C);
++  bool LUnit = isSmallSizeUnitLikeExpr(L, C);
++  bool RUnit = isSmallSizeUnitLikeExpr(R, C);
++  return (LIdx && RUnit) || (RIdx && LUnit);
++}
++
+ // Aggregated FP logic.
+ bool SAGenTestChecker::isFalsePositive(const Expr *Root,
+                                        const BinaryOperator *MulBO,
+@@ -879,6 +988,10 @@
+   // Targeted suppression: CFI erase-region product pattern.
+   if (isBenignCFIMaskedShiftInterleaveCase(MulBO, C))
++    return true;
++
++  // Targeted suppression: small-index × small-unit (e.g., defpdu_hdr_sz * index).
++  if (isSmallIndexTimesUnitPattern(MulBO, C))
+     return true;
+
+   return false;

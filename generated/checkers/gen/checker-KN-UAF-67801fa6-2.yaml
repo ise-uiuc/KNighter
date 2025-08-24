@@ -1,0 +1,429 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 67801fa67b94ebd0e4da7a77ac2d9f321b75fbe0
+commit_type: UAF
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program states\n//\
+  \ Map the pointee region of the published object -> the publish call site (for diagnostics).\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PublishSiteMap, const MemRegion*, const Stmt*)\n\
+  // Map the object region -> the guard VarRegion (error/status variable). Used to\
+  \ gate success.\n// Note: We record it, but in this implementation we publish immediately\
+  \ and keep the guard\n// to potentially extend later.\nREGISTER_MAP_WITH_PROGRAMSTATE(PendingPublishGuard,\
+  \ const MemRegion*, const VarRegion*)\n// Reverse map from guard variable to object\
+  \ region.\nREGISTER_MAP_WITH_PROGRAMSTATE(GuardToObject, const VarRegion*, const\
+  \ MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n    check::PostCall,\n\
+  \    check::PreCall,\n    check::Bind\n  > {\n\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\npublic:\n  SAGenTestChecker() : BT(new BugType(this, \"Early publish to\
+  \ xa/idr\", \"API Misuse\")) {}\n\n  void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \nprivate:\n  // Helpers\n  bool isPublishAPI(const CallEvent &Call, CheckerContext\
+  \ &C, unsigned &ObjParamIdx) const;\n  const MemRegion *getObjRegionFromArg(const\
+  \ CallEvent &Call, unsigned Idx, CheckerContext &C) const;\n  const VarRegion *getAssignedLHSVarRegion(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n  bool isPublishedFinal(ProgramStateRef\
+  \ State, const MemRegion *ObjBase) const;\n  void reportUseAfterPublish(const MemRegion\
+  \ *ObjBase, const Stmt *UseSite,\n                             CheckerContext &C)\
+  \ const;\n};\n\nbool SAGenTestChecker::isPublishAPI(const CallEvent &Call, CheckerContext\
+  \ &C, unsigned &ObjParamIdx) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // xa_* family, object is 3rd argument (index\
+  \ 2)\n  if (ExprHasName(Origin, \"xa_alloc\", C) ||\n      ExprHasName(Origin, \"\
+  xa_insert\", C) ||\n      ExprHasName(Origin, \"xa_store\", C)) {\n    ObjParamIdx\
+  \ = 2;\n    return Call.getNumArgs() > ObjParamIdx;\n  }\n\n  // idr_* family, object\
+  \ is 2nd argument (index 1)\n  if (ExprHasName(Origin, \"idr_alloc\", C) ||\n  \
+  \    ExprHasName(Origin, \"idr_alloc_cyclic\", C) ||\n      ExprHasName(Origin,\
+  \ \"idr_replace\", C)) {\n    ObjParamIdx = 1;\n    return Call.getNumArgs() > ObjParamIdx;\n\
+  \  }\n\n  return false;\n}\n\nconst MemRegion *SAGenTestChecker::getObjRegionFromArg(const\
+  \ CallEvent &Call, unsigned Idx, CheckerContext &C) const {\n  if (Idx >= Call.getNumArgs())\n\
+  \    return nullptr;\n\n  const Expr *ArgE = Call.getArgExpr(Idx);\n  if (!ArgE)\n\
+  \    return nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n\
+  \  if (!MR)\n    return nullptr;\n\n  return MR->getBaseRegion();\n}\n\nconst VarRegion\
+  \ *SAGenTestChecker::getAssignedLHSVarRegion(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n  \
+  \  return nullptr;\n\n  const CallExpr *CE = dyn_cast<CallExpr>(Origin);\n  if (!CE)\n\
+  \    return nullptr;\n\n  const BinaryOperator *BO = findSpecificTypeInParents<BinaryOperator>(CE,\
+  \ C);\n  if (!BO)\n    return nullptr;\n  if (!BO->isAssignmentOp())\n    return\
+  \ nullptr;\n\n  const Expr *LHS = BO->getLHS();\n  if (!LHS)\n    return nullptr;\n\
+  \n  const MemRegion *LHSRegion = getMemRegionFromExpr(LHS, C);\n  if (!LHSRegion)\n\
+  \    return nullptr;\n\n  LHSRegion = LHSRegion->getBaseRegion();\n  return dyn_cast<VarRegion>(LHSRegion);\n\
+  }\n\nbool SAGenTestChecker::isPublishedFinal(ProgramStateRef State, const MemRegion\
+  \ *ObjBase) const {\n  if (!ObjBase)\n    return false;\n  // Consider published\
+  \ if we have a publish site and no pending guard for the object.\n  const Stmt *const\
+  \ *Site = State->get<PublishSiteMap>(ObjBase);\n  if (!Site)\n    return false;\n\
+  \n  const VarRegion *const *Pending = State->get<PendingPublishGuard>(ObjBase);\n\
+  \  // If there's a recorded pending guard we could choose to delay, but for robustness\
+  \ and to\n  // catch the target buggy pattern, we treat the presence of a publish\
+  \ site as sufficient.\n  // If you want to enforce success-only paths, change this\
+  \ to (Pending == nullptr).\n  (void)Pending;\n  return true;\n}\n\nvoid SAGenTestChecker::reportUseAfterPublish(const\
+  \ MemRegion *ObjBase, const Stmt *UseSite,\n                                   \
+  \          CheckerContext &C) const {\n  if (!ObjBase || !UseSite)\n    return;\n\
+  \n  ProgramStateRef State = C.getState();\n  const Stmt *const *PubSite = State->get<PublishSiteMap>(ObjBase);\n\
+  \  if (!PubSite)\n    return;\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Object published to xa/idr before finalization; writes/use after publish\
+  \ may cause UAF.\", N);\n\n  // Highlight the use site and the publish site.\n \
+  \ R->addRange(UseSite->getSourceRange());\n  if (*PubSite)\n    R->addRange((*PubSite)->getSourceRange());\n\
+  \n  C.emitReport(std::move(R));\n\n  // Avoid duplicate reports for the same object\
+  \ by clearing the publish entry.\n  State = State->remove<PublishSiteMap>(ObjBase);\n\
+  \  State = State->remove<PendingPublishGuard>(ObjBase);\n  // We don't have the\
+  \ VarRegion for the guard here; clear all GuardToObject that map to this object.\n\
+  \  // This is optional and skipped for simplicity.\n\n  C.addTransition(State);\n\
+  }\n\n// Record potential publish site and associate guard if present.\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  unsigned ObjIdx = 0;\n  if (!isPublishAPI(Call,\
+  \ C, ObjIdx))\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  const\
+  \ MemRegion *ObjBase = getObjRegionFromArg(Call, ObjIdx, C);\n  if (!ObjBase)\n\
+  \    return;\n\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n \
+  \   return;\n\n  const CallExpr *CE = dyn_cast<CallExpr>(Origin);\n  if (!CE)\n\
+  \    return;\n\n  // Record publish site for diagnostics.\n  State = State->set<PublishSiteMap>(ObjBase,\
+  \ CE);\n\n  // If assigned to a guard variable (e.g., \"err = xa_alloc(...)\"),\
+  \ record it.\n  if (const VarRegion *VR = getAssignedLHSVarRegion(Call, C)) {\n\
+  \    State = State->set<PendingPublishGuard>(ObjBase, VR);\n    State = State->set<GuardToObject>(VR,\
+  \ ObjBase);\n  }\n\n  // In this implementation, we consider the object published\
+  \ right away to catch the target bug.\n  // More advanced gating on success can\
+  \ be added by inspecting branch assumptions.\n\n  C.addTransition(State);\n}\n\n\
+  void SAGenTestChecker::checkBind(SVal Loc, SVal /*Val*/, const Stmt *S, CheckerContext\
+  \ &C) const {\n  // Detect writes to an already published object (e.g., q->field\
+  \ = ...)\n  const MemRegion *MR = Loc.getAsRegion();\n  if (!MR)\n    return;\n\n\
+  \  const MemRegion *Base = MR->getBaseRegion();\n  if (!Base)\n    return;\n\n \
+  \ ProgramStateRef State = C.getState();\n  if (isPublishedFinal(State, Base)) {\n\
+  \    reportUseAfterPublish(Base, S, C);\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  // Skip publish APIs here; they\
+  \ are handled in checkPostCall.\n  unsigned TmpIdx = 0;\n  if (isPublishAPI(Call,\
+  \ C, TmpIdx))\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  // If\
+  \ the callee is known to dereference some params, check those.\n  llvm::SmallVector<unsigned,\
+  \ 4> DerefParams;\n  bool KnownDeref = functionKnownToDeref(Call, DerefParams);\n\
+  \n  for (unsigned I = 0, E = Call.getNumArgs(); I < E; ++I) {\n    const Expr *ArgE\
+  \ = Call.getArgExpr(I);\n    if (!ArgE)\n      continue;\n\n    const MemRegion\
+  \ *ArgReg = getMemRegionFromExpr(ArgE, C);\n    if (!ArgReg)\n      continue;\n\n\
+  \    ArgReg = ArgReg->getBaseRegion();\n    if (!ArgReg)\n      continue;\n\n  \
+  \  if (!isPublishedFinal(State, ArgReg))\n      continue;\n\n    // If we know this\
+  \ param will be dereferenced, report immediately.\n    if (KnownDeref) {\n     \
+  \ if (llvm::is_contained(DerefParams, I)) {\n        reportUseAfterPublish(ArgReg,\
+  \ Call.getOriginExpr(), C);\n        continue;\n      }\n    }\n\n    // Additionally,\
+  \ if the argument is an address of a subfield (&q->field),\n    // the base region\
+  \ will still match the object. Be conservative and report.\n    // This catches\
+  \ patterns like list_add_tail(&q->list, ...).\n    reportUseAfterPublish(ArgReg,\
+  \ Call.getOriginExpr(), C);\n  }\n}\n\n} // end anonymous namespace\n\nextern \"\
+  C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects publishing kernel objects to\
+  \ xa/idr before finalization which enables UAF via post-publish writes/uses\",\n\
+  \      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ndrm/xe/queue: move xa_alloc to prevent UAF\n\nEvil\
+  \ user can guess the next id of the queue before the ioctl completes\nand then call\
+  \ queue destroy ioctl to trigger UAF since create ioctl is\nstill referencing the\
+  \ same queue. Move the xa_alloc all the way to the end\nto prevent this.\n\nv2:\n\
+  \ - Rebase\n\nFixes: 2149ded63079 (\"drm/xe: Fix use after free when client stats\
+  \ are captured\")\nSigned-off-by: Matthew Auld <matthew.auld@intel.com>\nCc: Matthew\
+  \ Brost <matthew.brost@intel.com>\nReviewed-by: Nirmoy Das <nirmoy.das@intel.com>\n\
+  Reviewed-by: Matthew Brost <matthew.brost@intel.com>\nLink: https://patchwork.freedesktop.org/patch/msgid/20240925071426.144015-4-matthew.auld@intel.com\n\
+  (cherry picked from commit 16536582ddbebdbdf9e1d7af321bbba2bf955a87)\nSigned-off-by:\
+  \ Lucas De Marchi <lucas.demarchi@intel.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ xe_exec_queue_create_ioctl in drivers/gpu/drm/xe/xe_exec_queue.c\nint xe_exec_queue_create_ioctl(struct\
+  \ drm_device *dev, void *data,\n\t\t\t       struct drm_file *file)\n{\n\tstruct\
+  \ xe_device *xe = to_xe_device(dev);\n\tstruct xe_file *xef = to_xe_file(file);\n\
+  \tstruct drm_xe_exec_queue_create *args = data;\n\tstruct drm_xe_engine_class_instance\
+  \ eci[XE_HW_ENGINE_MAX_INSTANCE];\n\tstruct drm_xe_engine_class_instance __user\
+  \ *user_eci =\n\t\tu64_to_user_ptr(args->instances);\n\tstruct xe_hw_engine *hwe;\n\
+  \tstruct xe_vm *vm;\n\tstruct xe_gt *gt;\n\tstruct xe_tile *tile;\n\tstruct xe_exec_queue\
+  \ *q = NULL;\n\tu32 logical_mask;\n\tu32 id;\n\tu32 len;\n\tint err;\n\n\tif (XE_IOCTL_DBG(xe,\
+  \ args->flags) ||\n\t    XE_IOCTL_DBG(xe, args->reserved[0] || args->reserved[1]))\n\
+  \t\treturn -EINVAL;\n\n\tlen = args->width * args->num_placements;\n\tif (XE_IOCTL_DBG(xe,\
+  \ !len || len > XE_HW_ENGINE_MAX_INSTANCE))\n\t\treturn -EINVAL;\n\n\terr = __copy_from_user(eci,\
+  \ user_eci,\n\t\t\t       sizeof(struct drm_xe_engine_class_instance) *\n\t\t\t\
+  \       len);\n\tif (XE_IOCTL_DBG(xe, err))\n\t\treturn -EFAULT;\n\n\tif (XE_IOCTL_DBG(xe,\
+  \ eci[0].gt_id >= xe->info.gt_count))\n\t\treturn -EINVAL;\n\n\tif (eci[0].engine_class\
+  \ == DRM_XE_ENGINE_CLASS_VM_BIND) {\n\t\tif (XE_IOCTL_DBG(xe, args->width != 1)\
+  \ ||\n\t\t    XE_IOCTL_DBG(xe, args->num_placements != 1) ||\n\t\t    XE_IOCTL_DBG(xe,\
+  \ eci[0].engine_instance != 0))\n\t\t\treturn -EINVAL;\n\n\t\tfor_each_tile(tile,\
+  \ xe, id) {\n\t\t\tstruct xe_exec_queue *new;\n\t\t\tu32 flags = EXEC_QUEUE_FLAG_VM;\n\
+  \n\t\t\tif (id)\n\t\t\t\tflags |= EXEC_QUEUE_FLAG_BIND_ENGINE_CHILD;\n\n\t\t\tnew\
+  \ = xe_exec_queue_create_bind(xe, tile, flags,\n\t\t\t\t\t\t\targs->extensions);\n\
+  \t\t\tif (IS_ERR(new)) {\n\t\t\t\terr = PTR_ERR(new);\n\t\t\t\tif (q)\n\t\t\t\t\t\
+  goto put_exec_queue;\n\t\t\t\treturn err;\n\t\t\t}\n\t\t\tif (id == 0)\n\t\t\t\t\
+  q = new;\n\t\t\telse\n\t\t\t\tlist_add_tail(&new->multi_gt_list,\n\t\t\t\t\t   \
+  \   &q->multi_gt_link);\n\t\t}\n\t} else {\n\t\tgt = xe_device_get_gt(xe, eci[0].gt_id);\n\
+  \t\tlogical_mask = calc_validate_logical_mask(xe, gt, eci,\n\t\t\t\t\t\t\t  args->width,\n\
+  \t\t\t\t\t\t\t  args->num_placements);\n\t\tif (XE_IOCTL_DBG(xe, !logical_mask))\n\
+  \t\t\treturn -EINVAL;\n\n\t\thwe = xe_hw_engine_lookup(xe, eci[0]);\n\t\tif (XE_IOCTL_DBG(xe,\
+  \ !hwe))\n\t\t\treturn -EINVAL;\n\n\t\tvm = xe_vm_lookup(xef, args->vm_id);\n\t\t\
+  if (XE_IOCTL_DBG(xe, !vm))\n\t\t\treturn -ENOENT;\n\n\t\terr = down_read_interruptible(&vm->lock);\n\
+  \t\tif (err) {\n\t\t\txe_vm_put(vm);\n\t\t\treturn err;\n\t\t}\n\n\t\tif (XE_IOCTL_DBG(xe,\
+  \ xe_vm_is_closed_or_banned(vm))) {\n\t\t\tup_read(&vm->lock);\n\t\t\txe_vm_put(vm);\n\
+  \t\t\treturn -ENOENT;\n\t\t}\n\n\t\tq = xe_exec_queue_create(xe, vm, logical_mask,\n\
+  \t\t\t\t\t args->width, hwe, 0,\n\t\t\t\t\t args->extensions);\n\t\tup_read(&vm->lock);\n\
+  \t\txe_vm_put(vm);\n\t\tif (IS_ERR(q))\n\t\t\treturn PTR_ERR(q);\n\n\t\tif (xe_vm_in_preempt_fence_mode(vm))\
+  \ {\n\t\t\tq->lr.context = dma_fence_context_alloc(1);\n\n\t\t\terr = xe_vm_add_compute_exec_queue(vm,\
+  \ q);\n\t\t\tif (XE_IOCTL_DBG(xe, err))\n\t\t\t\tgoto put_exec_queue;\n\t\t}\n\n\
+  \t\tif (q->vm && q->hwe->hw_engine_group) {\n\t\t\terr = xe_hw_engine_group_add_exec_queue(q->hwe->hw_engine_group,\
+  \ q);\n\t\t\tif (err)\n\t\t\t\tgoto put_exec_queue;\n\t\t}\n\t}\n\n\terr = xa_alloc(&xef->exec_queue.xa,\
+  \ &id, q, xa_limit_32b, GFP_KERNEL);\n\tif (err)\n\t\tgoto kill_exec_queue;\n\n\t\
+  args->exec_queue_id = id;\n\tq->xef = xe_file_get(xef);\n\n\treturn 0;\n\nkill_exec_queue:\n\
+  \txe_exec_queue_kill(q);\nput_exec_queue:\n\txe_exec_queue_put(q);\n\treturn err;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/gpu/drm/xe/xe_exec_queue.c\
+  \ b/drivers/gpu/drm/xe/xe_exec_queue.c\nindex 7743ebdcbf4b..d098d2dd1b2d 100644\n\
+  --- a/drivers/gpu/drm/xe/xe_exec_queue.c\n+++ b/drivers/gpu/drm/xe/xe_exec_queue.c\n\
+  @@ -635,12 +635,14 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void\
+  \ *data,\n \t\t}\n \t}\n \n+\tq->xef = xe_file_get(xef);\n+\n+\t/* user id alloc\
+  \ must always be last in ioctl to prevent UAF */\n \terr = xa_alloc(&xef->exec_queue.xa,\
+  \ &id, q, xa_limit_32b, GFP_KERNEL);\n \tif (err)\n \t\tgoto kill_exec_queue;\n\
+  \ \n \targs->exec_queue_id = id;\n-\tq->xef = xe_file_get(xef);\n \n \treturn 0;\n\
+  \ \n```\n"
+pattern: '## Bug Pattern
+
+
+  Publishing a newly created kernel object into a user-visible ID map (e.g., via xa_alloc/idr)
+  before the object is fully initialized and before the creator has secured its own
+  stable reference. This early exposure lets untrusted users issue operations (e.g.,
+  destroy) on a predictable/guessable ID while the create path still uses the object,
+  leading to a race and use-after-free in the creator path.'
+plan: "1) Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(PublishSiteMap, const MemRegion*,\
+  \ const Stmt*)\n  - Key: the pointee region of the kernel object being published\
+  \ (e.g., q).\n  - Value: the CallExpr (as Stmt*) of the publish API (xa_alloc/idr_*),\
+  \ used for diagnostics.\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(PendingPublishGuard,\
+  \ const MemRegion*, const VarRegion*)\n  - Key: the same object region.\n  - Value:\
+  \ the VarRegion of the integer status variable assigned the publish call\u2019s\
+  \ return value (e.g., err). Used to gate publication to only the success path.\n\
+  \n- REGISTER_MAP_WITH_PROGRAMSTATE(GuardToObject, const VarRegion*, const MemRegion*)\n\
+  \  - Reverse mapping from the guard variable back to the object region, for quick\
+  \ lookup in branch assumptions.\n\nNotes:\n- We intentionally track the \u201Cpointee\u201D\
+  \ region (the heap/object region that q points to), not the VarRegion of q itself.\
+  \ This lets us match any subsequent alias that points to the same object.\n- No\
+  \ general alias map is required for this checker because both writes via q->field\
+  \ and deref-known calls with q share the same base pointee region. If you want to\
+  \ be conservative, you can add a simple pointer-to-pointee cache in checkBind, but\
+  \ it is not necessary for this pattern.\n\n2) Functions to flag as \u201Cpublish\u201D\
+  \ APIs\n- Maintain a small internal table with function name and index of the parameter\
+  \ that carries the published object pointer:\n  - xa_alloc: index 2 (third arg,\
+  \ \u201Centry\u201D)\n  - xa_insert: index 2\n  - xa_store: index 2\n  - idr_alloc:\
+  \ index 1 (second arg, \u201Cptr\u201D)\n  - idr_alloc_cyclic: index 1\n  - idr_replace:\
+  \ index 1 (publishes/replaces visible pointer)\n- A tiny helper isPublishAPI(const\
+  \ CallEvent&, unsigned &ObjParamIdx) to fill ObjParamIdx if matched.\n\n3) Callbacks\
+  \ and logic\n3.1) checkPostCall\n- Purpose: detect potential publication calls and\
+  \ record them as pending until success is proven on the path.\n- Steps:\n  - If\
+  \ not a publish API, return.\n  - Extract the object-expression argument using ObjParamIdx.\n\
+  \  - Compute the object\u2019s pointee region:\n    - Prefer getMemRegionFromExpr(ObjExpr,\
+  \ C) which returns the pointee MemRegion (if available).\n    - If it returns a\
+  \ non-pointee region (rare), try E->IgnoreImpCasts() or the SVal base\u2019s region;\
+  \ if still unknown, conservatively return (avoid false positives).\n  - Try to detect\
+  \ the common pattern \u201Cerr = xa_alloc(...);\u201D\n    - Use findSpecificTypeInParents<BinaryOperator>(CallExpr)\
+  \ and check it\u2019s an assignment where the RHS contains this call, and the LHS\
+  \ is an integer variable (VarRegion).\n    - If found:\n      - Insert PendingPublishGuard[ObjRegion]\
+  \ = ErrVarRegion\n      - Insert GuardToObject[ErrVarRegion] = ObjRegion\n     \
+  \ - Insert PublishSiteMap[ObjRegion] = CallExpr (for diagnostic location)\n    \
+  \  - Return (we will finalize on the success branch).\n  - Otherwise, handle inline-conditional\
+  \ calls like \u201Cif (xa_alloc(...)) { \u2026 }\u201D\n    - Do nothing here; we\u2019\
+  ll handle the branch in evalAssume by detecting the call inside the condition (see\
+  \ 3.2.2).\n  - If neither an assignment nor a conditional pattern is found, as a\
+  \ conservative fallback:\n    - Insert PublishSiteMap[ObjRegion] = CallExpr\n  \
+  \  - Also insert PendingPublishGuard[ObjRegion] = nullptr (meaning \u201Cno explicit\
+  \ guard var\u201D)\n    - This marks object as \u201Cpossibly published\u201D; the\
+  \ finalize will happen in 3.4 when we detect a post-publish use regardless of a\
+  \ guard. This fallback is optional; keep it if you prefer to catch more cases at\
+  \ the cost of potential noise.\n\n3.2) evalAssume\n- Purpose: finalize publication\
+  \ only for the success path (return value == 0).\n- We need to handle two common\
+  \ forms that gate the result of the publish call:\n  1) via an integer guard variable,\
+  \ e.g., \u201Cerr = xa_alloc(...); if (err) goto \u2026;\u201D\n  2) the call expression\
+  \ itself appears in the condition, e.g., \u201Cif (xa_alloc(...)) \u2026\u201D\n\
+  - Steps:\n  3.2.1) Guard variable path\n    - Extract any DeclRefExpr inside Cond\
+  \ using findSpecificTypeInChildren<DeclRefExpr>.\n    - If it refers to a VarRegion\
+  \ V and GuardToObject contains V, get ObjRegion.\n    - Determine how Cond is used:\n\
+  \      - If Cond is \u201Cerr\u201D or \u201Cerr != 0\u201D:\n        - If Assumption\
+  \ == false (condition is false, meaning err == 0), finalize publish: remove ObjRegion\
+  \ from PendingPublishGuard and insert ObjRegion into PublishSiteMap (already set\
+  \ in 3.1). If PublishSiteMap existed, keep it; if not, set it to the nearest call\
+  \ parent we recorded.\n      - If Cond is \u201C!err\u201D or \u201Cerr == 0\u201D\
+  :\n        - If Assumption == true, finalize publish as above.\n  3.2.2) Inline-call\
+  \ condition path\n    - Find a CallExpr inside Cond using findSpecificTypeInChildren<CallExpr>\
+  \ and check if it\u2019s a publish API (with ObjParamIdx).\n    - Extract the object\
+  \ pointee region as in 3.1 and store PublishSiteMap[ObjRegion] = CallExpr.\n   \
+  \ - Finalize when the Cond implies success for the call:\n      - \u201Cif (xa_alloc(...))\u201D\
+  : success is Cond == false (Assumption == false).\n      - \u201Cif (!xa_alloc(...))\u201D\
+  : success is Cond == true (Assumption == true).\n      - For explicit comparisons\
+  \ \u201C== 0\u201D or \u201C!= 0\u201D around the call, use the same rules as for\
+  \ the guard variable.\n    - No need to use PendingPublishGuard for this form.\n\
+  \n3.3) checkBind\n- Purpose A: detect writes to a published object after publication\
+  \ (the core of this bug pattern).\n  - The checker receives Loc (SVal) and Val.\
+  \ If Loc is a MemRegion:\n    - If Loc is a FieldRegion, ElementRegion, or any SubRegion,\
+  \ strip to the base region of the object (region->getBaseRegion()).\n    - If this\
+  \ base region exists in PublishSiteMap, report:\n      - Message: \"xa/idr publish\
+  \ not last; object written after publish (possible UAF).\"\n      - Attach a note\
+  \ range pointing to PublishSiteMap[ObjRegion] (the publish CallExpr).\n      - Use\
+  \ generateNonFatalErrorNode and PathSensitiveBugReport or BasicBugReport as preferred.\n\
+  \      - After reporting once for the object, you may remove the entry to avoid\
+  \ duplicates.\n- Purpose B: optional pointer-to-pointee caching (not required but\
+  \ can improve robustness).\n  - If the bind is of the form \u201Cp2 = p1;\u201D\
+  \ where both sides are pointers and State can obtain a pointee MemRegion for p1\u2019\
+  s value, you may cache that mapping. This is optional; the object writes we care\
+  \ about always have a FieldRegion base that we can match directly against PublishSiteMap\
+  \ without aliasing info.\n\n3.4) checkPreCall\n- Purpose: detect dereference/uses\
+  \ after publish via function calls that take object pointers or addresses to its\
+  \ subfields (e.g., list_add_tail(&q->list, ...), put/kill/destroy routines), which\
+  \ are evidence of post-publish use.\n- Steps:\n  - If the callee is a publish API,\
+  \ ignore here (already handled).\n  - For all args in the call:\n    - Try to get\
+  \ their MemRegion via getMemRegionFromExpr. If the region is a SubRegion (e.g.,\
+  \ address-of a field), strip to its base object region.\n    - If the base object\
+  \ region is in PublishSiteMap:\n      - Determine if the callee is known to dereference\
+  \ the argument index using functionKnownToDeref(Call, DerefParams).\n      - If\
+  \ yes for that argument, report as in 3.3 with the same short message and publish\
+  \ site note.\n  - This catches patterns like:\n    - list_add_tail(&q->multi_gt_list,\
+  \ ...)\n    - xe_exec_queue_kill(q);\n    - any known put/kill/destroy that dereferences\
+  \ the pointer.\n\n3.5) Optional: checkASTCodeBody or checkEndFunction\n- No heavy\
+  \ lifting needed here; rely on path-sensitive callbacks. You can clear any per-function\
+  \ caches if you added any.\n\n4) Reporting\n- Use a single BugType: \u201CEarly\
+  \ publish to xa/idr\u201D\n- Short message per Suggestions: \"Object published to\
+  \ xa/idr before finalization; writes/use after publish may cause UAF.\"\n- Add a\
+  \ note pointing to the publish site: \u201Cpublished here; publish must be last\
+  \ in ioctl.\u201D\n- Only report once per object region to reduce noise.\n\n5) Heuristics\
+  \ and scope\n- This checker is intended primarily for create/ioctl paths. You can\
+  \ optionally limit to functions whose names end with \u201C_ioctl\u201D or that\
+  \ have a struct drm_file* or struct file* parameter by checking the current FunctionDecl\
+  \ signature in checkBeginFunction to reduce noise.\n- The core invariant enforced:\n\
+  \  - After a successful publish (xa/idr) the object must not be written to or passed\
+  \ into deref-ing functions within the same path. In other words, publishing must\
+  \ be the last mutating step in the ioctl/create path.\n- The fixer pattern in the\
+  \ provided patch is naturally detected: assigning q->xef after xa_alloc would be\
+  \ flagged. Moving q->xef before xa_alloc and making xa_alloc the last step makes\
+  \ the warning disappear.\n\n6) Utility functions usage\n- findSpecificTypeInParents:\
+  \ used in checkPostCall to find if the publish call is on RHS of an assignment.\n\
+  - findSpecificTypeInChildren: used in evalAssume to find the guard variable or inline\
+  \ publish CallExpr inside the condition.\n- getMemRegionFromExpr: used to identify\
+  \ the pointee region for the object being published and to get base regions on subsequent\
+  \ writes/calls.\n- functionKnownToDeref: used in checkPreCall to decide if passing\
+  \ an object (or its field address) to a function implies dereference.\n- ExprHasName:\
+  \ optional if you want to quickly detect plain \u201Cif (err)\u201D or \u201Cif\
+  \ (!err)\u201D, but not required if you use DeclRefExpr-based detection.\n\n7) Minimal\
+  \ step-by-step summary\n- Detect publish calls (xa_alloc/idr_*) and identify the\
+  \ object region being published.\n- Associate the call\u2019s return variable (err)\
+  \ with the object region when assigned, or detect inline-call conditions.\n- Finalize\
+  \ \u201Cpublished\u201D only along paths where err == 0 (via evalAssume on the condition),\
+  \ or inline-call returns 0.\n- After finalized publication:\n  - Warn on any write\
+  \ to q->\u2026 via checkBind.\n  - Warn on any deref-known call that uses q or &q->field\
+  \ via checkPreCall.\n- Report once with a short message and a note at the publish\
+  \ call."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program states\n//\
+  \ Map the pointee region of the published object -> the publish call site (for diagnostics).\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(PublishSiteMap, const MemRegion*, const Stmt*)\n\
+  // Map the object region -> the guard VarRegion (error/status variable). Used to\
+  \ gate success.\n// Note: We record it, but in this implementation we publish immediately\
+  \ and keep the guard\n// to potentially extend later.\nREGISTER_MAP_WITH_PROGRAMSTATE(PendingPublishGuard,\
+  \ const MemRegion*, const VarRegion*)\n// Reverse map from guard variable to object\
+  \ region.\nREGISTER_MAP_WITH_PROGRAMSTATE(GuardToObject, const VarRegion*, const\
+  \ MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n    check::PostCall,\n\
+  \    check::PreCall,\n    check::Bind\n  > {\n\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\npublic:\n  SAGenTestChecker() : BT(new BugType(this, \"Early publish to\
+  \ xa/idr\", \"API Misuse\")) {}\n\n  void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \nprivate:\n  // Helpers\n  bool isPublishAPI(const CallEvent &Call, CheckerContext\
+  \ &C, unsigned &ObjParamIdx) const;\n  const MemRegion *getObjRegionFromArg(const\
+  \ CallEvent &Call, unsigned Idx, CheckerContext &C) const;\n  const VarRegion *getAssignedLHSVarRegion(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n\n  bool isPublishedFinal(ProgramStateRef\
+  \ State, const MemRegion *ObjBase) const;\n  void reportUseAfterPublish(const MemRegion\
+  \ *ObjBase, const Stmt *UseSite,\n                             CheckerContext &C)\
+  \ const;\n};\n\nbool SAGenTestChecker::isPublishAPI(const CallEvent &Call, CheckerContext\
+  \ &C, unsigned &ObjParamIdx) const {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n\n  // xa_* family, object is 3rd argument (index\
+  \ 2)\n  if (ExprHasName(Origin, \"xa_alloc\", C) ||\n      ExprHasName(Origin, \"\
+  xa_insert\", C) ||\n      ExprHasName(Origin, \"xa_store\", C)) {\n    ObjParamIdx\
+  \ = 2;\n    return Call.getNumArgs() > ObjParamIdx;\n  }\n\n  // idr_* family, object\
+  \ is 2nd argument (index 1)\n  if (ExprHasName(Origin, \"idr_alloc\", C) ||\n  \
+  \    ExprHasName(Origin, \"idr_alloc_cyclic\", C) ||\n      ExprHasName(Origin,\
+  \ \"idr_replace\", C)) {\n    ObjParamIdx = 1;\n    return Call.getNumArgs() > ObjParamIdx;\n\
+  \  }\n\n  return false;\n}\n\nconst MemRegion *SAGenTestChecker::getObjRegionFromArg(const\
+  \ CallEvent &Call, unsigned Idx, CheckerContext &C) const {\n  if (Idx >= Call.getNumArgs())\n\
+  \    return nullptr;\n\n  const Expr *ArgE = Call.getArgExpr(Idx);\n  if (!ArgE)\n\
+  \    return nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n\
+  \  if (!MR)\n    return nullptr;\n\n  return MR->getBaseRegion();\n}\n\nconst VarRegion\
+  \ *SAGenTestChecker::getAssignedLHSVarRegion(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n  \
+  \  return nullptr;\n\n  const CallExpr *CE = dyn_cast<CallExpr>(Origin);\n  if (!CE)\n\
+  \    return nullptr;\n\n  const BinaryOperator *BO = findSpecificTypeInParents<BinaryOperator>(CE,\
+  \ C);\n  if (!BO)\n    return nullptr;\n  if (!BO->isAssignmentOp())\n    return\
+  \ nullptr;\n\n  const Expr *LHS = BO->getLHS();\n  if (!LHS)\n    return nullptr;\n\
+  \n  const MemRegion *LHSRegion = getMemRegionFromExpr(LHS, C);\n  if (!LHSRegion)\n\
+  \    return nullptr;\n\n  LHSRegion = LHSRegion->getBaseRegion();\n  return dyn_cast<VarRegion>(LHSRegion);\n\
+  }\n\nbool SAGenTestChecker::isPublishedFinal(ProgramStateRef State, const MemRegion\
+  \ *ObjBase) const {\n  if (!ObjBase)\n    return false;\n  // Consider published\
+  \ if we have a publish site and no pending guard for the object.\n  const Stmt *const\
+  \ *Site = State->get<PublishSiteMap>(ObjBase);\n  if (!Site)\n    return false;\n\
+  \n  const VarRegion *const *Pending = State->get<PendingPublishGuard>(ObjBase);\n\
+  \  // If there's a recorded pending guard we could choose to delay, but for robustness\
+  \ and to\n  // catch the target buggy pattern, we treat the presence of a publish\
+  \ site as sufficient.\n  // If you want to enforce success-only paths, change this\
+  \ to (Pending == nullptr).\n  (void)Pending;\n  return true;\n}\n\nvoid SAGenTestChecker::reportUseAfterPublish(const\
+  \ MemRegion *ObjBase, const Stmt *UseSite,\n                                   \
+  \          CheckerContext &C) const {\n  if (!ObjBase || !UseSite)\n    return;\n\
+  \n  ProgramStateRef State = C.getState();\n  const Stmt *const *PubSite = State->get<PublishSiteMap>(ObjBase);\n\
+  \  if (!PubSite)\n    return;\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Object published to xa/idr before finalization; writes/use after publish\
+  \ may cause UAF.\", N);\n\n  // Highlight the use site and the publish site.\n \
+  \ R->addRange(UseSite->getSourceRange());\n  if (*PubSite)\n    R->addRange((*PubSite)->getSourceRange());\n\
+  \n  C.emitReport(std::move(R));\n\n  // Avoid duplicate reports for the same object\
+  \ by clearing the publish entry.\n  State = State->remove<PublishSiteMap>(ObjBase);\n\
+  \  State = State->remove<PendingPublishGuard>(ObjBase);\n  // We don't have the\
+  \ VarRegion for the guard here; clear all GuardToObject that map to this object.\n\
+  \  // This is optional and skipped for simplicity.\n\n  C.addTransition(State);\n\
+  }\n\n// Record potential publish site and associate guard if present.\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  unsigned ObjIdx = 0;\n  if (!isPublishAPI(Call,\
+  \ C, ObjIdx))\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  const\
+  \ MemRegion *ObjBase = getObjRegionFromArg(Call, ObjIdx, C);\n  if (!ObjBase)\n\
+  \    return;\n\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n \
+  \   return;\n\n  const CallExpr *CE = dyn_cast<CallExpr>(Origin);\n  if (!CE)\n\
+  \    return;\n\n  // Record publish site for diagnostics.\n  State = State->set<PublishSiteMap>(ObjBase,\
+  \ CE);\n\n  // If assigned to a guard variable (e.g., \"err = xa_alloc(...)\"),\
+  \ record it.\n  if (const VarRegion *VR = getAssignedLHSVarRegion(Call, C)) {\n\
+  \    State = State->set<PendingPublishGuard>(ObjBase, VR);\n    State = State->set<GuardToObject>(VR,\
+  \ ObjBase);\n  }\n\n  // In this implementation, we consider the object published\
+  \ right away to catch the target bug.\n  // More advanced gating on success can\
+  \ be added by inspecting branch assumptions.\n\n  C.addTransition(State);\n}\n\n\
+  void SAGenTestChecker::checkBind(SVal Loc, SVal /*Val*/, const Stmt *S, CheckerContext\
+  \ &C) const {\n  // Detect writes to an already published object (e.g., q->field\
+  \ = ...)\n  const MemRegion *MR = Loc.getAsRegion();\n  if (!MR)\n    return;\n\n\
+  \  const MemRegion *Base = MR->getBaseRegion();\n  if (!Base)\n    return;\n\n \
+  \ ProgramStateRef State = C.getState();\n  if (isPublishedFinal(State, Base)) {\n\
+  \    reportUseAfterPublish(Base, S, C);\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  // Skip publish APIs here; they\
+  \ are handled in checkPostCall.\n  unsigned TmpIdx = 0;\n  if (isPublishAPI(Call,\
+  \ C, TmpIdx))\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  // If\
+  \ the callee is known to dereference some params, check those.\n  llvm::SmallVector<unsigned,\
+  \ 4> DerefParams;\n  bool KnownDeref = functionKnownToDeref(Call, DerefParams);\n\
+  \n  for (unsigned I = 0, E = Call.getNumArgs(); I < E; ++I) {\n    const Expr *ArgE\
+  \ = Call.getArgExpr(I);\n    if (!ArgE)\n      continue;\n\n    const MemRegion\
+  \ *ArgReg = getMemRegionFromExpr(ArgE, C);\n    if (!ArgReg)\n      continue;\n\n\
+  \    ArgReg = ArgReg->getBaseRegion();\n    if (!ArgReg)\n      continue;\n\n  \
+  \  if (!isPublishedFinal(State, ArgReg))\n      continue;\n\n    // If we know this\
+  \ param will be dereferenced, report immediately.\n    if (KnownDeref) {\n     \
+  \ if (llvm::is_contained(DerefParams, I)) {\n        reportUseAfterPublish(ArgReg,\
+  \ Call.getOriginExpr(), C);\n        continue;\n      }\n    }\n\n    // Additionally,\
+  \ if the argument is an address of a subfield (&q->field),\n    // the base region\
+  \ will still match the object. Be conservative and report.\n    // This catches\
+  \ patterns like list_add_tail(&q->list, ...).\n    reportUseAfterPublish(ArgReg,\
+  \ Call.getOriginExpr(), C);\n  }\n}\n\n} // end anonymous namespace\n\nextern \"\
+  C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects publishing kernel objects to\
+  \ xa/idr before finalization which enables UAF via post-publish writes/uses\",\n\
+  \      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

@@ -1,0 +1,183 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -45,14 +45,14 @@   // Per-function: how many gotos target each label.
+   mutable llvm::DenseMap<const FunctionDecl*, llvm::DenseMap<const LabelStmt*, unsigned>> FuncLabelIncoming;
+
+-  // Per-function: fields directly assigned from allocator calls within this function.
+-  mutable llvm::DenseMap<const FunctionDecl*, llvm::SmallPtrSet<const FieldDecl*, 16>> FuncLocallyAllocFields;
++  // Per-function: fields directly assigned from ANY function call within this function.
++  mutable llvm::DenseMap<const FunctionDecl*, llvm::SmallPtrSet<const FieldDecl*, 16>> FuncLocallySetByCallFields;
+
+   // Per-function: for each label, keep the list of concrete goto statements targeting it.
+   mutable llvm::DenseMap<const FunctionDecl*, llvm::DenseMap<const LabelStmt*, llvm::SmallVector<const GotoStmt*, 4>>> FuncLabelGotos;
+
+-  // Per-function: earliest source location where a given FieldDecl is assigned from an allocator call.
+-  mutable llvm::DenseMap<const FunctionDecl*, llvm::DenseMap<const FieldDecl*, SourceLocation>> FuncFieldFirstAllocLoc;
++  // Per-function: earliest source location where a given FieldDecl is assigned from a function call.
++  mutable llvm::DenseMap<const FunctionDecl*, llvm::DenseMap<const FieldDecl*, SourceLocation>> FuncFieldFirstSetByCallLoc;
+
+ public:
+   SAGenTestChecker()
+@@ -71,13 +71,17 @@     return StringRef(Lower).contains(Needle);
+   }
+
+-  // Helper to collect labels, gotos, and fields locally assigned from allocators.
++  static bool isPointerType(QualType QT) {
++    return QT->isPointerType() || QT->isAnyPointerType();
++  }
++
++  // Helper to collect labels, gotos, and fields locally assigned from function calls.
+   struct FuncInfoCollector : public RecursiveASTVisitor<FuncInfoCollector> {
+     CheckerContext &C;
+     llvm::DenseMap<const LabelDecl *, const LabelStmt *> LabelMap;
+     llvm::SmallVector<const GotoStmt *, 16> Gotos;
+-    llvm::SmallPtrSet<const FieldDecl*, 16> LocallyAllocFields;
+-    llvm::DenseMap<const FieldDecl*, SourceLocation> FirstAllocLoc;
++    llvm::SmallPtrSet<const FieldDecl*, 16> LocallySetByCallFields;
++    llvm::DenseMap<const FieldDecl*, SourceLocation> FirstSetLoc;
+
+     FuncInfoCollector(CheckerContext &Ctx) : C(Ctx) {}
+
+@@ -104,26 +108,31 @@       if (!ME || !CE)
+         return true;
+
+-      // If RHS call looks like an allocator, record the assigned field and earliest loc.
+-      if (callExprLooksLikeAllocator(CE, C)) {
+-        if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {
+-          const FieldDecl *CanonFD = FD->getCanonicalDecl();
+-          LocallyAllocFields.insert(CanonFD);
+-          SourceLocation CurLoc = BO->getBeginLoc();
+-          auto It = FirstAllocLoc.find(CanonFD);
+-          if (It == FirstAllocLoc.end()) {
+-            FirstAllocLoc[CanonFD] = CurLoc;
+-          } else {
+-            const SourceManager &SM = C.getSourceManager();
+-            if (SM.isBeforeInTranslationUnit(CurLoc, It->second))
+-              It->second = CurLoc;
+-          }
++      // Only consider assignments of pointer-typed fields from function calls.
++      const ValueDecl *VD = ME->getMemberDecl();
++      if (!VD)
++        return true;
++      QualType LT = VD->getType();
++      if (!isPointerType(LT))
++        return true;
++
++      if (const auto *FD = dyn_cast<FieldDecl>(VD)) {
++        const FieldDecl *CanonFD = FD->getCanonicalDecl();
++        LocallySetByCallFields.insert(CanonFD);
++        SourceLocation CurLoc = BO->getBeginLoc();
++        auto It = FirstSetLoc.find(CanonFD);
++        if (It == FirstSetLoc.end()) {
++          FirstSetLoc[CanonFD] = CurLoc;
++        } else {
++          const SourceManager &SM = C.getSourceManager();
++          if (SM.isBeforeInTranslationUnit(CurLoc, It->second))
++            It->second = CurLoc;
+         }
+       }
+       return true;
+     }
+
+-    // Heuristic allocator detection for CallExpr using source text/Callee name.
++    // Unused here but kept for potential future refinements.
+     static bool callExprLooksLikeAllocator(const CallExpr *CE, CheckerContext &C) {
+       if (!CE)
+         return false;
+@@ -209,14 +218,15 @@   }
+
+   FuncLabelIncoming[FD] = std::move(IncomingCount);
+-  FuncLocallyAllocFields[FD] = std::move(Collector.LocallyAllocFields);
++  FuncLocallySetByCallFields[FD] = std::move(Collector.LocallySetByCallFields);
+   FuncLabelGotos[FD] = std::move(LabelToGotos);
+-  // Store earliest allocator-assignment locations for fields.
++
++  // Store earliest assignment-from-call locations for fields.
+   llvm::DenseMap<const FieldDecl*, SourceLocation> Earliest;
+-  for (const auto &P : Collector.FirstAllocLoc) {
++  for (const auto &P : Collector.FirstSetLoc) {
+     Earliest[P.first->getCanonicalDecl()] = P.second;
+   }
+-  FuncFieldFirstAllocLoc[FD] = std::move(Earliest);
++  FuncFieldFirstSetByCallLoc[FD] = std::move(Earliest);
+ }
+
+ bool SAGenTestChecker::isAllocatorCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -262,7 +272,7 @@   const FunctionDecl *FD = getCurrentFunction(C);
+   if (!FD)
+     return;
+-  // Build per-function metadata (labels and locally-allocated fields).
++  // Build per-function metadata (labels and locally-assigned-from-call fields).
+   buildPerFunctionInfo(FD, C);
+ }
+
+@@ -272,9 +282,9 @@     return;
+   // Clean per-function metadata.
+   FuncLabelIncoming.erase(FD);
+-  FuncLocallyAllocFields.erase(FD);
++  FuncLocallySetByCallFields.erase(FD);
+   FuncLabelGotos.erase(FD);
+-  FuncFieldFirstAllocLoc.erase(FD);
++  FuncFieldFirstSetByCallLoc.erase(FD);
+ }
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -400,7 +410,6 @@         if (const auto *IL = dyn_cast<IntegerLiteral>(X)) {
+           return IL->getValue().isZero(); // zero
+         }
+-        // We do not easily get negative constants unless folded; conservative: also treat zero checks.
+         return false;
+       };
+       auto IsErrVar = [&](const Expr *X) -> bool {
+@@ -518,36 +527,37 @@     }
+   }
+
+-  // 3) If all incoming gotos to this label lexically occur after the earliest allocator
+-  //    assignment to this field in the same function, then the shared label is safe.
++  // 3) If all incoming gotos to this label lexically occur after the earliest assignment
++  //    of this field from a function call in the same function, then the shared-label free
++  //    is consistent with local ownership -> suppress.
+   if (FD && FreedME) {
+     const FieldDecl *FreedFD = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
+     if (FreedFD) {
+       const FieldDecl *CanonFD = FreedFD->getCanonicalDecl();
+
+-      auto AllocItF = FuncFieldFirstAllocLoc.find(FD);
++      auto AssignItF = FuncFieldFirstSetByCallLoc.find(FD);
+       auto GotoItF  = FuncLabelGotos.find(FD);
+-      if (AllocItF != FuncFieldFirstAllocLoc.end() &&
++      if (AssignItF != FuncFieldFirstSetByCallLoc.end() &&
+           GotoItF  != FuncLabelGotos.end()) {
+-        auto AllocIt = AllocItF->second.find(CanonFD);
++        auto AssignIt = AssignItF->second.find(CanonFD);
+         auto GLabelIt = GotoItF->second.find(EnclosingLabel);
+-        if (AllocIt != AllocItF->second.end() &&
++        if (AssignIt != AssignItF->second.end() &&
+             GLabelIt != GotoItF->second.end()) {
+-          SourceLocation AllocLoc = AllocIt->second;
++          SourceLocation FirstSetLoc = AssignIt->second;
+           const auto &Gotos = GLabelIt->second;
+           if (!Gotos.empty()) {
+             const SourceManager &SM = C.getSourceManager();
+             bool AnyBefore = false;
+             for (const GotoStmt *GS : Gotos) {
+               SourceLocation GLoc = GS->getGotoLoc();
+-              if (SM.isBeforeInTranslationUnit(GLoc, AllocLoc)) {
++              if (SM.isBeforeInTranslationUnit(GLoc, FirstSetLoc)) {
+                 AnyBefore = true;
+                 break;
+               }
+             }
+             if (!AnyBefore) {
+-              // All incoming gotos occur after allocator assignment to this field.
+-              // The shared label free is consistent with local ownership.
++              // All incoming gotos occur after local assignment-from-call to this field.
++              // Treat as owned in this function -> suppress.
+               return true;
+             }
+           }
+@@ -599,7 +609,7 @@   if (Count < 2)
+     return;
+
+-  // New gating: Only consider labels that look like error paths.
++  // Only consider labels that look like error paths.
+   if (!labelHasErrorishIncoming(FD, EnclosingLabel, C))
+     return;

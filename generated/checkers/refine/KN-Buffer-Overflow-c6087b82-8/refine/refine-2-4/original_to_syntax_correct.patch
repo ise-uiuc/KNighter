@@ -1,0 +1,112 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -58,6 +58,9 @@
+   void reportUnbounded(const CallEvent &Call, const Expr *Dst,
+                        const Expr *Len, CheckerContext &C) const;
++
++  // Utility: try to robustly recover the base region referenced by any subexpression within E.
++  const MemRegion *getReferencedBaseRegion(const Expr *E, CheckerContext &C) const;
+ };
+
+ bool SAGenTestChecker::isCopyFromUser(const CallEvent &Call, CheckerContext &C) const {
+@@ -80,12 +83,16 @@   ArrReg = nullptr;
+   ArrName.clear();
+
+-  // Identify that DstArg is a fixed-size array and retrieve its size
++  // Identify that DstArg is a fixed-size array and retrieve its size.
+   if (!getArraySizeFromExpr(ArraySize, DstArg))
+     return false;
+
+-  // Retrieve the region of the destination and normalize to base region
++  // Retrieve the region of the destination and normalize to base region.
+   const MemRegion *MR = getMemRegionFromExpr(DstArg, C);
++  if (!MR) {
++    // Fall back to try to recover the underlying base region from a subexpression if needed.
++    MR = getReferencedBaseRegion(DstArg, C);
++  }
+   if (!MR)
+     return false;
+   MR = MR->getBaseRegion();
+@@ -113,6 +120,9 @@     if (UE->getKind() == UETT_SizeOf) {
+       if (const Expr *Arg = UE->getArgumentExpr()) {
+         const MemRegion *SizeofMR = getMemRegionFromExpr(Arg, C);
++        if (!SizeofMR) {
++          SizeofMR = getReferencedBaseRegion(Arg, C);
++        }
+         if (SizeofMR) {
+           SizeofMR = SizeofMR->getBaseRegion();
+           if (SizeofMR == ArrReg)
+@@ -129,6 +139,37 @@   return false;
+ }
+
++const MemRegion *SAGenTestChecker::getReferencedBaseRegion(const Expr *E, CheckerContext &C) const {
++  if (!E)
++    return nullptr;
++
++  // First, try the expression as-is.
++  if (const MemRegion *MR = getMemRegionFromExpr(E, C)) {
++    return MR->getBaseRegion();
++  }
++
++  // Peel off implicit casts quickly by recursing into their subexpression.
++  if (const auto *ICE = dyn_cast<ImplicitCastExpr>(E)) {
++    return getReferencedBaseRegion(ICE->getSubExpr(), C);
++  }
++
++  // Try to find a DeclRefExpr anywhere within the expression and get its region.
++  if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(E)) {
++    if (const MemRegion *MR = getMemRegionFromExpr(DRE, C)) {
++      return MR->getBaseRegion();
++    }
++  }
++
++  // Member expressions (e.g., obj.len) can also carry regions.
++  if (const auto *ME = findSpecificTypeInChildren<MemberExpr>(E)) {
++    if (const MemRegion *MR = getMemRegionFromExpr(ME, C)) {
++      return MR->getBaseRegion();
++    }
++  }
++
++  return nullptr;
++}
++
+ void SAGenTestChecker::getLenArgRegionOrSymbol(const Expr *LenArg, CheckerContext &C,
+                                                const MemRegion* &LenReg, SymbolRef &LenSym) const {
+   LenReg = nullptr;
+@@ -136,14 +177,13 @@
+   ProgramStateRef State = C.getState();
+
+-  // Try to get region
+-  const MemRegion *MR = getMemRegionFromExpr(LenArg, C);
++  // Try to recover the referenced base region even if LenArg is an rvalue/casted expression.
++  const MemRegion *MR = getReferencedBaseRegion(LenArg, C);
+   if (MR) {
+-    MR = MR->getBaseRegion();
+-    LenReg = MR;
+-  }
+-
+-  // Try to get symbol
++    LenReg = MR->getBaseRegion();
++  }
++
++  // Try to get symbol for the length value as seen on this path.
+   SVal SV = State->getSVal(LenArg, C.getLocationContext());
+   LenSym = SV.getAsSymbol();
+ }
+@@ -195,6 +235,9 @@         llvm::APInt DummySize;
+         if (getArraySizeFromExpr(DummySize, Arg)) {
+           const MemRegion *ArrMR = getMemRegionFromExpr(Arg, C);
++          if (!ArrMR) {
++            ArrMR = getReferencedBaseRegion(Arg, C);
++          }
+           if (ArrMR) {
+             ArrMR = ArrMR->getBaseRegion();
+             if (ArrMR) {
+@@ -205,7 +248,9 @@       }
+     }
+   } else {
+-    // Weak heuristic: if RHS contains both min and sizeof, consider LHS symbol bounded
++    // Heuristic: if RHS contains both min and sizeof, consider the resulting value bounded.
++    // Note: We record the symbol of the value being assigned so a later read of this variable
++    // will carry the same symbol and be recognized as bounded.
+     if (ExprHasName(RHS, "min", C) && ExprHasName(RHS, "sizeof", C)) {
+       if (SymbolRef Sym = Val.getAsSymbol())
+         State = State->add<BoundedLenSyms>(Sym);

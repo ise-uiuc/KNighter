@@ -1,0 +1,162 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -185,6 +185,23 @@             L == "nr" || L == "cnt");
+   }
+
++  static bool looksLikeIndexName(StringRef Name) {
++    if (Name.empty())
++      return false;
++    std::string L = toLowerCopy(Name);
++    // Strong index-like tokens and common short loop indices.
++    static const char *IndexToks[] = {
++      "idx","index","ind","pos","slot","cursor","off","offset","ix"
++    };
++    for (const char *Tok : IndexToks)
++      if (L.find(Tok) != std::string::npos)
++        return true;
++    // Single-letter loop indices are also index-like.
++    if (L == "i" || L == "j" || L == "k")
++      return true;
++    return false;
++  }
++
+   static StringRef getIdentNameFromExpr(const Expr *E) {
+     E = E ? E->IgnoreParenCasts() : nullptr;
+     if (!E)
+@@ -661,7 +678,100 @@     return false;
+   }
+
+-  bool isCandidateGtComparison(const BinaryOperator *BO, CheckerContext &C) const {
++  // Helper: does expression E reference the given VarDecl (by DeclRefExpr)?
++  static bool exprReferencesVar(const Expr *E, const Decl *Var) {
++    if (!E || !Var) return false;
++    E = E->IgnoreParenCasts();
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++      return DRE->getDecl()->getCanonicalDecl() == Var->getCanonicalDecl();
++    }
++    for (const Stmt *Child : E->children()) {
++      if (!Child) continue;
++      if (const auto *CE = dyn_cast<Expr>(Child))
++        if (exprReferencesVar(CE, Var))
++          return true;
++    }
++    return false;
++  }
++
++  // Recursively search for array subscript expressions where 'Var' is used as index.
++  static bool stmtContainsIndexUseOfVar(const Stmt *S, const Decl *Var) {
++    if (!S || !Var) return false;
++    if (const auto *E = dyn_cast<Expr>(S)) {
++      const Expr *EI = E->IgnoreParenCasts();
++      if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(EI)) {
++        const Expr *Idx = ASE->getIdx()->IgnoreParenCasts();
++        if (exprReferencesVar(Idx, Var))
++          return true;
++      }
++    }
++    for (const Stmt *Child : S->children()) {
++      if (Child && stmtContainsIndexUseOfVar(Child, Var))
++        return true;
++    }
++    return false;
++  }
++
++  // Search subsequent statements in the same enclosing compound for 'arr[var]' usage.
++  static bool varUsedAsIndexAfterIf(const IfStmt *IS, const Decl *Var, CheckerContext &C) {
++    if (!IS || !Var) return false;
++    const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IS, C);
++    if (!CS) return false;
++    bool SeenIf = false;
++    for (const Stmt *S : CS->body()) {
++      if (!SeenIf) {
++        if (S == IS)
++          SeenIf = true;
++        continue;
++      }
++      if (!S) continue;
++      if (stmtContainsIndexUseOfVar(S, Var))
++        return true;
++    }
++    return false;
++  }
++
++  // Recursively search for assignments of the form "count_like_target = Var".
++  static bool stmtHasCountLikeAssignmentFromVar(const Stmt *S, const Decl *Var) {
++    if (!S || !Var) return false;
++    if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
++      if (BO->isAssignmentOp()) {
++        const Expr *L = BO->getLHS()->IgnoreParenCasts();
++        const Expr *R = BO->getRHS()->IgnoreParenCasts();
++        if (exprReferencesVar(R, Var)) {
++          StringRef LName = getIdentNameFromExpr(L);
++          if (!LName.empty() && looksLikeCountOrOrdinalName(LName))
++            return true;
++        }
++      }
++    }
++    for (const Stmt *Child : S->children()) {
++      if (Child && stmtHasCountLikeAssignmentFromVar(Child, Var))
++        return true;
++    }
++    return false;
++  }
++
++  // Search subsequent statements in the same enclosing compound for "count_like = Var".
++  static bool flowsIntoCountLikeAfterIf(const IfStmt *IS, const Decl *Var, CheckerContext &C) {
++    if (!IS || !Var) return false;
++    const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IS, C);
++    if (!CS) return false;
++    bool SeenIf = false;
++    for (const Stmt *S : CS->body()) {
++      if (!SeenIf) {
++        if (S == IS)
++          SeenIf = true;
++        continue;
++      }
++      if (!S) continue;
++      if (stmtHasCountLikeAssignmentFromVar(S, Var))
++        return true;
++    }
++    return false;
++  }
++
++  bool isCandidateGtComparison(const BinaryOperator *BO, const IfStmt *EnclosingIf, CheckerContext &C) const {
+     if (!BO || BO->getOpcode() != BO_GT)
+       return false;
+
+@@ -686,6 +796,30 @@     // Exclude known false positives (e.g., bit-width checks, enum ID guards, min/max range).
+     if (isFalsePositive(LHS, RHS, C))
+       return false;
++
++    // Additional suppression to avoid count-setting false positives:
++    // If LHS is a plain variable (not an array subscript), require it to either:
++    //  - be strongly index-like by name, or
++    //  - be used as an array index later in the same scope after the 'if'.
++    // Also, suppress if it clearly flows into a count-like assignment later.
++    if (!isa<ArraySubscriptExpr>(LHS)) {
++      if (const auto *DRE = dyn_cast<DeclRefExpr>(LHS)) {
++        const Decl *Var = DRE->getDecl()->getCanonicalDecl();
++        StringRef LName = getIdentNameFromExpr(LHS);
++        bool StrongIndexName = looksLikeIndexName(LName);
++
++        bool UsedAsIndexLater = varUsedAsIndexAfterIf(EnclosingIf, Var, C);
++        bool FlowsToCount = flowsIntoCountLikeAfterIf(EnclosingIf, Var, C);
++
++        // If this value is used to set a count-like field, treat this as capacity validation, not index validation.
++        if (FlowsToCount)
++          return false;
++
++        // If not strongly index-like and not used later as an index, suppress.
++        if (!StrongIndexName && !UsedAsIndexLater)
++          return false;
++      }
++    }
+
+     return true;
+   }
+@@ -715,7 +849,7 @@     return;
+
+   for (const BinaryOperator *BO : GtComps) {
+-    if (!isCandidateGtComparison(BO, C))
++    if (!isCandidateGtComparison(BO, IS, C))
+       continue;
+
+     // Suppress the common 1-based ordinal check: (!x || x == 0/<=0/<1) || (x > Bound)

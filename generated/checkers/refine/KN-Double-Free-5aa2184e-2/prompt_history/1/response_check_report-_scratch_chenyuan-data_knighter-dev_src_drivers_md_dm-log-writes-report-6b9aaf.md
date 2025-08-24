@@ -1,0 +1,6 @@
+- Decision: NotABug
+- Reason: The reported code does not match the target bug pattern and does not present a real double free. The target pattern concerns a shared error label that unconditionally frees a pointer possibly already freed (or never allocated) by a callee on failure. In log_one_block(), there are two distinct exits:
+  - Error paths (write_metadata or write_inline_data failures, or bio_add_page failure) immediately go to the “error” label, which calls free_pending_block(lc, block). That routine frees vec pages, block->data, and block, and the function returns -1. These paths do not fall through to the “out” label.
+  - Success/normal paths go to the “out” label, which frees block->data and block and returns 0. Callees (write_metadata, write_inline_data) never free block->data on success; on their failures, the caller uses free_pending_block() and returns early.
+
+  Therefore there is no shared error label freeing memory with mixed ownership. The “out” label is a normal completion path, not an error path. Additionally, kfree(block->data) is safe even if datalen is 0 (block->data may be NULL). There is no scenario where block->data is freed both by a callee and again at “out”. Consequently, the warning is a false positive and does not match the specified bug pattern.

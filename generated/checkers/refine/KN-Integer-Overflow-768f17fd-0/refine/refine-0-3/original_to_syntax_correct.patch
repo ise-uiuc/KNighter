@@ -1,0 +1,297 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -8,6 +8,7 @@ #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+ #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+ #include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
++#include "clang/StaticAnalyzer/Core/PathSensitive/Store.h"
+ #include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+ #include "clang/AST/RecursiveASTVisitor.h"
+ #include "clang/AST/StmtVisitor.h"
+@@ -16,10 +17,13 @@ #include "clang/AST/Expr.h"
+ #include "clang/AST/ExprCXX.h"
+ #include "llvm/ADT/StringRef.h"
++#include <algorithm>
++#include <memory>
++#include <utility>
+
+ using namespace clang;
+ using namespace ento;
+-using namespace taint;
++using namespace clang::ento::taint;
+
+ // Utility functions provided by the user prompt (assumed available)
+ template <typename T>
+@@ -34,6 +38,9 @@ bool functionKnownToDeref(const CallEvent &Call, llvm::SmallVectorImpl<unsigned> &DerefParams);
+ bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
+
++// Track variables that effectively carry 32-bit register data even if their C type is 64-bit.
++REGISTER_SET_WITH_PROGRAMSTATE(Reg32Vars, const MemRegion *)
++
+ namespace {
+
+ class SAGenTestChecker
+@@ -55,17 +62,17 @@
+ private:
+   void analyzeAndReportShiftToWide(const Expr *E, QualType DestTy,
+-                                   CheckerContext &C, StringRef Ctx) const;
++                                   CheckerContext &C, StringRef Ctx,
++                                   const MemRegion *DestRegion = nullptr) const;
+
+   static const BinaryOperator *findShiftInTree(const Stmt *S);
+   static bool hasExplicitCastToWide64(const Expr *E, ASTContext &ACtx);
+
+-  // Helpers to refine and reduce false positives.
++  // Helpers
+   static const Expr *peel(const Expr *E) {
+     return E ? E->IgnoreParenImpCasts() : nullptr;
+   }
+
+-  // Report only if the shift is the top-level expression reaching the 64-bit destination.
+   static bool isTopLevelShiftExpr(const Expr *ContainerE, const BinaryOperator *Shl) {
+     if (!ContainerE || !Shl)
+       return false;
+@@ -73,8 +80,57 @@     return Top == static_cast<const Expr *>(Shl);
+   }
+
+-  // Precise constant-safety check: if both LHS and RHS are constant and the result
+-  // provably fits into the LHS bitwidth, we suppress.
++  static unsigned getTypeWidth(QualType T, ASTContext &ACtx) {
++    return T.isNull() ? 0u : ACtx.getTypeSize(T);
++  }
++
++  static bool isIntegerTypeWidthAtMost(QualType T, ASTContext &ACtx, unsigned W) {
++    return T->isIntegerType() && getTypeWidth(T, ACtx) <= W;
++  }
++
++  static bool isIntegerTypeWidthAtLeast(QualType T, ASTContext &ACtx, unsigned W) {
++    return T->isIntegerType() && getTypeWidth(T, ACtx) >= W;
++  }
++
++  static bool isNonLiteralExpr(const Expr *E) {
++    if (!E) return false;
++    E = E->IgnoreParenImpCasts();
++    return !isa<IntegerLiteral>(E);
++  }
++
++  // Heuristic: recognize "likely 32-bit hardware read" expressions.
++  // Return true if E has integer type width <= 32 and is not a plain integer literal,
++  // and is one of: a function call, a DeclRefExpr/MemberExpr to <=32-bit data.
++  static bool isLikelyNarrowHardwareRead(const Expr *E, CheckerContext &C) {
++    if (!E) return false;
++    ASTContext &ACtx = C.getASTContext();
++    QualType QT = E->getType();
++    if (!isIntegerTypeWidthAtMost(QT, ACtx, 32))
++      return false;
++
++    E = E->IgnoreParenImpCasts();
++    if (isa<IntegerLiteral>(E))
++      return false;
++
++    if (isa<CallExpr>(E))
++      return true;
++
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++      const ValueDecl *VD = DRE->getDecl();
++      if (VD && isIntegerTypeWidthAtMost(VD->getType(), ACtx, 32))
++        return true;
++    }
++
++    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
++      if (const ValueDecl *VD = ME->getMemberDecl())
++        if (isIntegerTypeWidthAtMost(VD->getType(), ACtx, 32))
++          return true;
++    }
++
++    return false;
++  }
++
++  // If both LHS and RHS are constants and the shift result fits into LHS width, suppress.
+   static bool constantShiftFitsInLHSWidth(const Expr *L, const Expr *R,
+                                           unsigned LHSW, CheckerContext &C) {
+     llvm::APSInt LHSEval, RHSEval;
+@@ -83,20 +139,15 @@     if (!EvaluateExprToInt(RHSEval, R, C))
+       return false;
+
+-    // Be conservative for negative LHS.
+     if (LHSEval.isSigned() && LHSEval.isNegative())
+       return false;
+
+-    // Active bits of the non-negative LHS.
+-    unsigned LBits = LHSEval.getActiveBits(); // 0 if value == 0
++    unsigned LBits = LHSEval.getActiveBits();
+     uint64_t ShiftAmt = RHSEval.getZExtValue();
+
+-    // Safe if highest set bit after shifting still fits in LHS width.
+-    // LBits == 0 is always safe (0 << n == 0).
+     if (LBits == 0)
+       return true;
+
+-    // Example: a 32-bit LHS can hold results where (LBits + ShiftAmt) <= 32.
+     return (uint64_t)LBits + ShiftAmt <= (uint64_t)LHSW;
+   }
+
+@@ -110,6 +161,12 @@
+     return false;
+   }
++
++  // Get MemRegion of LHS expression (variable) if any.
++  static const MemRegion *getDestRegionFromLHS(const Expr *LHS, CheckerContext &C) {
++    if (!LHS) return nullptr;
++    return getMemRegionFromExpr(LHS, C);
++  }
+ };
+
+ static const BinaryOperator *asShift(const Stmt *S) {
+@@ -140,7 +197,7 @@
+   if (const auto *ECE = dyn_cast<ExplicitCastExpr>(E->IgnoreParens())) {
+     QualType ToTy = ECE->getType();
+-    if (ToTy->isIntegerType() && ACtx.getIntWidth(ToTy) >= 64)
++    if (ToTy->isIntegerType() && getTypeWidth(ToTy, ACtx) >= 64)
+       return true;
+   }
+
+@@ -156,7 +213,8 @@ }
+
+ void SAGenTestChecker::analyzeAndReportShiftToWide(const Expr *E, QualType DestTy,
+-                                                   CheckerContext &C, StringRef) const {
++                                                   CheckerContext &C, StringRef /*Ctx*/,
++                                                   const MemRegion *DestRegion) const {
+   if (!E)
+     return;
+
+@@ -165,9 +223,17 @@   if (!DestTy->isIntegerType())
+     return;
+
+-  unsigned DestW = ACtx.getIntWidth(DestTy);
++  unsigned DestW = getTypeWidth(DestTy, ACtx);
+   if (DestW < 64)
+     return;
++
++  // If the destination region is known to hold only 32-bit register values, suppress.
++  if (DestRegion) {
++    ProgramStateRef State = C.getState();
++    const Reg32VarsTy &Set = State->get<Reg32Vars>();
++    if (Set.contains(DestRegion))
++      return;
++  }
+
+   const BinaryOperator *Shl = findShiftInTree(E);
+   if (!Shl || Shl->getOpcode() != BO_Shl)
+@@ -182,7 +248,7 @@   if (!ShlTy->isIntegerType())
+     return;
+
+-  unsigned ShlW = ACtx.getIntWidth(ShlTy);
++  unsigned ShlW = getTypeWidth(ShlTy, ACtx);
+   if (ShlW >= 64)
+     return; // Shift already performed in 64-bit, OK.
+
+@@ -190,7 +256,7 @@   if (!L->getType()->isIntegerType())
+     return;
+
+-  unsigned LHSW = ACtx.getIntWidth(L->getType());
++  unsigned LHSW = getTypeWidth(L->getType(), ACtx);
+   if (LHSW >= 64)
+     return; // LHS is already wide enough.
+
+@@ -198,7 +264,7 @@   if (hasExplicitCastToWide64(L, ACtx))
+     return;
+
+-  // Suppress known false-positive contexts.
++  // Suppress known false-positive contexts (non top-level shift).
+   if (isFalsePositiveContext(E, Shl, C))
+     return;
+
+@@ -221,16 +287,38 @@   if (!DS)
+     return;
+
++  ProgramStateRef State = C.getState();
++  ASTContext &ACtx = C.getASTContext();
++
+   for (const Decl *D : DS->decls()) {
+     const auto *VD = dyn_cast<VarDecl>(D);
+     if (!VD)
+       continue;
+-    if (!VD->hasInit())
+-      continue;
+-
+-    QualType DestTy = VD->getType();
+-    const Expr *Init = VD->getInit();
+-    analyzeAndReportShiftToWide(Init, DestTy, C, "initialization");
++
++    // If there's an initializer, analyze and also update Reg32 tracking.
++    if (VD->hasInit()) {
++      const Expr *Init = VD->getInit();
++      QualType DestTy = VD->getType();
++
++      // Try to get the region for this variable for both analysis and tracking.
++      const MemRegion *DestReg = nullptr;
++      {
++        MemRegionManager &MRMgr = C.getStoreManager().getRegionManager();
++        const VarRegion *VR = MRMgr.getVarRegion(VD, C.getLocationContext());
++        DestReg = VR;
++      }
++
++      // Update Reg32 tracking on initialization: only mark when the initializer
++      // looks like a register read (<=32-bit, non-literal).
++      if (isIntegerTypeWidthAtLeast(DestTy, ACtx, 64) &&
++          isLikelyNarrowHardwareRead(Init, C) && DestReg) {
++        State = State->add<Reg32Vars>(DestReg);
++        C.addTransition(State);
++      }
++
++      // Analyze for potential bug; pass DestReg for FP suppression based on Reg32 tracking.
++      analyzeAndReportShiftToWide(Init, DestTy, C, "initialization", DestReg);
++    }
+   }
+ }
+
+@@ -239,13 +327,36 @@   if (!BO || !BO->isAssignmentOp())
+     return;
+
++  ASTContext &ACtx = C.getASTContext();
++
+   const Expr *LHS = BO->getLHS();
+   const Expr *RHS = BO->getRHS();
+   if (!LHS || !RHS)
+     return;
+
+   QualType DestTy = LHS->getType();
+-  analyzeAndReportShiftToWide(RHS, DestTy, C, "assignment");
++  const MemRegion *DestReg = getDestRegionFromLHS(LHS, C);
++
++  // Update Reg32 tracking for simple assignments: mark/unmark as needed.
++  if (BO->getOpcode() == BO_Assign && DestReg) {
++    ProgramStateRef State = C.getState();
++
++    // Mark as Reg32 if assigning from a likely <=32-bit hardware read expr.
++    if (isIntegerTypeWidthAtLeast(DestTy, ACtx, 64) &&
++        isLikelyNarrowHardwareRead(RHS, C)) {
++      State = State->add<Reg32Vars>(DestReg);
++      C.addTransition(State);
++    } else {
++      // If assigning a >=64-bit value, unmark.
++      if (isIntegerTypeWidthAtLeast(RHS->getType(), ACtx, 64)) {
++        State = State->remove<Reg32Vars>(DestReg);
++        C.addTransition(State);
++      }
++    }
++  }
++
++  // Analyze RHS for potential bug; pass DestReg to enable Reg32 suppression.
++  analyzeAndReportShiftToWide(RHS, DestTy, C, "assignment", DestReg);
+ }
+
+ void SAGenTestChecker::checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const {
+@@ -263,7 +374,7 @@     return;
+
+   QualType DestTy = FD->getReturnType();
+-  analyzeAndReportShiftToWide(RetE, DestTy, C, "return");
++  analyzeAndReportShiftToWide(RetE, DestTy, C, "return", /*DestRegion=*/nullptr);
+ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -284,7 +395,7 @@     if (!ArgE)
+       continue;
+
+-    analyzeAndReportShiftToWide(ArgE, DestTy, C, "argument");
++    analyzeAndReportShiftToWide(ArgE, DestTy, C, "argument", /*DestRegion=*/nullptr);
+   }
+ }

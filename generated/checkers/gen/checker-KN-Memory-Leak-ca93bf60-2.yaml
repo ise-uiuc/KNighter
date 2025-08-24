@@ -1,0 +1,285 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ca93bf607a44c1f009283dac4af7df0d9ae5e357
+commit_type: Memory-Leak
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Track temporary buffers that must be freed with kfree().\nREGISTER_MAP_WITH_PROGRAMSTATE(TempBufMap,\
+  \ const MemRegion*, const Stmt*)\n// Track that a devm_krealloc has been seen after\
+  \ allocating a temp buffer.\n// This helps avoid reporting early error-returns unrelated\
+  \ to reallocation.\nREGISTER_MAP_WITH_PROGRAMSTATE(ReallocSeenMap, const MemRegion*,\
+  \ const Stmt*)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<\n \
+  \       check::PostCall,\n        check::PreCall,\n        check::PreStmt<ReturnStmt>\n\
+  \    > {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Leaked temporary buffer from nvmem_cell_read\", \"Memory\
+  \ Management\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n      void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;\n\
+  \n   private:\n\n      // Helpers\n      static bool isTempAllocReturningKmem(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static bool isFreeLike(const CallEvent\
+  \ &Call, CheckerContext &C);\n      static bool isDevmKrealloc(const CallEvent &Call,\
+  \ CheckerContext &C);\n\n      static const MemRegion* getReturnedRegion(const CallEvent\
+  \ &Call);\n      static const MemRegion* getFreedRegion(const CallEvent &Call, CheckerContext\
+  \ &C);\n\n      void reportLeak(const MemRegion *R, const Stmt *AllocSite, const\
+  \ Stmt *Sink, CheckerContext &C) const;\n};\n\n// Returns true for functions that\
+  \ return a kmem buffer requiring kfree().\n// Minimal set to match the target bug:\
+  \ nvmem_cell_read.\nbool SAGenTestChecker::isTempAllocReturningKmem(const CallEvent\
+  \ &Call, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if\
+  \ (!Origin)\n    return false;\n  return ExprHasName(Origin, \"nvmem_cell_read\"\
+  , C);\n}\n\nbool SAGenTestChecker::isFreeLike(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return\
+  \ false;\n  return ExprHasName(Origin, \"kfree\", C) || ExprHasName(Origin, \"kvfree\"\
+  , C);\n}\n\nbool SAGenTestChecker::isDevmKrealloc(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return\
+  \ false;\n  return ExprHasName(Origin, \"devm_krealloc\", C);\n}\n\nconst MemRegion*\
+  \ SAGenTestChecker::getReturnedRegion(const CallEvent &Call) {\n  const MemRegion\
+  \ *MR = Call.getReturnValue().getAsRegion();\n  if (!MR)\n    return nullptr;\n\
+  \  return MR->getBaseRegion();\n}\n\nconst MemRegion* SAGenTestChecker::getFreedRegion(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() == 0)\n    return\
+  \ nullptr;\n  const Expr *ArgE = Call.getArgExpr(0);\n  if (!ArgE)\n    return nullptr;\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR)\n    return\
+  \ nullptr;\n  return MR->getBaseRegion();\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  // Track temporary allocations that must be freed.\n\
+  \  if (isTempAllocReturningKmem(Call, C)) {\n    const MemRegion *R = getReturnedRegion(Call);\n\
+  \    if (R) {\n      State = State->set<TempBufMap>(R, Call.getOriginExpr());\n\
+  \      Changed = true;\n    }\n  }\n\n  // When a devm_krealloc is seen, remember\
+  \ that it happened after any outstanding temp buffers.\n  if (isDevmKrealloc(Call,\
+  \ C)) {\n    auto Map = State->get<TempBufMap>();\n    if (!Map.isEmpty()) {\n \
+  \     for (auto It = Map.begin(), E = Map.end(); It != E; ++It) {\n        const\
+  \ MemRegion *R = It->first;\n        State = State->set<ReallocSeenMap>(R, Call.getOriginExpr());\n\
+  \        Changed = true;\n      }\n    }\n  }\n\n  if (Changed)\n    C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  if (!isFreeLike(Call, C))\n    return;\n\n  ProgramStateRef State =\
+  \ C.getState();\n  const MemRegion *FR = getFreedRegion(Call, C);\n  if (!FR)\n\
+  \    return;\n\n  const Stmt **Val = State->get<TempBufMap>(FR);\n  if (!Val)\n\
+  \    return;\n\n  State = State->remove<TempBufMap>(FR);\n  State = State->remove<ReallocSeenMap>(FR);\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreStmt(const ReturnStmt\
+  \ *RS, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\n \
+  \ // If no outstanding temp buffers, nothing to do.\n  auto Map = State->get<TempBufMap>();\n\
+  \  if (Map.isEmpty())\n    return;\n\n  // Optional suppression: if returning the\
+  \ tracked pointer itself, skip.\n  if (const Expr *RetE = RS->getRetValue()) {\n\
+  \    SVal RetV = State->getSVal(RetE, C.getLocationContext());\n    if (const MemRegion\
+  \ *RetR = RetV.getAsRegion()) {\n      RetR = RetR->getBaseRegion();\n      if (RetR)\
+  \ {\n        const Stmt **AllocSite = State->get<TempBufMap>(RetR);\n        if\
+  \ (AllocSite) {\n          // Assume ownership transfer, do not report.\n      \
+  \    return;\n        }\n      }\n    }\n  }\n\n  // Report for the first outstanding\
+  \ temp buffer that is after a devm_krealloc seen on this path.\n  for (auto It =\
+  \ Map.begin(), E = Map.end(); It != E; ++It) {\n    const MemRegion *R = It->first;\n\
+  \    const Stmt *AllocSite = It->second;\n\n    const Stmt **AfterRealloc = State->get<ReallocSeenMap>(R);\n\
+  \    if (!AfterRealloc)\n      continue; // Only report when a devm_krealloc has\
+  \ been seen after allocation.\n\n    reportLeak(R, AllocSite, RS, C);\n    return;\
+  \ // Report one per return site.\n  }\n}\n\nvoid SAGenTestChecker::reportLeak(const\
+  \ MemRegion *R, const Stmt *AllocSite, const Stmt *Sink, CheckerContext &C) const\
+  \ {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\
+  \n  auto Report = std::make_unique<PathSensitiveBugReport>(\n      *BT, \"Temporary\
+  \ buffer not freed on early return\", N);\n  if (Sink)\n    Report->addRange(Sink->getSourceRange());\n\
+  \n  if (AllocSite) {\n    const SourceManager &SM = C.getSourceManager();\n    const\
+  \ LocationContext *LCtx = C.getLocationContext();\n    PathDiagnosticLocation Loc\
+  \ = PathDiagnosticLocation::createBegin(AllocSite, SM, LCtx);\n    Report->addNote(\"\
+  allocated here\", Loc);\n  }\n\n  C.emitReport(std::move(Report));\n}\n\n} // end\
+  \ anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects missing kfree of buffers returned by nvmem_cell_read when returning\
+  \ early after devm_krealloc failure\",\n      \"\");\n}\n\nextern \"C\" const char\
+  \ clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nthermal/drivers/mediatek/lvts_thermal: Fix a memory\
+  \ leak in an error handling path\n\nIf devm_krealloc() fails, then 'efuse' is leaking.\n\
+  So free it to avoid a leak.\n\nFixes: f5f633b18234 (\"thermal/drivers/mediatek:\
+  \ Add the Low Voltage Thermal Sensor driver\")\nSigned-off-by: Christophe JAILLET\
+  \ <christophe.jaillet@wanadoo.fr>\nReviewed-by: Matthias Brugger <matthias.bgg@gmail.com>\n\
+  Reviewed-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>\n\
+  Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>\nLink: https://lore.kernel.org/r/481d345233862d58c3c305855a93d0dbc2bbae7e.1706431063.git.christophe.jaillet@wanadoo.fr\n\
+  \n## Buggy Code\n\n```c\n// Function: lvts_calibration_read in drivers/thermal/mediatek/lvts_thermal.c\n\
+  static int lvts_calibration_read(struct device *dev, struct lvts_domain *lvts_td,\n\
+  \t\t\t\t\tconst struct lvts_data *lvts_data)\n{\n\tstruct device_node *np = dev_of_node(dev);\n\
+  \tstruct nvmem_cell *cell;\n\tstruct property *prop;\n\tconst char *cell_name;\n\
+  \n\tof_property_for_each_string(np, \"nvmem-cell-names\", prop, cell_name) {\n\t\
+  \tsize_t len;\n\t\tu8 *efuse;\n\n\t\tcell = of_nvmem_cell_get(np, cell_name);\n\t\
+  \tif (IS_ERR(cell)) {\n\t\t\tdev_err(dev, \"Failed to get cell '%s'\\n\", cell_name);\n\
+  \t\t\treturn PTR_ERR(cell);\n\t\t}\n\n\t\tefuse = nvmem_cell_read(cell, &len);\n\
+  \n\t\tnvmem_cell_put(cell);\n\n\t\tif (IS_ERR(efuse)) {\n\t\t\tdev_err(dev, \"Failed\
+  \ to read cell '%s'\\n\", cell_name);\n\t\t\treturn PTR_ERR(efuse);\n\t\t}\n\n\t\
+  \tlvts_td->calib = devm_krealloc(dev, lvts_td->calib,\n\t\t\t\t\t       lvts_td->calib_len\
+  \ + len, GFP_KERNEL);\n\t\tif (!lvts_td->calib)\n\t\t\treturn -ENOMEM;\n\n\t\tmemcpy(lvts_td->calib\
+  \ + lvts_td->calib_len, efuse, len);\n\n\t\tlvts_td->calib_len += len;\n\n\t\tkfree(efuse);\n\
+  \t}\n\n\treturn 0;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/thermal/mediatek/lvts_thermal.c\
+  \ b/drivers/thermal/mediatek/lvts_thermal.c\nindex 98d9c80bd4c6..fd4bd650c77a 100644\n\
+  --- a/drivers/thermal/mediatek/lvts_thermal.c\n+++ b/drivers/thermal/mediatek/lvts_thermal.c\n\
+  @@ -719,8 +719,10 @@ static int lvts_calibration_read(struct device *dev, struct\
+  \ lvts_domain *lvts_td\n \n \t\tlvts_td->calib = devm_krealloc(dev, lvts_td->calib,\n\
+  \ \t\t\t\t\t       lvts_td->calib_len + len, GFP_KERNEL);\n-\t\tif (!lvts_td->calib)\n\
+  +\t\tif (!lvts_td->calib) {\n+\t\t\tkfree(efuse);\n \t\t\treturn -ENOMEM;\n+\t\t\
+  }\n \n \t\tmemcpy(lvts_td->calib + lvts_td->calib_len, efuse, len);\n \n```\n"
+pattern: "## Bug Pattern\n\nAllocating a temporary buffer and then returning early\
+  \ on a subsequent allocation/reallocation failure without freeing the temporary\
+  \ buffer, causing a leak. Concretely:\n\n- A temporary buffer is allocated (e.g.,\
+  \ via nvmem_cell_read()).\n- A reallocation of the destination buffer is attempted\
+  \ (e.g., devm_krealloc()).\n- On failure of the reallocation, the code returns without\
+  \ kfree() of the temporary buffer.\n\nExample:\n\nu8 *tmp = nvmem_cell_read(cell,\
+  \ &len);  // must be kfree'd\n...\ndst = devm_krealloc(dev, dst, new_len, GFP_KERNEL);\n\
+  if (!dst)\n    return -ENOMEM;  // missing kfree(tmp) -> memory leak"
+plan: "Plan\n\n1. Program State\n- REGISTER_MAP_WITH_PROGRAMSTATE(TempBufMap, const\
+  \ MemRegion*, const Stmt*)\n  - Key: the pointee MemRegion of a temporary heap buffer\
+  \ that must be kfree\u2019d.\n  - Value: the allocation site (the CallExpr Stmt)\
+  \ to improve diagnostics.\n- Rationale: We only need to know \u201Cthis buffer must\
+  \ be freed later.\u201D No alias map is required because free()-like calls receive\
+  \ the same pointee region we track.\n\n2. Helper Utilities\n- isTempAllocReturningKmem(const\
+  \ CallEvent &Call)\n  - Return true when callee is a known function that returns\
+  \ a kmalloc\u2019d buffer which must be freed with kfree. For this checker, keep\
+  \ it minimal: recognize \"nvmem_cell_read\".\n- isFreeLike(const CallEvent &Call)\n\
+  \  - Return true if callee is \"kfree\" or \"kvfree\".\n- const MemRegion* getReturnedRegion(const\
+  \ CallEvent &Call, CheckerContext &C)\n  - Return Call.getReturnValue().getAsRegion().\n\
+  - const MemRegion* getFreedRegion(const CallEvent &Call, CheckerContext &C)\n  -\
+  \ Return getMemRegionFromExpr(Call.getArgExpr(0), C).\n- reportLeak(const MemRegion\
+  \ *R, const Stmt *AllocSite, const Stmt *Sink, CheckerContext &C)\n  - Emit report\
+  \ at Sink (the ReturnStmt), with a note pointing to AllocSite.\n\n3. Callbacks and\
+  \ Logic\n- checkPostCall(const CallEvent &Call, CheckerContext &C) const\n  - Track\
+  \ temporary allocations\n    - If isTempAllocReturningKmem(Call) is true:\n    \
+  \  - Get returned region: R = getReturnedRegion(Call, C).\n      - If R is non-null:\n\
+  \        - State = State->set<TempBufMap>(R, Call.getOriginExpr()).\n        - C.addTransition(State).\n\
+  \  - (Do not handle free here; we will do it in pre-call to ensure our bookkeeping\
+  \ happens before the region is invalidated by the model of kfree.)\n\n- checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const\n  - Handle freeing (clear from map\
+  \ when freed)\n    - If isFreeLike(Call) is true:\n      - FR = getFreedRegion(Call,\
+  \ C).\n      - If FR is non-null and FR is in TempBufMap:\n        - State = State->remove<TempBufMap>(FR).\n\
+  \        - C.addTransition(State).\n\n- checkPreStmt(const ReturnStmt *RS, CheckerContext\
+  \ &C) const\n  - Detect returning with outstanding temporary buffers (leak on early\
+  \ return)\n    - State = C.getState().\n    - Fetch TempBufMap. If empty, return.\n\
+  \    - Optional suppression: if the function returns a pointer and that pointer\u2019\
+  s region equals a tracked region, skip (transfer of ownership).\n      - Get RetExpr\
+  \ = RS->getRetValue(). If RetExpr exists and its SVal has a region RetR:\n     \
+  \   - If RetR is a key in TempBufMap, return (do not flag).\n    - Otherwise, report\
+  \ leak:\n      - Pick one entry (R, AllocSite) from TempBufMap (e.g., the first).\n\
+  \      - reportLeak(R, AllocSite, RS, C).\n    - Rationale: In the target pattern,\
+  \ the ReturnStmt is reached on devm_krealloc failure before the temp buffer (efuse)\
+  \ is kfree\u2019d; this path will have that temporary still present in TempBufMap,\
+  \ so the ReturnStmt triggers the report.\n\n4. What This Checker Specifically Catches\n\
+  - Temporary buffer allocated by nvmem_cell_read() (e.g., u8 *efuse = nvmem_cell_read(...);).\n\
+  - The buffer is intended to be kfree\u2019d later in the success path.\n- A subsequent\
+  \ early return (e.g., after devm_krealloc failure) occurs before kfree(efuse), causing\
+  \ a leak.\n- The checker flags any ReturnStmt encountered while a tracked (unfreed)\
+  \ temporary buffer is still outstanding.\n\n5. Why No Alias Map Is Needed\n- We\
+  \ track the pointee MemRegion of the allocated buffer. free()-like calls take the\
+  \ same pointee region regardless of which local variable holds it (p, q, alias,\
+  \ etc.). getMemRegionFromExpr on the free argument yields the pointee MemRegion,\
+  \ which matches our tracked key.\n\n6. Bug Report\n- Title: \u201CTemporary buffer\
+  \ allocated by nvmem_cell_read() is not freed on early return\u201D\n- Message:\
+  \ \u201CLeaked temporary buffer; call kfree() before returning.\u201D\n- Attach\
+  \ a note at the allocation site (AllocSite).\n- Use std::make_unique<PathSensitiveBugReport>.\
+  \ Create the bug type once and reuse. Generate a non-fatal error node.\n\n7. Scope\
+  \ and Noise Control\n- Keep the allocator list minimal (only \u201Cnvmem_cell_read\u201D\
+  ) to avoid false positives.\n- Only report on ReturnStmt (not at function end) to\
+  \ align with the intended early-return pattern.\n- Skip reporting when the function\
+  \ returns the tracked pointer (possible ownership transfer).\n\n8. Summary of Steps\n\
+  - State:\n  - REGISTER_MAP_WITH_PROGRAMSTATE(TempBufMap, const MemRegion*, const\
+  \ Stmt*)\n- checkPostCall:\n  - If callee == nvmem_cell_read, add returned region\
+  \ to TempBufMap with the CallExpr as AllocSite.\n- checkPreCall:\n  - If callee\
+  \ == kfree or kvfree, remove the pointee region (argument) from TempBufMap.\n- checkPreStmt(ReturnStmt):\n\
+  \  - If TempBufMap non-empty and not returning one of the tracked pointers, report\
+  \ leak at this return, noting the allocation site.\n\nThis minimal, path-sensitive\
+  \ plan precisely flags the target pattern: allocating a temporary buffer (nvmem_cell_read),\
+  \ then returning early (e.g., due to devm_krealloc failure) without kfree\u2019\
+  ing the temporary buffer."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Track temporary buffers that must be freed with kfree().\nREGISTER_MAP_WITH_PROGRAMSTATE(TempBufMap,\
+  \ const MemRegion*, const Stmt*)\n// Track that a devm_krealloc has been seen after\
+  \ allocating a temp buffer.\n// This helps avoid reporting early error-returns unrelated\
+  \ to reallocation.\nREGISTER_MAP_WITH_PROGRAMSTATE(ReallocSeenMap, const MemRegion*,\
+  \ const Stmt*)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<\n \
+  \       check::PostCall,\n        check::PreCall,\n        check::PreStmt<ReturnStmt>\n\
+  \    > {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Leaked temporary buffer from nvmem_cell_read\", \"Memory\
+  \ Management\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n      void checkPreStmt(const ReturnStmt *RS, CheckerContext &C) const;\n\
+  \n   private:\n\n      // Helpers\n      static bool isTempAllocReturningKmem(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static bool isFreeLike(const CallEvent\
+  \ &Call, CheckerContext &C);\n      static bool isDevmKrealloc(const CallEvent &Call,\
+  \ CheckerContext &C);\n\n      static const MemRegion* getReturnedRegion(const CallEvent\
+  \ &Call);\n      static const MemRegion* getFreedRegion(const CallEvent &Call, CheckerContext\
+  \ &C);\n\n      void reportLeak(const MemRegion *R, const Stmt *AllocSite, const\
+  \ Stmt *Sink, CheckerContext &C) const;\n};\n\n// Returns true for functions that\
+  \ return a kmem buffer requiring kfree().\n// Minimal set to match the target bug:\
+  \ nvmem_cell_read.\nbool SAGenTestChecker::isTempAllocReturningKmem(const CallEvent\
+  \ &Call, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if\
+  \ (!Origin)\n    return false;\n  return ExprHasName(Origin, \"nvmem_cell_read\"\
+  , C);\n}\n\nbool SAGenTestChecker::isFreeLike(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return\
+  \ false;\n  return ExprHasName(Origin, \"kfree\", C) || ExprHasName(Origin, \"kvfree\"\
+  , C);\n}\n\nbool SAGenTestChecker::isDevmKrealloc(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return\
+  \ false;\n  return ExprHasName(Origin, \"devm_krealloc\", C);\n}\n\nconst MemRegion*\
+  \ SAGenTestChecker::getReturnedRegion(const CallEvent &Call) {\n  const MemRegion\
+  \ *MR = Call.getReturnValue().getAsRegion();\n  if (!MR)\n    return nullptr;\n\
+  \  return MR->getBaseRegion();\n}\n\nconst MemRegion* SAGenTestChecker::getFreedRegion(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() == 0)\n    return\
+  \ nullptr;\n  const Expr *ArgE = Call.getArgExpr(0);\n  if (!ArgE)\n    return nullptr;\n\
+  \  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n  if (!MR)\n    return\
+  \ nullptr;\n  return MR->getBaseRegion();\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  // Track temporary allocations that must be freed.\n\
+  \  if (isTempAllocReturningKmem(Call, C)) {\n    const MemRegion *R = getReturnedRegion(Call);\n\
+  \    if (R) {\n      State = State->set<TempBufMap>(R, Call.getOriginExpr());\n\
+  \      Changed = true;\n    }\n  }\n\n  // When a devm_krealloc is seen, remember\
+  \ that it happened after any outstanding temp buffers.\n  if (isDevmKrealloc(Call,\
+  \ C)) {\n    auto Map = State->get<TempBufMap>();\n    if (!Map.isEmpty()) {\n \
+  \     for (auto It = Map.begin(), E = Map.end(); It != E; ++It) {\n        const\
+  \ MemRegion *R = It->first;\n        State = State->set<ReallocSeenMap>(R, Call.getOriginExpr());\n\
+  \        Changed = true;\n      }\n    }\n  }\n\n  if (Changed)\n    C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  if (!isFreeLike(Call, C))\n    return;\n\n  ProgramStateRef State =\
+  \ C.getState();\n  const MemRegion *FR = getFreedRegion(Call, C);\n  if (!FR)\n\
+  \    return;\n\n  const Stmt *const *Val = State->get<TempBufMap>(FR);\n  if (!Val)\n\
+  \    return;\n\n  State = State->remove<TempBufMap>(FR);\n  State = State->remove<ReallocSeenMap>(FR);\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreStmt(const ReturnStmt\
+  \ *RS, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\n \
+  \ // If no outstanding temp buffers, nothing to do.\n  auto Map = State->get<TempBufMap>();\n\
+  \  if (Map.isEmpty())\n    return;\n\n  // Optional suppression: if returning the\
+  \ tracked pointer itself, skip.\n  if (const Expr *RetE = RS->getRetValue()) {\n\
+  \    SVal RetV = State->getSVal(RetE, C.getLocationContext());\n    if (const MemRegion\
+  \ *RetR = RetV.getAsRegion()) {\n      RetR = RetR->getBaseRegion();\n      if (RetR)\
+  \ {\n        const Stmt *const *AllocSite = State->get<TempBufMap>(RetR);\n    \
+  \    if (AllocSite) {\n          // Assume ownership transfer, do not report.\n\
+  \          return;\n        }\n      }\n    }\n  }\n\n  // Report for the first\
+  \ outstanding temp buffer that is after a devm_krealloc seen on this path.\n  for\
+  \ (auto It = Map.begin(), E = Map.end(); It != E; ++It) {\n    const MemRegion *R\
+  \ = It->first;\n    const Stmt *AllocSite = It->second;\n\n    const Stmt *const\
+  \ *AfterRealloc = State->get<ReallocSeenMap>(R);\n    if (!AfterRealloc)\n     \
+  \ continue; // Only report when a devm_krealloc has been seen after allocation.\n\
+  \n    reportLeak(R, AllocSite, RS, C);\n    return; // Report one per return site.\n\
+  \  }\n}\n\nvoid SAGenTestChecker::reportLeak(const MemRegion *R, const Stmt *AllocSite,\
+  \ const Stmt *Sink, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto Report = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Temporary buffer not freed on early return\", N);\n  if (Sink)\n \
+  \   Report->addRange(Sink->getSourceRange());\n\n  if (AllocSite) {\n    const SourceManager\
+  \ &SM = C.getSourceManager();\n    const LocationContext *LCtx = C.getLocationContext();\n\
+  \    PathDiagnosticLocation Loc = PathDiagnosticLocation::createBegin(AllocSite,\
+  \ SM, LCtx);\n    Report->addNote(\"allocated here\", Loc);\n  }\n\n  C.emitReport(std::move(Report));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects missing kfree of buffers returned by nvmem_cell_read when returning\
+  \ early after devm_krealloc failure\",\n      \"\");\n}\n\nextern \"C\" const char\
+  \ clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

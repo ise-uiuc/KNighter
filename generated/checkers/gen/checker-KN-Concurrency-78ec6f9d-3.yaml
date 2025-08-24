@@ -1,0 +1,539 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 78ec6f9df6642418411c534683da6133e0962ec7
+commit_type: Concurrency
+index: 3
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"llvm/ADT/DenseSet.h\"\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\nREGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrMap,\
+  \ const MemRegion*, unsigned)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const\
+  \ MemRegion*, const MemRegion*)\n\nnamespace {\n\nenum PerCpuKind : unsigned {\n\
+  \  PCPU_Unknown = 0,\n  PCPU_LocalThisCPU = 1,  // Derived from this_cpu_ptr(...)\
+  \ or per_cpu_ptr(..., smp_processor_id())\n  PCPU_RemoteCPU = 2      // Derived\
+  \ from per_cpu_ptr(..., cpu) with explicit CPU not this CPU\n};\n\nclass SAGenTestChecker\n\
+  \  : public Checker<\n        check::Bind,\n        check::PostStmt<DeclStmt>,\n\
+  \        check::PreStmt<BinaryOperator>,\n        check::PreStmt<CompoundAssignOperator>,\n\
+  \        check::PreStmt<UnaryOperator>\n      > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n   // Avoid duplicate reports for the same statement.\n   mutable llvm::DenseSet<const\
+  \ Stmt*> Reported;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this,\
+  \ \"Per-CPU data race\", \"Concurrency\")) {}\n\n      void checkBind(SVal Loc,\
+  \ SVal Val, const Stmt *S, CheckerContext &C) const;\n      void checkPostStmt(const\
+  \ DeclStmt *DS, CheckerContext &C) const;\n      void checkPreStmt(const BinaryOperator\
+  \ *BO, CheckerContext &C) const;\n      void checkPreStmt(const CompoundAssignOperator\
+  \ *CAO, CheckerContext &C) const;\n      void checkPreStmt(const UnaryOperator *UO,\
+  \ CheckerContext &C) const;\n\n   private:\n      // Helpers\n      static const\
+  \ MemRegion* baseRegionOfExpr(const Expr *E, CheckerContext &C);\n      static const\
+  \ MemRegion* resolveAlias(const MemRegion *R, ProgramStateRef State);\n      static\
+  \ bool isCallNamed(const CallExpr *CE, StringRef Name, CheckerContext &C);\n   \
+  \   static bool isLocalCPUExpr(const Expr *E, CheckerContext &C);\n      static\
+  \ unsigned classifyPerCpuCall(const CallExpr *CE, CheckerContext &C);\n      static\
+  \ bool insideREADorWRITE_ONCE(const Expr *Child, CheckerContext &C);\n\n      static\
+  \ const Expr* getRHSFromStore(const Stmt *StoreE, const MemRegion *LReg, CheckerContext\
+  \ &C);\n      static const Expr* stripCasts(const Expr *E) {\n        return E ?\
+  \ E->IgnoreParenCasts() : nullptr;\n      }\n      unsigned getClassFromMemberBase(const\
+  \ Expr *Base, CheckerContext &C) const;\n\n      void setClassification(ProgramStateRef\
+  \ &State, const MemRegion *R, unsigned Kind) const;\n      llvm::Optional<unsigned>\
+  \ getClassification(ProgramStateRef State, const MemRegion *R) const;\n\n      void\
+  \ trackAlias(ProgramStateRef &State, const MemRegion *A, const MemRegion *B) const;\n\
+  \n      void reportIfNeeded(const Stmt *S, StringRef Msg, CheckerContext &C) const;\n\
+  };\n\nconst MemRegion* SAGenTestChecker::baseRegionOfExpr(const Expr *E, CheckerContext\
+  \ &C) {\n  if (!E) return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(E,\
+  \ C);\n  if (!MR) return nullptr;\n  MR = MR->getBaseRegion();\n  return MR;\n}\n\
+  \nconst MemRegion* SAGenTestChecker::resolveAlias(const MemRegion *R, ProgramStateRef\
+  \ State) {\n  if (!R) return nullptr;\n  // Follow simple alias chains, with a small\
+  \ limit to avoid cycles.\n  const MemRegion *Cur = R;\n  for (int i = 0; i < 8;\
+  \ ++i) {\n    const MemRegion *Next = State->get<PtrAliasMap>(Cur);\n    if (!Next\
+  \ || Next == Cur) break;\n    Cur = Next;\n  }\n  return Cur;\n}\n\nbool SAGenTestChecker::isCallNamed(const\
+  \ CallExpr *CE, StringRef Name, CheckerContext &C) {\n  if (!CE) return false;\n\
+  \  const Expr *CalleeE = CE->getCallee();\n  if (!CalleeE) return false;\n  return\
+  \ ExprHasName(CalleeE, Name, C);\n}\n\nbool SAGenTestChecker::isLocalCPUExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  E = stripCasts(E);\n  const CallExpr *CE = dyn_cast_or_null<CallExpr>(E);\n\
+  \  if (!CE) return false;\n  // smp_processor_id() or raw_smp_processor_id()\n \
+  \ if (isCallNamed(CE, \"smp_processor_id\", C)) return true;\n  if (isCallNamed(CE,\
+  \ \"raw_smp_processor_id\", C)) return true;\n  return false;\n}\n\nunsigned SAGenTestChecker::classifyPerCpuCall(const\
+  \ CallExpr *CE, CheckerContext &C) {\n  if (!CE) return PCPU_Unknown;\n  if (isCallNamed(CE,\
+  \ \"this_cpu_ptr\", C))\n    return PCPU_LocalThisCPU;\n\n  if (isCallNamed(CE,\
+  \ \"per_cpu_ptr\", C)) {\n    // per_cpu_ptr(ptr, cpu)\n    if (CE->getNumArgs()\
+  \ >= 2) {\n      const Expr *CPUArg = stripCasts(CE->getArg(1));\n      if (isLocalCPUExpr(CPUArg,\
+  \ C))\n        return PCPU_LocalThisCPU;\n      return PCPU_RemoteCPU;\n    }\n\
+  \  }\n  return PCPU_Unknown;\n}\n\nbool SAGenTestChecker::insideREADorWRITE_ONCE(const\
+  \ Expr *Child, CheckerContext &C) {\n  if (!Child) return false;\n  const CallExpr\
+  \ *ParentCall = findSpecificTypeInParents<CallExpr>(Child, C);\n  if (!ParentCall)\
+  \ return false;\n  if (isCallNamed(ParentCall, \"READ_ONCE\", C)) return true;\n\
+  \  if (isCallNamed(ParentCall, \"WRITE_ONCE\", C)) return true;\n  return false;\n\
+  }\n\nconst Expr* SAGenTestChecker::getRHSFromStore(const Stmt *StoreE, const MemRegion\
+  \ *LReg, CheckerContext &C) {\n  if (!StoreE) return nullptr;\n\n  if (const auto\
+  \ *BO = dyn_cast<BinaryOperator>(StoreE)) {\n    if (BO->isAssignmentOp())\n   \
+  \   return stripCasts(BO->getRHS());\n  }\n\n  if (const auto *DS = dyn_cast<DeclStmt>(StoreE))\
+  \ {\n    for (const Decl *D : DS->decls()) {\n      const auto *VD = dyn_cast<VarDecl>(D);\n\
+  \      if (!VD) continue;\n      if (!VD->hasInit()) continue;\n\n      // Match\
+  \ the specific variable bound in this bind via its region.\n      SVal LV = C.getSValBuilder().getLValue(VD,\
+  \ C.getLocationContext());\n      const MemRegion *VR = LV.getAsRegion();\n    \
+  \  if (!VR) continue;\n      VR = VR->getBaseRegion();\n      if (VR == LReg)\n\
+  \        return stripCasts(VD->getInit());\n    }\n  }\n\n  // As a fallback, if\
+  \ StoreE is an Expr, just return it (best-effort).\n  if (const auto *E = dyn_cast<Expr>(StoreE))\n\
+  \    return stripCasts(E);\n\n  return nullptr;\n}\n\nunsigned SAGenTestChecker::getClassFromMemberBase(const\
+  \ Expr *Base, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  Base = stripCasts(Base);\n\n  if (const auto *CE = dyn_cast<CallExpr>(Base))\
+  \ {\n    return classifyPerCpuCall(CE, C);\n  }\n\n  const MemRegion *BR = baseRegionOfExpr(Base,\
+  \ C);\n  if (!BR) return PCPU_Unknown;\n  BR = resolveAlias(BR, State);\n  const\
+  \ unsigned *K = State->get<PerCpuPtrMap>(BR);\n  return K ? *K : PCPU_Unknown;\n\
+  }\n\nvoid SAGenTestChecker::setClassification(ProgramStateRef &State, const MemRegion\
+  \ *R, unsigned Kind) const {\n  if (!R || Kind == PCPU_Unknown) return;\n  const\
+  \ unsigned *Old = State->get<PerCpuPtrMap>(R);\n  if (!Old || *Old != Kind) {\n\
+  \    State = State->set<PerCpuPtrMap>(R, Kind);\n  }\n}\n\nllvm::Optional<unsigned>\
+  \ SAGenTestChecker::getClassification(ProgramStateRef State, const MemRegion *R)\
+  \ const {\n  if (!R) return llvm::None;\n  const unsigned *K = State->get<PerCpuPtrMap>(R);\n\
+  \  if (!K) return llvm::None;\n  return *K;\n}\n\nvoid SAGenTestChecker::trackAlias(ProgramStateRef\
+  \ &State, const MemRegion *A, const MemRegion *B) const {\n  if (!A || !B) return;\n\
+  \  State = State->set<PtrAliasMap>(A, B);\n  State = State->set<PtrAliasMap>(B,\
+  \ A);\n}\n\nvoid SAGenTestChecker::reportIfNeeded(const Stmt *S, StringRef Msg,\
+  \ CheckerContext &C) const {\n  if (!S) return;\n  if (Reported.count(S)) return;\n\
+  \n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N) return;\n\n  auto\
+  \ R = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);\n  R->addRange(S->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n  Reported.insert(S);\n}\n\n// Track pointer origins\
+  \ and aliases.\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\n  const\
+  \ MemRegion *LReg = Loc.getAsRegion();\n  if (!LReg) return;\n  LReg = LReg->getBaseRegion();\n\
+  \  if (!LReg) return;\n\n  const Expr *RHS = getRHSFromStore(S, LReg, C);\n  if\
+  \ (!RHS) return;\n\n  RHS = stripCasts(RHS);\n\n  bool Changed = false;\n\n  //\
+  \ Case 1: RHS is a (this_cpu_ptr/per_cpu_ptr) call\n  if (const auto *CE = dyn_cast<CallExpr>(RHS))\
+  \ {\n    unsigned Kind = classifyPerCpuCall(CE, C);\n    if (Kind != PCPU_Unknown)\
+  \ {\n      setClassification(State, LReg, Kind);\n      Changed = true;\n    }\n\
+  \  }\n\n  // Case 2: RHS is a DeclRefExpr to another pointer; propagate classification\
+  \ and alias\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(RHS)) {\n    const MemRegion\
+  \ *RReg = baseRegionOfExpr(DRE, C);\n    if (RReg) {\n      RReg = resolveAlias(RReg,\
+  \ State);\n      if (auto K = getClassification(State, RReg)) {\n        setClassification(State,\
+  \ LReg, *K);\n        Changed = true;\n      }\n      trackAlias(State, LReg, RReg);\n\
+  \      Changed = true;\n    }\n  }\n\n  // Case 3: RHS is a MemberExpr like \"statc->parent\"\
+  ; propagate base classification\n  if (const auto *ME = dyn_cast<MemberExpr>(RHS))\
+  \ {\n    unsigned K = getClassFromMemberBase(ME->getBase(), C);\n    if (K != PCPU_Unknown)\
+  \ {\n      setClassification(State, LReg, K);\n      Changed = true;\n    }\n  \
+  \  // Do not alias LReg with ME base; they are different addresses.\n  }\n\n  if\
+  \ (Changed)\n    C.addTransition(State);\n}\n\n// Handle VarDecl initializers (e.g.,\
+  \ struct *statc = per_cpu_ptr(...);)\nvoid SAGenTestChecker::checkPostStmt(const\
+  \ DeclStmt *DS, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  for (const Decl *D : DS->decls()) {\n    const auto\
+  \ *VD = dyn_cast<VarDecl>(D);\n    if (!VD || !VD->hasInit())\n      continue;\n\
+  \n    const Expr *Init = stripCasts(VD->getInit());\n    if (!Init) continue;\n\n\
+  \    SVal LV = C.getSValBuilder().getLValue(VD, C.getLocationContext());\n    const\
+  \ MemRegion *LReg = LV.getAsRegion();\n    if (!LReg) continue;\n    LReg = LReg->getBaseRegion();\n\
+  \    if (!LReg) continue;\n\n    // Classify per_cpu calls\n    if (const auto *CE\
+  \ = dyn_cast<CallExpr>(Init)) {\n      unsigned Kind = classifyPerCpuCall(CE, C);\n\
+  \      if (Kind != PCPU_Unknown) {\n        setClassification(State, LReg, Kind);\n\
+  \        Changed = true;\n      }\n    } else if (const auto *DRE = dyn_cast<DeclRefExpr>(Init))\
+  \ {\n      // Propagate from another var\n      const MemRegion *RReg = baseRegionOfExpr(DRE,\
+  \ C);\n      if (RReg) {\n        RReg = resolveAlias(RReg, State);\n        if\
+  \ (auto K = getClassification(State, RReg)) {\n          setClassification(State,\
+  \ LReg, *K);\n          Changed = true;\n        }\n        trackAlias(State, LReg,\
+  \ RReg);\n        Changed = true;\n      }\n    } else if (const auto *ME = dyn_cast<MemberExpr>(Init))\
+  \ {\n      unsigned K = getClassFromMemberBase(ME->getBase(), C);\n      if (K !=\
+  \ PCPU_Unknown) {\n        setClassification(State, LReg, K);\n        Changed =\
+  \ true;\n      }\n    }\n  }\n\n  if (Changed)\n    C.addTransition(State);\n}\n\
+  \n// Detect remote write: statc->stats_updates = ...\nvoid SAGenTestChecker::checkPreStmt(const\
+  \ BinaryOperator *BO, CheckerContext &C) const {\n  if (!BO->isAssignmentOp())\n\
+  \    return;\n\n  const Expr *LHS = stripCasts(BO->getLHS());\n  if (!LHS) return;\n\
+  \n  const auto *ME = dyn_cast<MemberExpr>(LHS);\n  if (!ME) return;\n\n  // If already\
+  \ protected by READ/WRITE_ONCE, skip.\n  if (insideREADorWRITE_ONCE(ME, C))\n  \
+  \  return;\n\n  unsigned Kind = getClassFromMemberBase(ME->getBase(), C);\n  if\
+  \ (Kind == PCPU_RemoteCPU) {\n    reportIfNeeded(BO, \"Remote per-CPU field write\
+  \ without WRITE_ONCE\", C);\n  }\n  // For local plain assignment we do not warn\
+  \ (RMW is handled below).\n}\n\n// Detect local/remote RMW: \"+=\", \"-=\"\nvoid\
+  \ SAGenTestChecker::checkPreStmt(const CompoundAssignOperator *CAO, CheckerContext\
+  \ &C) const {\n  const Expr *LHS = stripCasts(CAO->getLHS());\n  if (!LHS) return;\n\
+  \n  const auto *ME = dyn_cast<MemberExpr>(LHS);\n  if (!ME) return;\n\n  if (insideREADorWRITE_ONCE(ME,\
+  \ C))\n    return;\n\n  unsigned Kind = getClassFromMemberBase(ME->getBase(), C);\n\
+  \  if (Kind == PCPU_LocalThisCPU || Kind == PCPU_RemoteCPU) {\n    reportIfNeeded(CAO,\
+  \ \"RMW on per-CPU field without READ_ONCE/WRITE_ONCE\", C);\n  }\n}\n\n// Detect\
+  \ ++/-- on per-CPU fields\nvoid SAGenTestChecker::checkPreStmt(const UnaryOperator\
+  \ *UO, CheckerContext &C) const {\n  UnaryOperatorKind Op = UO->getOpcode();\n \
+  \ if (Op != UO_PreInc && Op != UO_PostInc && Op != UO_PreDec && Op != UO_PostDec)\n\
+  \    return;\n\n  const Expr *Sub = stripCasts(UO->getSubExpr());\n  if (!Sub) return;\n\
+  \n  const auto *ME = dyn_cast<MemberExpr>(Sub);\n  if (!ME) return;\n\n  if (insideREADorWRITE_ONCE(ME,\
+  \ C))\n    return;\n\n  unsigned Kind = getClassFromMemberBase(ME->getBase(), C);\n\
+  \  if (Kind == PCPU_LocalThisCPU || Kind == PCPU_RemoteCPU) {\n    reportIfNeeded(UO,\
+  \ \"RMW on per-CPU field without READ_ONCE/WRITE_ONCE\", C);\n  }\n}\n\n} // end\
+  \ anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unsynchronized RMW and remote writes on per-CPU fields lacking\
+  \ READ_ONCE/WRITE_ONCE\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nmemcg: fix data-race KCSAN bug in rstats\n\nA data-race\
+  \ issue in memcg rstat occurs when two distinct code paths\naccess the same 4-byte\
+  \ region concurrently.  KCSAN detection triggers the\nfollowing BUG as a result.\n\
+  \n\tBUG: KCSAN: data-race in __count_memcg_events / mem_cgroup_css_rstat_flush\n\
+  \n\twrite to 0xffffe8ffff98e300 of 4 bytes by task 5274 on cpu 17:\n\tmem_cgroup_css_rstat_flush\
+  \ (mm/memcontrol.c:5850)\n\tcgroup_rstat_flush_locked (kernel/cgroup/rstat.c:243\
+  \ (discriminator 7))\n\tcgroup_rstat_flush (./include/linux/spinlock.h:401 kernel/cgroup/rstat.c:278)\n\
+  \tmem_cgroup_flush_stats.part.0 (mm/memcontrol.c:767)\n\tmemory_numa_stat_show (mm/memcontrol.c:6911)\n\
+  <snip>\n\n\tread to 0xffffe8ffff98e300 of 4 bytes by task 410848 on cpu 27:\n\t\
+  __count_memcg_events (mm/memcontrol.c:725 mm/memcontrol.c:962)\n\tcount_memcg_event_mm.part.0\
+  \ (./include/linux/memcontrol.h:1097 ./include/linux/memcontrol.h:1120)\n\thandle_mm_fault\
+  \ (mm/memory.c:5483 mm/memory.c:5622)\n<snip>\n\n\tvalue changed: 0x00000029 ->\
+  \ 0x00000000\n\nThe race occurs because two code paths access the same \"stats_updates\"\
+  \nlocation.  Although \"stats_updates\" is a per-CPU variable, it is remotely\n\
+  accessed by another CPU at\ncgroup_rstat_flush_locked()->mem_cgroup_css_rstat_flush(),\
+  \ leading to the\ndata race mentioned.\n\nConsidering that memcg_rstat_updated()\
+  \ is in the hot code path, adding a\nlock to protect it may not be desirable, especially\
+  \ since this variable\npertains solely to statistics.\n\nTherefore, annotating accesses\
+  \ to stats_updates with READ/WRITE_ONCE() can\nprevent KCSAN splats and potential\
+  \ partial reads/writes.\n\nLink: https://lkml.kernel.org/r/20240424125940.2410718-1-leitao@debian.org\n\
+  Fixes: 9cee7e8ef3e3 (\"mm: memcg: optimize parent iteration in memcg_rstat_updated()\"\
+  )\nSigned-off-by: Breno Leitao <leitao@debian.org>\nSuggested-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Acked-by: Johannes Weiner <hannes@cmpxchg.org>\nAcked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Reviewed-by: Yosry Ahmed <yosryahmed@google.com>\nCc: Michal Hocko <mhocko@suse.com>\n\
+  Cc: Roman Gushchin <roman.gushchin@linux.dev>\nCc: Muchun Song <songmuchun@bytedance.com>\n\
+  Signed-off-by: Andrew Morton <akpm@linux-foundation.org>\n\n## Buggy Code\n\n```c\n\
+  // Function: memcg_rstat_updated in mm/memcontrol.c\nstatic inline void memcg_rstat_updated(struct\
+  \ mem_cgroup *memcg, int val)\n{\n\tstruct memcg_vmstats_percpu *statc;\n\tint cpu\
+  \ = smp_processor_id();\n\n\tif (!val)\n\t\treturn;\n\n\tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n\tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n\tfor (; statc; statc =\
+  \ statc->parent) {\n\t\tstatc->stats_updates += abs(val);\n\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n\t\t\tcontinue;\n\n\t\t/*\n\t\t * If @memcg is already\
+  \ flush-able, increasing stats_updates is\n\t\t * redundant. Avoid the overhead\
+  \ of the atomic update.\n\t\t */\n\t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  \t\t\tatomic64_add(statc->stats_updates,\n\t\t\t\t     &statc->vmstats->stats_updates);\n\
+  \t\tstatc->stats_updates = 0;\n\t}\n}\n```\n\n```c\n// Function: mem_cgroup_css_rstat_flush\
+  \ in mm/memcontrol.c\nstatic void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state\
+  \ *css, int cpu)\n{\n\tstruct mem_cgroup *memcg = mem_cgroup_from_css(css);\n\t\
+  struct mem_cgroup *parent = parent_mem_cgroup(memcg);\n\tstruct memcg_vmstats_percpu\
+  \ *statc;\n\tlong delta, delta_cpu, v;\n\tint i, nid;\n\n\tstatc = per_cpu_ptr(memcg->vmstats_percpu,\
+  \ cpu);\n\n\tfor (i = 0; i < MEMCG_NR_STAT; i++) {\n\t\t/*\n\t\t * Collect the aggregated\
+  \ propagation counts of groups\n\t\t * below us. We're in a per-cpu loop here and\
+  \ this is\n\t\t * a global counter, so the first cycle will get them.\n\t\t */\n\
+  \t\tdelta = memcg->vmstats->state_pending[i];\n\t\tif (delta)\n\t\t\tmemcg->vmstats->state_pending[i]\
+  \ = 0;\n\n\t\t/* Add CPU changes on this level since the last flush */\n\t\tdelta_cpu\
+  \ = 0;\n\t\tv = READ_ONCE(statc->state[i]);\n\t\tif (v != statc->state_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->state_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\t\
+  \tstatc->state_prev[i] = v;\n\t\t}\n\n\t\t/* Aggregate counts on this level and\
+  \ propagate upwards */\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->state_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->state[i] += delta;\n\t\
+  \t\tif (parent)\n\t\t\t\tparent->vmstats->state_pending[i] += delta;\n\t\t}\n\t\
+  }\n\n\tfor (i = 0; i < NR_MEMCG_EVENTS; i++) {\n\t\tdelta = memcg->vmstats->events_pending[i];\n\
+  \t\tif (delta)\n\t\t\tmemcg->vmstats->events_pending[i] = 0;\n\n\t\tdelta_cpu =\
+  \ 0;\n\t\tv = READ_ONCE(statc->events[i]);\n\t\tif (v != statc->events_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->events_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\
+  \t\tstatc->events_prev[i] = v;\n\t\t}\n\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->events_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->events[i] += delta;\n\
+  \t\t\tif (parent)\n\t\t\t\tparent->vmstats->events_pending[i] += delta;\n\t\t}\n\
+  \t}\n\n\tfor_each_node_state(nid, N_MEMORY) {\n\t\tstruct mem_cgroup_per_node *pn\
+  \ = memcg->nodeinfo[nid];\n\t\tstruct mem_cgroup_per_node *ppn = NULL;\n\t\tstruct\
+  \ lruvec_stats_percpu *lstatc;\n\n\t\tif (parent)\n\t\t\tppn = parent->nodeinfo[nid];\n\
+  \n\t\tlstatc = per_cpu_ptr(pn->lruvec_stats_percpu, cpu);\n\n\t\tfor (i = 0; i <\
+  \ NR_VM_NODE_STAT_ITEMS; i++) {\n\t\t\tdelta = pn->lruvec_stats.state_pending[i];\n\
+  \t\t\tif (delta)\n\t\t\t\tpn->lruvec_stats.state_pending[i] = 0;\n\n\t\t\tdelta_cpu\
+  \ = 0;\n\t\t\tv = READ_ONCE(lstatc->state[i]);\n\t\t\tif (v != lstatc->state_prev[i])\
+  \ {\n\t\t\t\tdelta_cpu = v - lstatc->state_prev[i];\n\t\t\t\tdelta += delta_cpu;\n\
+  \t\t\t\tlstatc->state_prev[i] = v;\n\t\t\t}\n\n\t\t\tif (delta_cpu)\n\t\t\t\tpn->lruvec_stats.state_local[i]\
+  \ += delta_cpu;\n\n\t\t\tif (delta) {\n\t\t\t\tpn->lruvec_stats.state[i] += delta;\n\
+  \t\t\t\tif (ppn)\n\t\t\t\t\tppn->lruvec_stats.state_pending[i] += delta;\n\t\t\t\
+  }\n\t\t}\n\t}\n\tstatc->stats_updates = 0;\n\t/* We are in a per-cpu loop here,\
+  \ only do the atomic write once */\n\tif (atomic64_read(&memcg->vmstats->stats_updates))\n\
+  \t\tatomic64_set(&memcg->vmstats->stats_updates, 0);\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 9095ab05d47a..a111e0d981ba\
+  \ 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -715,6 +715,7 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n {\n \tstruct\
+  \ memcg_vmstats_percpu *statc;\n \tint cpu = smp_processor_id();\n+\tunsigned int\
+  \ stats_updates;\n \n \tif (!val)\n \t\treturn;\n@@ -722,8 +723,9 @@ static inline\
+  \ void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n \tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n \tfor (; statc; statc\
+  \ = statc->parent) {\n-\t\tstatc->stats_updates += abs(val);\n-\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n+\t\tstats_updates = READ_ONCE(statc->stats_updates) +\
+  \ abs(val);\n+\t\tWRITE_ONCE(statc->stats_updates, stats_updates);\n+\t\tif (stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n \t\t\tcontinue;\n \n \t\t/*\n@@ -731,9 +733,9 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \t\t * redundant.\
+  \ Avoid the overhead of the atomic update.\n \t\t */\n \t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  -\t\t\tatomic64_add(statc->stats_updates,\n+\t\t\tatomic64_add(stats_updates,\n\
+  \ \t\t\t\t     &statc->vmstats->stats_updates);\n-\t\tstatc->stats_updates = 0;\n\
+  +\t\tWRITE_ONCE(statc->stats_updates, 0);\n \t}\n }\n \n@@ -5887,7 +5889,7 @@ static\
+  \ void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)\n \t\
+  \t\t}\n \t\t}\n \t}\n-\tstatc->stats_updates = 0;\n+\tWRITE_ONCE(statc->stats_updates,\
+  \ 0);\n \t/* We are in a per-cpu loop here, only do the atomic write once */\n \t\
+  if (atomic64_read(&memcg->vmstats->stats_updates))\n \t\tatomic64_set(&memcg->vmstats->stats_updates,\
+  \ 0);\n```\n"
+pattern: "## Bug Pattern\n\nUnsynchronized read-modify-write of a per-CPU field that\
+  \ is also accessed \u201Cremotely\u201D from other CPUs.\n\nSpecifically, a per-CPU\
+  \ counter (statc->stats_updates) is:\n- incremented on the local CPU with plain\
+  \ loads/stores (\u201C+=\u201D),\n- concurrently read and zeroed by another CPU\
+  \ via per_cpu_ptr(..., cpu).\n\nBecause ordinary loads/stores are used instead of\
+  \ READ_ONCE/WRITE_ONCE (or atomics), this remote access pattern causes data races\
+  \ and potential torn reads/writes on the same 4-byte location."
+plan: "Plan\n\n1) Program state and lightweight globals\n- REGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrMap,\
+  \ const MemRegion*, unsigned)\n  - Values: 0 = Unknown, 1 = LocalThisCPU (this_cpu_ptr-derived),\
+  \ 2 = RemoteCPU (per_cpu_ptr with explicit cpu arg not equal to smp_processor_id()).\n\
+  - REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*, const MemRegion*)\n\
+  \  - Track simple pointer aliases so classification propagates through assignments.\n\
+  - Checker-level (non-state) containers:\n  - mutable llvm::DenseSet<const Stmt*>\
+  \ Reported; // avoid duplicate reports per statement.\n  - Optional: a BugType instance\
+  \ initialized once.\n\nRationale: We only need to know whether a pointer expression\
+  \ used as the base of a MemberExpr originates from this_cpu_ptr (local) or per_cpu_ptr\
+  \ with an explicit cpu (remote), and to propagate that classification via simple\
+  \ aliases. No heavier state is needed.\n\n2) Helper utilities\n- bool isCallNamed(const\
+  \ CallEvent/CallExpr*, StringRef)\n  - Compare callee identifier name.\n- bool isThisCpuPtrCall(const\
+  \ Expr* E)\n  - Return true if E (ignoring casts/parens) is CallExpr and callee\
+  \ name is \"this_cpu_ptr\".\n- bool isPerCpuPtrCall(const Expr* E)\n  - Return true\
+  \ if callee name is \"per_cpu_ptr\".\n- bool isLocalCPUExpr(const Expr* E)\n  -\
+  \ Return true if E is a CallExpr named \"smp_processor_id\" or \"raw_smp_processor_id\"\
+  . Otherwise false.\n- unsigned classifyPerCpuCall(const CallExpr* CE)\n  - If this_cpu_ptr:\
+  \ return LocalThisCPU.\n  - If per_cpu_ptr: return isLocalCPUExpr(Arg1) ? LocalThisCPU\
+  \ : RemoteCPU.\n  - Else 0.\n- const MemRegion* baseRegionOfExpr(const Expr* E,\
+  \ CheckerContext &C)\n  - getMemRegionFromExpr(E, C) and strip FieldElement/subregions\
+  \ back to the base variable region when needed.\n- const MemRegion* resolveAlias(const\
+  \ MemRegion* R, ProgramStateRef St)\n  - Follow PtrAliasMap chains to get the canonical\
+  \ mapped region.\n- bool insideREADorWRITE_ONCE(const Expr* AnyChild, CheckerContext\
+  \ &C)\n  - Find parent CallExpr (findSpecificTypeInParents<CallExpr>) and check\
+  \ if callee name is \"READ_ONCE\" or \"WRITE_ONCE\". Return true if yes.\n- bool\
+  \ isZeroLiteral(const Expr* E, CheckerContext &C)\n  - Use EvaluateExprToInt; return\
+  \ true if evaluation succeeded and result == 0.\n- bool isRMWCompound(const CompoundAssignOperator*\
+  \ CAO)\n  - Return true for +=, -=, ++, -- style ops (CompoundAssignOperator covers\
+  \ +=, -=; handle ++/-- via UnaryOperator below).\n\n3) checkBeginFunction\n- No\
+  \ state must persist per function; nothing required, but you may clear any lightweight\
+  \ function-local caches if you introduce them.\n\n4) checkBind (pointer origin and\
+  \ alias tracking)\n- Purpose: classify pointers as LocalThisCPU/RemoteCPU and propagate\
+  \ aliases.\n- If S is a BinaryOperator that assigns to a DeclRefExpr pointer variable\
+  \ LHSVar and the RHS is:\n  - A CallExpr CE to this_cpu_ptr/per_cpu_ptr:\n    -\
+  \ Determine kind = classifyPerCpuCall(CE).\n    - Get LHS region LReg via getMemRegionFromExpr\
+  \ on the LHS.\n    - State = State->set<PerCpuPtrMap>(LReg, kind).\n  - A DeclRefExpr\
+  \ or another pointer variable:\n    - Resolve RHS region RReg (then resolveAlias\
+  \ via PtrAliasMap).\n    - If PerCpuPtrMap has classification for RReg, set same\
+  \ classification for LReg.\n    - Record alias: State = State->set<PtrAliasMap>(LReg,\
+  \ RReg).\n  - A MemberExpr like \u201Cstatc->parent\u201D:\n    - Get base region\
+  \ BReg of that MemberExpr (the \u201Cstatc\u201D variable) and resolve alias.\n\
+  \    - If PerCpuPtrMap has classification for BReg, set the same classification\
+  \ for LReg. This keeps \u201Cstatc = statc->parent\u201D classified as Local/Remote.\n\
+  - Update C.addTransition(State) when changed.\n\n5) checkPreStmt for BinaryOperator\
+  \ (writes/zeroing and RMW \u201Cx = x + val\u201D if desired)\n- Trigger on BinaryOperator\
+  \ with opcode BO_Assign.\n- Extract LHS; if not a MemberExpr, ignore.\n- Let ME\
+  \ = cast<MemberExpr>(LHS->IgnoreParenCasts()).\n- Determine the base classification:\n\
+  \  - Case A: base expression of ME is a CallExpr to this_cpu_ptr/per_cpu_ptr =>\
+  \ classifyPerCpuCall.\n  - Case B: base is a DeclRefExpr (e.g., \u201Cstatc\u201D\
+  ):\n    - Get base region, resolve alias, and look up PerCpuPtrMap classification.\n\
+  \  - If classification is 0 (unknown), ignore.\n- If insideREADorWRITE_ONCE(LHS,\
+  \ C) is true, ignore (already protected).\n- Now decide if to warn:\n  - If classification\
+  \ == RemoteCPU:\n    - Any write to a per-CPU field should use WRITE_ONCE. If not,\
+  \ report.\n    - This covers \u201Cstatc->stats_updates = 0\u201D in the flush path.\n\
+  \  - If classification == LocalThisCPU:\n    - This assignment might be an RMW disguised\
+  \ as \u201Cx = x + k\u201D. If you want to be precise, check RHS subtree for a MemberExpr\
+  \ equivalent to LHS (same FieldDecl and same base variable after alias resolution).\
+  \ If detected and no READ/WRITE_ONCE protecting, report.\n    - Simpler (acceptable):\
+  \ only warn for Local RMW in CompoundAssignOperator/UnaryOperator and do not warn\
+  \ for plain \u201C=\u201D. See next steps.\n\n6) checkPreStmt for CompoundAssignOperator\
+  \ (local RMW like \u201C+=\u201D, \u201C-=\u201D\n- Trigger on CompoundAssignOperator.\n\
+  - If LHS is not MemberExpr, ignore.\n- Compute base classification as in step 5.\n\
+  - If classification == LocalThisCPU and not inside READ/WRITE_ONCE (on the LHS),\
+  \ report:\n  - Message: \u201CRMW on per-CPU field without READ_ONCE/WRITE_ONCE;\
+  \ field may be accessed from other CPUs.\u201D\n- If classification == RemoteCPU\
+  \ and not inside WRITE_ONCE, also report (rare but still unsafe).\n\n7) checkPreStmt\
+  \ for UnaryOperator (++/--)\n- Trigger on UnaryOperator with opcode UO_PreInc, UO_PostInc,\
+  \ UO_PreDec, UO_PostDec.\n- If operand is a MemberExpr, classify base as in step\
+  \ 5.\n- If LocalThisCPU and not inside READ/WRITE_ONCE, report same as step 6.\n\
+  - If RemoteCPU and not inside WRITE_ONCE, report.\n\n8) Macro-protected patterns\
+  \ (avoid FPs)\n- Skip reporting if the MemberExpr is an argument to a WRITE_ONCE/READ_ONCE\
+  \ call:\n  - For remote writes (assignments), require WRITE_ONCE.\n  - For local\
+  \ RMW, require both READ_ONCE and WRITE_ONCE pattern; practically, the presence\
+  \ of either READ_ONCE on the read side or WRITE_ONCE on the write side will change\
+  \ the AST shape and avoid a raw CompoundAssignOperator. In our checker we simply\
+  \ skip if insideREADorWRITE_ONCE is true.\n\n9) Bug report\n- When a violation is\
+  \ detected, create a non-fatal error node with C.generateNonFatalErrorNode().\n\
+  - Emit a PathSensitiveBugReport with a short message:\n  - For remote write: \u201C\
+  Remote per-CPU field write without WRITE_ONCE.\u201D\n  - For local RMW: \u201C\
+  RMW on per-CPU field without READ_ONCE/WRITE_ONCE.\u201D\n- Use the assignment/compound/unary\
+  \ operator statement as the location. Gate with the Reported set to avoid duplicates\
+  \ for the same Stmt.\n\n10) Notes on coverage and simplicity\n- This plan intentionally\
+  \ focuses on:\n  - Detecting writes to per-CPU fields through this_cpu_ptr/per_cpu_ptr-derived\
+  \ pointers.\n  - Flagging remote writes lacking WRITE_ONCE.\n  - Flagging local\
+  \ RMW operations (+=, ++, etc.) lacking READ/WRITE_ONCE.\n- It does not require\
+  \ whole-program knowledge of other functions: the remote path is directly recognized\
+  \ by per_cpu_ptr\u2019s cpu argument, and local RMW is recognized by CompoundAssign/Unary\
+  \ ops.\n- Aliasing within the function is handled via PtrAliasMap. Assignments like\
+  \ \u201Cstatc = statc->parent\u201D retain classification.\n\n11) Callback summary\n\
+  - checkBeginFunction: optional cleanup.\n- checkBind: classify pointer variables\
+  \ as LocalThisCPU/RemoteCPU; propagate via PtrAliasMap; keep classification through\
+  \ \u201C->parent\u201D assignments.\n- checkPreStmt(CompoundAssignOperator): detect\
+  \ local RMW on per-CPU field without READ/WRITE_ONCE; report.\n- checkPreStmt(UnaryOperator\
+  \ ++/--): same as above.\n- checkPreStmt(BinaryOperator BO_Assign): detect remote\
+  \ write to per-CPU field without WRITE_ONCE; optionally detect \u201Cx = x + k\u201D\
+  \ RMW if you implement LHS-in-RHS check; report.\n\nThis is the simplest, targeted\
+  \ approach to catch the kernel bug pattern: plain read-modify-write or zeroing of\
+  \ per-CPU fields used cross-CPU, without READ_ONCE/WRITE_ONCE."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/Store.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"llvm/ADT/DenseSet.h\"\n#include <optional>\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nREGISTER_MAP_WITH_PROGRAMSTATE(PerCpuPtrMap,\
+  \ const MemRegion*, unsigned)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const\
+  \ MemRegion*, const MemRegion*)\n\nnamespace {\n\nenum PerCpuKind : unsigned {\n\
+  \  PCPU_Unknown = 0,\n  PCPU_LocalThisCPU = 1,  // Derived from this_cpu_ptr(...)\
+  \ or per_cpu_ptr(..., smp_processor_id())\n  PCPU_RemoteCPU = 2      // Derived\
+  \ from per_cpu_ptr(..., cpu) with explicit CPU not this CPU\n};\n\nclass SAGenTestChecker\n\
+  \  : public Checker<\n        check::Bind,\n        check::PostStmt<DeclStmt>,\n\
+  \        check::PreStmt<BinaryOperator>,\n        check::PreStmt<CompoundAssignOperator>,\n\
+  \        check::PreStmt<UnaryOperator>\n      > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n   // Avoid duplicate reports for the same statement.\n   mutable llvm::DenseSet<const\
+  \ Stmt*> Reported;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this,\
+  \ \"Per-CPU data race\", \"Concurrency\")) {}\n\n      void checkBind(SVal Loc,\
+  \ SVal Val, const Stmt *S, CheckerContext &C) const;\n      void checkPostStmt(const\
+  \ DeclStmt *DS, CheckerContext &C) const;\n      void checkPreStmt(const BinaryOperator\
+  \ *BO, CheckerContext &C) const;\n      void checkPreStmt(const CompoundAssignOperator\
+  \ *CAO, CheckerContext &C) const;\n      void checkPreStmt(const UnaryOperator *UO,\
+  \ CheckerContext &C) const;\n\n   private:\n      // Helpers\n      static const\
+  \ MemRegion* baseRegionOfExpr(const Expr *E, CheckerContext &C);\n      static const\
+  \ MemRegion* resolveAlias(const MemRegion *R, ProgramStateRef State);\n      static\
+  \ bool isCallNamed(const CallExpr *CE, StringRef Name, CheckerContext &C);\n   \
+  \   static bool isLocalCPUExpr(const Expr *E, CheckerContext &C);\n      static\
+  \ unsigned classifyPerCpuCall(const CallExpr *CE, CheckerContext &C);\n      static\
+  \ bool insideREADorWRITE_ONCE(const Expr *Child, CheckerContext &C);\n\n      static\
+  \ const Expr* getRHSFromStore(const Stmt *StoreE, const MemRegion *LReg, CheckerContext\
+  \ &C);\n      static const Expr* stripCasts(const Expr *E) {\n        return E ?\
+  \ E->IgnoreParenCasts() : nullptr;\n      }\n      unsigned getClassFromMemberBase(const\
+  \ Expr *Base, CheckerContext &C) const;\n\n      void setClassification(ProgramStateRef\
+  \ &State, const MemRegion *R, unsigned Kind) const;\n      std::optional<unsigned>\
+  \ getClassification(ProgramStateRef State, const MemRegion *R) const;\n\n      void\
+  \ trackAlias(ProgramStateRef &State, const MemRegion *A, const MemRegion *B) const;\n\
+  \n      void reportIfNeeded(const Stmt *S, StringRef Msg, CheckerContext &C) const;\n\
+  };\n\nconst MemRegion* SAGenTestChecker::baseRegionOfExpr(const Expr *E, CheckerContext\
+  \ &C) {\n  if (!E) return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(E,\
+  \ C);\n  if (!MR) return nullptr;\n  MR = MR->getBaseRegion();\n  return MR;\n}\n\
+  \nconst MemRegion* SAGenTestChecker::resolveAlias(const MemRegion *R, ProgramStateRef\
+  \ State) {\n  if (!R) return nullptr;\n  // Follow simple alias chains, with a small\
+  \ limit to avoid cycles.\n  const MemRegion *Cur = R;\n  for (int i = 0; i < 8;\
+  \ ++i) {\n    const MemRegion *const *NextPtr = State->get<PtrAliasMap>(Cur);\n\
+  \    if (!NextPtr) break;\n    const MemRegion *Next = *NextPtr;\n    if (!Next\
+  \ || Next == Cur) break;\n    Cur = Next;\n  }\n  return Cur;\n}\n\nbool SAGenTestChecker::isCallNamed(const\
+  \ CallExpr *CE, StringRef Name, CheckerContext &C) {\n  if (!CE) return false;\n\
+  \  const Expr *CalleeE = CE->getCallee();\n  if (!CalleeE) return false;\n  return\
+  \ ExprHasName(CalleeE, Name, C);\n}\n\nbool SAGenTestChecker::isLocalCPUExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  E = stripCasts(E);\n  const CallExpr *CE = dyn_cast_or_null<CallExpr>(E);\n\
+  \  if (!CE) return false;\n  // smp_processor_id() or raw_smp_processor_id()\n \
+  \ if (isCallNamed(CE, \"smp_processor_id\", C)) return true;\n  if (isCallNamed(CE,\
+  \ \"raw_smp_processor_id\", C)) return true;\n  return false;\n}\n\nunsigned SAGenTestChecker::classifyPerCpuCall(const\
+  \ CallExpr *CE, CheckerContext &C) {\n  if (!CE) return PCPU_Unknown;\n  if (isCallNamed(CE,\
+  \ \"this_cpu_ptr\", C))\n    return PCPU_LocalThisCPU;\n\n  if (isCallNamed(CE,\
+  \ \"per_cpu_ptr\", C)) {\n    // per_cpu_ptr(ptr, cpu)\n    if (CE->getNumArgs()\
+  \ >= 2) {\n      const Expr *CPUArg = stripCasts(CE->getArg(1));\n      if (isLocalCPUExpr(CPUArg,\
+  \ C))\n        return PCPU_LocalThisCPU;\n      return PCPU_RemoteCPU;\n    }\n\
+  \  }\n  return PCPU_Unknown;\n}\n\nbool SAGenTestChecker::insideREADorWRITE_ONCE(const\
+  \ Expr *Child, CheckerContext &C) {\n  if (!Child) return false;\n  const CallExpr\
+  \ *ParentCall = findSpecificTypeInParents<CallExpr>(Child, C);\n  if (!ParentCall)\
+  \ return false;\n  if (isCallNamed(ParentCall, \"READ_ONCE\", C)) return true;\n\
+  \  if (isCallNamed(ParentCall, \"WRITE_ONCE\", C)) return true;\n  return false;\n\
+  }\n\nconst Expr* SAGenTestChecker::getRHSFromStore(const Stmt *StoreE, const MemRegion\
+  \ *LReg, CheckerContext &C) {\n  if (!StoreE) return nullptr;\n\n  if (const auto\
+  \ *BO = dyn_cast<BinaryOperator>(StoreE)) {\n    if (BO->isAssignmentOp())\n   \
+  \   return stripCasts(BO->getRHS());\n  }\n\n  if (const auto *DS = dyn_cast<DeclStmt>(StoreE))\
+  \ {\n    for (const Decl *D : DS->decls()) {\n      const auto *VD = dyn_cast<VarDecl>(D);\n\
+  \      if (!VD) continue;\n      if (!VD->hasInit()) continue;\n\n      // Match\
+  \ the specific variable bound in this bind via its region.\n      MemRegionManager\
+  \ &MRMgr = C.getStoreManager().getRegionManager();\n      const VarRegion *VRVar\
+  \ = MRMgr.getVarRegion(VD, C.getLocationContext());\n      const MemRegion *VR =\
+  \ VRVar ? VRVar->getBaseRegion() : nullptr;\n      if (!VR) continue;\n      if\
+  \ (VR == LReg)\n        return stripCasts(VD->getInit());\n    }\n  }\n\n  // As\
+  \ a fallback, if StoreE is an Expr, just return it (best-effort).\n  if (const auto\
+  \ *E = dyn_cast<Expr>(StoreE))\n    return stripCasts(E);\n\n  return nullptr;\n\
+  }\n\nunsigned SAGenTestChecker::getClassFromMemberBase(const Expr *Base, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n  Base = stripCasts(Base);\n\
+  \n  if (const auto *CE = dyn_cast<CallExpr>(Base)) {\n    return classifyPerCpuCall(CE,\
+  \ C);\n  }\n\n  const MemRegion *BR = baseRegionOfExpr(Base, C);\n  if (!BR) return\
+  \ PCPU_Unknown;\n  BR = resolveAlias(BR, State);\n  const unsigned *K = State->get<PerCpuPtrMap>(BR);\n\
+  \  return K ? *K : PCPU_Unknown;\n}\n\nvoid SAGenTestChecker::setClassification(ProgramStateRef\
+  \ &State, const MemRegion *R, unsigned Kind) const {\n  if (!R || Kind == PCPU_Unknown)\
+  \ return;\n  const unsigned *Old = State->get<PerCpuPtrMap>(R);\n  if (!Old || *Old\
+  \ != Kind) {\n    State = State->set<PerCpuPtrMap>(R, Kind);\n  }\n}\n\nstd::optional<unsigned>\
+  \ SAGenTestChecker::getClassification(ProgramStateRef State, const MemRegion *R)\
+  \ const {\n  if (!R) return std::nullopt;\n  const unsigned *K = State->get<PerCpuPtrMap>(R);\n\
+  \  if (!K) return std::nullopt;\n  return *K;\n}\n\nvoid SAGenTestChecker::trackAlias(ProgramStateRef\
+  \ &State, const MemRegion *A, const MemRegion *B) const {\n  if (!A || !B) return;\n\
+  \  State = State->set<PtrAliasMap>(A, B);\n  State = State->set<PtrAliasMap>(B,\
+  \ A);\n}\n\nvoid SAGenTestChecker::reportIfNeeded(const Stmt *S, StringRef Msg,\
+  \ CheckerContext &C) const {\n  if (!S) return;\n  if (Reported.count(S)) return;\n\
+  \n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N) return;\n\n  auto\
+  \ R = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);\n  R->addRange(S->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n  Reported.insert(S);\n}\n\n// Track pointer origins\
+  \ and aliases.\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\n  const\
+  \ MemRegion *LReg = Loc.getAsRegion();\n  if (!LReg) return;\n  LReg = LReg->getBaseRegion();\n\
+  \  if (!LReg) return;\n\n  const Expr *RHS = getRHSFromStore(S, LReg, C);\n  if\
+  \ (!RHS) return;\n\n  RHS = stripCasts(RHS);\n\n  bool Changed = false;\n\n  //\
+  \ Case 1: RHS is a (this_cpu_ptr/per_cpu_ptr) call\n  if (const auto *CE = dyn_cast<CallExpr>(RHS))\
+  \ {\n    unsigned Kind = classifyPerCpuCall(CE, C);\n    if (Kind != PCPU_Unknown)\
+  \ {\n      setClassification(State, LReg, Kind);\n      Changed = true;\n    }\n\
+  \  }\n\n  // Case 2: RHS is a DeclRefExpr to another pointer; propagate classification\
+  \ and alias\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(RHS)) {\n    const MemRegion\
+  \ *RReg = baseRegionOfExpr(DRE, C);\n    if (RReg) {\n      RReg = resolveAlias(RReg,\
+  \ State);\n      if (auto K = getClassification(State, RReg)) {\n        setClassification(State,\
+  \ LReg, *K);\n        Changed = true;\n      }\n      trackAlias(State, LReg, RReg);\n\
+  \      Changed = true;\n    }\n  }\n\n  // Case 3: RHS is a MemberExpr like \"statc->parent\"\
+  ; propagate base classification\n  if (const auto *ME = dyn_cast<MemberExpr>(RHS))\
+  \ {\n    unsigned K = getClassFromMemberBase(ME->getBase(), C);\n    if (K != PCPU_Unknown)\
+  \ {\n      setClassification(State, LReg, K);\n      Changed = true;\n    }\n  \
+  \  // Do not alias LReg with ME base; they are different addresses.\n  }\n\n  if\
+  \ (Changed)\n    C.addTransition(State);\n}\n\n// Handle VarDecl initializers (e.g.,\
+  \ struct *statc = per_cpu_ptr(...);)\nvoid SAGenTestChecker::checkPostStmt(const\
+  \ DeclStmt *DS, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  for (const Decl *D : DS->decls()) {\n    const auto\
+  \ *VD = dyn_cast<VarDecl>(D);\n    if (!VD || !VD->hasInit())\n      continue;\n\
+  \n    const Expr *Init = stripCasts(VD->getInit());\n    if (!Init) continue;\n\n\
+  \    MemRegionManager &MRMgr = C.getStoreManager().getRegionManager();\n    const\
+  \ VarRegion *VRVar = MRMgr.getVarRegion(VD, C.getLocationContext());\n    const\
+  \ MemRegion *LReg = VRVar ? VRVar->getBaseRegion() : nullptr;\n    if (!LReg) continue;\n\
+  \n    // Classify per_cpu calls\n    if (const auto *CE = dyn_cast<CallExpr>(Init))\
+  \ {\n      unsigned Kind = classifyPerCpuCall(CE, C);\n      if (Kind != PCPU_Unknown)\
+  \ {\n        setClassification(State, LReg, Kind);\n        Changed = true;\n  \
+  \    }\n    } else if (const auto *DRE = dyn_cast<DeclRefExpr>(Init)) {\n      //\
+  \ Propagate from another var\n      const MemRegion *RReg = baseRegionOfExpr(DRE,\
+  \ C);\n      if (RReg) {\n        RReg = resolveAlias(RReg, State);\n        if\
+  \ (auto K = getClassification(State, RReg)) {\n          setClassification(State,\
+  \ LReg, *K);\n          Changed = true;\n        }\n        trackAlias(State, LReg,\
+  \ RReg);\n        Changed = true;\n      }\n    } else if (const auto *ME = dyn_cast<MemberExpr>(Init))\
+  \ {\n      unsigned K = getClassFromMemberBase(ME->getBase(), C);\n      if (K !=\
+  \ PCPU_Unknown) {\n        setClassification(State, LReg, K);\n        Changed =\
+  \ true;\n      }\n    }\n  }\n\n  if (Changed)\n    C.addTransition(State);\n}\n\
+  \n// Detect remote write: statc->stats_updates = ...\nvoid SAGenTestChecker::checkPreStmt(const\
+  \ BinaryOperator *BO, CheckerContext &C) const {\n  if (!BO->isAssignmentOp())\n\
+  \    return;\n\n  const Expr *LHS = stripCasts(BO->getLHS());\n  if (!LHS) return;\n\
+  \n  const auto *ME = dyn_cast<MemberExpr>(LHS);\n  if (!ME) return;\n\n  // If already\
+  \ protected by READ/WRITE_ONCE, skip.\n  if (insideREADorWRITE_ONCE(ME, C))\n  \
+  \  return;\n\n  unsigned Kind = getClassFromMemberBase(ME->getBase(), C);\n  if\
+  \ (Kind == PCPU_RemoteCPU) {\n    reportIfNeeded(BO, \"Remote per-CPU field write\
+  \ without WRITE_ONCE\", C);\n  }\n  // For local plain assignment we do not warn\
+  \ (RMW is handled below).\n}\n\n// Detect local/remote RMW: \"+=\", \"-=\"\nvoid\
+  \ SAGenTestChecker::checkPreStmt(const CompoundAssignOperator *CAO, CheckerContext\
+  \ &C) const {\n  const Expr *LHS = stripCasts(CAO->getLHS());\n  if (!LHS) return;\n\
+  \n  const auto *ME = dyn_cast<MemberExpr>(LHS);\n  if (!ME) return;\n\n  if (insideREADorWRITE_ONCE(ME,\
+  \ C))\n    return;\n\n  unsigned Kind = getClassFromMemberBase(ME->getBase(), C);\n\
+  \  if (Kind == PCPU_LocalThisCPU || Kind == PCPU_RemoteCPU) {\n    reportIfNeeded(CAO,\
+  \ \"RMW on per-CPU field without READ_ONCE/WRITE_ONCE\", C);\n  }\n}\n\n// Detect\
+  \ ++/-- on per-CPU fields\nvoid SAGenTestChecker::checkPreStmt(const UnaryOperator\
+  \ *UO, CheckerContext &C) const {\n  UnaryOperatorKind Op = UO->getOpcode();\n \
+  \ if (Op != UO_PreInc && Op != UO_PostInc && Op != UO_PreDec && Op != UO_PostDec)\n\
+  \    return;\n\n  const Expr *Sub = stripCasts(UO->getSubExpr());\n  if (!Sub) return;\n\
+  \n  const auto *ME = dyn_cast<MemberExpr>(Sub);\n  if (!ME) return;\n\n  if (insideREADorWRITE_ONCE(ME,\
+  \ C))\n    return;\n\n  unsigned Kind = getClassFromMemberBase(ME->getBase(), C);\n\
+  \  if (Kind == PCPU_LocalThisCPU || Kind == PCPU_RemoteCPU) {\n    reportIfNeeded(UO,\
+  \ \"RMW on per-CPU field without READ_ONCE/WRITE_ONCE\", C);\n  }\n}\n\n} // end\
+  \ anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unsynchronized RMW and remote writes on per-CPU fields lacking\
+  \ READ_ONCE/WRITE_ONCE\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

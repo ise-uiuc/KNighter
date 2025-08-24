@@ -1,0 +1,134 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -29,6 +29,24 @@ REGISTER_MAP_WITH_PROGRAMSTATE(PartiallyInitAgg, const VarDecl*, char)
+ REGISTER_SET_WITH_PROGRAMSTATE(ZeroCleared, const VarDecl*)
+
++// Utility functions provided by the prompt
++template <typename T>
++const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
++template <typename T>
++const T* findSpecificTypeInChildren(const Stmt *S);
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C);
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C);
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E);
++bool getStringSize(llvm::APInt &StringSize, const Expr *E);
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C);
++struct KnownDerefFunction {
++  const char *Name;
++  llvm::SmallVector<unsigned, 4> Params;
++};
++bool functionKnownToDeref(const CallEvent &Call,
++                          llvm::SmallVectorImpl<unsigned> &DerefParams);
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
++
+ namespace {
+
+ class SAGenTestChecker : public Checker<
+@@ -134,8 +152,11 @@     return LenVal >= VarSize;
+   }
+
+-  // Fallback: textual containment of variable name (captures sizeof(var) pattern)
+-  return ExprHasName(LenExpr, VD->getName(), C);
++  // Fallback: textual containment of sizeof(var) pattern
++  if (ExprHasName(LenExpr, "sizeof", C) && ExprHasName(LenExpr, VD->getName(), C))
++    return true;
++
++  return false;
+ }
+
+ bool SAGenTestChecker::isNetlinkExportCall(const CallEvent &Call, unsigned &LenIdx, unsigned &DataIdx, CheckerContext &C) {
+@@ -204,13 +225,29 @@   return ZK_None;
+ }
+
+-// Detect if a record type has implicit padding/holes (including tail padding).
+-// Conservative rules applied:
+-//  - Any union is treated as having padding.
+-//  - Any bitfield presence is treated as having padding.
+-//  - Otherwise, check inter-field gaps and tail padding using ASTRecordLayout.
+-//  - Packed attributes are respected by the layout.
++// Recursively check if a type (record or arrays of records) has implicit padding.
++// This version uses ASTRecordLayout's DataSize vs Size, detects inter-field gaps,
++// bitfields, unions, and recurses into nested records and array element types.
++static QualType unwrapArrayElementBaseType(QualType T) {
++  const Type *Ty = T.getTypePtr();
++  while (const auto *AT = dyn_cast<ArrayType>(Ty)) {
++    T = cast<ArrayType>(Ty)->getElementType();
++    Ty = T.getTypePtr();
++  }
++  return T;
++}
++
+ bool SAGenTestChecker::hasImplicitPadding(QualType QT, ASTContext &Ctx) {
++  QT = QT.getCanonicalType().getUnqualifiedType();
++
++  // If it's an array, check the base element type.
++  if (const auto *AT = dyn_cast<ArrayType>(QT.getTypePtr())) {
++    QualType ElemT = unwrapArrayElementBaseType(QT);
++    if (ElemT->isRecordType())
++      return hasImplicitPadding(ElemT, Ctx);
++    return false;
++  }
++
+   const RecordType *RT = QT->getAs<RecordType>();
+   if (!RT)
+     return false;
+@@ -224,36 +261,38 @@     return false;
+
+   if (RD->isUnion())
+-    return true; // conservative: a smaller active member leaves extra bytes
++    return true; // conservative for unions
+
+   const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
+
++  // Inter-field padding and nested record padding
+   uint64_t PrevEndBits = 0;
+-  bool First = true;
+   unsigned Index = 0;
+
+   for (const FieldDecl *FD : RD->fields()) {
+-    // Any bit-field implies potential unused bits.
+     if (FD->isBitField())
+       return true;
+
++    QualType FT = FD->getType();
++    // Recurse into nested records/array-of-records
++    {
++      QualType Base = unwrapArrayElementBaseType(FT);
++      if (Base->isRecordType() && hasImplicitPadding(Base, Ctx))
++        return true;
++    }
++
+     uint64_t FieldOffsetBits = Layout.getFieldOffset(Index);
+-
+-    if (!First) {
+-      if (FieldOffsetBits > PrevEndBits)
+-        return true; // gap between fields
+-    }
+-
+-    uint64_t FieldSizeBits = Ctx.getTypeSize(FD->getType());
++    if (Index > 0 && FieldOffsetBits > PrevEndBits)
++      return true; // gap between fields
++
++    uint64_t FieldSizeBits = Ctx.getTypeSize(FT);
+     PrevEndBits = FieldOffsetBits + FieldSizeBits;
+
+     ++Index;
+-    First = false;
+-  }
+-
+-  // Tail padding check
+-  uint64_t TotalBits = Ctx.getTypeSize(QT);
+-  if (!First && PrevEndBits < TotalBits)
++  }
++
++  // Tail padding check using DataSize vs Size (more robust than manual sum).
++  if (Layout.getSize() > Layout.getDataSize())
+     return true;
+
+   return false;
+@@ -310,7 +349,7 @@       continue;
+     }
+
+-    // Non-zeroing init-list: only interesting if the type actually has padding.
++    // Only interesting if the type actually has implicit padding.
+     if (isNonZeroingInitList(ILE) &&
+         hasImplicitPadding(VD->getType(), C.getASTContext())) {
+       ProgramStateRef NewState = State->set<PartiallyInitAgg>(VD, 1);

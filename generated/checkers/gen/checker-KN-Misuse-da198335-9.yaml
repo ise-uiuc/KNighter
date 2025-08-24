@@ -1,0 +1,460 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: da1983355ccefcfb3f8eb410fff82e250fa87e39
+commit_type: Misuse
+index: 9
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Attr.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"clang/AST/Type.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state map: track whether a specific count field (as a FieldRegion) is\
+  \ initialized.\n// Key: const MemRegion* (the FieldRegion for the count field)\n\
+  // Val: char (1 means initialized)\nREGISTER_MAP_WITH_PROGRAMSTATE(CountInitMap,\
+  \ const MemRegion*, char)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Write before count init\", \"API Misuse\")) {}\n\n  \
+  \    void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n      void\
+  \ checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\n   private:\n\
+  \      // Helpers\n      static bool isFlexibleArray(const FieldDecl *FD);\n   \
+  \   static bool isMemWriteLikeCall(const CallEvent &Call, CheckerContext &C);\n\
+  \      static bool sizeArgDefinitelyZero(const CallEvent &Call, CheckerContext &C);\n\
+  \      static const MemberExpr *findMemberExprInArgToFAM(const Expr *Arg,\n    \
+  \                                                    const FieldDecl *&FAMFieldOut,\n\
+  \                                                        const FieldDecl *&CountFieldOut,\n\
+  \                                                        CheckerContext &C);\n \
+  \     static const MemRegion* getBaseRegionOfME(const MemberExpr *ME, CheckerContext\
+  \ &C);\n\n      static const FieldDecl* getCountFieldFromCountedBy(const FieldDecl\
+  \ *FAMField,\n                                                         CheckerContext\
+  \ &C);\n      static bool fieldIsCountFieldInRecord(const FieldDecl *FD, CheckerContext\
+  \ &C);\n\n      void reportWriteBeforeCountInit(StringRef Msg, const Stmt *S, CheckerContext\
+  \ &C) const;\n};\n\n// ------------------------ Helper implementations ------------------------\n\
+  \nbool SAGenTestChecker::isFlexibleArray(const FieldDecl *FD) {\n  if (!FD) return\
+  \ false;\n  QualType QT = FD->getType();\n  if (const auto *IAT = dyn_cast<IncompleteArrayType>(QT.getTypePtr()))\n\
+  \    (void)IAT; // just to silence unused warning in some builds\n  if (QT->isIncompleteArrayType())\n\
+  \    return true;\n  if (const auto *CAT = dyn_cast<ConstantArrayType>(QT.getTypePtr()))\
+  \ {\n    return CAT->getSize() == 0;\n  }\n  return false;\n}\n\nconst FieldDecl*\
+  \ SAGenTestChecker::getCountFieldFromCountedBy(const FieldDecl *FAMField,\n    \
+  \                                                          CheckerContext &C) {\n\
+  \  if (!FAMField) return nullptr;\n\n  // Check the attribute presence.\n  if (!FAMField->hasAttrs())\n\
+  \    return nullptr;\n\n  const CountedByAttr *A = FAMField->getAttr<CountedByAttr>();\n\
+  \  if (!A)\n    return nullptr;\n\n  // Extract the spelled attribute text and parse\
+  \ the argument name.\n  const SourceManager &SM = C.getSourceManager();\n  const\
+  \ LangOptions &Lang = C.getLangOpts();\n\n  // The attribute's source range should\
+  \ contain something like \"__counted_by(name)\" or \"counted_by(name)\".\n  SourceRange\
+  \ R = A->getRange();\n  if (R.isInvalid())\n    return nullptr;\n\n  CharSourceRange\
+  \ CR = CharSourceRange::getTokenRange(R);\n  StringRef AttrText = Lexer::getSourceText(CR,\
+  \ SM, Lang);\n  if (AttrText.empty())\n    return nullptr;\n\n  // Find parameter\
+  \ inside parentheses.\n  size_t lpos = AttrText.find('(');\n  size_t rpos = AttrText.rfind(')');\n\
+  \  if (lpos == StringRef::npos || rpos == StringRef::npos || rpos <= lpos + 1)\n\
+  \    return nullptr;\n\n  StringRef Param = AttrText.slice(lpos + 1, rpos).trim();\n\
+  \  if (Param.empty())\n    return nullptr;\n\n  // Sometimes the macro could expand\
+  \ weirdly; keep it simple: expect identifier.\n  // Strip potential casts or address-of\
+  \ (just in case), though kernel uses a bare identifier.\n  while (!Param.empty()\
+  \ && (Param.front() == '&' || Param.front() == '*'))\n    Param = Param.drop_front().ltrim();\n\
+  \n  // Lookup a field with matching name in the same record.\n  const RecordDecl\
+  \ *RD = FAMField->getParent();\n  if (!RD)\n    return nullptr;\n\n  for (const\
+  \ FieldDecl *FD : RD->fields()) {\n    if (FD && FD->getIdentifier() && FD->getName()\
+  \ == Param)\n      return FD;\n  }\n\n  return nullptr;\n}\n\nbool SAGenTestChecker::fieldIsCountFieldInRecord(const\
+  \ FieldDecl *FD, CheckerContext &C) {\n  if (!FD) return false;\n  const RecordDecl\
+  \ *RD = FD->getParent();\n  if (!RD) return false;\n\n  for (const FieldDecl *G\
+  \ : RD->fields()) {\n    if (!G) continue;\n    if (!isFlexibleArray(G))\n     \
+  \ continue;\n    const FieldDecl *CF = getCountFieldFromCountedBy(G, C);\n    if\
+  \ (CF == FD)\n      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isMemWriteLikeCall(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE) return false;\n\n  return ExprHasName(OE, \"memcpy\", C) || ExprHasName(OE,\
+  \ \"memmove\", C);\n}\n\nbool SAGenTestChecker::sizeArgDefinitelyZero(const CallEvent\
+  \ &Call, CheckerContext &C) {\n  if (Call.getNumArgs() < 3)\n    return false;\n\
+  \n  const Expr *SizeE = Call.getArgExpr(2);\n  if (!SizeE)\n    return false;\n\n\
+  \  llvm::APSInt Res;\n  if (EvaluateExprToInt(Res, SizeE, C)) {\n    return Res\
+  \ == 0;\n  }\n  return false;\n}\n\nconst MemberExpr *SAGenTestChecker::findMemberExprInArgToFAM(const\
+  \ Expr *Arg,\n                                                             const\
+  \ FieldDecl *&FAMFieldOut,\n                                                   \
+  \          const FieldDecl *&CountFieldOut,\n                                  \
+  \                           CheckerContext &C) {\n  FAMFieldOut = nullptr;\n  CountFieldOut\
+  \ = nullptr;\n\n  if (!Arg)\n    return nullptr;\n\n  // Search downwards for a\
+  \ MemberExpr\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(Arg);\n\
+  \  if (!ME)\n    return nullptr;\n\n  const ValueDecl *VD = ME->getMemberDecl();\n\
+  \  const FieldDecl *FD = dyn_cast_or_null<FieldDecl>(VD);\n  if (!FD)\n    return\
+  \ nullptr;\n\n  if (!isFlexibleArray(FD))\n    return nullptr;\n\n  const FieldDecl\
+  \ *CountFD = getCountFieldFromCountedBy(FD, C);\n  if (!CountFD)\n    return nullptr;\n\
+  \n  FAMFieldOut = FD;\n  CountFieldOut = CountFD;\n  return ME;\n}\n\nconst MemRegion*\
+  \ SAGenTestChecker::getBaseRegionOfME(const MemberExpr *ME, CheckerContext &C) {\n\
+  \  if (!ME)\n    return nullptr;\n  const Expr *BaseE = ME->getBase();\n  if (!BaseE)\n\
+  \    return nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(BaseE, C);\n\
+  \  if (!MR)\n    return nullptr;\n  MR = MR->getBaseRegion();\n  return MR;\n}\n\
+  \nvoid SAGenTestChecker::reportWriteBeforeCountInit(StringRef Msg, const Stmt *S,\
+  \ CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// ------------------------ Checker callbacks ------------------------\n\n\
+  void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  if (!isMemWriteLikeCall(Call, C))\n    return;\n\n  // Destination pointer\
+  \ is arg0.\n  if (Call.getNumArgs() < 1)\n    return;\n  const Expr *DstE = Call.getArgExpr(0);\n\
+  \  if (!DstE)\n    return;\n\n  const FieldDecl *FAMField = nullptr;\n  const FieldDecl\
+  \ *CountField = nullptr;\n  const MemberExpr *DstME = findMemberExprInArgToFAM(DstE,\
+  \ FAMField, CountField, C);\n  if (!DstME || !FAMField || !CountField)\n    return;\n\
+  \n  // Get the base object region (e.g., tz)\n  const MemRegion *Base = getBaseRegionOfME(DstME,\
+  \ C);\n  if (!Base)\n    return;\n\n  // Compute the FieldRegion for the count field\
+  \ on this base.\n  MemRegionManager &MRMgr = C.getSValBuilder().getRegionManager();\n\
+  \  const SubRegion *Super = dyn_cast<SubRegion>(Base);\n  if (!Super)\n    return;\n\
+  \n  const FieldRegion *CountFR = MRMgr.getFieldRegion(CountField, Super);\n  if\
+  \ (!CountFR)\n    return;\n\n  ProgramStateRef State = C.getState();\n  const char\
+  \ *Inited = State->get<CountInitMap>(CountFR);\n  if (Inited) {\n    // Already\
+  \ initialized on this path.\n    return;\n  }\n\n  // Optional: if size is definitely\
+  \ zero, skip warning\n  if (sizeArgDefinitelyZero(Call, C))\n    return;\n\n  //\
+  \ Report: write to counted_by FAM before initializing count field.\n  reportWriteBeforeCountInit(\"\
+  Write to __counted_by() flexible array before initializing its count field\",\n\
+  \                             Call.getOriginExpr(), C);\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  const MemRegion *Reg\
+  \ = Loc.getAsRegion();\n  if (!Reg)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  MemRegionManager &MRMgr = C.getSValBuilder().getRegionManager();\n\n  // Case\
+  \ 1: Assigning to a field: if it's the count field, mark initialized.\n  if (const\
+  \ auto *FR = dyn_cast<FieldRegion>(Reg)) {\n    const FieldDecl *FD = FR->getDecl();\n\
+  \    if (FD && fieldIsCountFieldInRecord(FD, C)) {\n      // Mark this specific\
+  \ count field region as initialized.\n      State = State->set<CountInitMap>(FR,\
+  \ 1);\n      C.addTransition(State);\n      return;\n    }\n  }\n\n  // Case 2:\
+  \ Direct write into the flexible array via element region: tz->arr[i] = ...\n  if\
+  \ (const auto *ER = dyn_cast<ElementRegion>(Reg)) {\n    const MemRegion *SR = ER->getSuperRegion();\n\
+  \    const auto *FReg = dyn_cast<FieldRegion>(SR);\n    if (!FReg)\n      return;\n\
+  \n    const FieldDecl *FAMField = FReg->getDecl();\n    if (!FAMField || !isFlexibleArray(FAMField))\n\
+  \      return;\n\n    const FieldDecl *CountField = getCountFieldFromCountedBy(FAMField,\
+  \ C);\n    if (!CountField)\n      return;\n\n    // Super region of the field is\
+  \ the base object region (tz).\n    const SubRegion *Super = dyn_cast<SubRegion>(FReg->getSuperRegion());\n\
+  \    if (!Super)\n      return;\n\n    const FieldRegion *CountFR = MRMgr.getFieldRegion(CountField,\
+  \ Super);\n    if (!CountFR)\n      return;\n\n    const char *Inited = State->get<CountInitMap>(CountFR);\n\
+  \    if (!Inited) {\n      // Count field not yet initialized; report.\n      reportWriteBeforeCountInit(\"\
+  Write to __counted_by() flexible array before initializing its count field\", S,\
+  \ C);\n    }\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect writes to __counted_by() flexible arrays before initializing the\
+  \ count field\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nthermal: core: Move initial num_trips assignment before\
+  \ memcpy()\n\nWhen booting a CONFIG_FORTIFY_SOURCE=y kernel compiled with a toolchain\n\
+  that supports __counted_by() (such as clang-18 and newer), there is a\npanic on\
+  \ boot:\n\n  [    2.913770] memcpy: detected buffer overflow: 72 byte write of buffer\
+  \ size 0\n  [    2.920834] WARNING: CPU: 2 PID: 1 at lib/string_helpers.c:1027 __fortify_report+0x5c/0x74\n\
+  \  ...\n  [    3.039208] Call trace:\n  [    3.041643]  __fortify_report+0x5c/0x74\n\
+  \  [    3.045469]  __fortify_panic+0x18/0x20\n  [    3.049209]  thermal_zone_device_register_with_trips+0x4c8/0x4f8\n\
+  \nThis panic occurs because trips is counted by num_trips but num_trips is\nassigned\
+  \ after the call to memcpy(), so the fortify checks think the\nbuffer size is zero\
+  \ because tz was allocated with kzalloc().\n\nMove the num_trips assignment before\
+  \ the memcpy() to resolve the panic\nand ensure that the fortify checks work properly.\n\
+  \nFixes: 9b0a62758665 (\"thermal: core: Store zone trips table in struct thermal_zone_device\"\
+  )\nSigned-off-by: Nathan Chancellor <nathan@kernel.org>\nReviewed-by: Kees Cook\
+  \ <keescook@chromium.org>\nSigned-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: thermal_zone_device_register_with_trips in\
+  \ drivers/thermal/thermal_core.c\nstruct thermal_zone_device *\nthermal_zone_device_register_with_trips(const\
+  \ char *type,\n\t\t\t\t\tconst struct thermal_trip *trips,\n\t\t\t\t\tint num_trips,\
+  \ int mask,\n\t\t\t\t\tvoid *devdata,\n\t\t\t\t\tconst struct thermal_zone_device_ops\
+  \ *ops,\n\t\t\t\t\tconst struct thermal_zone_params *tzp,\n\t\t\t\t\tint passive_delay,\
+  \ int polling_delay)\n{\n\tstruct thermal_zone_device *tz;\n\tint id;\n\tint result;\n\
+  \tstruct thermal_governor *governor;\n\n\tif (!type || strlen(type) == 0) {\n\t\t\
+  pr_err(\"No thermal zone type defined\\n\");\n\t\treturn ERR_PTR(-EINVAL);\n\t}\n\
+  \n\tif (strlen(type) >= THERMAL_NAME_LENGTH) {\n\t\tpr_err(\"Thermal zone name (%s)\
+  \ too long, should be under %d chars\\n\",\n\t\t       type, THERMAL_NAME_LENGTH);\n\
+  \t\treturn ERR_PTR(-EINVAL);\n\t}\n\n\t/*\n\t * Max trip count can't exceed 31 as\
+  \ the \"mask >> num_trips\" condition.\n\t * For example, shifting by 32 will result\
+  \ in compiler warning:\n\t * warning: right shift count >= width of type [-Wshift-count-\
+  \ overflow]\n\t *\n\t * Also \"mask >> num_trips\" will always be true with 32 bit\
+  \ shift.\n\t * E.g. mask = 0x80000000 for trip id 31 to be RW. Then\n\t * mask >>\
+  \ 32 = 0x80000000\n\t * This will result in failure for the below condition.\n\t\
+  \ *\n\t * Check will be true when the bit 31 of the mask is set.\n\t * 32 bit shift\
+  \ will cause overflow of 4 byte integer.\n\t */\n\tif (num_trips > (BITS_PER_TYPE(int)\
+  \ - 1) || num_trips < 0 || mask >> num_trips) {\n\t\tpr_err(\"Incorrect number of\
+  \ thermal trips\\n\");\n\t\treturn ERR_PTR(-EINVAL);\n\t}\n\n\tif (!ops || !ops->get_temp)\
+  \ {\n\t\tpr_err(\"Thermal zone device ops not defined\\n\");\n\t\treturn ERR_PTR(-EINVAL);\n\
+  \t}\n\n\tif (num_trips > 0 && !trips)\n\t\treturn ERR_PTR(-EINVAL);\n\n\tif (!thermal_class)\n\
+  \t\treturn ERR_PTR(-ENODEV);\n\n\ttz = kzalloc(struct_size(tz, trips, num_trips),\
+  \ GFP_KERNEL);\n\tif (!tz)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tif (tzp) {\n\t\ttz->tzp\
+  \ = kmemdup(tzp, sizeof(*tzp), GFP_KERNEL);\n\t\tif (!tz->tzp) {\n\t\t\tresult =\
+  \ -ENOMEM;\n\t\t\tgoto free_tz;\n\t\t}\n\t}\n\n\tINIT_LIST_HEAD(&tz->thermal_instances);\n\
+  \tINIT_LIST_HEAD(&tz->node);\n\tida_init(&tz->ida);\n\tmutex_init(&tz->lock);\n\t\
+  init_completion(&tz->removal);\n\tid = ida_alloc(&thermal_tz_ida, GFP_KERNEL);\n\
+  \tif (id < 0) {\n\t\tresult = id;\n\t\tgoto free_tzp;\n\t}\n\n\ttz->id = id;\n\t\
+  strscpy(tz->type, type, sizeof(tz->type));\n\n\ttz->ops = *ops;\n\tif (!tz->ops.critical)\n\
+  \t\ttz->ops.critical = thermal_zone_device_critical;\n\n\ttz->device.class = thermal_class;\n\
+  \ttz->devdata = devdata;\n\tmemcpy(tz->trips, trips, num_trips * sizeof(*trips));\n\
+  \ttz->num_trips = num_trips;\n\n\tthermal_set_delay_jiffies(&tz->passive_delay_jiffies,\
+  \ passive_delay);\n\tthermal_set_delay_jiffies(&tz->polling_delay_jiffies, polling_delay);\n\
+  \n\t/* sys I/F */\n\t/* Add nodes that are always present via .groups */\n\tresult\
+  \ = thermal_zone_create_device_groups(tz, mask);\n\tif (result)\n\t\tgoto remove_id;\n\
+  \n\t/* A new thermal zone needs to be updated anyway. */\n\tatomic_set(&tz->need_update,\
+  \ 1);\n\n\tresult = dev_set_name(&tz->device, \"thermal_zone%d\", tz->id);\n\tif\
+  \ (result) {\n\t\tthermal_zone_destroy_device_groups(tz);\n\t\tgoto remove_id;\n\
+  \t}\n\tresult = device_register(&tz->device);\n\tif (result)\n\t\tgoto release_device;\n\
+  \n\t/* Update 'this' zone's governor information */\n\tmutex_lock(&thermal_governor_lock);\n\
+  \n\tif (tz->tzp)\n\t\tgovernor = __find_governor(tz->tzp->governor_name);\n\telse\n\
+  \t\tgovernor = def_governor;\n\n\tresult = thermal_set_governor(tz, governor);\n\
+  \tif (result) {\n\t\tmutex_unlock(&thermal_governor_lock);\n\t\tgoto unregister;\n\
+  \t}\n\n\tmutex_unlock(&thermal_governor_lock);\n\n\tif (!tz->tzp || !tz->tzp->no_hwmon)\
+  \ {\n\t\tresult = thermal_add_hwmon_sysfs(tz);\n\t\tif (result)\n\t\t\tgoto unregister;\n\
+  \t}\n\n\tmutex_lock(&thermal_list_lock);\n\tmutex_lock(&tz->lock);\n\tlist_add_tail(&tz->node,\
+  \ &thermal_tz_list);\n\tmutex_unlock(&tz->lock);\n\tmutex_unlock(&thermal_list_lock);\n\
+  \n\t/* Bind cooling devices for this zone */\n\tbind_tz(tz);\n\n\tthermal_zone_device_init(tz);\n\
+  \t/* Update the new thermal zone and mark it as already updated. */\n\tif (atomic_cmpxchg(&tz->need_update,\
+  \ 1, 0))\n\t\tthermal_zone_device_update(tz, THERMAL_EVENT_UNSPECIFIED);\n\n\tthermal_notify_tz_create(tz);\n\
+  \n\tthermal_debug_tz_add(tz);\n\n\treturn tz;\n\nunregister:\n\tdevice_del(&tz->device);\n\
+  release_device:\n\tput_device(&tz->device);\nremove_id:\n\tida_free(&thermal_tz_ida,\
+  \ id);\nfree_tzp:\n\tkfree(tz->tzp);\nfree_tz:\n\tkfree(tz);\n\treturn ERR_PTR(result);\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/thermal/thermal_core.c\
+  \ b/drivers/thermal/thermal_core.c\nindex bb21f78b4bfa..1eabc8ebe27d 100644\n---\
+  \ a/drivers/thermal/thermal_core.c\n+++ b/drivers/thermal/thermal_core.c\n@@ -1354,8\
+  \ +1354,8 @@ thermal_zone_device_register_with_trips(const char *type,\n \n \ttz->device.class\
+  \ = thermal_class;\n \ttz->devdata = devdata;\n-\tmemcpy(tz->trips, trips, num_trips\
+  \ * sizeof(*trips));\n \ttz->num_trips = num_trips;\n+\tmemcpy(tz->trips, trips,\
+  \ num_trips * sizeof(*trips));\n \n \tthermal_set_delay_jiffies(&tz->passive_delay_jiffies,\
+  \ passive_delay);\n \tthermal_set_delay_jiffies(&tz->polling_delay_jiffies, polling_delay);\n\
+  ```\n"
+pattern: '## Bug Pattern
+
+
+  Writing into a flexible array member annotated with __counted_by() before initializing
+  its count field.
+
+
+  Pattern example:
+
+  - Struct has: T arr[] __counted_by(n); with size tracked by n.
+
+  - Allocation uses struct_size() and kzalloc/kmalloc.
+
+  - Code copies into arr (e.g., memcpy) before setting n:
+
+
+  tz = kzalloc(struct_size(tz, trips, num_trips), GFP_KERNEL);
+
+  memcpy(tz->trips, trips, num_trips * sizeof(*trips));  // BUG: n is still 0
+
+  tz->num_trips = num_trips;
+
+
+  With FORTIFY_SOURCE and __counted_by, the destination buffer is seen as size 0 until
+  n is set, causing a fortify overflow. The fix is to assign the count field before
+  any writes to the flexible array.'
+plan: "Plan\n\n1. Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(CountInitMap, std::pair<const\
+  \ MemRegion*, const FieldDecl*>, char)\n  - Key = {BaseRegion, CountFieldDecl}\n\
+  \  - Value = 1 (initialized) or absent (not initialized yet)\n- Rationale: We only\
+  \ need to know, per concrete struct instance (MemRegion*) and per specific counted-by\
+  \ field (FieldDecl*), whether that field has been written at least once on the current\
+  \ path. No other state is necessary.\n\n2. Helper utilities (private methods)\n\
+  - bool isFlexibleArray(const FieldDecl *FD)\n  - Return true if FD\u2019s type is\
+  \ a flexible array: FD->getType()->isIncompleteArrayType() OR a ConstantArrayType\
+  \ with size == 0.\n- const FieldDecl* getCountFieldFromCountedBy(const FieldDecl\
+  \ *FAMField)\n  - If FAMField has the Clang CountedByAttr (from __counted_by), return\
+  \ the FieldDecl that the attr references (the \u201Ccount\u201D field). Otherwise\
+  \ return nullptr.\n  - Implementation detail: Use FAMField->getAttr<CountedByAttr>()\
+  \ and fetch the referenced count field from it (e.g., Attr->getMember() or equivalent\
+  \ accessor).\n- bool fieldIsCountFieldInRecord(const FieldDecl *FD)\n  - Returns\
+  \ true if the parent RecordDecl of FD contains at least one field G that:\n    -\
+  \ isFlexibleArray(G) is true, and\n    - getCountFieldFromCountedBy(G) == FD.\n\
+  - const MemberExpr* findMemberExprInArgToFAM(const Expr *Arg, const FieldDecl *&FAMFieldOut,\
+  \ const FieldDecl *&CountFieldOut)\n  - Traverse Arg to find a MemberExpr that ultimately\
+  \ refers to a field.\n  - If the field is a flexible array field AND has a CountedByAttr,\
+  \ set:\n    - FAMFieldOut = that flexible array field,\n    - CountFieldOut = getCountFieldFromCountedBy(FAMFieldOut),\n\
+  \    - return the MemberExpr.\n  - Use findSpecificTypeInChildren<MemberExpr>(Arg)\
+  \ and inspect its referenced FieldDecl.\n- const MemRegion* getBaseRegionOfME(const\
+  \ MemberExpr *ME, CheckerContext &C)\n  - Return the MemRegion corresponding to\
+  \ the base object expression ME->getBase().\n  - Use getMemRegionFromExpr(ME->getBase(),\
+  \ C). This is the region used as the first component in our CountInitMap key.\n\
+  - bool isMemWriteLikeCall(const CallEvent &Call)\n  - Return true for writes that\
+  \ commonly target buffers:\n    - Callee name equals \"memcpy\" or \"memmove\"\n\
+  \  - Keep the initial set small to avoid noise; you can add more later (e.g., \"\
+  strscpy\", \"copy_from_user\") if desired.\n- bool sizeArgDefinitelyZero(const CallEvent\
+  \ &Call)\n  - For memcpy/memmove (3rd argument), try EvaluateExprToInt on the \u201C\
+  size\u201D argument.\n  - If evaluation succeeds and equals 0, return true (skip\
+  \ reporting); otherwise false.\n\n3. Callback: checkBind\nGoal: Mark the counted_by\
+  \ \u201Ccount\u201D field as initialized on assignment.\n\n- Trigger: This callback\
+  \ is invoked on any binding. Use it to detect writes to fields.\n- Steps:\n  1.\
+  \ If Loc.getAsRegion() is nullptr, return.\n  2. If Loc is a FieldRegion FR:\n \
+  \    - const FieldDecl *FD = FR->getDecl();\n     - If fieldIsCountFieldInRecord(FD)\
+  \ is false, return.\n     - const MemRegion *Base = FR->getSuperRegion();\n    \
+  \ - Create key K = {Base, FD}.\n     - State = State->set<CountInitMap>(K, 1).\n\
+  \  3. Else if Loc is an ElementRegion ER (e.g., assignment to tz->arr[i]):\n   \
+  \  - Get its super region; if it is a FieldRegion FR referring to a flexible array\
+  \ whose CountedByAttr references CountFieldOut, we may wish to report too (optional;\
+  \ see Step 5).\n     - For the initialization map we do nothing here; only assignments\
+  \ to the count field should mark initialization.\n\n4. Callback: checkPreCall\n\
+  Goal: Detect writes to a flexible array (with __counted_by) before count field has\
+  \ been initialized.\n\n- Steps:\n  1. If !isMemWriteLikeCall(Call), return.\n  2.\
+  \ Get the destination argument (arg 0). If no args, return.\n  3. Use findMemberExprInArgToFAM(Arg0,\
+  \ FAMField, CountField):\n     - If it returns null, or CountField is null, return.\n\
+  \     - If !isFlexibleArray(FAMField), return.\n  4. Compute Base region: Base =\
+  \ getBaseRegionOfME(MemberExprFound, C).\n     - If Base is null, return.\n  5.\
+  \ Compose key K = {Base, CountField}.\n     - Look up in CountInitMap:\n       -\
+  \ If present, do nothing (count field already initialized on this path).\n     \
+  \  - If absent:\n         - Optionally skip if sizeArgDefinitelyZero(Call) is true.\n\
+  \         - Create a non-fatal error node and report:\n           - Message: \"\
+  Write to __counted_by() flexible array before initializing its count field\"\n \
+  \          - Attach the call expression as the location.\n           - Optionally,\
+  \ add a note to the count field declaration location.\n\n5. Optional (broader coverage):\
+  \ detect direct stores into the FAM without memcpy\n- In checkBind:\n  - If Loc\
+  \ is an ElementRegion ER whose super region is a FieldRegion FR:\n    - Let FAMField\
+  \ = FR->getDecl(); if not isFlexibleArray(FAMField), return.\n    - Let CountField\
+  \ = getCountFieldFromCountedBy(FAMField); if null, return.\n    - Get the base region\
+  \ Base = FR->getSuperRegion();\n    - If CountInitMap does not contain {Base, CountField},\
+  \ report:\n      - \"Write to __counted_by() flexible array before initializing\
+  \ its count field\"\n      - Use S as the location.\n\n6. Reporting\n- Use generateNonFatalErrorNode(State)\
+  \ to get a node; if null, return.\n- Use a BugType stored in the checker (e.g.,\
+  \ BugType BT(\"Counted-by FAM write before init\", \"API Misuse\")).\n- Emit with\
+  \ std::make_unique<PathSensitiveBugReport>(BT, Message, Node).\n- Keep message short:\n\
+  \  - \"Write to __counted_by() flexible array before initializing its count field\"\
+  \n- Optionally, add a note if you can retrieve the CountFieldDecl source location:\n\
+  \  - \"Count field is this member\" at CountFieldDecl->getLocation().\n\n7. Notes\
+  \ and simplifications\n- No taint or alias maps are required. The MemRegion for\
+  \ the base object is stable across pointer aliases, so using Base MemRegion + CountFieldDecl\
+  \ uniquely identifies the initialized state for each concrete struct instance.\n\
+  - No need to model allocations (kzalloc/kmalloc/struct_size). The bug pattern is\
+  \ purely \u201Cwrite happens before count assignment\u201D; tracking the first assignment\
+  \ to the count field is sufficient.\n- To reduce false positives:\n  - Restrict\
+  \ detection to FAMs that actually carry CountedByAttr.\n  - Optionally skip reporting\
+  \ when the size argument to memcpy/memmove is provably 0.\n- Utility functions to\
+  \ use:\n  - getMemRegionFromExpr to get Base regions.\n  - findSpecificTypeInChildren<MemberExpr>\
+  \ to recover MemberExpr under casts/decays.\n  - EvaluateExprToInt for optional\
+  \ size-zero filtering.\n\n8. Callbacks used\n- checkBind: mark the counted_by count\
+  \ field as initialized when it is assigned.\n- checkPreCall: flag memcpy/memmove\
+  \ into a counted_by flexible array if its count field has not yet been initialized\
+  \ on the current path.\n\nThis minimal setup detects the specific ordering bug fixed\
+  \ in the patch: memcpy into tz->trips while tz->num_trips has not yet been assigned."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Attr.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"clang/AST/Type.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state map: track whether a specific count field (as a FieldRegion) is\
+  \ initialized.\n// Key: const MemRegion* (the FieldRegion for the count field)\n\
+  // Val: char (1 means initialized)\nREGISTER_MAP_WITH_PROGRAMSTATE(CountInitMap,\
+  \ const MemRegion*, char)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Write before count init\", \"API Misuse\")) {}\n\n  \
+  \    void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n      void\
+  \ checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\n   private:\n\
+  \      // Helpers\n      static bool isFlexibleArray(const FieldDecl *FD);\n   \
+  \   static bool isMemWriteLikeCall(const CallEvent &Call, CheckerContext &C);\n\
+  \      static bool sizeArgDefinitelyZero(const CallEvent &Call, CheckerContext &C);\n\
+  \      static const MemberExpr *findMemberExprInArgToFAM(const Expr *Arg,\n    \
+  \                                                    const FieldDecl *&FAMFieldOut,\n\
+  \                                                        const FieldDecl *&CountFieldOut,\n\
+  \                                                        CheckerContext &C);\n \
+  \     static const MemRegion* getBaseRegionOfME(const MemberExpr *ME, CheckerContext\
+  \ &C);\n\n      static const FieldDecl* getCountFieldFromCountedBy(const FieldDecl\
+  \ *FAMField,\n                                                         CheckerContext\
+  \ &C);\n      static bool fieldIsCountFieldInRecord(const FieldDecl *FD, CheckerContext\
+  \ &C);\n\n      void reportWriteBeforeCountInit(StringRef Msg, const Stmt *S, CheckerContext\
+  \ &C) const;\n};\n\n// ------------------------ Helper implementations ------------------------\n\
+  \nbool SAGenTestChecker::isFlexibleArray(const FieldDecl *FD) {\n  if (!FD) return\
+  \ false;\n  QualType QT = FD->getType();\n  if (const auto *IAT = dyn_cast<IncompleteArrayType>(QT.getTypePtr()))\n\
+  \    (void)IAT; // just to silence unused warning in some builds\n  if (QT->isIncompleteArrayType())\n\
+  \    return true;\n  if (const auto *CAT = dyn_cast<ConstantArrayType>(QT.getTypePtr()))\
+  \ {\n    return CAT->getSize() == 0;\n  }\n  return false;\n}\n\nconst FieldDecl*\
+  \ SAGenTestChecker::getCountFieldFromCountedBy(const FieldDecl *FAMField,\n    \
+  \                                                          CheckerContext &C) {\n\
+  \  if (!FAMField) return nullptr;\n\n  // Check the attribute presence.\n  if (!FAMField->hasAttrs())\n\
+  \    return nullptr;\n\n  const CountedByAttr *A = FAMField->getAttr<CountedByAttr>();\n\
+  \  if (!A)\n    return nullptr;\n\n  // Extract the spelled attribute text and parse\
+  \ the argument name.\n  const SourceManager &SM = C.getSourceManager();\n  const\
+  \ LangOptions &Lang = C.getLangOpts();\n\n  // The attribute's source range should\
+  \ contain something like \"__counted_by(name)\" or \"counted_by(name)\".\n  SourceRange\
+  \ R = A->getRange();\n  if (R.isInvalid())\n    return nullptr;\n\n  CharSourceRange\
+  \ CR = CharSourceRange::getTokenRange(R);\n  StringRef AttrText = Lexer::getSourceText(CR,\
+  \ SM, Lang);\n  if (AttrText.empty())\n    return nullptr;\n\n  // Find parameter\
+  \ inside parentheses.\n  size_t lpos = AttrText.find('(');\n  size_t rpos = AttrText.rfind(')');\n\
+  \  if (lpos == StringRef::npos || rpos == StringRef::npos || rpos <= lpos + 1)\n\
+  \    return nullptr;\n\n  StringRef Param = AttrText.slice(lpos + 1, rpos).trim();\n\
+  \  if (Param.empty())\n    return nullptr;\n\n  // Sometimes the macro could expand\
+  \ weirdly; keep it simple: expect identifier.\n  // Strip potential casts or address-of\
+  \ (just in case), though kernel uses a bare identifier.\n  while (!Param.empty()\
+  \ && (Param.front() == '&' || Param.front() == '*'))\n    Param = Param.drop_front().ltrim();\n\
+  \n  // Lookup a field with matching name in the same record.\n  const RecordDecl\
+  \ *RD = FAMField->getParent();\n  if (!RD)\n    return nullptr;\n\n  for (const\
+  \ FieldDecl *FD : RD->fields()) {\n    if (FD && FD->getIdentifier() && FD->getName()\
+  \ == Param)\n      return FD;\n  }\n\n  return nullptr;\n}\n\nbool SAGenTestChecker::fieldIsCountFieldInRecord(const\
+  \ FieldDecl *FD, CheckerContext &C) {\n  if (!FD) return false;\n  const RecordDecl\
+  \ *RD = FD->getParent();\n  if (!RD) return false;\n\n  for (const FieldDecl *G\
+  \ : RD->fields()) {\n    if (!G) continue;\n    if (!isFlexibleArray(G))\n     \
+  \ continue;\n    const FieldDecl *CF = getCountFieldFromCountedBy(G, C);\n    if\
+  \ (CF == FD)\n      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isMemWriteLikeCall(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE) return false;\n\n  return ExprHasName(OE, \"memcpy\", C) || ExprHasName(OE,\
+  \ \"memmove\", C);\n}\n\nbool SAGenTestChecker::sizeArgDefinitelyZero(const CallEvent\
+  \ &Call, CheckerContext &C) {\n  if (Call.getNumArgs() < 3)\n    return false;\n\
+  \n  const Expr *SizeE = Call.getArgExpr(2);\n  if (!SizeE)\n    return false;\n\n\
+  \  llvm::APSInt Res;\n  if (EvaluateExprToInt(Res, SizeE, C)) {\n    return Res\
+  \ == 0;\n  }\n  return false;\n}\n\nconst MemberExpr *SAGenTestChecker::findMemberExprInArgToFAM(const\
+  \ Expr *Arg,\n                                                             const\
+  \ FieldDecl *&FAMFieldOut,\n                                                   \
+  \          const FieldDecl *&CountFieldOut,\n                                  \
+  \                           CheckerContext &C) {\n  FAMFieldOut = nullptr;\n  CountFieldOut\
+  \ = nullptr;\n\n  if (!Arg)\n    return nullptr;\n\n  // Search downwards for a\
+  \ MemberExpr\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(Arg);\n\
+  \  if (!ME)\n    return nullptr;\n\n  const ValueDecl *VD = ME->getMemberDecl();\n\
+  \  const FieldDecl *FD = dyn_cast_or_null<FieldDecl>(VD);\n  if (!FD)\n    return\
+  \ nullptr;\n\n  if (!isFlexibleArray(FD))\n    return nullptr;\n\n  const FieldDecl\
+  \ *CountFD = getCountFieldFromCountedBy(FD, C);\n  if (!CountFD)\n    return nullptr;\n\
+  \n  FAMFieldOut = FD;\n  CountFieldOut = CountFD;\n  return ME;\n}\n\nconst MemRegion*\
+  \ SAGenTestChecker::getBaseRegionOfME(const MemberExpr *ME, CheckerContext &C) {\n\
+  \  if (!ME)\n    return nullptr;\n  const Expr *BaseE = ME->getBase();\n  if (!BaseE)\n\
+  \    return nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(BaseE, C);\n\
+  \  if (!MR)\n    return nullptr;\n  MR = MR->getBaseRegion();\n  return MR;\n}\n\
+  \nvoid SAGenTestChecker::reportWriteBeforeCountInit(StringRef Msg, const Stmt *S,\
+  \ CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (S)\n    R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// ------------------------ Checker callbacks ------------------------\n\n\
+  void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  if (!isMemWriteLikeCall(Call, C))\n    return;\n\n  // Destination pointer\
+  \ is arg0.\n  if (Call.getNumArgs() < 1)\n    return;\n  const Expr *DstE = Call.getArgExpr(0);\n\
+  \  if (!DstE)\n    return;\n\n  const FieldDecl *FAMField = nullptr;\n  const FieldDecl\
+  \ *CountField = nullptr;\n  const MemberExpr *DstME = findMemberExprInArgToFAM(DstE,\
+  \ FAMField, CountField, C);\n  if (!DstME || !FAMField || !CountField)\n    return;\n\
+  \n  // Get the base object region (e.g., tz)\n  const MemRegion *Base = getBaseRegionOfME(DstME,\
+  \ C);\n  if (!Base)\n    return;\n\n  // Compute the FieldRegion for the count field\
+  \ on this base.\n  MemRegionManager &MRMgr = C.getSValBuilder().getRegionManager();\n\
+  \  const SubRegion *Super = dyn_cast<SubRegion>(Base);\n  if (!Super)\n    return;\n\
+  \n  const FieldRegion *CountFR = MRMgr.getFieldRegion(CountField, Super);\n  if\
+  \ (!CountFR)\n    return;\n\n  ProgramStateRef State = C.getState();\n  const char\
+  \ *Inited = State->get<CountInitMap>(CountFR);\n  if (Inited) {\n    // Already\
+  \ initialized on this path.\n    return;\n  }\n\n  // Optional: if size is definitely\
+  \ zero, skip warning\n  if (sizeArgDefinitelyZero(Call, C))\n    return;\n\n  //\
+  \ Report: write to counted_by FAM before initializing count field.\n  reportWriteBeforeCountInit(\"\
+  Write to __counted_by() flexible array before initializing its count field\",\n\
+  \                             Call.getOriginExpr(), C);\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  const MemRegion *Reg\
+  \ = Loc.getAsRegion();\n  if (!Reg)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  MemRegionManager &MRMgr = C.getSValBuilder().getRegionManager();\n\n  // Case\
+  \ 1: Assigning to a field: if it's the count field, mark initialized.\n  if (const\
+  \ auto *FR = dyn_cast<FieldRegion>(Reg)) {\n    const FieldDecl *FD = FR->getDecl();\n\
+  \    if (FD && fieldIsCountFieldInRecord(FD, C)) {\n      // Mark this specific\
+  \ count field region as initialized.\n      State = State->set<CountInitMap>(FR,\
+  \ 1);\n      C.addTransition(State);\n      return;\n    }\n  }\n\n  // Case 2:\
+  \ Direct write into the flexible array via element region: tz->arr[i] = ...\n  if\
+  \ (const auto *ER = dyn_cast<ElementRegion>(Reg)) {\n    const MemRegion *SR = ER->getSuperRegion();\n\
+  \    const auto *FReg = dyn_cast<FieldRegion>(SR);\n    if (!FReg)\n      return;\n\
+  \n    const FieldDecl *FAMField = FReg->getDecl();\n    if (!FAMField || !isFlexibleArray(FAMField))\n\
+  \      return;\n\n    const FieldDecl *CountField = getCountFieldFromCountedBy(FAMField,\
+  \ C);\n    if (!CountField)\n      return;\n\n    // Super region of the field is\
+  \ the base object region (tz).\n    const SubRegion *Super = dyn_cast<SubRegion>(FReg->getSuperRegion());\n\
+  \    if (!Super)\n      return;\n\n    const FieldRegion *CountFR = MRMgr.getFieldRegion(CountField,\
+  \ Super);\n    if (!CountFR)\n      return;\n\n    const char *Inited = State->get<CountInitMap>(CountFR);\n\
+  \    if (!Inited) {\n      // Count field not yet initialized; report.\n      reportWriteBeforeCountInit(\"\
+  Write to __counted_by() flexible array before initializing its count field\", S,\
+  \ C);\n    }\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect writes to __counted_by() flexible arrays before initializing the\
+  \ count field\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

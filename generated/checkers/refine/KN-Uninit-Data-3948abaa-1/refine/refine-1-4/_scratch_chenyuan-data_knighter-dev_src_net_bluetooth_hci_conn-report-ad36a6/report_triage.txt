@@ -1,0 +1,7 @@
+- Decision: NotABug
+- Reason: The buffer allocated with kmalloc (cl) is fully initialized over exactly the region that is copied to userspace. Specifically:
+  - The header fields cl->dev_id and cl->conn_num are set before copy.
+  - For each entry 0..n-1, every field of struct hci_conn_info is explicitly assigned: bdaddr, handle, type, out, state, and link_mode.
+  - The copy size is computed as sizeof(req) + n * sizeof(*ci), not using req.conn_num, so no bytes from uninitialized entries are copied.
+  - The involved structs (hci_conn_list_req and hci_conn_info) do not introduce padding within the copied region that remains uninitialized (bdaddr_t is a 6-byte array; alignment of subsequent fields results in a tightly packed 16-byte struct with all bytes written).
+  - Therefore, no uninitialized kernel memory is leaked via copy_to_user, and this does not match the target bug pattern.

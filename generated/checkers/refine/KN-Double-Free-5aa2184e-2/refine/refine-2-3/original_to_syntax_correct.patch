@@ -1,0 +1,140 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -86,6 +86,19 @@     return QT->isPointerType() || QT->isAnyPointerType();
+   }
+
++  // is NULL literal or an integer zero after ignoring casts.
++  static bool isExplicitNullExpr(const Expr *E) {
++    if (!E) return false;
++    E = E->IgnoreParenImpCasts();
++    if (isa<GNUNullExpr>(E)) return true;
++#if CLANG_VERSION_MAJOR >= 4
++    if (isa<CXXNullPtrLiteralExpr>(E)) return true;
++#endif
++    if (const auto *IL = dyn_cast<IntegerLiteral>(E))
++      return IL->getValue().isZero();
++    return false;
++  }
++
+   // Helper to collect labels, gotos, and fields locally assigned from function calls,
+   // as well as free/nullset/allocator-assign locations per (param, field).
+   struct FuncInfoCollector : public RecursiveASTVisitor<FuncInfoCollector> {
+@@ -123,7 +136,7 @@       return Cur->IgnoreParenImpCasts();
+     }
+
+-    static bool isExplicitNullExpr(const Expr *E) {
++    static bool isExplicitNullExprLocal(const Expr *E) {
+       if (!E) return false;
+       E = E->IgnoreParenImpCasts();
+       if (isa<GNUNullExpr>(E)) return true;
+@@ -232,7 +245,7 @@           const ParmVarDecl *BaseP = getDirectBaseParam(ME->getBase());
+           if (BaseP) {
+             // NULL set tracking.
+-            if (isExplicitNullExpr(RHS)) {
++            if (isExplicitNullExprLocal(RHS)) {
+               NullSetLocs[FD->getCanonicalDecl()][BaseP].push_back(CurLoc);
+             }
+             // Allocator-assignment tracking when RHS is a call.
+@@ -361,6 +374,16 @@   bool condLooksErrorish(const Expr *Cond, CheckerContext &C) const;
+   const Expr *stripWrapperCalls(const Expr *E, CheckerContext &C) const;
+
++  // New: immediate post-label nullification check to robustly suppress FPs like adf_rl_start().
++  bool isImmediateNullificationAfterLabel(const LabelStmt *LS,
++                                          const FieldDecl *FD,
++                                          const ParmVarDecl *BaseP,
++                                          CheckerContext &C) const;
++
++  bool sameFieldAndBase(const MemberExpr *ME,
++                        const FieldDecl *FD,
++                        const ParmVarDecl *BaseP) const;
++
+   void reportFreeUnownedInSharedLabel(const CallEvent &Call, CheckerContext &C) const;
+ };
+
+@@ -676,6 +699,73 @@   return false;
+ }
+
++bool SAGenTestChecker::sameFieldAndBase(const MemberExpr *ME,
++                                        const FieldDecl *FD,
++                                        const ParmVarDecl *BaseP) const {
++  if (!ME || !FD || !BaseP)
++    return false;
++  const auto *MEFD = dyn_cast<FieldDecl>(ME->getMemberDecl());
++  if (!MEFD)
++    return false;
++  if (MEFD->getCanonicalDecl() != FD->getCanonicalDecl())
++    return false;
++  const ParmVarDecl *MEBaseP = getDirectBaseParam(ME->getBase());
++  return MEBaseP && MEBaseP->getCanonicalDecl() == BaseP->getCanonicalDecl();
++}
++
++// Robust, local suppression: If the free is the first statement in a label and the next
++// one or two statements set the same param->field to NULL, consider it a safe cleanup idiom.
++bool SAGenTestChecker::isImmediateNullificationAfterLabel(const LabelStmt *LS,
++                                                          const FieldDecl *FD,
++                                                          const ParmVarDecl *BaseP,
++                                                          CheckerContext &C) const {
++  if (!LS || !FD || !BaseP)
++    return false;
++
++  const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(LS, C);
++  if (!CS)
++    return false;
++
++  // Locate LS inside its compound.
++  bool FoundLabel = false;
++  unsigned LookAhead = 0;
++  for (const Stmt *Child : CS->body()) {
++    if (!FoundLabel) {
++      if (Child == LS)
++        FoundLabel = true;
++      continue;
++    }
++    // We are after the label.
++    if (!Child)
++      break;
++    // Stop scanning if we hit another label or a return.
++    if (isa<LabelStmt>(Child) || isa<ReturnStmt>(Child))
++      break;
++    // Be conservative: only look ahead a couple of statements.
++    if (LookAhead++ >= 2)
++      break;
++
++    // Try to find an assignment in this statement subtree.
++    const BinaryOperator *BO = findSpecificTypeInChildren<BinaryOperator>(Child);
++    if (!BO || !BO->isAssignmentOp())
++      continue;
++
++    const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
++    const auto *LME = dyn_cast<MemberExpr>(LHS);
++    if (!LME)
++      continue;
++
++    const Expr *RHS = BO->getRHS();
++    if (!isExplicitNullExpr(RHS))
++      continue;
++
++    if (sameFieldAndBase(LME, FD, BaseP))
++      return true;
++  }
++
++  return false;
++}
++
+ bool SAGenTestChecker::isFalsePositive(const Expr *FreedArgE,
+                                        const MemberExpr *FreedME,
+                                        const ParmVarDecl *BaseParam,
+@@ -687,6 +777,16 @@   const FunctionDecl *FD = getCurrentFunction(C);
+   if (FD && EnclosingLabel && !labelHasErrorishIncoming(FD, EnclosingLabel, C))
+     return true;
++
++  // 0.5) Immediate post-label nullification suppression.
++  // If the very next statements after the label assign "param->field = NULL", accept the cleanup.
++  if (EnclosingLabel && FreedME && BaseParam) {
++    const auto *FDField = dyn_cast<FieldDecl>(FreedME->getMemberDecl());
++    if (FDField && isImmediateNullificationAfterLabel(EnclosingLabel, FDField->getCanonicalDecl(),
++                                                      BaseParam, C)) {
++      return true;
++    }
++  }
+
+   // 1) If the argument is definitely the literal NULL at this point, kfree(NULL) is a no-op.
+   if (FreedArgE) {

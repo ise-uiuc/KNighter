@@ -1,0 +1,319 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: c6087b82a9146826564a55c5ca0164cac40348f5
+commit_type: Buffer-Overflow
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Decl.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program state map: pointer MemRegion -> destination fixed-size array\
+  \ VarDecl\nREGISTER_MAP_WITH_PROGRAMSTATE(BufAliasMap, const MemRegion *, const\
+  \ VarDecl *)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \      : BT(new BugType(this, \"copy_from_user into fixed-size buffer\",\n     \
+  \                  \"Memory Error\")) {}\n\n  void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  bool isCopyFromUser(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  bool getArrayFromDestExpr(const\
+  \ Expr *Dest, const VarDecl *&ArrVD,\n                            llvm::APInt &ArrSize,\n\
+  \                            CheckerContext &C) const;\n  bool lenExprLooksUnboundedUserCount(const\
+  \ Expr *LenE, const VarDecl *ArrVD,\n                                      CheckerContext\
+  \ &C) const;\n  void reportUnbounded(const CallEvent &Call, const Expr *DestE,\n\
+  \                       CheckerContext &C, StringRef Msg) const;\n};\n\nbool SAGenTestChecker::isCopyFromUser(const\
+  \ CallEvent &Call,\n                                      CheckerContext &C) const\
+  \ {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\
+  \  // Use source-based name matching for robustness as suggested.\n  if (ExprHasName(Origin,\
+  \ \"copy_from_user\", C))\n    return true;\n  if (ExprHasName(Origin, \"__copy_from_user\"\
+  , C))\n    return true;\n  return false;\n}\n\nbool SAGenTestChecker::getArrayFromDestExpr(const\
+  \ Expr *Dest,\n                                            const VarDecl *&ArrVD,\n\
+  \                                            llvm::APInt &ArrSize,\n           \
+  \                                 CheckerContext &C) const {\n  ArrVD = nullptr;\n\
+  \n  // Try direct array use: e.g., copy_from_user(mybuf, ...)\n  if (const auto\
+  \ *DRE =\n          dyn_cast<DeclRefExpr>(Dest->IgnoreParenImpCasts())) {\n    if\
+  \ (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n      if (const auto *CAT\
+  \ =\n              dyn_cast<ConstantArrayType>(VD->getType().getTypePtr())) {\n\
+  \        ArrVD = VD;\n        ArrSize = CAT->getSize();\n        return true;\n\
+  \      }\n    }\n  }\n\n  // Try alias via program state map: e.g., pbuf = mybuf;\
+  \ copy_from_user(pbuf, ...)\n  const MemRegion *MR = getMemRegionFromExpr(Dest,\
+  \ C);\n  if (!MR)\n    return false;\n  MR = MR->getBaseRegion();\n  if (!MR)\n\
+  \    return false;\n\n  ProgramStateRef State = C.getState();\n  const VarDecl *const\
+  \ *VDPtr = State->get<BufAliasMap>(MR);\n  if (!VDPtr)\n    return false;\n\n  const\
+  \ VarDecl *VD = *VDPtr;\n  if (!VD)\n    return false;\n\n  if (const auto *CAT\
+  \ =\n          dyn_cast<ConstantArrayType>(VD->getType().getTypePtr())) {\n    ArrVD\
+  \ = VD;\n    ArrSize = CAT->getSize();\n    return true;\n  }\n\n  return false;\n\
+  }\n\nbool SAGenTestChecker::lenExprLooksUnboundedUserCount(const Expr *LenE,\n \
+  \                                                     const VarDecl *ArrVD,\n  \
+  \                                                    CheckerContext &C) const {\n\
+  \  if (!LenE)\n    return false;\n\n  // Suppress if there is a clear clamp via\
+  \ min(...)\n  if (ExprHasName(LenE, \"min\", C))\n    return false;\n\n  // Suppress\
+  \ if expression mentions sizeof(array)\n  if (ArrVD) {\n    if (ExprHasName(LenE,\
+  \ \"sizeof\", C) &&\n        ExprHasName(LenE, ArrVD->getName(), C))\n      return\
+  \ false;\n  }\n\n  // Direct parameter reference named \"nbytes\" or \"count\"\n\
+  \  if (const auto *DRE =\n          dyn_cast<DeclRefExpr>(LenE->IgnoreParenImpCasts()))\
+  \ {\n    if (const auto *PVD = dyn_cast<ParmVarDecl>(DRE->getDecl())) {\n      StringRef\
+  \ N = PVD->getName();\n      if (N.equals(\"nbytes\") || N.equals(\"count\"))\n\
+  \        return true;\n    }\n  }\n\n  // Heuristic text search for common names\n\
+  \  if (ExprHasName(LenE, \"nbytes\", C) || ExprHasName(LenE, \"count\", C))\n  \
+  \  return true;\n\n  return false;\n}\n\nvoid SAGenTestChecker::reportUnbounded(const\
+  \ CallEvent &Call, const Expr *DestE,\n                                       CheckerContext\
+  \ &C, StringRef Msg) const {\n  ExplodedNode *EN = C.generateNonFatalErrorNode();\n\
+  \  if (!EN)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, EN);\n  R->addRange(Call.getSourceRange());\n  if (DestE)\n    R->addRange(DestE->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call,\n                                    CheckerContext &C) const {\n  if (!isCopyFromUser(Call,\
+  \ C))\n    return;\n\n  if (Call.getNumArgs() < 3)\n    return;\n\n  const Expr\
+  \ *DestE = Call.getArgExpr(0);\n  const Expr *LenE = Call.getArgExpr(2);\n  if (!DestE\
+  \ || !LenE)\n    return;\n\n  // Resolve destination array\n  const VarDecl *ArrVD\
+  \ = nullptr;\n  llvm::APInt ArrSize; // number of bytes in array\n  if (!getArrayFromDestExpr(DestE,\
+  \ ArrVD, ArrSize, C))\n    return; // only flag when we know it's a fixed-size local\
+  \ array\n\n  // If length is a constant, check it against the array size.\n  llvm::APSInt\
+  \ EvalRes;\n  if (EvaluateExprToInt(EvalRes, LenE, C)) {\n    // Negative or zero-length\
+  \ copies are not overflows.\n    if (EvalRes.isSigned() && EvalRes.isNegative())\n\
+  \      return;\n\n    llvm::APSInt ArrSizeAPS(EvalRes.getBitWidth(), /*isUnsigned=*/true);\n\
+  \    ArrSizeAPS = ArrSize.getLimitedValue();\n\n    llvm::APSInt LenVal = EvalRes;\n\
+  \    if (LenVal.isSigned())\n      LenVal.setIsUnsigned(true); // compare as unsigned\n\
+  \n    if (LenVal > ArrSizeAPS) {\n      reportUnbounded(Call, DestE, C,\n      \
+  \                \"copy_from_user length exceeds destination buffer\");\n    }\n\
+  \    return; // handled the constant case\n  }\n\n  // Heuristic: unbounded user\
+  \ length used directly without clamping\n  if (lenExprLooksUnboundedUserCount(LenE,\
+  \ ArrVD, C)) {\n    reportUnbounded(Call, DestE, C,\n                    \"copy_from_user\
+  \ into fixed-size buffer uses unbounded user length\");\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S,\n                                 CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *LHSReg\
+  \ = Loc.getAsRegion();\n  if (!LHSReg)\n    return;\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg)\n    return;\n\n  const MemRegion *RHSReg = Val.getAsRegion();\n\
+  \  if (!RHSReg)\n    return;\n  RHSReg = RHSReg->getBaseRegion();\n  if (!RHSReg)\n\
+  \    return;\n\n  // We care about aliases to arrays: find if RHS base region is\
+  \ a VarDecl of a fixed array.\n  if (const auto *VR = dyn_cast<VarRegion>(RHSReg))\
+  \ {\n    const VarDecl *VD = VR->getDecl();\n    if (!VD)\n      return;\n\n   \
+  \ // Only care about fixed-size arrays\n    if (dyn_cast<ConstantArrayType>(VD->getType().getTypePtr()))\
+  \ {\n      // Track alias: pointer (LHSReg) -> array VarDecl (VD)\n      State =\
+  \ State->set<BufAliasMap>(LHSReg, VD);\n      C.addTransition(State);\n    }\n \
+  \ }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect unbounded copy_from_user into fixed-size local buffers\", \"\"\
+  );\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nscsi: lpfc: Prevent lpfc_debugfs_lockstat_write()\
+  \ buffer overflow\n\nA static code analysis tool flagged the possibility of buffer\
+  \ overflow when\nusing copy_from_user() for a debugfs entry.\n\nCurrently, it is\
+  \ possible that copy_from_user() copies more bytes than what\nwould fit in the mybuf\
+  \ char array.  Add a min() restriction check between\nsizeof(mybuf) - 1 and nbytes\
+  \ passed from the userspace buffer to protect\nagainst buffer overflow.\n\nLink:\
+  \ https://lore.kernel.org/r/20230301231626.9621-2-justintee8345@gmail.com\nSigned-off-by:\
+  \ Justin Tee <justin.tee@broadcom.com>\nSigned-off-by: Martin K. Petersen <martin.petersen@oracle.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: lpfc_debugfs_lockstat_write in drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  static ssize_t\nlpfc_debugfs_lockstat_write(struct file *file, const char __user\
+  \ *buf,\n\t\t\t    size_t nbytes, loff_t *ppos)\n{\n\tstruct lpfc_debug *debug =\
+  \ file->private_data;\n\tstruct lpfc_hba *phba = (struct lpfc_hba *)debug->i_private;\n\
+  \tstruct lpfc_sli4_hdw_queue *qp;\n\tchar mybuf[64];\n\tchar *pbuf;\n\tint i;\n\n\
+  \tmemset(mybuf, 0, sizeof(mybuf));\n\n\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  \t\treturn -EFAULT;\n\tpbuf = &mybuf[0];\n\n\tif ((strncmp(pbuf, \"reset\", strlen(\"\
+  reset\")) == 0) ||\n\t    (strncmp(pbuf, \"zero\", strlen(\"zero\")) == 0)) {\n\t\
+  \tfor (i = 0; i < phba->cfg_hdw_queue; i++) {\n\t\t\tqp = &phba->sli4_hba.hdwq[i];\n\
+  \t\t\tqp->lock_conflict.alloc_xri_get = 0;\n\t\t\tqp->lock_conflict.alloc_xri_put\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_xri = 0;\n\t\t\tqp->lock_conflict.wq_access\
+  \ = 0;\n\t\t\tqp->lock_conflict.alloc_pvt_pool = 0;\n\t\t\tqp->lock_conflict.mv_from_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.mv_to_pub_pool = 0;\n\t\t\tqp->lock_conflict.mv_to_pvt_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.free_pvt_pool = 0;\n\t\t\tqp->lock_conflict.free_pub_pool\
+  \ = 0;\n\t\t\tqp->lock_conflict.wq_access = 0;\n\t\t}\n\t}\n\treturn nbytes;\n}\n\
+  ```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/scsi/lpfc/lpfc_debugfs.c\
+  \ b/drivers/scsi/lpfc/lpfc_debugfs.c\nindex f5252e45a48a..3e365e5e194a 100644\n\
+  --- a/drivers/scsi/lpfc/lpfc_debugfs.c\n+++ b/drivers/scsi/lpfc/lpfc_debugfs.c\n\
+  @@ -2157,10 +2157,13 @@ lpfc_debugfs_lockstat_write(struct file *file, const char\
+  \ __user *buf,\n \tchar mybuf[64];\n \tchar *pbuf;\n \tint i;\n+\tsize_t bsize;\n\
+  \ \n \tmemset(mybuf, 0, sizeof(mybuf));\n \n-\tif (copy_from_user(mybuf, buf, nbytes))\n\
+  +\tbsize = min(nbytes, (sizeof(mybuf) - 1));\n+\n+\tif (copy_from_user(mybuf, buf,\
+  \ bsize))\n \t\treturn -EFAULT;\n \tpbuf = &mybuf[0];\n \n@@ -2181,7 +2184,7 @@\
+  \ lpfc_debugfs_lockstat_write(struct file *file, const char __user *buf,\n \t\t\t\
+  qp->lock_conflict.wq_access = 0;\n \t\t}\n \t}\n-\treturn nbytes;\n+\treturn bsize;\n\
+  \ }\n #endif\n \n```\n"
+pattern: "## Bug Pattern\n\nCopying user-provided data into a fixed-size buffer using\
+  \ copy_from_user() with the unbounded user length (nbytes) instead of clamping it\
+  \ to the buffer\u2019s capacity (e.g., sizeof(buf) - 1). This allows a user to pass\
+  \ a size larger than the local array, causing a buffer overflow in debugfs write\
+  \ handlers (or similar file ops). The fix is to limit the copy length with min(nbytes,\
+  \ sizeof(buf) - 1) and return the actual consumed size."
+plan: "Plan to detect unbounded copy_from_user into fixed-size local buffer\n\n1.\
+  \ Program state\n- Keep it simple but cover a common aliasing pattern (p = mybuf\
+  \ or p = &mybuf[0]):\n  - REGISTER_MAP_WITH_PROGRAMSTATE(BufAliasMap, const MemRegion*,\
+  \ const VarDecl*)\n    - Key: pointer variable\u2019s MemRegion (the LHS region\
+  \ that will later be passed to copy_from_user).\n    - Value: the VarDecl of the\
+  \ fixed-size local array that the pointer aliases.\n- No other custom state/traits\
+  \ are required.\n\n2. Helper checks/utilities (internal to the checker)\n- isCopyFromUser(const\
+  \ CallEvent &Call):\n  - Return true if callee name is one of: \"copy_from_user\"\
+  , \"__copy_from_user\" (extendable if needed).\n- getArrayFromDestExpr(const Expr\
+  \ *Dest, const VarDecl *&ArrVD, llvm::APInt &ArrSize, CheckerContext &C):\n  - Try\
+  \ direct array:\n    - If getArraySizeFromExpr(ArrSize, Dest) succeeds:\n      -\
+  \ Extract VarDecl from the DeclRefExpr (dyn_cast<DeclRefExpr>(Dest->IgnoreImpCasts())->getDecl())\
+  \ into ArrVD.\n      - Return true.\n  - Try alias via program state:\n    - If\
+  \ direct fails, get MemRegion for Dest via getMemRegionFromExpr(Dest, C).\n    -\
+  \ Lookup this region in BufAliasMap. If found, ArrVD = mapped VarDecl. Get ArrSize\
+  \ from ArrVD\u2019s type (ConstantArrayType).\n    - Return true if resolved; else\
+  \ false.\n- lenExprIsConstantAndSafe(const Expr *LenE, const llvm::APInt &ArrSize,\
+  \ CheckerContext &C):\n  - If EvaluateExprToInt succeeds, return true if value <=\
+  \ ArrSize, false if > ArrSize (reportable).\n- lenExprLooksUnboundedUserCount(const\
+  \ Expr *LenE, const VarDecl *MaybeParam, const VarDecl *ArrVD, CheckerContext &C):\n\
+  \  - Goal: detect the specific pattern that LenE directly uses the unbounded size\
+  \ parameter (e.g., nbytes) and is not clamped.\n  - Steps:\n    - If LenE is DeclRefExpr\
+  \ to a ParmVarDecl PVD, and PVD\u2019s name is one of {\"nbytes\",\"count\"} (optionally\
+  \ include {\"len\",\"length\",\"size\"} if you wish), return true (likely unbounded).\n\
+  \    - Else, use ExprHasName:\n      - If ExprHasName(LenE, \"nbytes\") or ExprHasName(LenE,\
+  \ \"count\") is true, AND\n      - ExprHasName(LenE, \"min\") is false (to avoid\
+  \ flagging min(nbytes, ...) clamps), then return true.\n    - Additional suppression:\n\
+  \      - If ArrVD is known, and LenE source contains \"sizeof(\" and contains ArrVD->getName(),\
+  \ consider it \u201Cclamped,\u201D return false.\n    - Otherwise return false.\n\
+  \n3. Callback: checkBind (track simple pointer-to-array aliases)\n- Goal: map a\
+  \ pointer variable to a local array when we see statements like:\n  - p = mybuf;\
+  \ or p = &mybuf[0]; or char *p = mybuf; etc.\n- Implementation:\n  - On each binding,\
+  \ obtain LHS MemRegion from Loc.getAsRegion(). If not a MemRegion, bail.\n  - Inspect\
+  \ Val.getAsRegion():\n    - If it is a SubRegion/ElementRegion/VarRegion that ultimately\
+  \ bases on a VarRegion of a VarDecl with ConstantArrayType, record alias:\n    \
+  \  - BufAliasMap = State->set<BufAliasMap>(LHSRegion, ArrVarDecl).\n  - Also handle\
+  \ array-to-pointer decay:\n    - If Val is a loc::MemRegionVal whose region is a\
+  \ VarRegion/ElementRegion corresponding to an array (base VarRegion is the array\
+  \ VarDecl), record same mapping.\n  - Only track if ArrVarDecl is a local variable\
+  \ (VD->isLocalVarDecl()) and has ConstantArrayType.\n\n4. Callback: checkPreCall\
+  \ (flag the bug at the point of copy_from_user)\n- Identify the target call:\n \
+  \ - If !isCopyFromUser(Call), return.\n- Extract arguments:\n  - DestE = Call.getArgExpr(0),\
+  \ LenE = Call.getArgExpr(2).\n- Resolve destination as a fixed-size local array:\n\
+  \  - VarDecl *ArrVD; llvm::APInt ArrSize;\n  - If !getArrayFromDestExpr(DestE, ArrVD,\
+  \ ArrSize, C): return (we only flag array cases).\n- Quick constant safety check:\n\
+  \  - If lenExprIsConstantAndSafe(LenE, ArrSize, C) is true, return (safe).\n  -\
+  \ If it evaluates to a constant > ArrSize, report immediately (overflow with constant\
+  \ length).\n- Heuristic for unbounded length:\n  - Optionally identify the function\
+  \ context and the size parameter:\n    - const FunctionDecl *FD = dyn_cast<FunctionDecl>(C.getLocationContext()->getDecl()).\n\
+  \    - If FD has a ParmVarDecl named \"nbytes\" or \"count\", pass it as MaybeParam\
+  \ to lenExprLooksUnboundedUserCount (not strictly required, but can improve precision).\n\
+  \  - If lenExprLooksUnboundedUserCount(LenE, MaybeParam, ArrVD, C) is true:\n  \
+  \  - Report bug: \u201Ccopy_from_user length not clamped to destination buffer size\u201D\
+  \n- Bug reporting:\n  - Generate a non-fatal error node with generateNonFatalErrorNode().\n\
+  \  - Use std::make_unique<PathSensitiveBugReport> with a short message:\n    - \u201C\
+  copy_from_user into fixed-size buffer uses unbounded user length\u201D\n  - Add\
+  \ a note range on DestE or ArrVD\u2019s declaration if helpful.\n\n5. Callback:\
+  \ checkPostStmt (optional; no-op)\n- Not needed for this pattern.\n\n6. Callback:\
+  \ checkBranchCondition, checkLocation, evalCall, etc.\n- Not needed.\n\n7. Notes\
+  \ on precision and suppression\n- By requiring:\n  - Destination is a fixed-size\
+  \ local array, and\n  - Length expression directly references \u201Cnbytes\u201D\
+  \ (or \u201Ccount\u201D) and does not contain \u201Cmin(\u201D,\n  the checker aligns\
+  \ closely with the kernel write-handler pattern and minimizes false positives.\n\
+  - The simple alias tracking in checkBind allows catching the common p = mybuf; followed\
+  \ by copy_from_user(p, buf, nbytes); case.\n- The checker intentionally does not\
+  \ attempt deep dataflow for computed variables (e.g., bsize) to keep it simple and\
+  \ robust; thus, it avoids flagging when bsize is used instead of nbytes.\n\n8. Summary\
+  \ of detection criteria\n- Call to copy_from_user/(__copy_from_user).\n- Destination\
+  \ resolves to a local fixed-size array (or a pointer proven to alias such an array).\n\
+  - Length argument:\n  - Is a constant > array size -> report, OR\n  - References\
+  \ the unbounded user count parameter (typically \u201Cnbytes\u201D or \u201Ccount\u201D\
+  ) and does not appear to be clamped via min/sizeof -> report.\n\nThis plan uses\
+  \ the provided utility functions:\n- getArraySizeFromExpr for extracting array bounds,\n\
+  - EvaluateExprToInt to evaluate constant lengths,\n- getMemRegionFromExpr and program\
+  \ state map for simple aliasing,\n- ExprHasName to heuristically detect use of \u201C\
+  nbytes\u201D and absence of \u201Cmin\u201D/\u201Csizeof\u201D."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Decl.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program state map: pointer MemRegion -> destination fixed-size array\
+  \ VarDecl\nREGISTER_MAP_WITH_PROGRAMSTATE(BufAliasMap, const MemRegion *, const\
+  \ VarDecl *)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PreCall,\
+  \ check::Bind> {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \      : BT(new BugType(this, \"copy_from_user into fixed-size buffer\",\n     \
+  \                  \"Memory Error\")) {}\n\n  void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n  void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  bool isCopyFromUser(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n  bool getArrayFromDestExpr(const\
+  \ Expr *Dest, const VarDecl *&ArrVD,\n                            llvm::APInt &ArrSize,\n\
+  \                            CheckerContext &C) const;\n  bool lenExprLooksUnboundedUserCount(const\
+  \ Expr *LenE, const VarDecl *ArrVD,\n                                      CheckerContext\
+  \ &C) const;\n  void reportUnbounded(const CallEvent &Call, const Expr *DestE,\n\
+  \                       CheckerContext &C, StringRef Msg) const;\n};\n\nbool SAGenTestChecker::isCopyFromUser(const\
+  \ CallEvent &Call,\n                                      CheckerContext &C) const\
+  \ {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return false;\n\
+  \  // Use source-based name matching for robustness as suggested.\n  if (ExprHasName(Origin,\
+  \ \"copy_from_user\", C))\n    return true;\n  if (ExprHasName(Origin, \"__copy_from_user\"\
+  , C))\n    return true;\n  return false;\n}\n\nbool SAGenTestChecker::getArrayFromDestExpr(const\
+  \ Expr *Dest,\n                                            const VarDecl *&ArrVD,\n\
+  \                                            llvm::APInt &ArrSize,\n           \
+  \                                 CheckerContext &C) const {\n  ArrVD = nullptr;\n\
+  \n  // Try direct array use: e.g., copy_from_user(mybuf, ...)\n  if (const auto\
+  \ *DRE =\n          dyn_cast<DeclRefExpr>(Dest->IgnoreParenImpCasts())) {\n    if\
+  \ (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n      if (const auto *CAT\
+  \ =\n              dyn_cast<ConstantArrayType>(VD->getType().getTypePtr())) {\n\
+  \        ArrVD = VD;\n        ArrSize = CAT->getSize();\n        return true;\n\
+  \      }\n    }\n  }\n\n  // Try alias via program state map: e.g., pbuf = mybuf;\
+  \ copy_from_user(pbuf, ...)\n  const MemRegion *MR = getMemRegionFromExpr(Dest,\
+  \ C);\n  if (!MR)\n    return false;\n  MR = MR->getBaseRegion();\n  if (!MR)\n\
+  \    return false;\n\n  ProgramStateRef State = C.getState();\n  const VarDecl *const\
+  \ *VDPtr = State->get<BufAliasMap>(MR);\n  if (!VDPtr)\n    return false;\n\n  const\
+  \ VarDecl *VD = *VDPtr;\n  if (!VD)\n    return false;\n\n  if (const auto *CAT\
+  \ =\n          dyn_cast<ConstantArrayType>(VD->getType().getTypePtr())) {\n    ArrVD\
+  \ = VD;\n    ArrSize = CAT->getSize();\n    return true;\n  }\n\n  return false;\n\
+  }\n\nbool SAGenTestChecker::lenExprLooksUnboundedUserCount(const Expr *LenE,\n \
+  \                                                     const VarDecl *ArrVD,\n  \
+  \                                                    CheckerContext &C) const {\n\
+  \  if (!LenE)\n    return false;\n\n  // Suppress if there is a clear clamp via\
+  \ min(...)\n  if (ExprHasName(LenE, \"min\", C))\n    return false;\n\n  // Suppress\
+  \ if expression mentions sizeof(array)\n  if (ArrVD) {\n    if (ExprHasName(LenE,\
+  \ \"sizeof\", C) &&\n        ExprHasName(LenE, ArrVD->getName(), C))\n      return\
+  \ false;\n  }\n\n  // Direct parameter reference named \"nbytes\" or \"count\"\n\
+  \  if (const auto *DRE =\n          dyn_cast<DeclRefExpr>(LenE->IgnoreParenImpCasts()))\
+  \ {\n    if (const auto *PVD = dyn_cast<ParmVarDecl>(DRE->getDecl())) {\n      StringRef\
+  \ N = PVD->getName();\n      if (N.equals(\"nbytes\") || N.equals(\"count\"))\n\
+  \        return true;\n    }\n  }\n\n  // Heuristic text search for common names\n\
+  \  if (ExprHasName(LenE, \"nbytes\", C) || ExprHasName(LenE, \"count\", C))\n  \
+  \  return true;\n\n  return false;\n}\n\nvoid SAGenTestChecker::reportUnbounded(const\
+  \ CallEvent &Call, const Expr *DestE,\n                                       CheckerContext\
+  \ &C, StringRef Msg) const {\n  ExplodedNode *EN = C.generateNonFatalErrorNode();\n\
+  \  if (!EN)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, EN);\n  R->addRange(Call.getSourceRange());\n  if (DestE)\n    R->addRange(DestE->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call,\n                                    CheckerContext &C) const {\n  if (!isCopyFromUser(Call,\
+  \ C))\n    return;\n\n  if (Call.getNumArgs() < 3)\n    return;\n\n  const Expr\
+  \ *DestE = Call.getArgExpr(0);\n  const Expr *LenE = Call.getArgExpr(2);\n  if (!DestE\
+  \ || !LenE)\n    return;\n\n  // Resolve destination array\n  const VarDecl *ArrVD\
+  \ = nullptr;\n  llvm::APInt ArrSize; // number of bytes in array\n  if (!getArrayFromDestExpr(DestE,\
+  \ ArrVD, ArrSize, C))\n    return; // only flag when we know it's a fixed-size local\
+  \ array\n\n  // If length is a constant, check it against the array size.\n  llvm::APSInt\
+  \ EvalRes;\n  if (EvaluateExprToInt(EvalRes, LenE, C)) {\n    // Negative or zero-length\
+  \ copies are not overflows.\n    if (EvalRes.isSigned() && EvalRes.isNegative())\n\
+  \      return;\n\n    llvm::APSInt ArrSizeAPS(EvalRes.getBitWidth(), /*isUnsigned=*/true);\n\
+  \    ArrSizeAPS = ArrSize.getLimitedValue();\n\n    llvm::APSInt LenVal = EvalRes;\n\
+  \    if (LenVal.isSigned())\n      LenVal.setIsUnsigned(true); // compare as unsigned\n\
+  \n    if (LenVal > ArrSizeAPS) {\n      reportUnbounded(Call, DestE, C,\n      \
+  \                \"copy_from_user length exceeds destination buffer\");\n    }\n\
+  \    return; // handled the constant case\n  }\n\n  // Heuristic: unbounded user\
+  \ length used directly without clamping\n  if (lenExprLooksUnboundedUserCount(LenE,\
+  \ ArrVD, C)) {\n    reportUnbounded(Call, DestE, C,\n                    \"copy_from_user\
+  \ into fixed-size buffer uses unbounded user length\");\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S,\n                                 CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *LHSReg\
+  \ = Loc.getAsRegion();\n  if (!LHSReg)\n    return;\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg)\n    return;\n\n  const MemRegion *RHSReg = Val.getAsRegion();\n\
+  \  if (!RHSReg)\n    return;\n  RHSReg = RHSReg->getBaseRegion();\n  if (!RHSReg)\n\
+  \    return;\n\n  // We care about aliases to arrays: find if RHS base region is\
+  \ a VarDecl of a fixed array.\n  if (const auto *VR = dyn_cast<VarRegion>(RHSReg))\
+  \ {\n    const VarDecl *VD = VR->getDecl();\n    if (!VD)\n      return;\n\n   \
+  \ // Only care about fixed-size arrays\n    if (dyn_cast<ConstantArrayType>(VD->getType().getTypePtr()))\
+  \ {\n      // Track alias: pointer (LHSReg) -> array VarDecl (VD)\n      State =\
+  \ State->set<BufAliasMap>(LHSReg, VD);\n      C.addTransition(State);\n    }\n \
+  \ }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detect unbounded copy_from_user into fixed-size local buffers\", \"\"\
+  );\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

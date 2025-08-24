@@ -1,0 +1,4 @@
+- Decision: NotABug
+- Reason: The flagged free is kfree(efx->nic_data) in falcon_probe_nic(). This function itself allocates nic_data via kzalloc and immediately assigns it to efx->nic_data before any goto to the shared error labels. If allocation fails, it returns -ENOMEM directly, so the error labels are only reachable after efx->nic_data was allocated by this function. None of the called helpers in the failing paths free efx->nic_data, and there is no earlier kfree of this field in the function. Thus, the cleanup at the shared error label frees memory owned and allocated by this function exactly once.
+
+This does not match the target bug pattern, which concerns freeing callee-managed or conditionally allocated memory unconditionally in a shared error path (leading to double free). Here, the memory is not callee-managed; it is always owned by the caller when the error labels are used. Therefore, the report is a false positive and not a real bug.

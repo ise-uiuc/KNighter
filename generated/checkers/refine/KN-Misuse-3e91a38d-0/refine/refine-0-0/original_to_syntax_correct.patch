@@ -1,0 +1,149 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -21,73 +21,73 @@ using namespace ento;
+ using namespace taint;
+
+-// No custom program state needed.
+-
+ namespace {
+
+ class SAGenTestChecker : public Checker<check::PreCall> {
+-   mutable std::unique_ptr<BugType> BT;
++  mutable std::unique_ptr<BugType> BT;
+
+-   public:
+-      SAGenTestChecker() : BT(new BugType(this, "Use memdup_array_user for array copy", "API Misuse")) {}
++public:
++  SAGenTestChecker()
++      : BT(new BugType(this, "Use memdup_array_user for array copy",
++                       "API Misuse")) {}
+
+-      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
++  void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
+
+-   private:
++private:
++  static bool isSizeofExpr(const Expr *E);
++  static const BinaryOperator *getMulWithSizeof(const Expr *E);
+
+-      bool isMulWithSizeof(const Expr *E, CheckerContext &C) const;
+-      bool looksLikeMulWithSizeofTextual(const Expr *E, CheckerContext &C) const;
++  // Filter out known benign cases to avoid false positives.
++  static bool isFalsePositive(const Expr *SizeArg);
++
++  static bool isMemdupUser(const CallEvent &Call);
+ };
+
+-bool SAGenTestChecker::isMulWithSizeof(const Expr *E, CheckerContext &C) const {
++bool SAGenTestChecker::isSizeofExpr(const Expr *E) {
+   if (!E)
+     return false;
++  E = E->IgnoreParenImpCasts();
++  if (const auto *U = dyn_cast<UnaryExprOrTypeTraitExpr>(E))
++    return U->getKind() == UETT_SizeOf;
++  return false;
++}
+
+-  const Expr *NormE = E->IgnoreParenImpCasts();
+-  const auto *BO = dyn_cast<BinaryOperator>(NormE);
++const BinaryOperator *SAGenTestChecker::getMulWithSizeof(const Expr *E) {
++  if (!E)
++    return nullptr;
++  E = E->IgnoreParenImpCasts();
++  const auto *BO = dyn_cast<BinaryOperator>(E);
+   if (!BO)
+-    return false;
+-
++    return nullptr;
+   if (BO->getOpcode() != BO_Mul)
+-    return false;
++    return nullptr;
+
+   const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
+   const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
+
+-  auto IsSizeof = [](const Expr *Op) -> bool {
+-    if (!Op) return false;
+-    if (const auto *U = dyn_cast<UnaryExprOrTypeTraitExpr>(Op)) {
+-      return U->getKind() == UETT_SizeOf;
+-    }
+-    return false;
+-  };
++  if (isSizeofExpr(LHS) || isSizeofExpr(RHS))
++    return BO;
+
+-  return IsSizeof(LHS) || IsSizeof(RHS);
++  return nullptr;
+ }
+
+-bool SAGenTestChecker::looksLikeMulWithSizeofTextual(const Expr *E, CheckerContext &C) const {
+-  if (!E)
+-    return false;
+-
+-  const SourceManager &SM = C.getSourceManager();
+-  const LangOptions &LangOpts = C.getLangOpts();
+-  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());
+-
+-  StringRef Text = Lexer::getSourceText(Range, SM, LangOpts);
+-  if (Text.empty())
+-    return false;
+-
+-  // Heuristic: both "sizeof" and "*" appear in the expression text.
+-  return Text.contains("sizeof") && Text.contains('*');
++bool SAGenTestChecker::isFalsePositive(const Expr *SizeArg) {
++  // The primary false positive we observed: sizeof(*ptr) (no multiplication).
++  // If the size argument is a plain sizeof expression, it's not an array copy
++  // and memdup_user is the correct API.
++  return isSizeofExpr(SizeArg);
+ }
+
+-void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+-  const Expr *OriginExpr = Call.getOriginExpr();
+-  if (!OriginExpr)
+-    return;
++bool SAGenTestChecker::isMemdupUser(const CallEvent &Call) {
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier())
++    return ID->getName() == "memdup_user";
++  return false;
++}
+
+-  // Verify this is a call to memdup_user using source text matcher for robustness.
+-  if (!ExprHasName(OriginExpr, "memdup_user", C))
++void SAGenTestChecker::checkPreCall(const CallEvent &Call,
++                                    CheckerContext &C) const {
++  // Only interested in direct calls to memdup_user (not memdup_user_nul, etc.).
++  if (!isMemdupUser(Call))
+     return;
+
+   if (Call.getNumArgs() < 2)
+@@ -97,9 +97,13 @@   if (!SizeArg)
+     return;
+
+-  // Detect "count * sizeof(elem)" style usage.
+-  bool Match = isMulWithSizeof(SizeArg, C) || looksLikeMulWithSizeofTextual(SizeArg, C);
+-  if (!Match)
++  // Suppress plain sizeof(...) calls.
++  if (isFalsePositive(SizeArg))
++    return;
++
++  // Detect size expressions of the form count * sizeof(...).
++  const BinaryOperator *Mul = getMulWithSizeof(SizeArg);
++  if (!Mul)
+     return;
+
+   ExplodedNode *N = C.generateNonFatalErrorNode();
+@@ -108,7 +112,8 @@
+   auto R = std::make_unique<PathSensitiveBugReport>(
+       *BT,
+-      "Use memdup_array_user(ptr, count, elem_size) instead of memdup_user(ptr, count * elem_size); multiplication may overflow.",
++      "Use memdup_array_user(ptr, count, elem_size) instead of memdup_user(ptr, "
++      "count * elem_size); multiplication may overflow.",
+       N);
+   R->addRange(SizeArg->getSourceRange());
+   C.emitReport(std::move(R));
+@@ -119,7 +124,8 @@ extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
+   registry.addChecker<SAGenTestChecker>(
+       "custom.SAGenTestChecker",
+-      "Detects memdup_user used with count * sizeof(...) and suggests memdup_array_user",
++      "Detects memdup_user used with count * sizeof(...) and suggests "
++      "memdup_array_user",
+       "");
+ }

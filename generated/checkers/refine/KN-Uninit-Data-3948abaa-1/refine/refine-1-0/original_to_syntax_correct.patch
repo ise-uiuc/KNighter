@@ -1,0 +1,107 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -74,6 +74,7 @@       // Producer modeling helpers
+       bool functionKnownToInitBuffer(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx, unsigned &LenPtrParamIdx) const;
+       bool functionKnownToInitLenIsReturn(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const;
++      bool functionKnownToFormatReturnsLen(const CallEvent &Call, unsigned &BufParamIdx) const;
+       SymbolRef getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const;
+       bool isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
+ };
+@@ -208,6 +209,23 @@   return false;
+ }
+
++// Recognize sprintf-family formatters that write to a buffer and return written length (or would-be length).
++bool SAGenTestChecker::functionKnownToFormatReturnsLen(const CallEvent &Call, unsigned &BufParamIdx) const {
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    StringRef Fn = ID->getName();
++    // Kernel commonly uses these; we treat them as producers.
++    // sprintf(char *buf, const char *fmt, ...)
++    if (Fn.equals("sprintf")) { BufParamIdx = 0; return true; }
++    // snprintf(char *buf, size_t size, const char *fmt, ...)
++    if (Fn.equals("snprintf")) { BufParamIdx = 0; return true; }
++    if (Fn.equals("vsnprintf")) { BufParamIdx = 0; return true; }
++    // scnprintf/vscnprintf return number of chars actually written
++    if (Fn.equals("scnprintf")) { BufParamIdx = 0; return true; }
++    if (Fn.equals("vscnprintf")) { BufParamIdx = 0; return true; }
++  }
++  return false;
++}
++
+ SymbolRef SAGenTestChecker::getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+   SVal PtrV = Call.getArgSVal(Idx);
+@@ -231,9 +249,31 @@
+   SVal LenArgV = CopyToUserCall.getArgSVal(2);
+   SymbolRef CopyLenSym = LenArgV.getAsSymbol();
+-  if (!CopyLenSym || CopyLenSym != *LenSymP)
++  if (!CopyLenSym)
+     return false;
+
++  // If the copy length symbol equals the producer length symbol, we are safe.
++  if (CopyLenSym == *LenSymP)
++    return true;
++
++  // If the path constraints prove CopyLenSym <= ProducerLenSym, also safe
++  // (partial copy of initialized prefix).
++  {
++    SValBuilder &SVB = C.getSValBuilder();
++    QualType CondTy = SVB.getConditionType();
++    SVal CondS = SVB.evalBinOp(State, BO_LE,
++                               nonloc::SymbolVal(CopyLenSym),
++                               nonloc::SymbolVal(*LenSymP),
++                               CondTy);
++    if (auto D = CondS.getAs<DefinedOrUnknownSVal>()) {
++      auto StTrue = State->assume(*D, true);
++      auto StFalse = State->assume(*D, false);
++      if (StTrue && !StFalse)
++        return true;
++    }
++  }
++
++  // If we modeled a status symbol (success/failure), require known-success.
+   if (const SymbolRef *StatusSymP = State->get<ProducerStatusSymMap>(FromReg)) {
+     if (*StatusSymP) {
+       SValBuilder &SVB = C.getSValBuilder();
+@@ -244,13 +284,15 @@       if (auto StTrue = State->assume(Cond, true)) {
+         auto StFalse = State->assume(Cond, false);
+         if (StTrue && !StFalse) {
+-          return true;
++          // Even if we can't prove CopyLenSym <= LenSymP, if equality was
++          // already proven above this would have returned. Keep conservative.
++          return false;
+         }
+       }
+     }
+   }
+
+-  return true;
++  return false;
+ }
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -333,6 +375,20 @@     }
+     return;
+   }
++
++  // Model sprintf-family formatters as producers whose return value is the number of bytes written.
++  unsigned FmtBufIdx = 0;
++  if (functionKnownToFormatReturnsLen(Call, FmtBufIdx)) {
++    const MemRegion *BufReg = getArgBaseRegion(Call, FmtBufIdx, C);
++    if (BufReg) {
++      if (SymbolRef RetSym = Call.getReturnValue().getAsSymbol()) {
++        State = State->set<ProducerLenSymMap>(BufReg, RetSym);
++        State = State->remove<ProducerStatusSymMap>(BufReg); // not applicable
++        C.addTransition(State);
++      }
++    }
++    return;
++  }
+ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -358,7 +414,8 @@   if (*Kind != 2)
+     return;
+
+-  // Recognize and suppress false positives when a known producer initialized exactly the copied bytes.
++  // Recognize and suppress false positives when a known producer initialized exactly the copied bytes,
++  // or the path implies we copy no more than the produced length.
+   if (isFalsePositiveDueToProducer(Call, C, FromReg))
+     return;

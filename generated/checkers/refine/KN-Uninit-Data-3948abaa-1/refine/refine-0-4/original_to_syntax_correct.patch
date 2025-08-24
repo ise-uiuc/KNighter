@@ -1,0 +1,121 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -19,6 +19,7 @@ #include <cstdint>
+ #include <algorithm>
+ #include <memory>
++#include <optional>
+
+ using namespace clang;
+ using namespace ento;
+@@ -76,6 +77,11 @@       bool functionKnownToInitLenIsReturn(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const;
+       SymbolRef getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const;
+       bool isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
++
++      // FP suppression helpers
++      bool isCopyLenDefinitelyZero(const CallEvent &CopyToUserCall, CheckerContext &C) const;
++      bool isCopyLenCoveredByZeroInit(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
++      bool isFalsePositive(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
+ };
+
+ const MemRegion *SAGenTestChecker::canonical(ProgramStateRef State, const MemRegion *R) const {
+@@ -253,6 +259,76 @@   return true;
+ }
+
++// The copy length is definitely 0 under current constraints.
++bool SAGenTestChecker::isCopyLenDefinitelyZero(const CallEvent &CopyToUserCall, CheckerContext &C) const {
++  const Expr *LenE = CopyToUserCall.getArgExpr(2);
++  ProgramStateRef State = C.getState();
++  SVal LenV = CopyToUserCall.getArgSVal(2);
++
++  SValBuilder &SVB = C.getSValBuilder();
++  QualType LenTy = LenE ? LenE->getType() : C.getASTContext().LongTy;
++  SVal ZeroV = SVB.makeZeroVal(LenTy);
++
++  std::optional<DefinedOrUnknownSVal> DLen = LenV.getAs<DefinedOrUnknownSVal>();
++  std::optional<DefinedOrUnknownSVal> DZero = ZeroV.getAs<DefinedOrUnknownSVal>();
++  if (!DLen || !DZero)
++    return false;
++
++  DefinedOrUnknownSVal Eq = SVB.evalEQ(State, *DLen, *DZero);
++  ProgramStateRef StTrue = State->assume(Eq, true);
++  ProgramStateRef StFalse = State->assume(Eq, false);
++  return StTrue && !StFalse;
++}
++
++// If we've recorded zero-initialization for this buffer, and we can prove that
++// the copy length's maximum possible value is <= that zero-initialized size,
++// then it's safe.
++bool SAGenTestChecker::isCopyLenCoveredByZeroInit(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const {
++  ProgramStateRef State = C.getState();
++  const uint64_t *ZeroedBytes = State->get<ZeroInitSizeMap>(FromReg);
++  if (!ZeroedBytes)
++    return false;
++
++  // First, try constant evaluation.
++  const Expr *LenE = CopyToUserCall.getArgExpr(2);
++  llvm::APSInt EvalRes;
++  if (LenE && EvaluateExprToInt(EvalRes, LenE, C)) {
++    uint64_t Len = EvalRes.getZExtValue();
++    return Len <= *ZeroedBytes;
++  }
++
++  // If not constant, try to get a symbolic maximum bound.
++  SVal LenV = CopyToUserCall.getArgSVal(2);
++  if (SymbolRef Sym = LenV.getAsSymbol()) {
++    if (const llvm::APSInt *Max = inferSymbolMaxVal(Sym, C)) {
++      // Compare as unsigned
++      llvm::APSInt MaxZ = *Max;
++      if (MaxZ.isSigned())
++        MaxZ = MaxZ.extOrTrunc(64);
++      uint64_t MaxVal = MaxZ.getZExtValue();
++      return MaxVal <= *ZeroedBytes;
++    }
++  }
++  return false;
++}
++
++// Aggregate FP suppression checks.
++bool SAGenTestChecker::isFalsePositive(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const {
++  // 1) Length definitely zero.
++  if (isCopyLenDefinitelyZero(CopyToUserCall, C))
++    return true;
++
++  // 2) Known producers fully initialized exactly the copied size.
++  if (isFalsePositiveDueToProducer(CopyToUserCall, C, FromReg))
++    return true;
++
++  // 3) Explicit zero-init covers the maximum possible copy length.
++  if (isCopyLenCoveredByZeroInit(CopyToUserCall, C, FromReg))
++    return true;
++
++  return false;
++}
++
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+
+@@ -358,11 +434,11 @@   if (*Kind != 2)
+     return;
+
+-  // Recognize and suppress false positives when a known producer initialized exactly the copied bytes.
+-  if (isFalsePositiveDueToProducer(Call, C, FromReg))
+-    return;
+-
+-  // Evaluate length if possible
++  // Heuristic/constraint-based false-positive filters:
++  if (isFalsePositive(Call, C, FromReg))
++    return;
++
++  // Evaluate length if possible for a precise comparison with known zero-init length.
+   const Expr *LenE = Call.getArgExpr(2);
+   uint64_t CopyLen = 0;
+   bool LenKnown = false;
+@@ -381,9 +457,8 @@     reportLeak(Call, C, FromReg);
+     return;
+   } else {
+-    if (!ZeroedBytes) {
+-      reportLeak(Call, C, FromReg);
+-    }
++    // If we reach here, length is unknown and not covered by any suppression logic.
++    reportLeak(Call, C, FromReg);
+     return;
+   }
+ }

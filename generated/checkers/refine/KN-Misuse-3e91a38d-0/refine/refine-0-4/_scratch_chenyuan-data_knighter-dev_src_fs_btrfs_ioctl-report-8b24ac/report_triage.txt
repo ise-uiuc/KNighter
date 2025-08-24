@@ -1,0 +1,2 @@
+- Decision: NotABug
+- Reason: The flagged line copies a single fixed-size struct from userspace: vol_args = memdup_user(arg, sizeof(*vol_args)); There is no count * element_size multiplication, and thus no risk of integer overflow in the allocation size calculation. memdup_array_user is intended for arrays where the size is computed as count * elem_size; that pattern does not occur here. The code correctly handles potential ERR_PTR returns from memdup_user. Therefore, this does not match the target bug pattern and is a false positive.

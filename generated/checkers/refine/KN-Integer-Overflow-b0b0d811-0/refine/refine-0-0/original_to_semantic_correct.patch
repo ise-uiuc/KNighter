@@ -1,0 +1,213 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -49,8 +49,15 @@   static bool isWideTargetType(QualType QT, CheckerContext &C);
+   static bool isConstantFolded(const Expr *E, CheckerContext &C);
+
+-  static bool findFirstSuspiciousMul(const Stmt *S, unsigned TargetBits,
+-                                     const BinaryOperator *&OutMul,
++  // Finds a suspicious '*' on the value-producing path of Root.
++  static bool findFirstSuspiciousMulOnValuePath(const Expr *Root,
++                                                unsigned TargetBits,
++                                                const BinaryOperator *&OutMul,
++                                                CheckerContext &C);
++
++  // Optional post-filter for special-casing known false positives (extensible).
++  static bool isFalsePositiveContext(const Expr *Root,
++                                     const BinaryOperator *MulBO,
+                                      CheckerContext &C);
+
+   void emitReport(const BinaryOperator *MulBO, QualType LHSType,
+@@ -73,7 +80,6 @@   if (!isIntegerLike(QT))
+     return false;
+
+-  // Special-case typedef names like dma_addr_t, but still rely on bit-width.
+   unsigned Bits = getTypeBitWidth(QT, C);
+   return Bits >= 64;
+ }
+@@ -86,52 +92,110 @@   return EvaluateExprToInt(EvalRes, E, C);
+ }
+
+-// DFS to find first multiply whose resulting type is narrower than target.
+-bool SAGenTestChecker::findFirstSuspiciousMul(const Stmt *S, unsigned TargetBits,
+-                                              const BinaryOperator *&OutMul,
+-                                              CheckerContext &C) {
+-  if (!S)
+-    return false;
+-
+-  // Normalize expression nodes.
+-  if (const auto *E = dyn_cast<Expr>(S)) {
+-    const Expr *NormE = E->IgnoreParenImpCasts();
+-    if (NormE != E)
+-      return findFirstSuspiciousMul(NormE, TargetBits, OutMul, C);
+-
+-    if (const auto *BO = dyn_cast<BinaryOperator>(NormE)) {
+-      if (BO->getOpcode() == BO_Mul) {
+-        // Only consider integer-like multiplication.
+-        QualType ResT = BO->getType();
+-        if (isIntegerLike(ResT)) {
+-          unsigned MulBits = getTypeBitWidth(ResT, C);
+-          if (MulBits < TargetBits) {
+-            OutMul = BO;
+-            return true;
+-          }
++// Restrict traversal to the value-producing path of Root:
++// - Do NOT traverse into CallExpr arguments: their values do not form the
++//   final rvalue assigned; the call's return value does.
++// - Do NOT traverse into expressions that only compute addresses/indices
++//   (ArraySubscriptExpr index, MemberExpr base, UnaryOperator UO_Deref/UO_AddrOf).
++// - Traverse through arithmetic, casts, parentheses, comma (RHS only), and
++//   conditional operator arms.
++// Return true and set OutMul if a '*' is found whose result type is narrower
++// than TargetBits and is on the value path.
++bool SAGenTestChecker::findFirstSuspiciousMulOnValuePath(const Expr *Root,
++                                                         unsigned TargetBits,
++                                                         const BinaryOperator *&OutMul,
++                                                         CheckerContext &C) {
++  if (!Root)
++    return false;
++
++  const Expr *E = Root->IgnoreParenImpCasts();
++
++  // Handle binary operators explicitly.
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++    BinaryOperatorKind Op = BO->getOpcode();
++
++    if (Op == BO_Mul) {
++      QualType ResT = BO->getType();
++      if (isIntegerLike(ResT)) {
++        unsigned MulBits = getTypeBitWidth(ResT, C);
++        if (MulBits < TargetBits) {
++          OutMul = BO;
++          return true;
+         }
+       }
+-      // Recurse into operands
+-      if (findFirstSuspiciousMul(BO->getLHS(), TargetBits, OutMul, C))
++      // Even if not suspicious, do not stop searching; sub-operands might contain another mul.
++      if (findFirstSuspiciousMulOnValuePath(BO->getLHS(), TargetBits, OutMul, C))
+         return true;
+-      if (findFirstSuspiciousMul(BO->getRHS(), TargetBits, OutMul, C))
++      if (findFirstSuspiciousMulOnValuePath(BO->getRHS(), TargetBits, OutMul, C))
+         return true;
+       return false;
+     }
+
+-    // Generic recursion: traverse children.
+-    for (const Stmt *Child : NormE->children()) {
+-      if (findFirstSuspiciousMul(Child, TargetBits, OutMul, C))
+-        return true;
+-    }
+-    return false;
+-  }
+-
+-  // For non-Expr statements, traverse children.
+-  for (const Stmt *Child : S->children()) {
+-    if (findFirstSuspiciousMul(Child, TargetBits, OutMul, C))
++    // For comma operator, only the RHS contributes to the resulting value.
++    if (Op == BO_Comma) {
++      return findFirstSuspiciousMulOnValuePath(BO->getRHS(), TargetBits, OutMul, C);
++    }
++
++    // For simple assignment in a subexpression, only RHS determines resulting value.
++    if (Op == BO_Assign) {
++      return findFirstSuspiciousMulOnValuePath(BO->getRHS(), TargetBits, OutMul, C);
++    }
++
++    // For other arithmetic/bitwise operators, both sides contribute to value.
++    if (findFirstSuspiciousMulOnValuePath(BO->getLHS(), TargetBits, OutMul, C))
+       return true;
+-  }
++    if (findFirstSuspiciousMulOnValuePath(BO->getRHS(), TargetBits, OutMul, C))
++      return true;
++    return false;
++  }
++
++  // Conditional operator: either arm may be the resulting value.
++  if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
++    if (findFirstSuspiciousMulOnValuePath(CO->getTrueExpr(), TargetBits, OutMul, C))
++      return true;
++    if (findFirstSuspiciousMulOnValuePath(CO->getFalseExpr(), TargetBits, OutMul, C))
++      return true;
++    return false;
++  }
++
++  // Unary operator: break on address/indirection which form lvalue/address computation.
++  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    UnaryOperatorKind UOK = UO->getOpcode();
++    if (UOK == UO_AddrOf || UOK == UO_Deref)
++      return false;
++    return findFirstSuspiciousMulOnValuePath(UO->getSubExpr(), TargetBits, OutMul, C);
++  }
++
++  // Explicit casts: continue through.
++  if (const auto *CE = dyn_cast<CastExpr>(E)) {
++    return findFirstSuspiciousMulOnValuePath(CE->getSubExpr(), TargetBits, OutMul, C);
++  }
++
++  // Do not traverse into call arguments: call's return value is the value path.
++  if (isa<CallExpr>(E))
++    return false;
++
++  // Array subscripts: indexing/math does not become the resulting rvalue itself.
++  if (isa<ArraySubscriptExpr>(E))
++    return false;
++
++  // Member access: base computation does not propagate to the value itself.
++  if (isa<MemberExpr>(E))
++    return false;
++
++  // Default: stop if leaf or non-handled node on value path.
++  return false;
++}
++
++// Secondary guard: currently we filter via value-path traversal, but we keep
++// this extensibility point if later special cases need to be whitelisted.
++bool SAGenTestChecker::isFalsePositiveContext(const Expr *Root,
++                                              const BinaryOperator *MulBO,
++                                              CheckerContext &C) {
++  (void)Root;
++  (void)MulBO;
++  (void)C;
++  // No extra filters for now beyond value-path traversal.
+   return false;
+ }
+
+@@ -170,10 +234,12 @@         return;
+
+       const BinaryOperator *MulBO = nullptr;
+-      if (findFirstSuspiciousMul(CAO->getRHS(), getTypeBitWidth(LT, C), MulBO, C)) {
+-        // Skip fully constant folded cases.
+-        if (MulBO && !isConstantFolded(MulBO, C))
++      const Expr *RHS = CAO->getRHS();
++      if (findFirstSuspiciousMulOnValuePath(RHS, getTypeBitWidth(LT, C), MulBO, C)) {
++        if (MulBO && !isConstantFolded(MulBO, C) &&
++            !isFalsePositiveContext(RHS, MulBO, C)) {
+           emitReport(MulBO, LT, C);
++        }
+       }
+     }
+     return;
+@@ -193,9 +259,11 @@
+     const Expr *RHS = BO->getRHS();
+     const BinaryOperator *MulBO = nullptr;
+-    if (findFirstSuspiciousMul(RHS, getTypeBitWidth(LT, C), MulBO, C)) {
+-      if (MulBO && !isConstantFolded(MulBO, C))
++    if (findFirstSuspiciousMulOnValuePath(RHS, getTypeBitWidth(LT, C), MulBO, C)) {
++      if (MulBO && !isConstantFolded(MulBO, C) &&
++          !isFalsePositiveContext(RHS, MulBO, C)) {
+         emitReport(MulBO, LT, C);
++      }
+     }
+   }
+ }
+@@ -218,9 +286,11 @@
+     const Expr *Init = VD->getInit();
+     const BinaryOperator *MulBO = nullptr;
+-    if (findFirstSuspiciousMul(Init, getTypeBitWidth(T, C), MulBO, C)) {
+-      if (MulBO && !isConstantFolded(MulBO, C))
++    if (findFirstSuspiciousMulOnValuePath(Init, getTypeBitWidth(T, C), MulBO, C)) {
++      if (MulBO && !isConstantFolded(MulBO, C) &&
++          !isFalsePositiveContext(Init, MulBO, C)) {
+         emitReport(MulBO, T, C);
++      }
+     }
+   }
+ }

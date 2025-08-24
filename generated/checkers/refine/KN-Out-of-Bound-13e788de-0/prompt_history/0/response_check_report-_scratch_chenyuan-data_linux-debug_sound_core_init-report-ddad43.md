@@ -1,0 +1,4 @@
+- Decision: NotABug
+- Reason: The reported line is not an index validation but a buffer-size/length check before concatenation. It computes the total required size including the trailing NUL and a potential separating space:
+  needed = strlen(card->components) + 1 (space) + len (component) + 1 (NUL).
+  Using “> sizeof(card->components)” is correct here: writes are safe when needed <= sizeof(buffer), and only overflow when needed > sizeof(buffer). Switching to “>=” would incorrectly reject the exact-fit case (needed == sizeof), which is safe because it leaves the NUL at the last position. Additionally, the code is conservative by always adding 1 for a space even when the buffer is empty, which only reduces capacity but does not cause an overflow. This does not match the target bug pattern (off-by-one index check with idx vs MAX), nor is it a real bug.

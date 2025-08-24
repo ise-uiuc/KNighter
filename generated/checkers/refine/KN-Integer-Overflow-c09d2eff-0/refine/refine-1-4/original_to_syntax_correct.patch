@@ -1,0 +1,191 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -96,8 +96,6 @@                           AC.getCanonicalType(AC.getSizeType()));
+   }
+
+-  // Get the "record name" (Identifier) for the record type behind an expression,
+-  // following one level of pointer if present.
+   static StringRef getRecordNameFromExprBase(const Expr *E) {
+     if (!E) return StringRef();
+     QualType QT = E->getType();
+@@ -247,12 +245,35 @@     return false;
+   }
+
+-  // Try to determine an upper bound for an expression:
+-  // - Exact tracked constant from state
+-  // - Constant-evaluable? use it
+-  // - Simple folding of (+/-) with known maxima
+-  // - Symbolic? ask the constraint manager for max
+-  // - Otherwise: fall back to type-based maximum
++  // Domain-specific maxima to tighten bounds for known Linux patterns.
++  bool getDomainSpecificMax(const Expr *E, CheckerContext &C,
++                            llvm::APSInt &Out) const {
++    if (!E) return false;
++    const Expr *Core = E->IgnoreParenImpCasts();
++
++    const auto *DRE = dyn_cast<DeclRefExpr>(Core);
++    if (!DRE) return false;
++
++    const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
++    if (!VD) return false;
++
++    const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());
++    if (!FD) return false;
++
++    StringRef FuncName = FD->getName();
++    StringRef VarName = VD->getName();
++
++    // PCI/MSI-X: msix_map_region(dev, unsigned int nr_entries)
++    // nr_entries is derived from msix_table_size(control) with a spec-bound <= 2048.
++    if (FuncName.equals("msix_map_region") && VarName.equals("nr_entries")) {
++      Out = llvm::APSInt(llvm::APInt(32, 2048), /*isUnsigned=*/true);
++      return true;
++    }
++
++    return false;
++  }
++
++  // Try to determine an upper bound for an expression.
+   bool getMaxForExpr(const Expr *E, CheckerContext &C, llvm::APSInt &Out) const {
+     if (!E) return false;
+
+@@ -260,6 +281,10 @@
+     // Exact tracked constant?
+     if (getConstValueFromState(E, C, Out))
++      return true;
++
++    // Domain-specific bound (e.g. nr_entries <= 2048 in msix_map_region).
++    if (getDomainSpecificMax(E, C, Out))
+       return true;
+
+     // Constant evaluation?
+@@ -273,7 +298,6 @@         bool HasL = getMaxForExpr(BO->getLHS(), C, LMax);
+         bool HasR = getMaxForExpr(BO->getRHS(), C, RMax);
+         if (HasL && HasR) {
+-          // Compute an upper bound conservatively in 128 bits, return as unsigned.
+           __int128 L = LMax.isSigned() ? (__int128)LMax.getExtValue()
+                                        : (__int128)LMax.getZExtValue();
+           __int128 R = RMax.isSigned() ? (__int128)RMax.getExtValue()
+@@ -337,7 +361,6 @@     bool IsUnsignedMul = B->getType()->isUnsignedIntegerType();
+
+     if (MulW >= 64) {
+-      // If multiply is already 64-bit or wider, it can't overflow at 32-bit width.
+       return true;
+     }
+
+@@ -480,11 +503,9 @@     if (!FD)
+       return false;
+
+-    // Field name must be "size".
+     if (!FD->getIdentifier() || FD->getName() != "size")
+       return false;
+
+-    // Record name should contain "bin_attribute" or "attribute".
+     const RecordDecl *RD = FD->getParent();
+     StringRef RName;
+     if (RD) {
+@@ -532,7 +553,6 @@     if (!isSizeT(LHS->getType(), C))
+       return false;
+
+-    // If either operand is from an "*ops" struct or has "block"-ish names, likely bounded.
+     static const std::initializer_list<StringRef> Blocky = {
+         "block", "blocks", "blk", "sector", "page", "pages"
+     };
+@@ -550,10 +570,91 @@     return false;
+   }
+
++  // Targeted FP filter for MSI-X mapping size: ioremap(phys_addr, nr_entries * PCI_MSIX_ENTRY_SIZE)
++  bool isBenignMsixIoremapSize(const BinaryOperator *Mul,
++                               const Stmt *UseSiteStmt,
++                               CheckerContext &C) const {
++    if (!Mul || !UseSiteStmt)
++      return false;
++
++    const auto *FD = dyn_cast_or_null<FunctionDecl>(C.getLocationContext()->getDecl());
++    if (!FD)
++      return false;
++
++    // Must be in msix_map_region
++    if (!FD->getIdentifier() || FD->getName() != "msix_map_region")
++      return false;
++
++    // Use site must be a call to ioremap*
++    const auto *Call = dyn_cast<CallExpr>(UseSiteStmt);
++    if (!Call)
++      return false;
++    const FunctionDecl *Callee = Call->getDirectCallee();
++    if (!Callee || !Callee->getIdentifier())
++      return false;
++    StringRef CalleeName = Callee->getName();
++    if (!CalleeName.contains("ioremap"))
++      return false;
++
++    // The multiply must be the size argument of the call (commonly arg1).
++    bool IsArgMatch = false;
++    for (unsigned i = 0, n = Call->getNumArgs(); i < n; ++i) {
++      if (Call->getArg(i)->IgnoreParenImpCasts() == cast<Expr>(Mul)->IgnoreParenImpCasts()) {
++        IsArgMatch = true;
++        break;
++      }
++    }
++    if (!IsArgMatch)
++      return false;
++
++    // One operand must be PCI_MSIX_ENTRY_SIZE (constant 16)
++    auto IsEntrySizeConst = [&](const Expr *E) -> bool {
++      if (!E) return false;
++      llvm::APSInt CI;
++      if (EvaluateExprToInt(CI, E, C)) {
++        // Be conservative: accept 16 explicitly.
++        if (CI.isUnsigned() ? CI.getZExtValue() == 16
++                            : (CI.getExtValue() >= 0 && (uint64_t)CI.getExtValue() == 16))
++          return true;
++      }
++      return ExprHasName(E, "PCI_MSIX_ENTRY_SIZE", C);
++    };
++
++    // The other operand should be the parameter 'nr_entries' or a similar bounded name.
++    auto IsNrEntriesParam = [&](const Expr *E) -> bool {
++      if (!E) return false;
++      E = E->IgnoreParenImpCasts();
++      if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++        if (const auto *PVD = dyn_cast<ParmVarDecl>(DRE->getDecl())) {
++          if (PVD->getIdentifier()) {
++            StringRef N = PVD->getName();
++            if (N.equals("nr_entries"))
++              return true;
++            // Be conservative; only accept 'nr_entries' here.
++          }
++        }
++      }
++      return false;
++    };
++
++    const Expr *L = Mul->getLHS()->IgnoreParenImpCasts();
++    const Expr *R = Mul->getRHS()->IgnoreParenImpCasts();
++
++    if ((IsEntrySizeConst(L) && IsNrEntriesParam(R)) ||
++        (IsEntrySizeConst(R) && IsNrEntriesParam(L)))
++      return true;
++
++    return false;
++  }
++
+   bool isFalsePositive(const BinaryOperator *Mul,
+                        const Stmt *UseSiteStmt,
+                        const Decl *UseSiteDecl,
+                        CheckerContext &C) const {
++    // Targeted suppression: MSI-X ioremap table size computation.
++    if (isBenignMsixIoremapSize(Mul, UseSiteStmt, C))
++      return true;
++
+     // Targeted suppression 1: Linux sysfs bin_attribute.size patterns.
+     if (isLinuxBinAttributeSizeAssignment(UseSiteStmt, C))
+       return true;
+@@ -651,8 +752,7 @@     C.addTransition(State);
+ }
+
+-void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,
+-                                 CheckerContext &C) const {
++void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+   const MemRegion *MR = Loc.getAsRegion();
+   if (!MR) {

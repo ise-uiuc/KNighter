@@ -1,0 +1,181 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -65,6 +65,14 @@     return E ? E->IgnoreParenImpCasts() : nullptr;
+   }
+
++  static const BinaryOperator *asShift(const Stmt *S) {
++    if (const auto *BO = dyn_cast_or_null<BinaryOperator>(S)) {
++      if (BO->getOpcode() == BO_Shl)
++        return BO;
++    }
++    return nullptr;
++  }
++
+   // Report only if the shift is the top-level expression reaching the 64-bit destination.
+   static bool isTopLevelShiftExpr(const Expr *ContainerE, const BinaryOperator *Shl) {
+     if (!ContainerE || !Shl)
+@@ -73,31 +81,109 @@     return Top == static_cast<const Expr *>(Shl);
+   }
+
++  // Try to fetch a ConcreteInt from the current symbolic state for E.
++  static bool getConcreteAPSIntFromState(const Expr *E, CheckerContext &C,
++                                         llvm::APSInt &Out) {
++    ProgramStateRef State = C.getState();
++    SVal SV = State->getSVal(E, C.getLocationContext());
++    if (auto CI = SV.getAs<nonloc::ConcreteInt>()) {
++      Out = CI->getValue();
++      return true;
++    }
++    return false;
++  }
++
++  // Computes the number of active bits if E is a known non-negative constant in the current state/AST.
++  // Returns true only if we can determine a constant value for E.
++  static bool getActiveBitsIfConstNonNeg(const Expr *E, CheckerContext &C,
++                                         unsigned &ActiveBits) {
++    llvm::APSInt V;
++    // Prefer path-sensitive concrete value from state; fallback to AST constant evaluator.
++    if (!getConcreteAPSIntFromState(E, C, V)) {
++      if (!EvaluateExprToInt(V, E, C))
++        return false;
++    }
++    if (V.isSigned() && V.isNegative())
++      return false;
++    ActiveBits = V.getActiveBits(); // 0 for value == 0
++    return true;
++  }
++
++  // Try to infer an upper bound on RHS via constant-eval or the constraint manager.
++  static bool getExprUpperBound(const Expr *E, CheckerContext &C, uint64_t &MaxOut) {
++    llvm::APSInt V;
++    // First try path-sensitive concrete value.
++    if (getConcreteAPSIntFromState(E, C, V) || EvaluateExprToInt(V, E, C)) {
++      // Clamp to zero for negative, though shift amounts should be non-negative.
++      if (V.isSigned() && V.isNegative())
++        MaxOut = 0;
++      else
++        MaxOut = V.getZExtValue();
++      return true;
++    }
++
++    // Try to obtain a symbolic upper bound from constraints.
++    ProgramStateRef State = C.getState();
++    SVal SV = State->getSVal(E, C.getLocationContext());
++    if (SymbolRef Sym = SV.getAsSymbol()) {
++      if (const llvm::APSInt *Max = inferSymbolMaxVal(Sym, C)) {
++        MaxOut = Max->getZExtValue();
++        return true;
++      }
++    }
++
++    return false;
++  }
++
+   // Precise constant-safety check: if both LHS and RHS are constant and the result
+-  // provably fits into the LHS bitwidth, we suppress.
+-  static bool constantShiftFitsInLHSWidth(const Expr *L, const Expr *R,
+-                                          unsigned LHSW, CheckerContext &C) {
++  // provably fits into the shift's computation type width, we suppress.
++  static bool constantShiftFitsInWidth(const Expr *L, const Expr *R,
++                                       unsigned ShiftW, bool ShiftTypeIsSigned,
++                                       CheckerContext &C) {
+     llvm::APSInt LHSEval, RHSEval;
+-    if (!EvaluateExprToInt(LHSEval, L, C))
+-      return false;
+-    if (!EvaluateExprToInt(RHSEval, R, C))
+-      return false;
+-
+-    // Be conservative for negative LHS.
++    // Use path-sensitive concrete values if available; otherwise AST evaluation.
++    bool LHSHave = getConcreteAPSIntFromState(L, C, LHSEval) || EvaluateExprToInt(LHSEval, L, C);
++    bool RHSHave = getConcreteAPSIntFromState(R, C, RHSEval) || EvaluateExprToInt(RHSEval, R, C);
++    if (!LHSHave || !RHSHave)
++      return false;
++
+     if (LHSEval.isSigned() && LHSEval.isNegative())
+       return false;
+
+-    // Active bits of the non-negative LHS.
+     unsigned LBits = LHSEval.getActiveBits(); // 0 if value == 0
+-    uint64_t ShiftAmt = RHSEval.getZExtValue();
+-
+-    // Safe if highest set bit after shifting still fits in LHS width.
+-    // LBits == 0 is always safe (0 << n == 0).
++    uint64_t ShiftAmt = (RHSEval.isSigned() && RHSEval.isNegative()) ? 0
++                                                                     : RHSEval.getZExtValue();
++
++    // Max allowed highest-set-bit index in result for representable values:
++    // - For unsigned N-bit: indices 0..(N-1).
++    // - For signed N-bit: be conservative and avoid setting the sign bit: indices 0..(N-2).
++    uint64_t Limit = ShiftW - (ShiftTypeIsSigned ? 1u : 0u);
++
+     if (LBits == 0)
+       return true;
+
+-    // Example: a 32-bit LHS can hold results where (LBits + ShiftAmt) <= 32.
+-    return (uint64_t)LBits + ShiftAmt <= (uint64_t)LHSW;
++    return (uint64_t)LBits + ShiftAmt <= Limit;
++  }
++
++  // Path-sensitive bounded safety: if L is a known constant and RHS has a known upper bound,
++  // and the result definitely fits in the shift computation width, suppress.
++  static bool boundedShiftFitsInWidthViaConstraints(const Expr *L, const Expr *R,
++                                                    unsigned ShiftW, bool ShiftTypeIsSigned,
++                                                    CheckerContext &C) {
++    unsigned LBits = 0;
++    if (!getActiveBitsIfConstNonNeg(L, C, LBits))
++      return false;
++
++    uint64_t RHSMax = 0;
++    if (!getExprUpperBound(R, C, RHSMax))
++      return false;
++
++    uint64_t Limit = ShiftW - (ShiftTypeIsSigned ? 1u : 0u);
++
++    if (LBits == 0)
++      return true;
++
++    return (uint64_t)LBits + RHSMax <= Limit;
+   }
+
+   // Centralized FP gate
+@@ -112,14 +198,6 @@   }
+ };
+
+-static const BinaryOperator *asShift(const Stmt *S) {
+-  if (const auto *BO = dyn_cast_or_null<BinaryOperator>(S)) {
+-    if (BO->getOpcode() == BO_Shl)
+-      return BO;
+-  }
+-  return nullptr;
+-}
+-
+ const BinaryOperator *SAGenTestChecker::findShiftInTree(const Stmt *S) {
+   if (!S)
+     return nullptr;
+@@ -186,13 +264,7 @@   if (ShlW >= 64)
+     return; // Shift already performed in 64-bit, OK.
+
+-  // LHS must be integer and narrower than 64.
+-  if (!L->getType()->isIntegerType())
+-    return;
+-
+-  unsigned LHSW = ACtx.getIntWidth(L->getType());
+-  if (LHSW >= 64)
+-    return; // LHS is already wide enough.
++  bool ShiftTypeIsSigned = ShlTy->isSignedIntegerType();
+
+   // If there is an explicit cast to >=64-bit within the LHS subtree, suppress.
+   if (hasExplicitCastToWide64(L, ACtx))
+@@ -202,8 +274,12 @@   if (isFalsePositiveContext(E, Shl, C))
+     return;
+
+-  // Precise constant-bound suppression: only if both sides are constants and safe.
+-  if (constantShiftFitsInLHSWidth(L, R, LHSW, C))
++  // 1) Constant-proof using actual shift type width and signedness.
++  if (constantShiftFitsInWidth(L, R, ShlW, ShiftTypeIsSigned, C))
++    return;
++
++  // 2) Path-sensitive bounded proof using constraints when L is a constant.
++  if (boundedShiftFitsInWidthViaConstraints(L, R, ShlW, ShiftTypeIsSigned, C))
+     return;
+
+   // Report

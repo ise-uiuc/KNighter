@@ -1,0 +1,235 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -23,7 +23,23 @@ using namespace ento;
+ using namespace taint;
+
+-// No program state traits required for this checker.
++// Utility functions provided in the prompt.
++template <typename T>
++const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
++template <typename T>
++const T* findSpecificTypeInChildren(const Stmt *S);
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C);
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C);
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E);
++bool getStringSize(llvm::APInt &StringSize, const Expr *E);
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C);
++struct KnownDerefFunction {
++  const char *Name;
++  llvm::SmallVector<unsigned, 4> Params;
++};
++bool functionKnownToDeref(const CallEvent &Call,
++                                 llvm::SmallVectorImpl<unsigned> &DerefParams);
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
+
+ namespace {
+
+@@ -59,9 +75,14 @@   // Extract a variable/field identifier name from an expression if possible.
+   static std::string extractIdentifierLikeName(const Expr *E);
+
++  // Semantic filters to reduce false positives.
++  static bool isAddressOrSizeLikeLHS(const Expr *LHS);
++  static bool isIrqLikeContext(const Expr *Root, const Expr *LHS, CheckerContext &C);
++
+   // Heuristic: detect known-timeout/jiffies contexts to avoid FPs.
+   static bool isFalsePositiveContext(const Expr *Root,
+                                      const BinaryOperator *MulBO,
++                                     const Expr *LHSExpr,
+                                      CheckerContext &C);
+
+   // FP suppressors for cases where '*' is not contributing directly to the value
+@@ -75,6 +96,7 @@   // Aggregated FP gate.
+   static bool isFalsePositive(const Expr *Root,
+                               const BinaryOperator *MulBO,
++                              const Expr *LHSExpr,
+                               CheckerContext &C);
+
+   static bool nameContains(StringRef TextLower,
+@@ -112,15 +134,7 @@   return EvaluateExprToInt(EvalRes, E, C);
+ }
+
+-// Restrict traversal to the value-producing path of Root:
+-// - Do NOT traverse into CallExpr arguments: their values do not form the
+-//   final rvalue assigned; the call's return value does.
+-// - Do NOT traverse into expressions that only compute addresses/indices
+-//   (ArraySubscriptExpr index, MemberExpr base, UnaryOperator UO_Deref/UO_AddrOf).
+-// - Traverse through arithmetic, casts, parentheses, comma (RHS only), and
+-//   conditional operator arms.
+-// Return true and set OutMul if a '*' is found whose result type is narrower
+-// than TargetBits and is on the value path.
++// Restrict traversal to the value-producing path of Root.
+ bool SAGenTestChecker::findFirstSuspiciousMulOnValuePath(const Expr *Root,
+                                                          unsigned TargetBits,
+                                                          const BinaryOperator *&OutMul,
+@@ -213,6 +227,12 @@     return {};
+   E = E->IgnoreParenImpCasts();
+
++  // Look through deref to get the underlying identifier.
++  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    if (UO->getOpcode() == UO_Deref || UO->getOpcode() == UO_AddrOf)
++      return extractIdentifierLikeName(UO->getSubExpr());
++  }
++
+   if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+     if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl()))
+       return FD->getNameAsString();
+@@ -233,9 +253,54 @@   return false;
+ }
+
++// Address/size-like LHS filter for intended bug surface.
++bool SAGenTestChecker::isAddressOrSizeLikeLHS(const Expr *LHS) {
++  std::string Name = extractIdentifierLikeName(LHS);
++  if (Name.empty())
++    return false;
++  std::string Lower = Name;
++  std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++
++  // Heuristic keywords that map to memory/byte/size/address semantics.
++  // This keeps detection focused on the intended bug pattern.
++  return nameContains(Lower,
++                      {"addr", "address", "dma_addr",
++                       "size", "len", "length", "bytes", "nbytes",
++                       "count", "pitch", "stride", "offset", "ofs"});
++}
++
++// IRQ-like context suppression.
++bool SAGenTestChecker::isIrqLikeContext(const Expr *Root, const Expr *LHS, CheckerContext &C) {
++  // LHS name contains irq-ish patterns (e.g., out_hwirq).
++  std::string LHSName = extractIdentifierLikeName(LHS);
++  std::string Lower = LHSName;
++  std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++  if (!Lower.empty() && nameContains(Lower, {"irq", "hwirq", "intid", "gsi", "spi", "ppi"}))
++    return true;
++
++  // Function name contains irq-domain style names (e.g., *_irq_domain_*xlate*).
++  const FunctionDecl *FD = nullptr;
++  if (const auto *LC = C.getLocationContext())
++    FD = dyn_cast_or_null<FunctionDecl>(LC->getDecl());
++  if (FD) {
++    std::string FName = FD->getNameAsString();
++    std::transform(FName.begin(), FName.end(), FName.begin(), ::tolower);
++    if (nameContains(FName, {"irq", "hwirq", "xlate", "irq_domain"}))
++      return true;
++  }
++
++  // Source expression text heuristic.
++  if (ExprHasName(Root, "intspec", C) || ExprHasName(Root, "irq", C) ||
++      ExprHasName(Root, "hwirq", C))
++    return true;
++
++  return false;
++}
++
+ // Secondary guard: filter known jiffies/timeout contexts to avoid false positives.
+ bool SAGenTestChecker::isFalsePositiveContext(const Expr *Root,
+                                               const BinaryOperator *MulBO,
++                                              const Expr *LHSExpr,
+                                               CheckerContext &C) {
+   (void)MulBO;
+
+@@ -252,15 +317,16 @@   const BinaryOperator *AssignBO =
+       findSpecificTypeInParents<BinaryOperator>(Root, C);
+
+-  const Expr *LHSExpr = nullptr;
+-  if (CAO) {
+-    LHSExpr = CAO->getLHS();
+-  } else if (AssignBO && AssignBO->getOpcode() == BO_Assign) {
+-    LHSExpr = AssignBO->getLHS();
+-  }
+-
+-  if (LHSExpr) {
+-    std::string LHSName = extractIdentifierLikeName(LHSExpr);
++  const Expr *LHS = LHSExpr;
++  if (!LHS) {
++    if (CAO)
++      LHS = CAO->getLHS();
++    else if (AssignBO && AssignBO->getOpcode() == BO_Assign)
++      LHS = AssignBO->getLHS();
++  }
++
++  if (LHS) {
++    std::string LHSName = extractIdentifierLikeName(LHS);
+     if (!LHSName.empty()) {
+       std::string Lower = LHSName;
+       std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
+@@ -268,6 +334,10 @@         return true;
+     }
+   }
++
++  // 3) IRQ-like contexts (e.g., hwirq math) commonly wide-typed but safe.
++  if (LHS && isIrqLikeContext(Root, LHS, C))
++    return true;
+
+   return false;
+ }
+@@ -292,18 +362,25 @@ // Aggregated FP logic.
+ bool SAGenTestChecker::isFalsePositive(const Expr *Root,
+                                        const BinaryOperator *MulBO,
++                                       const Expr *LHSExpr,
+                                        CheckerContext &C) {
+   if (!MulBO)
+     return true;
+
+   // Suppress when:
+-  // - The context is time/jiffies-like.
++  // - The LHS is not address/size-like (we only target addr/size/len/offset/pitch/stride).
++  if (!isAddressOrSizeLikeLHS(LHSExpr))
++    return true;
++
++  // - The context is time/jiffies-like or irq-domain-like.
++  if (isFalsePositiveContext(Root, MulBO, LHSExpr, C))
++    return true;
++
+   // - The multiplication is under a CallExpr (argument), e.g., MSR index macros.
++  if (isMulUnderCallArg(MulBO, Root, C))
++    return true;
++
+   // - The multiplication is under an ArraySubscriptExpr (index computation).
+-  if (isFalsePositiveContext(Root, MulBO, C))
+-    return true;
+-  if (isMulUnderCallArg(MulBO, Root, C))
+-    return true;
+   if (isMulUnderArrayIndex(MulBO, C))
+     return true;
+
+@@ -348,7 +425,7 @@       const Expr *RHS = CAO->getRHS();
+       if (findFirstSuspiciousMulOnValuePath(RHS, getTypeBitWidth(LT, C), MulBO, C)) {
+         if (MulBO && !isConstantFolded(MulBO, C) &&
+-            !isFalsePositive(RHS, MulBO, C)) {
++            !isFalsePositive(RHS, MulBO, LHS, C)) {
+           emitReport(MulBO, LT, C);
+         }
+       }
+@@ -372,7 +449,7 @@     const BinaryOperator *MulBO = nullptr;
+     if (findFirstSuspiciousMulOnValuePath(RHS, getTypeBitWidth(LT, C), MulBO, C)) {
+       if (MulBO && !isConstantFolded(MulBO, C) &&
+-          !isFalsePositive(RHS, MulBO, C)) {
++          !isFalsePositive(RHS, MulBO, LHS, C)) {
+         emitReport(MulBO, LT, C);
+       }
+     }
+@@ -398,8 +475,26 @@     const Expr *Init = VD->getInit();
+     const BinaryOperator *MulBO = nullptr;
+     if (findFirstSuspiciousMulOnValuePath(Init, getTypeBitWidth(T, C), MulBO, C)) {
++      // For initialization, synthesize a pseudo-LHS using the VarDecl's name.
++      // We'll build a simple DeclRefExpr-like name via VD.
++      // Here we create a very small shim: we pass nullptr for LHSExpr, but handle
++      // it in isFalsePositiveContext by scanning jiffies/irq in Root and using
++      // the VarDecl's name as a proxy for LHS semantics.
++      // Simpler: construct a fake DeclRefExpr is heavy; instead check name here.
++      // If VD name isn't address/size-like, suppress.
++      std::string Name = VD->getNameAsString();
++      std::string Lower = Name;
++      std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
++      bool IsAddrSizeLike =
++          nameContains(Lower,
++                       {"addr", "address", "dma_addr",
++                        "size", "len", "length", "bytes", "nbytes",
++                        "count", "pitch", "stride", "offset", "ofs"});
++      if (!IsAddrSizeLike)
++        continue;
++
+       if (MulBO && !isConstantFolded(MulBO, C) &&
+-          !isFalsePositive(Init, MulBO, C)) {
++          !isFalsePositive(Init, MulBO, nullptr, C)) {
+         emitReport(MulBO, T, C);
+       }
+     }

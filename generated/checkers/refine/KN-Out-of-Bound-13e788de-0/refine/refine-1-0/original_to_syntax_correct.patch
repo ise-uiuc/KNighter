@@ -1,0 +1,266 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -124,6 +124,24 @@     return Lexer::getSourceText(Range, SM, LangOpts);
+   }
+
++  static std::string normalizeNoSpace(StringRef S) {
++    std::string Out;
++    Out.reserve(S.size());
++    for (char ch : S) {
++      if (!isspace(static_cast<unsigned char>(ch)))
++        Out.push_back(ch);
++    }
++    return Out;
++  }
++
++  static bool exprTextEqual(const Expr *A, const Expr *B, CheckerContext &C) {
++    if (!A || !B) return false;
++    StringRef TA = getExprText(A, C);
++    StringRef TB = getExprText(B, C);
++    if (TA.empty() || TB.empty()) return false;
++    return normalizeNoSpace(TA) == normalizeNoSpace(TB);
++  }
++
+   static bool nameLooksLikeCountBound(StringRef Name) {
+     std::string Lower = Name.lower();
+     if (Lower.find("max") != std::string::npos)
+@@ -136,7 +154,27 @@       return true;
+     if (Lower.find("count") != std::string::npos || Lower.find("num") != std::string::npos)
+       return true;
+-    return false;
++    if (Lower.find("size") != std::string::npos || Lower.find("len") != std::string::npos)
++      return true;
++    return false;
++  }
++
++  static bool containsTimeLikeToken(StringRef S) {
++    std::string L = S.lower();
++    return L.find("period") != std::string::npos ||
++           L.find("time") != std::string::npos ||
++           L.find("timeout") != std::string::npos ||
++           L.find("ns") != std::string::npos ||
++           L.find("usec") != std::string::npos ||
++           L.find("msec") != std::string::npos ||
++           L.find("ms") != std::string::npos ||
++           L.find("sec") != std::string::npos ||
++           L.find("hz") != std::string::npos ||
++           L.find("clock") != std::string::npos ||
++           L.find("clk") != std::string::npos ||
++           L.find("rate") != std::string::npos ||
++           L.find("freq") != std::string::npos ||
++           L.find("cycle") != std::string::npos;
+   }
+
+   static bool isDeclRefWithNameLikeCount(const Expr *E) {
+@@ -163,7 +201,7 @@     E = E ? E->IgnoreParenCasts() : nullptr;
+     if (!E)
+       return false;
+-    return !isa<DeclRefExpr>(E) && !isa<MemberExpr>(E);
++    return !isa<DeclRefExpr>(E) && !isa<MemberExpr>(E) && !isa<IntegerLiteral>(E);
+   }
+
+   static bool isUnarySizeOf(const Expr *E) {
+@@ -207,25 +245,61 @@     return isLikelyErrorReturn(RS, C);
+   }
+
++  // Check if an IntegerLiteral is spelled as a macro-like named constant.
++  // E.g., RHS node is IntegerLiteral but source text contains an identifier like FOO_MAX.
++  static bool isIntegerLiteralSpelledAsNamedBound(const Expr *E, CheckerContext &C) {
++    const auto *IL = dyn_cast_or_null<IntegerLiteral>(E ? E->IgnoreParenCasts() : nullptr);
++    if (!IL)
++      return false;
++    StringRef Txt = getExprText(E, C);
++    if (Txt.empty())
++      return false;
++
++    // Allow typical numeric literal chars in integers: digits, hex prefix, and U/L suffixes.
++    auto IsAllowedNumChar = [](char ch) {
++      return (ch >= '0' && ch <= '9') ||
++             (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F') ||
++             ch == 'x' || ch == 'X' || ch == 'u' || ch == 'U' || ch == 'l' || ch == 'L' ||
++             ch == '\''; // digit separators
++    };
++
++    bool HasNonNumericToken = false;
++    for (char ch : Txt) {
++      if (isspace(static_cast<unsigned char>(ch)))
++        continue;
++      if (!IsAllowedNumChar(ch)) {
++        HasNonNumericToken = true;
++        break;
++      }
++    }
++
++    if (!HasNonNumericToken)
++      return false; // Pure numeric literal.
++
++    // If it contains non-numeric token(s), check if it looks like a MAX-like named bound.
++    return nameLooksLikeCountBound(Txt);
++  }
++
+   static bool isPlainMaxLikeBound(const Expr *Bound, CheckerContext &C) {
+     if (!Bound)
+       return false;
+
+     Bound = Bound->IgnoreParenCasts();
+
+-    // Do not consider literal bounds here; reduces FPs like 'bits > 32'.
+-    if (isa<IntegerLiteral>(Bound))
+-      return false;
+-
+     // Do not consider sizeof-style bounds.
+     if (isUnarySizeOf(Bound))
+       return false;
+
+-    // Do not consider complex expressions; stick to named constants/fields.
+-    if (isCompositeBoundExpr(Bound))
+-      return false;
+-
+-    return isDeclRefWithNameLikeCount(Bound);
++    // Named DeclRef/MemberExpr bound like FOO_MAX or obj.max_count.
++    if (!isCompositeBoundExpr(Bound) && !isa<IntegerLiteral>(Bound))
++      return isDeclRefWithNameLikeCount(Bound);
++
++    // IntegerLiteral that is spelled via a named macro (e.g. RDS_MSG_RX_DGRAM_TRACE_MAX).
++    if (isa<IntegerLiteral>(Bound))
++      return isIntegerLiteralSpelledAsNamedBound(Bound, C);
++
++    // Avoid complex expressions (e.g., ARRAY_SIZE(), a+b), to reduce FPs.
++    return false;
+   }
+
+   static bool isLikelyIndexExpr(const Expr *E) {
+@@ -237,8 +311,12 @@     if (isa<IntegerLiteral>(E))
+       return false;
+
+-    // We consider raw vars/fields or explicit array indices as index-like.
+-    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E) || isa<ArraySubscriptExpr>(E))
++    // Prefer array-subscript style (most direct evidence of index usage).
++    if (isa<ArraySubscriptExpr>(E))
++      return true;
++
++    // Also accept raw vars/fields which might be propagated indices.
++    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E))
+       return true;
+
+     return false;
+@@ -257,7 +335,7 @@     return false;
+   }
+
+-  // Specific false-positive filters.
++  // Specific false-positive filters for bit-width like "bits > 32".
+   static bool containsBitsToken(StringRef S) {
+     StringRef L = S.lower();
+     return L.contains("bit") || L.contains("bits");
+@@ -291,19 +369,45 @@     return (HasBitsToken || LHSCallHasBits) && RHSIsBitWidthLiteral;
+   }
+
+-  static bool isFalsePositive(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+-    (void)LHS;
+-
++  // FP filter: temporal/rate guards (period/time/clk/hz/rate/etc).
++  static bool isTimeOrPeriodGuard(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
++    StringRef LT = getExprText(LHS, C);
++    StringRef RT = getExprText(RHS, C);
++    return containsTimeLikeToken(LT) || containsTimeLikeToken(RT);
++  }
++
++  // Find if the same LHS variable is also checked with a lower bound (var < min or var <= min)
++  // within the same condition tree. This is commonly a value-range guard, not an index bound check.
++  static bool hasLowerBoundForSameLHS(const Expr *RootCond, const Expr *TargetLHS, CheckerContext &C) {
++    if (!RootCond || !TargetLHS)
++      return false;
++
++    RootCond = RootCond->IgnoreParenImpCasts();
++
++    if (const auto *BO = dyn_cast<BinaryOperator>(RootCond)) {
++      BinaryOperatorKind Op = BO->getOpcode();
++      if (Op == BO_LT || Op == BO_LE) {
++        if (exprTextEqual(BO->getLHS()->IgnoreParenCasts(), TargetLHS->IgnoreParenCasts(), C))
++          return true;
++      }
++      // Traverse both sides for logical and other composed expressions.
++      return hasLowerBoundForSameLHS(BO->getLHS(), TargetLHS, C) ||
++             hasLowerBoundForSameLHS(BO->getRHS(), TargetLHS, C);
++    }
++
++    if (const auto *CO = dyn_cast<ConditionalOperator>(RootCond)) {
++      return hasLowerBoundForSameLHS(CO->getCond(), TargetLHS, C) ||
++             hasLowerBoundForSameLHS(CO->getTrueExpr(), TargetLHS, C) ||
++             hasLowerBoundForSameLHS(CO->getFalseExpr(), TargetLHS, C);
++    }
++
++    return false;
++  }
++
++  static bool isFalsePositive(const Expr *LHS, const Expr *RHS, const Expr *RootCond, CheckerContext &C) {
+     const Expr *R = RHS ? RHS->IgnoreParenCasts() : nullptr;
+     if (!R)
+       return true;
+-
+-    // Reject integer literal RHS outright. This excludes many non-index guards,
+-    // including 'bits > 32' and similar.
+-    if (const auto *IL = dyn_cast<IntegerLiteral>(R)) {
+-      (void)IL;
+-      return true;
+-    }
+
+     // Exclude "x > MAX - 1" patterns; these are not our target in this checker.
+     StringRef TxtR = getExprText(RHS, C);
+@@ -312,6 +416,20 @@
+     // Exclude bit-width style guards (e.g., "foo_bits(...) > 32").
+     if (isBitWidthStyleGuard(LHS, RHS, C))
++      return true;
++
++    // Exclude time/period/rate style guards (e.g., "period_ns > max_period_ns").
++    if (isTimeOrPeriodGuard(LHS, RHS, C))
++      return true;
++
++    // If RHS is a pure numeric literal (not macro-spelled), treat as FP.
++    if (const auto *IL = dyn_cast<IntegerLiteral>(R)) {
++      if (!isIntegerLiteralSpelledAsNamedBound(RHS, C))
++        return true;
++    }
++
++    // If this '>' comparison is part of a range guard '(var < min || var > max)' on same LHS, exclude.
++    if (hasLowerBoundForSameLHS(RootCond, LHS, C))
+       return true;
+
+     return false;
+@@ -343,7 +461,7 @@     }
+   }
+
+-  bool isCandidateGtComparison(const BinaryOperator *BO, CheckerContext &C) const {
++  bool isCandidateGtComparison(const BinaryOperator *BO, const Expr *RootCond, CheckerContext &C) const {
+     if (!BO || BO->getOpcode() != BO_GT)
+       return false;
+
+@@ -353,11 +471,11 @@     if (!LHS || !RHS)
+       return false;
+
+-    // LHS should look like an index.
++    // LHS should look like an index or an index-bearing expression.
+     if (!isLikelyIndexExpr(LHS))
+       return false;
+
+-    // RHS should be a named MAX-like bound.
++    // RHS should be a MAX-like bound (accept macro-spelled IntegerLiterals too).
+     if (!isPlainMaxLikeBound(RHS, C))
+       return false;
+
+@@ -365,8 +483,8 @@     if (isBufferCapacityComparison(LHS, RHS, C))
+       return false;
+
+-    // Exclude known false positives (e.g., bit-width checks).
+-    if (isFalsePositive(LHS, RHS, C))
++    // Exclude known false positives (bit-width, time/rate, range-guard, etc.).
++    if (isFalsePositive(LHS, RHS, RootCond, C))
+       return false;
+
+     return true;
+@@ -397,7 +515,7 @@     return;
+
+   for (const BinaryOperator *BO : GtComps) {
+-    if (!isCandidateGtComparison(BO, C))
++    if (!isCandidateGtComparison(BO, CondE, C))
+       continue;
+
+     ExplodedNode *N = C.generateNonFatalErrorNode();

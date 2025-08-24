@@ -1,0 +1,7 @@
+- Decision: NotABug
+- Reason: This report does not match the target bug pattern and is not a real double-free. The target pattern concerns a shared error path freeing a resource that may be callee-managed or conditionally allocated by a failing helper, leading to a double free (e.g., freeing mt->fc after a callee that may have already freed it). Here, sctp_auth_init()’s shared error label unconditionally kfree’s ep->auth_hmacs_list and ep->auth_chunk_list, but:
+  - These fields are owned by the endpoint and by this initializer, not by the failing callee. The helper sctp_auth_init_hmacs() allocates/frees only ep->auth_hmacs and, on failure, cleans up ep->auth_hmacs itself and does not touch the two lists.
+  - The error path sets ep->auth_hmacs_list and ep->auth_chunk_list to NULL immediately after kfree, preventing later double free in sctp_auth_free().
+  - In practical control flow, sctp_auth_init() is used during endpoint initialization where these fields start as NULL and are allocated here; freeing them on failure is correct. The analyzer’s flagged path assumes both lists are already non-NULL, but sctp_auth_init() is not designed to be called in a context where these pre-exist and, even if it were, freeing these endpoint-owned fields on failure would still not cause a double free.
+
+Therefore, the reported case neither exhibits callee-managed freeing nor produces a double free, and it does not match the specified target bug pattern.

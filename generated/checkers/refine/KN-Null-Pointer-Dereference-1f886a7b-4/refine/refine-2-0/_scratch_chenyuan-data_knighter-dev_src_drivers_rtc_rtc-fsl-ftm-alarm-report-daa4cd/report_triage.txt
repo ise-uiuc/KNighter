@@ -1,0 +1,6 @@
+- Decision: NotABug
+- Reason: The reported site does not match the target bug pattern and is not a real bug. In ftm_rtc_probe():
+  - The per-instance structure ‘rtc’ is allocated with devm_kzalloc() and immediately checked for NULL; on failure it returns -ENOMEM. So it does not fit the “missing NULL check after devm_kzalloc” pattern.
+  - The warning points to rtc->rtc_dev from devm_rtc_allocate_device(&pdev->dev). That helper does not return NULL on failure; it returns an ERR_PTR (e.g., ERR_PTR(-ENOMEM)). The code correctly checks IS_ERR(rtc->rtc_dev) and returns PTR_ERR(...) on failure. Therefore rtc->rtc_dev cannot be NULL past that check, and the later dereference rtc->rtc_dev->ops is safe.
+  - The analyzer’s message about “devm_kzalloc() result may be NULL” appears to conflate an internal allocation inside devm_rtc_allocate_device() with the caller’s contract; however, the helper converts allocation failure into ERR_PTR, not NULL.
+  - Consequently, there is no feasible NULL dereference here, and it does not match the specified bug pattern.

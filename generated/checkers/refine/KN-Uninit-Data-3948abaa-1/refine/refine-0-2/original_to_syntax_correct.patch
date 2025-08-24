@@ -1,0 +1,129 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -76,6 +76,10 @@       bool functionKnownToInitLenIsReturn(const CallEvent &Call, CheckerContext &C, unsigned &BufParamIdx) const;
+       SymbolRef getPointeeSymbolForPointerArg(const CallEvent &Call, unsigned Idx, CheckerContext &C) const;
+       bool isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const;
++
++      // New helpers for relational reasoning
++      bool isProvablyTrue(ProgramStateRef State, DefinedOrUnknownSVal Cond, CheckerContext &C) const;
++      const Expr *extractOffsetExprFromFromArg(const CallEvent &CopyToUserCall) const;
+ };
+
+ const MemRegion *SAGenTestChecker::canonical(ProgramStateRef State, const MemRegion *R) const {
+@@ -204,6 +208,15 @@         return true;
+       }
+     }
++    // snprintf(buf, size, ...)
++    if (ExprHasName(Origin, "snprintf", C) || ExprHasName(Origin, "scnprintf", C) ||
++        ExprHasName(Origin, "vsnprintf", C) || ExprHasName(Origin, "vscnprintf", C) ||
++        ExprHasName(Origin, "sprintf", C) || ExprHasName(Origin, "vsprintf", C)) {
++      if (Call.getNumArgs() >= 1) {
++        BufParamIdx = 0;
++        return true;
++      }
++    }
+   }
+   return false;
+ }
+@@ -220,8 +233,30 @@   return Pointee.getAsSymbol();
+ }
+
++bool SAGenTestChecker::isProvablyTrue(ProgramStateRef State, DefinedOrUnknownSVal Cond, CheckerContext &C) const {
++  if (Cond.isUnknown())
++    return false;
++  auto StTrue = State->assume(Cond, true);
++  auto StFalse = State->assume(Cond, false);
++  return StTrue && !StFalse;
++}
++
++// Try to pull out an integer offset from the second argument of copy_to_user when it looks like "buf + off".
++const Expr *SAGenTestChecker::extractOffsetExprFromFromArg(const CallEvent &CopyToUserCall) const {
++  const Expr *FromE = CopyToUserCall.getArgExpr(1);
++  if (!FromE)
++    return nullptr;
++  const BinaryOperator *BO = findSpecificTypeInChildren<BinaryOperator>(FromE);
++  if (!BO)
++    return nullptr;
++  if (BO->getOpcode() == BO_Add) {
++    return BO->getRHS();
++  }
++  return nullptr;
++}
++
+ // Decide if this copy_to_user should be suppressed because a known producer
+-// fully initialized the buffer for exactly the number of bytes being copied.
++// fully initialized the buffer for the number of bytes being copied (or a provable subset of it).
+ bool SAGenTestChecker::isFalsePositiveDueToProducer(const CallEvent &CopyToUserCall, CheckerContext &C, const MemRegion *FromReg) const {
+   ProgramStateRef State = C.getState();
+
+@@ -229,11 +264,7 @@   if (!LenSymP || !*LenSymP)
+     return false;
+
+-  SVal LenArgV = CopyToUserCall.getArgSVal(2);
+-  SymbolRef CopyLenSym = LenArgV.getAsSymbol();
+-  if (!CopyLenSym || CopyLenSym != *LenSymP)
+-    return false;
+-
++  // If there is a status symbol, require that it is provably success (== 0).
+   if (const SymbolRef *StatusSymP = State->get<ProducerStatusSymMap>(FromReg)) {
+     if (*StatusSymP) {
+       SValBuilder &SVB = C.getSValBuilder();
+@@ -241,16 +272,48 @@       DefinedOrUnknownSVal Cond = SVB.evalEQ(State,
+                                              nonloc::SymbolVal(*StatusSymP),
+                                              SVB.makeZeroVal(IntTy));
+-      if (auto StTrue = State->assume(Cond, true)) {
+-        auto StFalse = State->assume(Cond, false);
+-        if (StTrue && !StFalse) {
+-          return true;
++      if (!isProvablyTrue(State, Cond, C))
++        return false; // Can't prove success, don't suppress
++    }
++  }
++
++  SVal LenArgV = CopyToUserCall.getArgSVal(2);
++  SValBuilder &SVB = C.getSValBuilder();
++
++  // First, try to prove: copy_len <= produced_len
++  if (LenArgV.getAs<NonLoc>()) {
++    DefinedOrUnknownSVal CondLE =
++        SVB.evalBinOp(State, BO_LE, LenArgV.castAs<NonLoc>(),
++                      nonloc::SymbolVal(*LenSymP), SVB.getConditionType()).castAs<DefinedOrUnknownSVal>();
++    if (isProvablyTrue(State, CondLE, C))
++      return true;
++  }
++
++  // Next, handle the common pattern "copy_to_user(dst, buf + off, len)" and check "len + off <= produced_len".
++  if (LenArgV.getAs<NonLoc>()) {
++    const Expr *OffE = extractOffsetExprFromFromArg(CopyToUserCall);
++    if (OffE) {
++      SVal OffSV = State->getSVal(OffE, C.getLocationContext());
++      if (OffSV.getAs<NonLoc>()) {
++        SVal Sum = SVB.evalBinOp(State, BO_Add, LenArgV.castAs<NonLoc>(),
++                                 OffSV.castAs<NonLoc>(), C.getASTContext().getSizeType());
++        if (Sum.getAs<NonLoc>()) {
++          DefinedOrUnknownSVal CondLE2 =
++              SVB.evalBinOp(State, BO_LE, Sum.castAs<NonLoc>(),
++                            nonloc::SymbolVal(*LenSymP), SVB.getConditionType()).castAs<DefinedOrUnknownSVal>();
++          if (isProvablyTrue(State, CondLE2, C))
++            return true;
+         }
+       }
+     }
+   }
+
+-  return true;
++  // Fallback to strict equality of symbols (legacy behavior).
++  SymbolRef CopyLenSym = LenArgV.getAsSymbol();
++  if (CopyLenSym && CopyLenSym == *LenSymP)
++    return true;
++
++  return false;
+ }
+
+ void SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -358,7 +421,8 @@   if (*Kind != 2)
+     return;
+
+-  // Recognize and suppress false positives when a known producer initialized exactly the copied bytes.
++  // Recognize and suppress false positives when a known producer initialized exactly the copied bytes,
++  // or when the copy length is provably no greater than the produced length (optionally accounting for offset).
+   if (isFalsePositiveDueToProducer(Call, C, FromReg))
+     return;

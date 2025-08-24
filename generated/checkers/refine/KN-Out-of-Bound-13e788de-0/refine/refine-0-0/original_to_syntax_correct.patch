@@ -1,0 +1,224 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -34,46 +34,132 @@   void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;
+
+ private:
+-  bool looksLikeMaxBound(const Expr *E, CheckerContext &C) const;
+-  bool isEarlyReturnInThen(const IfStmt *IS) const;
+-};
+-
+-bool SAGenTestChecker::looksLikeMaxBound(const Expr *E,
+-                                         CheckerContext &C) const {
+-  if (!E)
++  // Helpers
++  static StringRef getExprText(const Expr *E, CheckerContext &C) {
++    if (!E)
++      return StringRef();
++    const SourceManager &SM = C.getSourceManager();
++    const LangOptions &LangOpts = C.getLangOpts();
++    CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());
++    return Lexer::getSourceText(Range, SM, LangOpts);
++  }
++
++  static bool nameLooksLikeCountBound(StringRef Name) {
++    // Heuristic: Names that denote counts/sizes/maximums
++    // We intentionally do NOT match "INDEX" to avoid confusing last-index checks.
++    std::string Lower = Name.lower();
++    return Lower.find("max") != std::string::npos ||
++           Lower.find("count") != std::string::npos ||
++           Lower.find("num") != std::string::npos ||
++           Lower.find("size") != std::string::npos;
++  }
++
++  static bool isDeclRefWithNameLikeCount(const Expr *E) {
++    E = E ? E->IgnoreParenCasts() : nullptr;
++    if (!E)
++      return false;
++
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++      if (const auto *II = DRE->getDecl()->getIdentifier())
++        return nameLooksLikeCountBound(II->getName());
++      // Enum constants or unnamed identifiers may not have IdentifierInfo,
++      // but they still have a Decl name string.
++      if (const NamedDecl *ND = dyn_cast<NamedDecl>(DRE->getDecl()))
++        return nameLooksLikeCountBound(ND->getName());
++    }
++
++    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
++      if (const auto *ND = dyn_cast<NamedDecl>(ME->getMemberDecl()))
++        return nameLooksLikeCountBound(ND->getName());
++    }
++
+     return false;
+-
+-  // If the expression source contains "MAX", we consider it a bound-like expr.
+-  if (ExprHasName(E, "MAX", C))
+-    return true;
+-
+-  // If it's a DeclRefExpr whose name contains "MAX", accept it.
+-  if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenCasts())) {
+-    if (const auto *II = DRE->getDecl()->getIdentifier()) {
+-      if (II->getName().contains("MAX"))
++  }
++
++  static bool isCompositeBoundExpr(const Expr *E) {
++    // True if E is a non-trivial expression (e.g., MAX - 1, MAX + 1, sizeof...)
++    // We only want to consider a plain DeclRefExpr/MemberExpr bound to reduce FPs.
++    E = E ? E->IgnoreParenCasts() : nullptr;
++    if (!E)
++      return false;
++    return !isa<DeclRefExpr>(E) && !isa<MemberExpr>(E);
++  }
++
++  static bool isLikelyErrorReturn(const ReturnStmt *RS, CheckerContext &C) {
++    if (!RS)
++      return false;
++    const Expr *RV = RS->getRetValue();
++    if (!RV)
++      return false;
++
++    // Try to evaluate to integer and see if it's negative.
++    llvm::APSInt Val;
++    if (EvaluateExprToInt(Val, RV, C))
++      return Val.isSigned() ? Val.isNegative() : false;
++
++    // If not foldable, still consider it likely if source contains a known errno or negative.
++    StringRef Txt = getExprText(RV, C);
++    if (Txt.contains("-E") || Txt.contains("ERR_PTR") || Txt.contains("error") ||
++        Txt.contains("-EINVAL") || Txt.contains("-EFAULT") || Txt.contains("-ENODATA") ||
++        Txt.contains("-ENOLINK") || Txt.contains("-ENOLCK") || Txt.contains("-ERANGE"))
++      return true;
++
++    return false;
++  }
++
++  static bool thenBranchHasEarlyErrorReturn(const IfStmt *IS, CheckerContext &C) {
++    if (!IS)
++      return false;
++    const Stmt *ThenS = IS->getThen();
++    if (!ThenS)
++      return false;
++
++    // Look for a ReturnStmt somewhere in the Then branch and check if it's an error return.
++    const ReturnStmt *RS = findSpecificTypeInChildren<ReturnStmt>(ThenS);
++    if (!RS)
++      return false;
++
++    return isLikelyErrorReturn(RS, C);
++  }
++
++  // A more precise bound check predicate: 'Var > Bound' where Bound is a simple
++  // MAX/COUNT/NUM/SIZE-like identifier and not a composite expression or integer literal.
++  static bool isPlainMaxLikeBound(const Expr *Bound, CheckerContext &C) {
++    if (!Bound)
++      return false;
++
++    Bound = Bound->IgnoreParenCasts();
++
++    if (isa<IntegerLiteral>(Bound))
++      return false; // do not treat integer literal RHS as a MAX-like bound
++
++    if (isCompositeBoundExpr(Bound))
++      return false; // do not accept 'MAX - 1' or other complex forms
++
++    return isDeclRefWithNameLikeCount(Bound);
++  }
++
++  // Additional guard to reject obvious false positives.
++  static bool isFalsePositive(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
++    // Reject when RHS is a small integer literal like 0, 1, 2. These are often last-index checks.
++    const Expr *R = RHS ? RHS->IgnoreParenCasts() : nullptr;
++    if (!R)
++      return true;
++
++    if (const auto *IL = dyn_cast<IntegerLiteral>(R)) {
++      // Anything small (<= 2) is very likely a last-index style check: 'idx > 1' for 0..1.
++      if (IL->getValue().ule(2))
+         return true;
+     }
+-  }
+-
+-  // Alternatively, if it folds to an integer constant, also accept.
+-  llvm::APSInt Dummy;
+-  if (EvaluateExprToInt(Dummy, E, C))
+-    return true;
+-
+-  return false;
+-}
+-
+-bool SAGenTestChecker::isEarlyReturnInThen(const IfStmt *IS) const {
+-  if (!IS)
++
++    // If RHS text contains an explicit '- 1' pattern, it's likely correct: 'idx > MAX - 1'
++    StringRef Txt = getExprText(RHS, C);
++    if (Txt.contains("- 1") || Txt.contains("-1"))
++      return true;
++
+     return false;
+-  const Stmt *ThenS = IS->getThen();
+-  if (!ThenS)
+-    return false;
+-
+-  // Look for a ReturnStmt somewhere in the Then branch.
+-  const ReturnStmt *RS = findSpecificTypeInChildren<ReturnStmt>(ThenS);
+-  return RS != nullptr;
+-}
++  }
++};
+
+ void SAGenTestChecker::checkBranchCondition(const Stmt *Condition,
+                                             CheckerContext &C) const {
+@@ -91,43 +177,35 @@
+   CondE = CondE->IgnoreParenImpCasts();
+
+-  // We only consider simple relational comparisons.
++  // We only consider simple relational comparisons with '>'.
+   const auto *BO = dyn_cast<BinaryOperator>(CondE);
+   if (!BO)
+     return;
+
+   BinaryOperator::Opcode Op = BO->getOpcode();
+-  if (Op != BO_GT && Op != BO_LT)
++  if (Op != BO_GT)
+     return;
+
+   const Expr *LHS = BO->getLHS()->IgnoreParenCasts();
+   const Expr *RHS = BO->getRHS()->IgnoreParenCasts();
+
+-  // Normalize to "Var > Bound".
+-  const Expr *VarExpr = nullptr;
+-  const Expr *BoundExpr = nullptr;
+-  if (Op == BO_GT) {
+-    VarExpr = LHS;
+-    BoundExpr = RHS;
+-  } else if (Op == BO_LT) {
+-    // "A < B" is equivalent to "B > A".
+-    VarExpr = RHS;
+-    BoundExpr = LHS;
+-  }
+-
+-  if (!VarExpr || !BoundExpr)
+-    return;
+-
+-  // Bound should look like a MAX-like constant or fold to an int.
+-  if (!looksLikeMaxBound(BoundExpr, C))
++  if (!LHS || !RHS)
++    return;
++
++  // Bound should be a simple MAX/COUNT/NUM/SIZE-like identifier.
++  if (!isPlainMaxLikeBound(RHS, C))
+     return;
+
+   // The Then branch should look like an error path with early return.
+-  if (!isEarlyReturnInThen(IS))
++  if (!thenBranchHasEarlyErrorReturn(IS, C))
+     return;
+
+   // Skip degenerate cases like "5 > MAX".
+-  if (isa<IntegerLiteral>(VarExpr))
++  if (isa<IntegerLiteral>(LHS))
++    return;
++
++  // Additional false-positive guards.
++  if (isFalsePositive(LHS, RHS, C))
+     return;
+
+   // Report the likely off-by-one check.

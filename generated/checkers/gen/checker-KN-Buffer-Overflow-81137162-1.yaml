@@ -1,0 +1,313 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 81137162bfaa7278785b24c1fd2e9e74f082e8e4
+commit_type: Buffer-Overflow
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Type.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/APInt.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ No custom program states required.\n\nnamespace {\nclass SAGenTestChecker : public\
+  \ Checker<check::PreCall> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Unbounded strcpy into fixed-size\
+  \ buffer\", \"Memory Safety\")) {}\n\n      void checkPreCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n\n   private:\n      // Helpers\n      static const\
+  \ Expr *unwrapArrayDecay(const Expr *E);\n      static bool getConstantArraySizeFromExpr(const\
+  \ Expr *E, llvm::APInt &Size);\n      static bool isStrcpyOrBuiltin(const CallEvent\
+  \ &Call, CheckerContext &C);\n      static bool isStrcatOrBuiltin(const CallEvent\
+  \ &Call, CheckerContext &C);\n      static void report(CheckerContext &C, const\
+  \ CallEvent &Call, StringRef Msg);\n};\n\n// Unwrap Array-to-pointer decay from\
+  \ ImplicitCastExpr or UnaryOperator (defensive)\nconst Expr *SAGEN_NOEXCEPT unwrapArrayDecayImpl(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  E = E->IgnoreParenImpCasts();\n  // Handle\
+  \ ImplicitCastExpr CK_ArrayToPointerDecay\n  if (const auto *ICE = dyn_cast<ImplicitCastExpr>(E))\
+  \ {\n    if (ICE->getCastKind() == CK_ArrayToPointerDecay) {\n      E = ICE->getSubExpr()->IgnoreParenImpCasts();\n\
+  \    }\n  } else if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode()\
+  \ == UO_ArrayToPointerDecay) {\n      E = UO->getSubExpr()->IgnoreParenImpCasts();\n\
+  \    }\n  }\n  return E;\n}\nconst Expr *SAGenTestChecker::unwrapArrayDecay(const\
+  \ Expr *E) {\n  return unwrapArrayDecayImpl(E);\n}\n\n// Try to get constant array\
+  \ size from expressions like:\n// - DeclRefExpr to array variable\n// - MemberExpr\
+  \ to struct/union field of ConstantArrayType\nbool SAGenTestChecker::getConstantArraySizeFromExpr(const\
+  \ Expr *E, llvm::APInt &Size) {\n  if (!E) return false;\n\n  // First try helper\
+  \ for DeclRefExpr directly\n  if (getArraySizeFromExpr(Size, E))\n    return true;\n\
+  \n  // Remove decays and casts\n  E = unwrapArrayDecay(E);\n  if (!E) return false;\n\
+  \n  // Try again after unwrap for DeclRefExpr\n  if (getArraySizeFromExpr(Size,\
+  \ E))\n    return true;\n\n  // Handle MemberExpr to a field of ConstantArrayType\n\
+  \  if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    const ValueDecl *VD = ME->getMemberDecl();\n\
+  \    if (const auto *FD = dyn_cast<FieldDecl>(VD)) {\n      QualType FT = FD->getType();\n\
+  \      if (const auto *CAT = dyn_cast<ConstantArrayType>(FT.getTypePtr())) {\n \
+  \       Size = CAT->getSize();\n        return true;\n      }\n    }\n  }\n\n  //\
+  \ Also handle a DeclRefExpr to a variable of ConstantArrayType (fallback)\n  if\
+  \ (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\
+  \ {\n      QualType T = VD->getType();\n      if (const auto *CAT = dyn_cast<ConstantArrayType>(T.getTypePtr()))\
+  \ {\n        Size = CAT->getSize();\n        return true;\n      }\n    }\n  }\n\
+  \n  return false;\n}\n\nbool SAGenTestChecker::isStrcpyOrBuiltin(const CallEvent\
+  \ &Call, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if\
+  \ (!Origin)\n    return false;\n  // Use source text matcher helper for robustness\
+  \ (macros, builtins)\n  if (ExprHasName(Origin, \"strcpy\", C))\n    return true;\n\
+  \  if (ExprHasName(Origin, \"__builtin_strcpy\", C))\n    return true;\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::isStrcatOrBuiltin(const CallEvent &Call, CheckerContext\
+  \ &C) {\n  const Expr *Origin = Call.getOriginExpr();\n  if (!Origin)\n    return\
+  \ false;\n  if (ExprHasName(Origin, \"strcat\", C))\n    return true;\n  if (ExprHasName(Origin,\
+  \ \"__builtin_strcat\", C))\n    return true;\n  return false;\n}\n\nvoid SAGenTestChecker::report(CheckerContext\
+  \ &C, const CallEvent &Call, StringRef Msg) {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  bool IsStrcpy = isStrcpyOrBuiltin(Call, C);\n  bool IsStrcat = isStrcatOrBuiltin(Call,\
+  \ C);\n  if (!IsStrcpy && !IsStrcat)\n    return;\n\n  if (Call.getNumArgs() < 2)\n\
+  \    return;\n\n  const Expr *Dest = Call.getArgExpr(0);\n  const Expr *Src  = Call.getArgExpr(1);\n\
+  \  if (!Dest || !Src)\n    return;\n\n  // Destination must be a fixed-size array\
+  \ to avoid FPs.\n  llvm::APInt DestSize(32, 0);\n  bool DestKnown = getConstantArraySizeFromExpr(Dest,\
+  \ DestSize);\n  if (!DestKnown)\n    return;\n\n  // Determine source length if\
+  \ possible\n  llvm::APInt SrcLitLen(32, 0);\n  bool SrcIsLiteral = getStringSize(SrcLitLen,\
+  \ Src);\n\n  llvm::APInt SrcArrSize(32, 0);\n  bool SrcIsConstArray = getConstantArraySizeFromExpr(Src,\
+  \ SrcArrSize);\n\n  // Decision logic\n  if (IsStrcpy) {\n    // strcpy copies literal\
+  \ length + 1 for the null\n    if (SrcIsLiteral) {\n      llvm::APInt BytesCopied\
+  \ = SrcLitLen + 1; // include null\n      if (BytesCopied.ugt(DestSize)) {\n   \
+  \     SmallString<128> Msg;\n        llvm::raw_svector_ostream OS(Msg);\n      \
+  \  OS << \"strcpy overflows fixed-size buffer (dest size=\" << DestSize\n      \
+  \     << \", src literal bytes=\" << BytesCopied << \")\";\n        report(C, Call,\
+  \ OS.str());\n        return;\n      }\n      // literal fits: no warning\n    \
+  \  return;\n    }\n\n    if (SrcIsConstArray) {\n      // If the source array's\
+  \ bound is larger than dest, likely overflow.\n      if (SrcArrSize.ugt(DestSize))\
+  \ {\n        SmallString<128> Msg;\n        llvm::raw_svector_ostream OS(Msg);\n\
+  \        OS << \"strcpy may overflow fixed-size buffer (dest size=\" << DestSize\n\
+  \           << \", src bound=\" << SrcArrSize << \")\";\n        report(C, Call,\
+  \ OS.str());\n        return;\n      }\n      // If src bound <= dest bound, avoid\
+  \ warning to control FPs.\n      return;\n    }\n\n    // Unknown source length,\
+  \ but dest is fixed-size: unbounded copy -> warn.\n    {\n      SmallString<128>\
+  \ Msg;\n      llvm::raw_svector_ostream OS(Msg);\n      OS << \"Unbounded strcpy\
+  \ into fixed-size buffer; possible overflow (dest size=\" << DestSize << \")\";\n\
+  \      report(C, Call, OS.str());\n      return;\n    }\n  } else {\n    // strcat:\
+  \ also unbounded; conservative handling like strcpy\n    if (SrcIsLiteral) {\n \
+  \     llvm::APInt BytesAppended = SrcLitLen; // strcat appends literal without replacing\
+  \ dest's existing content; null terminator also written but hard to account\n  \
+  \    // We cannot know current length of dest. Still unbounded into fixed-size buffer.\n\
+  \      SmallString<128> Msg;\n      llvm::raw_svector_ostream OS(Msg);\n      OS\
+  \ << \"Unbounded strcat into fixed-size buffer; possible overflow (dest size=\"\
+  \ << DestSize << \")\";\n      report(C, Call, OS.str());\n      return;\n    }\n\
+  \n    if (SrcIsConstArray) {\n      if (SrcArrSize.ugt(DestSize)) {\n        SmallString<128>\
+  \ Msg;\n        llvm::raw_svector_ostream OS(Msg);\n        OS << \"strcat may overflow\
+  \ fixed-size buffer (dest size=\" << DestSize\n           << \", src bound=\" <<\
+  \ SrcArrSize << \")\";\n        report(C, Call, OS.str());\n        return;\n  \
+  \    }\n      // Still unbounded due to unknown existing length in dest; warn conservatively.\n\
+  \      SmallString<128> Msg;\n      llvm::raw_svector_ostream OS(Msg);\n      OS\
+  \ << \"Unbounded strcat into fixed-size buffer; possible overflow (dest size=\"\
+  \ << DestSize << \")\";\n      report(C, Call, OS.str());\n      return;\n    }\n\
+  \n    // Unknown source: warn\n    {\n      SmallString<128> Msg;\n      llvm::raw_svector_ostream\
+  \ OS(Msg);\n      OS << \"Unbounded strcat into fixed-size buffer; possible overflow\
+  \ (dest size=\" << DestSize << \")\";\n      report(C, Call, OS.str());\n      return;\n\
+  \    }\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unbounded strcpy/strcat into fixed-size buffers that may overflow\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nBluetooth: hci_core: Fix possible buffer overflow\n\
+  \nstruct hci_dev_info has a fixed size name[8] field so in the event that\nhdev->name\
+  \ is bigger than that strcpy would attempt to write past its\nsize, so this fixes\
+  \ this problem by switching to use strscpy.\n\nFixes: dcda165706b9 (\"Bluetooth:\
+  \ hci_core: Fix build warnings\")\nSigned-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>\n\
+  \n## Buggy Code\n\n```c\n// Function: hci_get_dev_info in net/bluetooth/hci_core.c\n\
+  int hci_get_dev_info(void __user *arg)\n{\n\tstruct hci_dev *hdev;\n\tstruct hci_dev_info\
+  \ di;\n\tunsigned long flags;\n\tint err = 0;\n\n\tif (copy_from_user(&di, arg,\
+  \ sizeof(di)))\n\t\treturn -EFAULT;\n\n\thdev = hci_dev_get(di.dev_id);\n\tif (!hdev)\n\
+  \t\treturn -ENODEV;\n\n\t/* When the auto-off is configured it means the transport\n\
+  \t * is running, but in that case still indicate that the\n\t * device is actually\
+  \ down.\n\t */\n\tif (hci_dev_test_flag(hdev, HCI_AUTO_OFF))\n\t\tflags = hdev->flags\
+  \ & ~BIT(HCI_UP);\n\telse\n\t\tflags = hdev->flags;\n\n\tstrcpy(di.name, hdev->name);\n\
+  \tdi.bdaddr   = hdev->bdaddr;\n\tdi.type     = (hdev->bus & 0x0f) | ((hdev->dev_type\
+  \ & 0x03) << 4);\n\tdi.flags    = flags;\n\tdi.pkt_type = hdev->pkt_type;\n\tif\
+  \ (lmp_bredr_capable(hdev)) {\n\t\tdi.acl_mtu  = hdev->acl_mtu;\n\t\tdi.acl_pkts\
+  \ = hdev->acl_pkts;\n\t\tdi.sco_mtu  = hdev->sco_mtu;\n\t\tdi.sco_pkts = hdev->sco_pkts;\n\
+  \t} else {\n\t\tdi.acl_mtu  = hdev->le_mtu;\n\t\tdi.acl_pkts = hdev->le_pkts;\n\t\
+  \tdi.sco_mtu  = 0;\n\t\tdi.sco_pkts = 0;\n\t}\n\tdi.link_policy = hdev->link_policy;\n\
+  \tdi.link_mode   = hdev->link_mode;\n\n\tmemcpy(&di.stat, &hdev->stat, sizeof(di.stat));\n\
+  \tmemcpy(&di.features, &hdev->features, sizeof(di.features));\n\n\tif (copy_to_user(arg,\
+  \ &di, sizeof(di)))\n\t\terr = -EFAULT;\n\n\thci_dev_put(hdev);\n\n\treturn err;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/net/bluetooth/hci_core.c b/net/bluetooth/hci_core.c\n\
+  index 6ca4c0df9f9c..230d2bbb933b 100644\n--- a/net/bluetooth/hci_core.c\n+++ b/net/bluetooth/hci_core.c\n\
+  @@ -908,7 +908,7 @@ int hci_get_dev_info(void __user *arg)\n \telse\n \t\tflags\
+  \ = hdev->flags;\n \n-\tstrcpy(di.name, hdev->name);\n+\tstrscpy(di.name, hdev->name,\
+  \ sizeof(di.name));\n \tdi.bdaddr   = hdev->bdaddr;\n \tdi.type     = (hdev->bus\
+  \ & 0x0f) | ((hdev->dev_type & 0x03) << 4);\n \tdi.flags    = flags;\n```\n"
+pattern: '## Bug Pattern
+
+
+  Using an unbounded string copy (strcpy) to copy a variable-length source into a
+  fixed-size destination buffer in a struct, without checking or limiting the length
+  of the copy, leading to potential buffer overflow.
+
+
+  Example:
+
+  - strcpy(di.name, hdev->name); where di.name is a small fixed array (e.g., char
+  name[8]) and hdev->name may exceed that size.'
+plan: "1) Program state\n- No custom program state is required. The bug is detectable\
+  \ at call sites using AST/type information only.\n\n2) Callbacks and overall flow\n\
+  - Use only checkPreCall. Inspect calls to strcpy/__builtin_strcpy, analyze destination\
+  \ and source expressions, and emit a report if the destination is a fixed-size array\
+  \ and the copy is unbounded or provably too large.\n\n3) Detailed steps for checkPreCall\n\
+  - Identify target calls:\n  - If Call.getCalleeIdentifier() name equals \"strcpy\"\
+  \ or \"__builtin_strcpy\", proceed.\n  - Ensure the call has exactly 2 arguments.\n\
+  \n- Extract arguments:\n  - const Expr *Dest = Call.getArgExpr(0);\n  - const Expr\
+  \ *Src  = Call.getArgExpr(1);\n\n- Compute destination buffer size (compile-time,\
+  \ array only):\n  - Normalize expression: E = Dest->IgnoreParenImpCasts().\n  -\
+  \ If E is a UnaryOperator with opcode UO_ArrayToPointerDecay, set E = E->getSubExpr()->IgnoreParenImpCasts().\n\
+  \  - Case A: E is DeclRefExpr to a variable with ConstantArrayType:\n    - Use provided\
+  \ getArraySizeFromExpr(ArraySize, E) to obtain size (element count).\n  - Case B:\
+  \ E is MemberExpr to a field:\n    - Retrieve FieldDecl *FD = cast<FieldDecl>(ME->getMemberDecl()).\n\
+  \    - QualType FT = FD->getType(); if dyn_cast<ConstantArrayType>(FT.getTypePtr())\
+  \ succeeds, get its size (element count) as DestSize.\n  - Otherwise (not a constant\
+  \ array, e.g., pointer param, flexible array member, VLA), skip (no report) to reduce\
+  \ false positives.\n\n- Try to determine source length (optional refinement):\n\
+  \  - First, check for string literal:\n    - If getStringSize(SrcLen, Src) succeeds,\
+  \ remember that string literal length is contents length; strcpy will also copy\
+  \ the null terminator, so effective bytes copied = SrcLen + 1.\n  - Otherwise, try\
+  \ to identify if source is a constant-size array:\n    - Similar normalization as\
+  \ destination:\n      - If Src->IgnoreParenImpCasts() is UO_ArrayToPointerDecay,\
+  \ inspect subexpression.\n      - If subexpression is DeclRefExpr or MemberExpr\
+  \ to ConstantArrayType, extract SrcSize as its element count. For char arrays, the\
+  \ maximum bytes copied can be up to SrcSize (if fully filled including null).\n\
+  \  - If none apply, source length is unknown/unbounded.\n\n- Decide and report:\n\
+  \  - If source is string literal and (SrcLen + 1) > DestSize: definite overflow.\n\
+  \    - Emit bug: \"strcpy overflows fixed-size buffer\".\n  - Else if source is\
+  \ a constant array and SrcSize > DestSize: likely overflow.\n    - Emit bug: \"\
+  strcpy may overflow fixed-size buffer\".\n  - Else (source length unknown) but destination\
+  \ is a fixed-size array: unbounded copy into fixed-size buffer.\n    - Emit bug:\
+  \ \"Unbounded strcpy into fixed-size buffer; possible overflow\".\n  - For all reports:\n\
+  \    - Create a non-fatal error node with C.generateNonFatalErrorNode().\n    -\
+  \ Use a static BugType, e.g., \"Unchecked string copy into fixed-size buffer\".\n\
+  \    - Build a PathSensitiveBugReport. Keep message short and clear. Optionally\
+  \ include sizes if known, e.g., \"dest size=8\".\n    - Highlight the call expression\
+  \ range, and optionally add a note range on the destination argument.\n\n4) Helper\
+  \ utilities to implement\n- bool isStrcpyCall(const CallEvent &Call):\n  - Return\
+  \ true if callee identifier is \"strcpy\" or \"__builtin_strcpy\".\n\n- bool getConstantArraySizeFromExpr(const\
+  \ Expr *E, llvm::APInt &Size):\n  - Try provided getArraySizeFromExpr(Size, E) first.\n\
+  \  - Else, unwrap ArrayToPointerDecay and check MemberExpr:\n    - If MemberExpr,\
+  \ get FieldDecl type; if ConstantArrayType, set Size to its size and return true.\n\
+  \  - Else, unwrap to DeclRefExpr and check if its type is ConstantArrayType; if\
+  \ so, extract size.\n  - Return false if none matched.\n\n- Optional: format a brief\
+  \ suffix string with known sizes for the report message:\n  - If DestSize known,\
+  \ append \"(dest size=N)\".\n  - If SrcLen literal known, append \"(src literal\
+  \ length=L)\".\n\n5) False positive control\n- Only warn when the destination is\
+  \ a compile-time constant array (ConstantArrayType).\n- Do not warn when destination\
+  \ is a pointer (cannot know size).\n- Do not warn if the source is a string literal\
+  \ whose length+1 fits in the destination (safe).\n- Do not warn for bounded APIs\
+  \ (strlcpy/strscpy/strncpy) \u2014 simply ignore them in isStrcpyCall.\n\n6) Optional\
+  \ enhancements (keep simple for initial version)\n- Also flag strcat/__builtin_strcat\
+  \ using the exact same logic, as it is also unbounded. This can be added by extending\
+  \ isStrcpyCall to recognize \"strcat\"/\"__builtin_strcat\".\n- If desired, include\
+  \ a brief fix-it hint in the message: \"Use strscpy(dest, src, sizeof(dest))\"."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Type.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/APInt.h\"\
+  \n#include \"llvm/ADT/SmallString.h\"\n#include <memory>\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\n// No custom program states required.\n\
+  \nnamespace {\nclass SAGenTestChecker : public Checker<check::PreCall> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Unbounded strcpy into fixed-size buffer\", \"Memory Safety\"))\
+  \ {}\n\n      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n   private:\n      // Helpers\n      static const Expr *unwrapArrayDecay(const\
+  \ Expr *E);\n      static bool getConstantArraySizeFromExpr(const Expr *E, llvm::APInt\
+  \ &Size);\n      static bool isStrcpyOrBuiltin(const CallEvent &Call, CheckerContext\
+  \ &C);\n      static bool isStrcatOrBuiltin(const CallEvent &Call, CheckerContext\
+  \ &C);\n      void report(CheckerContext &C, const CallEvent &Call, StringRef Msg)\
+  \ const;\n};\n\n// Unwrap Array-to-pointer decay from ImplicitCastExpr (defensive)\n\
+  const Expr *unwrapArrayDecayImpl(const Expr *E) {\n  if (!E) return nullptr;\n \
+  \ E = E->IgnoreParenImpCasts();\n  // Handle ImplicitCastExpr CK_ArrayToPointerDecay\n\
+  \  if (const auto *ICE = dyn_cast<ImplicitCastExpr>(E)) {\n    if (ICE->getCastKind()\
+  \ == CK_ArrayToPointerDecay) {\n      E = ICE->getSubExpr()->IgnoreParenImpCasts();\n\
+  \    }\n  }\n  return E;\n}\nconst Expr *SAGenTestChecker::unwrapArrayDecay(const\
+  \ Expr *E) {\n  return unwrapArrayDecayImpl(E);\n}\n\n// Try to get constant array\
+  \ size from expressions like:\n// - DeclRefExpr to array variable\n// - MemberExpr\
+  \ to struct/union field of ConstantArrayType\nbool SAGenTestChecker::getConstantArraySizeFromExpr(const\
+  \ Expr *E, llvm::APInt &Size) {\n  if (!E) return false;\n\n  // First try helper\
+  \ for DeclRefExpr directly\n  if (getArraySizeFromExpr(Size, E))\n    return true;\n\
+  \n  // Remove decays and casts\n  E = unwrapArrayDecay(E);\n  if (!E) return false;\n\
+  \n  // Try again after unwrap for DeclRefExpr\n  if (getArraySizeFromExpr(Size,\
+  \ E))\n    return true;\n\n  // Handle MemberExpr to a field of ConstantArrayType\n\
+  \  if (const auto *ME = dyn_cast<MemberExpr>(E)) {\n    const ValueDecl *VD = ME->getMemberDecl();\n\
+  \    if (const auto *FD = dyn_cast<FieldDecl>(VD)) {\n      QualType FT = FD->getType();\n\
+  \      if (const auto *CAT = dyn_cast<ConstantArrayType>(FT.getTypePtr())) {\n \
+  \       Size = CAT->getSize();\n        return true;\n      }\n    }\n  }\n\n  //\
+  \ Also handle a DeclRefExpr to a variable of ConstantArrayType (fallback)\n  if\
+  \ (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\
+  \ {\n      QualType T = VD->getType();\n      if (const auto *CAT = dyn_cast<ConstantArrayType>(T.getTypePtr()))\
+  \ {\n        Size = CAT->getSize();\n        return true;\n      }\n    }\n  }\n\
+  \n  return false;\n}\n\nbool SAGenTestChecker::isStrcpyOrBuiltin(const CallEvent\
+  \ &Call, CheckerContext &C) {\n  (void)C;\n  if (const IdentifierInfo *II = Call.getCalleeIdentifier())\
+  \ {\n    if (II->isStr(\"strcpy\") || II->isStr(\"__builtin_strcpy\"))\n      return\
+  \ true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isStrcatOrBuiltin(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  (void)C;\n  if (const IdentifierInfo\
+  \ *II = Call.getCalleeIdentifier()) {\n    if (II->isStr(\"strcat\") || II->isStr(\"\
+  __builtin_strcat\"))\n      return true;\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::report(CheckerContext\
+  \ &C, const CallEvent &Call, StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const {\n  bool IsStrcpy = isStrcpyOrBuiltin(Call, C);\n  bool IsStrcat = isStrcatOrBuiltin(Call,\
+  \ C);\n  if (!IsStrcpy && !IsStrcat)\n    return;\n\n  if (Call.getNumArgs() < 2)\n\
+  \    return;\n\n  const Expr *Dest = Call.getArgExpr(0);\n  const Expr *Src  = Call.getArgExpr(1);\n\
+  \  if (!Dest || !Src)\n    return;\n\n  // Destination must be a fixed-size array\
+  \ to avoid FPs.\n  llvm::APInt DestSize(32, 0);\n  bool DestKnown = getConstantArraySizeFromExpr(Dest,\
+  \ DestSize);\n  if (!DestKnown)\n    return;\n\n  // Determine source length if\
+  \ possible\n  llvm::APInt SrcLitLen(32, 0);\n  bool SrcIsLiteral = getStringSize(SrcLitLen,\
+  \ Src);\n\n  llvm::APInt SrcArrSize(32, 0);\n  bool SrcIsConstArray = getConstantArraySizeFromExpr(Src,\
+  \ SrcArrSize);\n\n  // Decision logic\n  if (IsStrcpy) {\n    // strcpy copies literal\
+  \ length + 1 for the null\n    if (SrcIsLiteral) {\n      llvm::APInt BytesCopied\
+  \ = SrcLitLen + 1; // include null\n      if (BytesCopied.ugt(DestSize)) {\n   \
+  \     SmallString<128> Msg;\n        llvm::raw_svector_ostream OS(Msg);\n      \
+  \  OS << \"strcpy overflows fixed-size buffer (dest size=\" << DestSize\n      \
+  \     << \", src literal bytes=\" << BytesCopied << \")\";\n        report(C, Call,\
+  \ OS.str());\n        return;\n      }\n      // literal fits: no warning\n    \
+  \  return;\n    }\n\n    if (SrcIsConstArray) {\n      // If the source array's\
+  \ bound is larger than dest, likely overflow.\n      if (SrcArrSize.ugt(DestSize))\
+  \ {\n        SmallString<128> Msg;\n        llvm::raw_svector_ostream OS(Msg);\n\
+  \        OS << \"strcpy may overflow fixed-size buffer (dest size=\" << DestSize\n\
+  \           << \", src bound=\" << SrcArrSize << \")\";\n        report(C, Call,\
+  \ OS.str());\n        return;\n      }\n      // If src bound <= dest bound, avoid\
+  \ warning to control FPs.\n      return;\n    }\n\n    // Unknown source length,\
+  \ but dest is fixed-size: unbounded copy -> warn.\n    {\n      SmallString<128>\
+  \ Msg;\n      llvm::raw_svector_ostream OS(Msg);\n      OS << \"Unbounded strcpy\
+  \ into fixed-size buffer; possible overflow (dest size=\" << DestSize << \")\";\n\
+  \      report(C, Call, OS.str());\n      return;\n    }\n  } else {\n    // strcat:\
+  \ also unbounded; conservative handling like strcpy\n    if (SrcIsLiteral) {\n \
+  \     llvm::APInt BytesAppended = SrcLitLen; // strcat appends literal without replacing\
+  \ dest's existing content; null terminator also written but hard to account\n  \
+  \    (void)BytesAppended;\n      SmallString<128> Msg;\n      llvm::raw_svector_ostream\
+  \ OS(Msg);\n      OS << \"Unbounded strcat into fixed-size buffer; possible overflow\
+  \ (dest size=\" << DestSize << \")\";\n      report(C, Call, OS.str());\n      return;\n\
+  \    }\n\n    if (SrcIsConstArray) {\n      if (SrcArrSize.ugt(DestSize)) {\n  \
+  \      SmallString<128> Msg;\n        llvm::raw_svector_ostream OS(Msg);\n     \
+  \   OS << \"strcat may overflow fixed-size buffer (dest size=\" << DestSize\n  \
+  \         << \", src bound=\" << SrcArrSize << \")\";\n        report(C, Call, OS.str());\n\
+  \        return;\n      }\n      // Still unbounded due to unknown existing length\
+  \ in dest; warn conservatively.\n      SmallString<128> Msg;\n      llvm::raw_svector_ostream\
+  \ OS(Msg);\n      OS << \"Unbounded strcat into fixed-size buffer; possible overflow\
+  \ (dest size=\" << DestSize << \")\";\n      report(C, Call, OS.str());\n      return;\n\
+  \    }\n\n    // Unknown source: warn\n    {\n      SmallString<128> Msg;\n    \
+  \  llvm::raw_svector_ostream OS(Msg);\n      OS << \"Unbounded strcat into fixed-size\
+  \ buffer; possible overflow (dest size=\" << DestSize << \")\";\n      report(C,\
+  \ Call, OS.str());\n      return;\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects unbounded strcpy/strcat into\
+  \ fixed-size buffers that may overflow\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

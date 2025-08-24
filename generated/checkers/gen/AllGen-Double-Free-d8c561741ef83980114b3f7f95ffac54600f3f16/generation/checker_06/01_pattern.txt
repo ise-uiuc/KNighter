@@ -1,0 +1,3 @@
+## Bug Pattern
+
+Using a high-level “close/free” cleanup helper in an intermediate error path after only a subset of resources has been acquired, causing software-owned memory to be freed twice. Specifically, after successfully creating a HW SQ (mlx5_core_create_sq) but failing to set it ready, the code called hws_send_ring_close_sq(sq), which frees software buffers (e.g., sq->dep_wqe, sq->wq_ctrl.buf.frags, sq->wr_priv) that are also freed later by the outer cleanup, leading to double free. The correct pattern is to undo only what was just acquired (call the matching low-level destroy, mlx5_core_destroy_sq) and leave higher-level resource freeing to the owning cleanup path.

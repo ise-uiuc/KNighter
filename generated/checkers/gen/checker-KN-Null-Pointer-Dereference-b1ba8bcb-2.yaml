@@ -1,0 +1,365 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: b1ba8bcb2d1ffce11b308ce166c9cc28d989e3b9
+commit_type: Null-Pointer-Dereference
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/PathDiagnostic.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// ---------------- Program\
+  \ state customizations ----------------\nREGISTER_SET_WITH_PROGRAMSTATE(OptionalRetSyms,\
+  \ SymbolRef)\nREGISTER_MAP_WITH_PROGRAMSTATE(OptionalRetSymOrigin, SymbolRef, const\
+  \ Stmt*)\nREGISTER_MAP_WITH_PROGRAMSTATE(OptionalRegionChecked, const MemRegion*,\
+  \ bool)\nREGISTER_MAP_WITH_PROGRAMSTATE(OptionalRegionOrigin, const MemRegion*,\
+  \ const Stmt*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n    check::PostCall,\n\
+  \    check::Bind,\n    check::BranchCondition,\n    check::Location\n> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Unchecked dereference of optional resource\", \"API Misuse\"))\
+  \ {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \      void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\
+  \      void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C)\
+  \ const;\n\n   private:\n      static bool isOptionalGetter(const CallEvent &Call,\
+  \ CheckerContext &C);\n      static bool isNullExpr(const Expr *E, CheckerContext\
+  \ &C);\n      void markRegionCheckedForExpr(const Expr *E, CheckerContext &C) const;\n\
+  \      void reportUncheckedDeref(const Stmt *DerefSite, const MemRegion *BaseReg,\n\
+  \                                CheckerContext &C) const;\n};\n\nbool SAGenTestChecker::isOptionalGetter(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *OE = Call.getOriginExpr();\n\
+  \  if (!OE)\n    return false;\n\n  // Tight allowlist of optional getters that\
+  \ legitimately return NULL if absent.\n  if (ExprHasName(OE, \"devm_gpiod_get_array_optional\"\
+  , C)) return true;\n  if (ExprHasName(OE, \"devm_gpiod_get_optional\", C)) return\
+  \ true;\n  if (ExprHasName(OE, \"gpiod_get_optional\", C)) return true;\n\n  return\
+  \ false;\n}\n\nbool SAGenTestChecker::isNullExpr(const Expr *E, CheckerContext &C)\
+  \ {\n  if (!E) return false;\n  return E->isNullPointerConstant(C.getASTContext(),\n\
+  \                                  Expr::NPC_ValueDependentIsNull);\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isOptionalGetter(Call, C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n\n  SVal Ret = Call.getReturnValue();\n\
+  \  SymbolRef Sym = Ret.getAsSymbol();\n  if (!Sym)\n    return;\n\n  // Tag this\
+  \ return symbol as optional (may be NULL).\n  State = State->add<OptionalRetSyms>(Sym);\n\
+  \n  // Remember origin call stmt for diagnostics.\n  if (const Stmt *S = Call.getOriginExpr())\n\
+  \    State = State->set<OptionalRetSymOrigin>(Sym, S);\n\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *DstR\
+  \ = Loc.getAsRegion();\n  if (!DstR)\n    return;\n  DstR = DstR->getBaseRegion();\n\
+  \  if (!DstR)\n    return;\n\n  bool DidUpdate = false;\n\n  // Case 1: Binding\
+  \ from a return symbol of an optional getter.\n  if (SymbolRef RHSym = Val.getAsSymbol())\
+  \ {\n    if (State->contains<OptionalRetSyms>(RHSym)) {\n      State = State->set<OptionalRegionChecked>(DstR,\
+  \ false);\n      if (const Stmt *Orig = State->get<OptionalRetSymOrigin>(RHSym))\
+  \ {\n        State = State->set<OptionalRegionOrigin>(DstR, Orig);\n      }\n  \
+  \    DidUpdate = true;\n    }\n  }\n\n  // Case 2: Propagate tag between regions\
+  \ on plain assignment/aliasing.\n  if (!DidUpdate) {\n    if (const MemRegion *SrcR\
+  \ = Val.getAsRegion()) {\n      SrcR = SrcR->getBaseRegion();\n      if (SrcR) {\n\
+  \        if (const bool *Checked = State->get<OptionalRegionChecked>(SrcR)) {\n\
+  \          State = State->set<OptionalRegionChecked>(DstR, *Checked);\n        \
+  \  if (const Stmt *Orig = State->get<OptionalRegionOrigin>(SrcR))\n            State\
+  \ = State->set<OptionalRegionOrigin>(DstR, Orig);\n          DidUpdate = true;\n\
+  \        }\n      }\n    }\n  }\n\n  if (DidUpdate)\n    C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::markRegionCheckedForExpr(const Expr *E, CheckerContext\
+  \ &C) const {\n  if (!E)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \n  // Map expression to region.\n  const MemRegion *R = getMemRegionFromExpr(E,\
+  \ C);\n  if (!R)\n    return;\n\n  R = R->getBaseRegion();\n  if (!R)\n    return;\n\
+  \n  if (const bool *Tracked = State->get<OptionalRegionChecked>(R)) {\n    if (!*Tracked)\
+  \ {\n      State = State->set<OptionalRegionChecked>(R, true);\n      C.addTransition(State);\n\
+  \    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const {\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE)\n    return;\n\n  // Pattern 1: if (!ptr) or multiple logical nots;\
+  \ still consider it a check.\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      const Expr *Sub = UO->getSubExpr();\n\
+  \      if (Sub) {\n        markRegionCheckedForExpr(Sub, C);\n      }\n      return;\n\
+  \    }\n  }\n\n  // Pattern 2: if (ptr == NULL) or if (ptr != NULL)\n  if (const\
+  \ auto *BO = dyn_cast<BinaryOperator>(CondE)) {\n    if (BO->getOpcode() == BO_EQ\
+  \ || BO->getOpcode() == BO_NE) {\n      const Expr *L = BO->getLHS();\n      const\
+  \ Expr *R = BO->getRHS();\n      const Expr *PtrExpr = nullptr;\n\n      bool LIsNull\
+  \ = isNullExpr(L, C);\n      bool RIsNull = isNullExpr(R, C);\n      if (LIsNull\
+  \ && !RIsNull)\n        PtrExpr = R;\n      else if (RIsNull && !LIsNull)\n    \
+  \    PtrExpr = L;\n\n      if (PtrExpr) {\n        markRegionCheckedForExpr(PtrExpr,\
+  \ C);\n      }\n      return;\n    }\n  }\n\n  // Pattern 3: if (ptr)\n  // Treat\
+  \ any direct pointer-as-condition as a check.\n  markRegionCheckedForExpr(CondE,\
+  \ C);\n}\n\nvoid SAGenTestChecker::reportUncheckedDeref(const Stmt *DerefSite,\n\
+  \                                            const MemRegion *BaseReg,\n       \
+  \                                     CheckerContext &C) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto Rpt = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Optional resource may be NULL; dereferenced without NULL check\",\
+  \ N);\n\n  if (DerefSite)\n    Rpt->addRange(DerefSite->getSourceRange());\n\n \
+  \ if (BaseReg) {\n    ProgramStateRef State = C.getState();\n    if (const Stmt\
+  \ *Origin = State->get<OptionalRegionOrigin>(BaseReg)) {\n      PathDiagnosticLocation\
+  \ Loc = PathDiagnosticLocation::createBegin(Origin, C.getSourceManager(), N->getLocationContext());\n\
+  \      Rpt->addNote(\"Optional getter can return NULL here\", Loc, C.getSourceManager());\n\
+  \    }\n  }\n\n  C.emitReport(std::move(Rpt));\n}\n\nvoid SAGenTestChecker::checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {\n  if (!IsLoad ||\
+  \ !S)\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  // Helper lambda\
+  \ to check base expression's region for being tracked and unchecked.\n  auto CheckBaseExpr\
+  \ = [&](const Expr *BaseE) {\n    if (!BaseE) return;\n    const MemRegion *R =\
+  \ getMemRegionFromExpr(BaseE, C);\n    if (!R) return;\n    R = R->getBaseRegion();\n\
+  \    if (!R) return;\n\n    const bool *Checked = State->get<OptionalRegionChecked>(R);\n\
+  \    if (Checked && *Checked == false) {\n      reportUncheckedDeref(S, R, C);\n\
+  \    }\n  };\n\n  // Detect ptr->field\n  if (const auto *ME = findSpecificTypeInParents<MemberExpr>(S,\
+  \ C)) {\n    if (ME->isArrow()) {\n      CheckBaseExpr(ME->getBase());\n      return;\n\
+  \    }\n  }\n\n  // Detect ptr[i]\n  if (const auto *ASE = findSpecificTypeInParents<ArraySubscriptExpr>(S,\
+  \ C)) {\n    CheckBaseExpr(ASE->getBase());\n    return;\n  }\n\n  // Detect *ptr\n\
+  \  if (const auto *UO = findSpecificTypeInParents<UnaryOperator>(S, C)) {\n    if\
+  \ (UO->getOpcode() == UO_Deref) {\n      CheckBaseExpr(UO->getSubExpr());\n    \
+  \  return;\n    }\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unchecked dereference when using *_get_optional() APIs that may\
+  \ return NULL\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbacklight: hx8357: Fix potential NULL pointer dereference\n\
+  \nThe \"im\" pins are optional. Add missing check in the hx8357_probe().\n\nReported-by:\
+  \ Dan Carpenter <dan.carpenter@linaro.org>\nCloses: https://lore.kernel.org/r/642e1230-3358-4006-a17f-3f297897ae74@moroto.mountain\n\
+  Fixes: 7d84a63a39b7 (\"backlight: hx8357: Convert to agnostic GPIO API\")\nSigned-off-by:\
+  \ Andy Shevchenko <andriy.shevchenko@linux.intel.com>\nReviewed-by: Daniel Thompson\
+  \ <daniel.thompson@linaro.org>\nLink: https://lore.kernel.org/r/20240114143921.550736-1-andriy.shevchenko@linux.intel.com\n\
+  Signed-off-by: Lee Jones <lee@kernel.org>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ hx8357_probe in drivers/video/backlight/hx8357.c\nstatic int hx8357_probe(struct\
+  \ spi_device *spi)\n{\n\tstruct device *dev = &spi->dev;\n\tstruct lcd_device *lcdev;\n\
+  \tstruct hx8357_data *lcd;\n\tconst struct of_device_id *match;\n\tint i, ret;\n\
+  \n\tlcd = devm_kzalloc(&spi->dev, sizeof(*lcd), GFP_KERNEL);\n\tif (!lcd)\n\t\t\
+  return -ENOMEM;\n\n\tret = spi_setup(spi);\n\tif (ret < 0) {\n\t\tdev_err(&spi->dev,\
+  \ \"SPI setup failed.\\n\");\n\t\treturn ret;\n\t}\n\n\tlcd->spi = spi;\n\n\tmatch\
+  \ = of_match_device(hx8357_dt_ids, &spi->dev);\n\tif (!match || !match->data)\n\t\
+  \treturn -EINVAL;\n\n\tlcd->reset = devm_gpiod_get(dev, \"reset\", GPIOD_OUT_LOW);\n\
+  \tif (IS_ERR(lcd->reset))\n\t\treturn dev_err_probe(dev, PTR_ERR(lcd->reset), \"\
+  failed to request reset GPIO\\n\");\n\tgpiod_set_consumer_name(lcd->reset, \"hx8357-reset\"\
+  );\n\n\tlcd->im_pins = devm_gpiod_get_array_optional(dev, \"im\", GPIOD_OUT_LOW);\n\
+  \tif (IS_ERR(lcd->im_pins))\n\t\treturn dev_err_probe(dev, PTR_ERR(lcd->im_pins),\
+  \ \"failed to request im GPIOs\\n\");\n\tif (lcd->im_pins->ndescs < HX8357_NUM_IM_PINS)\n\
+  \t\treturn dev_err_probe(dev, -EINVAL, \"not enough im GPIOs\\n\");\n\n\tfor (i\
+  \ = 0; i < HX8357_NUM_IM_PINS; i++)\n\t\tgpiod_set_consumer_name(lcd->im_pins->desc[i],\
+  \ \"im_pins\");\n\n\tlcdev = devm_lcd_device_register(&spi->dev, \"mxsfb\", &spi->dev,\
+  \ lcd,\n\t\t\t\t\t&hx8357_ops);\n\tif (IS_ERR(lcdev)) {\n\t\tret = PTR_ERR(lcdev);\n\
+  \t\treturn ret;\n\t}\n\tspi_set_drvdata(spi, lcdev);\n\n\thx8357_lcd_reset(lcdev);\n\
+  \n\tret = ((int (*)(struct lcd_device *))match->data)(lcdev);\n\tif (ret) {\n\t\t\
+  dev_err(&spi->dev, \"Couldn't initialize panel\\n\");\n\t\treturn ret;\n\t}\n\n\t\
+  dev_info(&spi->dev, \"Panel probed\\n\");\n\n\treturn 0;\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/drivers/video/backlight/hx8357.c b/drivers/video/backlight/hx8357.c\n\
+  index d7298376cf74..bf18337ff0c2 100644\n--- a/drivers/video/backlight/hx8357.c\n\
+  +++ b/drivers/video/backlight/hx8357.c\n@@ -609,11 +609,13 @@ static int hx8357_probe(struct\
+  \ spi_device *spi)\n \tlcd->im_pins = devm_gpiod_get_array_optional(dev, \"im\"\
+  , GPIOD_OUT_LOW);\n \tif (IS_ERR(lcd->im_pins))\n \t\treturn dev_err_probe(dev,\
+  \ PTR_ERR(lcd->im_pins), \"failed to request im GPIOs\\n\");\n-\tif (lcd->im_pins->ndescs\
+  \ < HX8357_NUM_IM_PINS)\n-\t\treturn dev_err_probe(dev, -EINVAL, \"not enough im\
+  \ GPIOs\\n\");\n+\tif (lcd->im_pins) {\n+\t\tif (lcd->im_pins->ndescs < HX8357_NUM_IM_PINS)\n\
+  +\t\t\treturn dev_err_probe(dev, -EINVAL, \"not enough im GPIOs\\n\");\n \n-\tfor\
+  \ (i = 0; i < HX8357_NUM_IM_PINS; i++)\n-\t\tgpiod_set_consumer_name(lcd->im_pins->desc[i],\
+  \ \"im_pins\");\n+\t\tfor (i = 0; i < HX8357_NUM_IM_PINS; i++)\n+\t\t\tgpiod_set_consumer_name(lcd->im_pins->desc[i],\
+  \ \"im_pins\");\n+\t}\n \n \tlcdev = devm_lcd_device_register(&spi->dev, \"mxsfb\"\
+  , &spi->dev, lcd,\n \t\t\t\t\t&hx8357_ops);\n```\n"
+pattern: "## Bug Pattern\n\nCalling an \u201Coptional\u201D resource getter (e.g.,\
+  \ devm_gpiod_get_array_optional) which returns NULL when the resource is absent,\
+  \ checking only IS_ERR() and then unconditionally dereferencing the returned pointer.\
+  \ Specifically:\n- After devm_gpiod_get_array_optional(...), the code accesses lcd->im_pins->ndescs\
+  \ and lcd->im_pins->desc[i] without verifying lcd->im_pins is non-NULL.\n- Correct\
+  \ pattern requires guarding all uses with if (ptr) { ... } because NULL indicates\
+  \ a valid \u201Cresource not present\u201D case, not an error."
+plan: "1) Program state customizations\n- REGISTER_SET_WITH_PROGRAMSTATE(OptionalRetSyms,\
+  \ SymbolRef)\n  - Set of return symbols from calls that can legitimately return\
+  \ NULL (i.e., \u201C_optional\u201D getters).\n- REGISTER_MAP_WITH_PROGRAMSTATE(OptionalRetSymOrigin,\
+  \ SymbolRef, const Stmt*)\n  - For diagnostics: remembers the call site that produced\
+  \ the optional return symbol.\n- REGISTER_MAP_WITH_PROGRAMSTATE(OptionalRegionChecked,\
+  \ const MemRegion*, bool)\n  - Tracks \u201Coptional pointer\u201D regions and whether\
+  \ they have been NULL-checked (true = checked, false = unchecked).\n- REGISTER_MAP_WITH_PROGRAMSTATE(OptionalRegionOrigin,\
+  \ const MemRegion*, const Stmt*)\n  - For diagnostics: remembers the call stmt that\
+  \ originated the optional region.\n\nRationale:\n- We first tag the return symbol\
+  \ of an optional getter, then on assignment/binding we transfer that tag to the\
+  \ destination region and mark it as unchecked. Later, when we see a NULL-check we\
+  \ mark the region as checked. On dereference, we report only if the region is tracked\
+  \ as unchecked.\n\n2) Callback functions, responsibilities, and implementation details\n\
+  \nA) checkPostCall\n- Goal: Identify calls to optional getters and tag their return\
+  \ symbol.\n- Detect callee by name. Maintain a small allowlist of functions that\
+  \ can return NULL on absence (not error):\n  - \"devm_gpiod_get_optional\"\n  -\
+  \ \"devm_gpiod_get_array_optional\"\n  - \"gpiod_get_optional\"\n  - You can extend\
+  \ with other well-known *_get_optional() as needed later, but keep it small to avoid\
+  \ false positives.\n- Steps:\n  1. If callee matches one of the above names:\n \
+  \    - Get SVal Ret = Call.getReturnValue(); SymbolRef Sym = Ret.getAsSymbol();\n\
+  \     - If Sym:\n       - State = State.add(OptionalRetSyms, Sym);\n       - State\
+  \ = State.set(OptionalRetSymOrigin, Sym, Call.getOriginExpr() or Call.getSourceRange/Stmt\
+  \ as available).\n     - addTransition(State).\n\nB) checkBind\n- Goal: Transfer\
+  \ \u201Coptional possibly-NULL\u201D tag from return symbol to the region being\
+  \ assigned to. Also propagate between regions on plain assignments.\n- Steps:\n\
+  \  1. Extract the destination region: if Loc is a loc::MemRegionVal, const MemRegion\
+  \ *DstR = Loc.getAsRegion().\n  2. Analyze source (Val):\n     - If Val has a SymbolRef\
+  \ RHSym and RHSym \u2208 OptionalRetSyms:\n       - State = State.set(OptionalRegionChecked,\
+  \ DstR, false);\n       - Copy origin: const Stmt* CallS = State.get(OptionalRetSymOrigin,\
+  \ RHSym); if (CallS) State = State.set(OptionalRegionOrigin, DstR, CallS);\n   \
+  \  - Else if Val refers to a region (e.g., Val.getAsRegion() or cast via loc::MemRegionVal)\
+  \ and that SrcR \u2208 OptionalRegionChecked:\n       - bool Checked = State.get(OptionalRegionChecked,\
+  \ SrcR);\n       - State = State.set(OptionalRegionChecked, DstR, Checked);\n  \
+  \     - Also propagate origin: CallS = State.get(OptionalRegionOrigin, SrcR); if\
+  \ (CallS) State = State.set(OptionalRegionOrigin, DstR, CallS);\n  3. addTransition(State).\n\
+  - Notes:\n  - This gives minimal alias tracking sufficient for common patterns:\
+  \ storing the optional return into a variable/field and then using that variable/field,\
+  \ or copying it to another pointer.\n\nC) checkBranchCondition\n- Goal: Mark regions\
+  \ as checked when they undergo a NULL-check.\n- Patterns to recognize:\n  - if (ptr)\n\
+  \  - if (ptr != NULL)\n  - if (NULL != ptr)\n  - if (!!ptr) (via ignoring implicit\
+  \ casts and unary nots)\n- Steps:\n  1. From Condition (Stmt*), try to extract the\
+  \ pointer expression being tested:\n     - If UnaryOperator is \u2018!\u2019 or\
+  \ has implicit casts, strip them to reach the underlying Expr.\n     - For BinaryOperator\
+  \ \u2018==\u2019/\u2018!=\u2019, identify which side is the pointer and which side\
+  \ is NULL/0:\n       - Recognize integer literal 0, GNU __null, or identifier \u201C\
+  NULL\u201D via ExprHasName(..., \"NULL\", C) fallback if needed.\n     - For simple\
+  \ \u201Cif (ptr)\u201D, the condition is just the pointer with implicit cast to\
+  \ bool; strip casts using IgnoreParenImpCasts().\n  2. Get its region: const MemRegion*\
+  \ R = getMemRegionFromExpr(TestExpr, C).\n  3. If R is in OptionalRegionChecked:\n\
+  \     - State = State.set(OptionalRegionChecked, R, true);\n     - addTransition(State).\n\
+  - Simplicity note:\n  - This approach marks the region as checked regardless of\
+  \ then/else path. It is a pragmatic approximation that works well for the \u201C\
+  if (ptr) { \u2026 deref \u2026 }\u201D kernel pattern. It intentionally does not\
+  \ treat \u201Cif (!ptr) { return; } \u2026 deref \u2026\u201D path-sensitively to\
+  \ keep the checker simple.\n\nD) checkLocation\n- Goal: Detect unchecked dereferences\
+  \ of optional pointers.\n- We only warn on actual dereference, not when the pointer\
+  \ is only being compared or passed around.\n- Steps:\n  1. Trigger only for IsLoad\
+  \ == true.\n  2. Extract the region being loaded from: if Loc is a MemRegionVal,\
+  \ const MemRegion* R = Loc.getAsRegion().\n  3. If R is not in OptionalRegionChecked\
+  \ map, return (not tracked).\n  4. If R is tracked and its value is false (unchecked),\
+  \ determine if this load corresponds to a dereference context:\n     - Use the provided\
+  \ utility findSpecificTypeInParents to look for:\n       - MemberExpr ME with ME->isArrow()\
+  \ == true (ptr->field)\n       - ArraySubscriptExpr (ptr[i])\n       - UnaryOperator\
+  \ with opcode UO_Deref (*ptr)\n     - If none of the above ancestors exist, ignore\
+  \ (e.g., it could be a benign load for comparison).\n  5. If dereference context\
+  \ found:\n     - Generate a non-fatal error node and emit a bug report:\n      \
+  \ - Message: \"Optional resource may be NULL; dereferenced without NULL check\"\n\
+  \       - If available, add a note pointing to the origin call site: retrieve OptionalRegionOrigin[R]\
+  \ and add a note like \"Optional getter can return NULL here\".\n     - Optionally,\
+  \ to reduce duplicate reports, you can remove R from the map after reporting on\
+  \ this node/state.\n\nE) Optional: checkEndFunction\n- Clear state (not strictly\
+  \ necessary; state is per-function) or leave as is.\n\n3) Additional details and\
+  \ heuristics\n\n- Function identification:\n  - Implement a small helper: bool isOptionalGetter(const\
+  \ CallEvent &Call) that returns true if callee name equals one of:\n    - \"devm_gpiod_get_optional\"\
+  \n    - \"devm_gpiod_get_array_optional\"\n    - \"gpiod_get_optional\"\n  - Keep\
+  \ the list tight to avoid false positives.\n- Avoid suppressing for IS_ERR() checks:\n\
+  \  - Do not mark as checked when code checks IS_ERR(ptr). That check validates \u201C\
+  error pointer\u201D ranges, not NULL. The checker should still warn if later dereferenced\
+  \ without an explicit null-check.\n- Origin tracking:\n  - The OptionalRetSymOrigin\
+  \ and OptionalRegionOrigin maps are solely for better diagnostics; if unavailable,\
+  \ the core detection still works.\n- Utility usage:\n  - Use getMemRegionFromExpr\
+  \ to map expressions to regions.\n  - Use findSpecificTypeInParents in checkLocation\
+  \ to confirm dereference contexts.\n  - Use ExprHasName to help detect comparisons\
+  \ to NULL in ambiguous cases (though comparing to integer literal 0 is the main\
+  \ case).\n- Reporting style:\n  - Create a BugType once (e.g., \"Unchecked dereference\
+  \ of optional resource\").\n  - Use std::make_unique<PathSensitiveBugReport> with\
+  \ a short message.\n\n4) Minimal end-to-end flow (as in the target patch)\n- devm_gpiod_get_array_optional(...)\
+  \ is called:\n  - checkPostCall marks return symbol as optional.\n- Assignment to\
+  \ lcd->im_pins:\n  - checkBind transfers the tag to the field region and sets it\
+  \ Unchecked.\n- Code checks IS_ERR(lcd->im_pins) only:\n  - No NULL check detected,\
+  \ so region remains Unchecked.\n- Later deref lcd->im_pins->ndescs or lcd->im_pins->desc[i]:\n\
+  \  - checkLocation sees a load from the field region, detects it occurs under a\
+  \ MemberExpr with \u201C->\u201D, and since region is Unchecked, it reports the\
+  \ bug.\n\nThis plan directly captures the bug pattern in the provided patch: using\
+  \ an optional getter, failing to test for NULL, and then dereferencing the pointer."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include <memory>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// ---------------- Program state customizations ----------------\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(OptionalRetSyms, SymbolRef)\nREGISTER_MAP_WITH_PROGRAMSTATE(OptionalRetSymOrigin,\
+  \ SymbolRef, const Stmt*)\nREGISTER_MAP_WITH_PROGRAMSTATE(OptionalRegionChecked,\
+  \ const MemRegion*, bool)\nREGISTER_MAP_WITH_PROGRAMSTATE(OptionalRegionOrigin,\
+  \ const MemRegion*, const Stmt*)\n\nnamespace {\n\nclass SAGenTestChecker : public\
+  \ Checker<\n    check::PostCall,\n    check::Bind,\n    check::BranchCondition,\n\
+  \    check::Location\n> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Unchecked dereference of optional\
+  \ resource\", \"API Misuse\")) {}\n\n      void checkPostCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const;\n      void checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const;\n      void checkLocation(SVal Loc, bool IsLoad, const\
+  \ Stmt *S, CheckerContext &C) const;\n\n   private:\n      static bool isOptionalGetter(const\
+  \ CallEvent &Call, CheckerContext &C);\n      static bool isNullExpr(const Expr\
+  \ *E, CheckerContext &C);\n      void markRegionCheckedForExpr(const Expr *E, CheckerContext\
+  \ &C) const;\n      void reportUncheckedDeref(const Stmt *DerefSite, const MemRegion\
+  \ *BaseReg,\n                                CheckerContext &C) const;\n};\n\nbool\
+  \ SAGenTestChecker::isOptionalGetter(const CallEvent &Call, CheckerContext &C) {\n\
+  \  const Expr *OE = Call.getOriginExpr();\n  if (!OE)\n    return false;\n\n  //\
+  \ Tight allowlist of optional getters that legitimately return NULL if absent.\n\
+  \  if (ExprHasName(OE, \"devm_gpiod_get_array_optional\", C)) return true;\n  if\
+  \ (ExprHasName(OE, \"devm_gpiod_get_optional\", C)) return true;\n  if (ExprHasName(OE,\
+  \ \"gpiod_get_optional\", C)) return true;\n\n  return false;\n}\n\nbool SAGenTestChecker::isNullExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return false;\n  return E->isNullPointerConstant(C.getASTContext(),\n\
+  \                                  Expr::NPC_ValueDependentIsNull);\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  if (!isOptionalGetter(Call, C))\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n\n  SVal Ret = Call.getReturnValue();\n\
+  \  SymbolRef Sym = Ret.getAsSymbol();\n  if (!Sym)\n    return;\n\n  // Tag this\
+  \ return symbol as optional (may be NULL).\n  State = State->add<OptionalRetSyms>(Sym);\n\
+  \n  // Remember origin call stmt for diagnostics.\n  if (const Stmt *S = Call.getOriginExpr())\n\
+  \    State = State->set<OptionalRetSymOrigin>(Sym, S);\n\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  const MemRegion *DstR\
+  \ = Loc.getAsRegion();\n  if (!DstR)\n    return;\n  DstR = DstR->getBaseRegion();\n\
+  \  if (!DstR)\n    return;\n\n  bool DidUpdate = false;\n\n  // Case 1: Binding\
+  \ from a return symbol of an optional getter.\n  if (SymbolRef RHSym = Val.getAsSymbol())\
+  \ {\n    if (State->contains<OptionalRetSyms>(RHSym)) {\n      State = State->set<OptionalRegionChecked>(DstR,\
+  \ false);\n      if (const Stmt *const *Orig = State->get<OptionalRetSymOrigin>(RHSym))\
+  \ {\n        State = State->set<OptionalRegionOrigin>(DstR, *Orig);\n      }\n \
+  \     DidUpdate = true;\n    }\n  }\n\n  // Case 2: Propagate tag between regions\
+  \ on plain assignment/aliasing.\n  if (!DidUpdate) {\n    if (const MemRegion *SrcR\
+  \ = Val.getAsRegion()) {\n      SrcR = SrcR->getBaseRegion();\n      if (SrcR) {\n\
+  \        if (const bool *Checked = State->get<OptionalRegionChecked>(SrcR)) {\n\
+  \          State = State->set<OptionalRegionChecked>(DstR, *Checked);\n        \
+  \  if (const Stmt *const *Orig = State->get<OptionalRegionOrigin>(SrcR))\n     \
+  \       State = State->set<OptionalRegionOrigin>(DstR, *Orig);\n          DidUpdate\
+  \ = true;\n        }\n      }\n    }\n  }\n\n  if (DidUpdate)\n    C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::markRegionCheckedForExpr(const Expr *E, CheckerContext\
+  \ &C) const {\n  if (!E)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \n  // Map expression to region.\n  const MemRegion *R = getMemRegionFromExpr(E,\
+  \ C);\n  if (!R)\n    return;\n\n  R = R->getBaseRegion();\n  if (!R)\n    return;\n\
+  \n  if (const bool *Tracked = State->get<OptionalRegionChecked>(R)) {\n    if (!*Tracked)\
+  \ {\n      State = State->set<OptionalRegionChecked>(R, true);\n      C.addTransition(State);\n\
+  \    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C) const {\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE)\n    return;\n\n  // Pattern 1: if (!ptr) or multiple logical nots;\
+  \ still consider it a check.\n  if (const auto *UO = dyn_cast<UnaryOperator>(CondE))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      const Expr *Sub = UO->getSubExpr();\n\
+  \      if (Sub) {\n        markRegionCheckedForExpr(Sub, C);\n      }\n      return;\n\
+  \    }\n  }\n\n  // Pattern 2: if (ptr == NULL) or if (ptr != NULL)\n  if (const\
+  \ auto *BO = dyn_cast<BinaryOperator>(CondE)) {\n    if (BO->getOpcode() == BO_EQ\
+  \ || BO->getOpcode() == BO_NE) {\n      const Expr *L = BO->getLHS();\n      const\
+  \ Expr *R = BO->getRHS();\n      const Expr *PtrExpr = nullptr;\n\n      bool LIsNull\
+  \ = isNullExpr(L, C);\n      bool RIsNull = isNullExpr(R, C);\n      if (LIsNull\
+  \ && !RIsNull)\n        PtrExpr = R;\n      else if (RIsNull && !LIsNull)\n    \
+  \    PtrExpr = L;\n\n      if (PtrExpr) {\n        markRegionCheckedForExpr(PtrExpr,\
+  \ C);\n      }\n      return;\n    }\n  }\n\n  // Pattern 3: if (ptr)\n  // Treat\
+  \ any direct pointer-as-condition as a check.\n  markRegionCheckedForExpr(CondE,\
+  \ C);\n}\n\nvoid SAGenTestChecker::reportUncheckedDeref(const Stmt *DerefSite,\n\
+  \                                            const MemRegion *BaseReg,\n       \
+  \                                     CheckerContext &C) const {\n  ExplodedNode\
+  \ *N = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto Rpt = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Optional resource may be NULL; dereferenced without NULL check\",\
+  \ N);\n\n  if (DerefSite)\n    Rpt->addRange(DerefSite->getSourceRange());\n\n \
+  \ if (BaseReg) {\n    ProgramStateRef State = C.getState();\n    if (const Stmt\
+  \ *const *Origin = State->get<OptionalRegionOrigin>(BaseReg)) {\n      PathDiagnosticLocation\
+  \ Loc = PathDiagnosticLocation::createBegin(*Origin, C.getSourceManager(), N->getLocationContext());\n\
+  \      Rpt->addNote(\"Optional getter can return NULL here\", Loc);\n    }\n  }\n\
+  \n  C.emitReport(std::move(Rpt));\n}\n\nvoid SAGenTestChecker::checkLocation(SVal\
+  \ Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {\n  if (!IsLoad ||\
+  \ !S)\n    return;\n\n  ProgramStateRef State = C.getState();\n\n  // Helper lambda\
+  \ to check base expression's region for being tracked and unchecked.\n  auto CheckBaseExpr\
+  \ = [&](const Expr *BaseE) {\n    if (!BaseE) return;\n    const MemRegion *R =\
+  \ getMemRegionFromExpr(BaseE, C);\n    if (!R) return;\n    R = R->getBaseRegion();\n\
+  \    if (!R) return;\n\n    const bool *Checked = State->get<OptionalRegionChecked>(R);\n\
+  \    if (Checked && *Checked == false) {\n      reportUncheckedDeref(S, R, C);\n\
+  \    }\n  };\n\n  // Detect ptr->field\n  if (const auto *ME = findSpecificTypeInParents<MemberExpr>(S,\
+  \ C)) {\n    if (ME->isArrow()) {\n      CheckBaseExpr(ME->getBase());\n      return;\n\
+  \    }\n  }\n\n  // Detect ptr[i]\n  if (const auto *ASE = findSpecificTypeInParents<ArraySubscriptExpr>(S,\
+  \ C)) {\n    CheckBaseExpr(ASE->getBase());\n    return;\n  }\n\n  // Detect *ptr\n\
+  \  if (const auto *UO = findSpecificTypeInParents<UnaryOperator>(S, C)) {\n    if\
+  \ (UO->getOpcode() == UO_Deref) {\n      CheckBaseExpr(UO->getSubExpr());\n    \
+  \  return;\n    }\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unchecked dereference when using *_get_optional() APIs that may\
+  \ return NULL\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

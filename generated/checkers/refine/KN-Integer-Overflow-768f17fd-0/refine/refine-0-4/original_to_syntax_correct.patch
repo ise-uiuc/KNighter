@@ -1,0 +1,175 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -65,6 +65,14 @@     return E ? E->IgnoreParenImpCasts() : nullptr;
+   }
+
++  static const BinaryOperator *asShift(const Stmt *S) {
++    if (const auto *BO = dyn_cast_or_null<BinaryOperator>(S)) {
++      if (BO->getOpcode() == BO_Shl)
++        return BO;
++    }
++    return nullptr;
++  }
++
+   // Report only if the shift is the top-level expression reaching the 64-bit destination.
+   static bool isTopLevelShiftExpr(const Expr *ContainerE, const BinaryOperator *Shl) {
+     if (!ContainerE || !Shl)
+@@ -96,11 +104,130 @@     if (LBits == 0)
+       return true;
+
+-    // Example: a 32-bit LHS can hold results where (LBits + ShiftAmt) <= 32.
+     return (uint64_t)LBits + ShiftAmt <= (uint64_t)LHSW;
+   }
+
+-  // Centralized FP gate
++  // Try to get an upper bound for the shift amount from constants or the constraint manager.
++  static bool getUpperBoundForShiftAmount(const Expr *R, uint64_t &UB,
++                                          CheckerContext &C) {
++    if (!R)
++      return false;
++
++    llvm::APSInt RHSEval;
++    if (EvaluateExprToInt(RHSEval, R, C)) {
++      if (RHSEval.isSigned() && RHSEval.isNegative())
++        return false;
++      UB = RHSEval.getZExtValue();
++      return true;
++    }
++
++    ProgramStateRef State = C.getState();
++    SVal RV = State->getSVal(R, C.getLocationContext());
++    if (SymbolRef Sym = RV.getAsSymbol()) {
++      if (const llvm::APSInt *Max = inferSymbolMaxVal(Sym, C)) {
++        if (Max->isSigned() && Max->isNegative())
++          return false;
++        UB = Max->getZExtValue();
++        return true;
++      }
++    }
++
++    // As a small fallback, handle simple "X * Const" forms if we can bound X.
++    if (const auto *BO = dyn_cast<BinaryOperator>(peel(R))) {
++      if (BO->getOpcode() == BO_Mul) {
++        // Try (X * C) or (C * X)
++        llvm::APSInt ConstEval;
++        const Expr *A = BO->getLHS();
++        const Expr *B = BO->getRHS();
++
++        const Expr *X = nullptr;
++        uint64_t Factor = 0;
++
++        if (EvaluateExprToInt(ConstEval, A, C)) {
++          if (!(ConstEval.isSigned() && ConstEval.isNegative())) {
++            Factor = ConstEval.getZExtValue();
++            X = B;
++          } else {
++            return false;
++          }
++        } else if (EvaluateExprToInt(ConstEval, B, C)) {
++          if (!(ConstEval.isSigned() && ConstEval.isNegative())) {
++            Factor = ConstEval.getZExtValue();
++            X = A;
++          } else {
++            return false;
++          }
++        }
++
++        if (X && Factor != 0) {
++          uint64_t XUB = 0;
++          if (getUpperBoundForShiftAmount(X, XUB, C)) {
++            // Beware of overflow; clamp to 64-bit.
++            llvm::APInt Prod(128, XUB);
++            Prod *= llvm::APInt(128, Factor);
++            UB = Prod.getZExtValue();
++            return true;
++          }
++        }
++      }
++    }
++
++    return false;
++  }
++
++  // Try to get a safe upper bound on the number of active bits the left operand can have.
++  // Returns true if it could compute a non-negative bound.
++  static bool getMaxActiveBitsForLHS(const Expr *L, unsigned &ActiveBits,
++                                     CheckerContext &C) {
++    if (!L)
++      return false;
++
++    llvm::APSInt LHSEval;
++    if (EvaluateExprToInt(LHSEval, L, C)) {
++      if (LHSEval.isSigned() && LHSEval.isNegative())
++        return false;
++      ActiveBits = LHSEval.getActiveBits(); // 0 for 0
++      return true;
++    }
++
++    ProgramStateRef State = C.getState();
++    SVal LV = State->getSVal(L, C.getLocationContext());
++    if (SymbolRef Sym = LV.getAsSymbol()) {
++      if (const llvm::APSInt *Max = inferSymbolMaxVal(Sym, C)) {
++        if (Max->isSigned() && Max->isNegative())
++          return false;
++        ActiveBits = Max->getActiveBits();
++        return true;
++      }
++    }
++
++    return false;
++  }
++
++  // If we can prove that the 32-bit shift result fits entirely within the LHS bitwidth,
++  // it is safe to perform the shift in 32-bit even if the overall destination is 64-bit.
++  static bool shiftResultProvablyFitsInLHSType(const Expr *L, const Expr *R,
++                                               unsigned LHSW, CheckerContext &C) {
++    // Fast path for fully constant expressions.
++    if (constantShiftFitsInLHSWidth(L, R, LHSW, C))
++      return true;
++
++    // Path-sensitive bound: get RHS upper bound and LHS max active bits.
++    uint64_t ShiftUB = 0;
++    unsigned LActiveBits = 0;
++    if (!getUpperBoundForShiftAmount(R, ShiftUB, C))
++      return false;
++    if (!getMaxActiveBitsForLHS(L, LActiveBits, C))
++      return false;
++
++    // 0 << n is always safe
++    if (LActiveBits == 0)
++      return true;
++
++    return (uint64_t)LActiveBits + ShiftUB <= (uint64_t)LHSW;
++  }
++
++  // Centralized FP gate for structural/context checks.
+   static bool isFalsePositiveContext(const Expr *WholeExpr,
+                                      const BinaryOperator *Shl,
+                                      CheckerContext &C) {
+@@ -108,17 +235,10 @@     if (!isTopLevelShiftExpr(WholeExpr, Shl))
+       return true;
+
++    (void)C; // currently unused, keep signature for future extensions
+     return false;
+   }
+ };
+-
+-static const BinaryOperator *asShift(const Stmt *S) {
+-  if (const auto *BO = dyn_cast_or_null<BinaryOperator>(S)) {
+-    if (BO->getOpcode() == BO_Shl)
+-      return BO;
+-  }
+-  return nullptr;
+-}
+
+ const BinaryOperator *SAGenTestChecker::findShiftInTree(const Stmt *S) {
+   if (!S)
+@@ -202,8 +322,9 @@   if (isFalsePositiveContext(E, Shl, C))
+     return;
+
+-  // Precise constant-bound suppression: only if both sides are constants and safe.
+-  if (constantShiftFitsInLHSWidth(L, R, LHSW, C))
++  // New: path-sensitive suppression. If we can prove the 32-bit shift result fits in LHS width,
++  // then computing in 32-bit is safe, even if the destination is 64-bit.
++  if (shiftResultProvablyFitsInLHSType(L, R, LHSW, C))
+     return;
+
+   // Report

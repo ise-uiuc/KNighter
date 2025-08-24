@@ -1,0 +1,382 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: b58b1b883b9b702e25204dbe2b221eecc8ecd159
+commit_type: Buffer-Overflow
+index: 7
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\n\nusing namespace clang;\nusing\
+  \ namespace ento;\nusing namespace taint;\n\n// Program state:\n// - Map \"shorten-like\"\
+  \ VarDecl* -> iov_iter VarDecl* used to compute it\nREGISTER_MAP_WITH_PROGRAMSTATE(ShortenMap,\
+  \ const VarDecl*, const VarDecl*)\n// - Set of \"shorten-like\" VarDecl* that are\
+  \ guarded by a comparison with iter->count\nREGISTER_SET_WITH_PROGRAMSTATE(SafeShortenSet,\
+  \ const VarDecl*)\n\nnamespace {\n\nstatic const VarDecl *getVarDeclFromExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  E = E->IgnoreParenCasts();\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n\
+  \      return VD;\n  }\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n \
+  \   return getVarDeclFromExpr(UO->getSubExpr());\n  }\n  if (const auto *ME = dyn_cast<MemberExpr>(E))\
+  \ {\n    return getVarDeclFromExpr(ME->getBase());\n  }\n  if (const auto *ASE =\
+  \ dyn_cast<ArraySubscriptExpr>(E)) {\n    return getVarDeclFromExpr(ASE->getBase());\n\
+  \  }\n  // Fallback: search downwards for a DeclRefExpr\n  if (const auto *DRE =\
+  \ findSpecificTypeInChildren<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n\
+  \      return VD;\n  }\n  return nullptr;\n}\n\nstatic const VarDecl *extractIterFromIovCountExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return nullptr;\n  // Find a CallExpr\
+  \ below E which is iov_iter_count(...)\n  const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(E);\n\
+  \  if (!CE)\n    return nullptr;\n\n  if (!ExprHasName(CE, \"iov_iter_count\", C))\n\
+  \    return nullptr;\n\n  if (CE->getNumArgs() < 1)\n    return nullptr;\n\n  const\
+  \ Expr *Arg0 = CE->getArg(0);\n  return getVarDeclFromExpr(Arg0);\n}\n\nstatic bool\
+  \ isCountMemberExprOfIter(const Expr *E, const VarDecl *&OutIterVD) {\n  OutIterVD\
+  \ = nullptr;\n  if (!E) return false;\n  E = E->IgnoreParenCasts();\n  const auto\
+  \ *ME = dyn_cast<MemberExpr>(E);\n  if (!ME) return false;\n\n  const ValueDecl\
+  \ *Member = ME->getMemberDecl();\n  if (!Member) return false;\n\n  // Check field\
+  \ name is \"count\"\n  if (Member->getName() != \"count\")\n    return false;\n\n\
+  \  // Extract base variable (iter)\n  OutIterVD = getVarDeclFromExpr(ME->getBase());\n\
+  \  return OutIterVD != nullptr;\n}\n\nclass SAGenTestChecker : public Checker<\n\
+  \    check::PostStmt<DeclStmt>,\n    check::Bind,\n    check::BranchCondition> {\n\
+  \   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Size underflow in iov_iter->count\", \"Integer\")) {}\n\
+  \n      void checkPostStmt(const DeclStmt *DS, CheckerContext &C) const;\n     \
+  \ void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \      void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\
+  \n   private:\n      void recordShortenLike(const VarDecl *ShortenVD, const Expr\
+  \ *RHSorInit, CheckerContext &C) const;\n      void maybeReport(const Stmt *S, const\
+  \ VarDecl *IterVD, const VarDecl *ShortenVD, CheckerContext &C) const;\n};\n\nvoid\
+  \ SAGenTestChecker::recordShortenLike(const VarDecl *ShortenVD, const Expr *RHSorInit,\
+  \ CheckerContext &C) const {\n  if (!ShortenVD || !RHSorInit)\n    return;\n\n \
+  \ // Ensure the shorten-like variable is of unsigned integer type\n  if (!ShortenVD->getType()->isUnsignedIntegerType())\n\
+  \    return;\n\n  const Expr *E = RHSorInit->IgnoreParenCasts();\n  const auto *BO\
+  \ = dyn_cast<BinaryOperator>(E);\n  if (!BO || BO->getOpcode() != BO_Sub)\n    return;\n\
+  \n  const Expr *L = BO->getLHS();\n  const Expr *R = BO->getRHS();\n  if (!L ||\
+  \ !R)\n    return;\n\n  // Require that left contains iov_iter_count and right contains\
+  \ round_up\n  CheckerContext &CRef = const_cast<CheckerContext &>(C);\n  if (!ExprHasName(L,\
+  \ \"iov_iter_count\", CRef))\n    return;\n  if (!ExprHasName(R, \"round_up\", CRef))\n\
+  \    return;\n\n  // Extract iter var from the LHS call iov_iter_count(iter)\n \
+  \ const VarDecl *IterVD = extractIterFromIovCountExpr(L, CRef);\n  if (!IterVD)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  State = State->set<ShortenMap>(ShortenVD,\
+  \ IterVD);\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPostStmt(const\
+  \ DeclStmt *DS, CheckerContext &C) const {\n  // For each declared variable with\
+  \ initializer, check for:\n  //   size_t shorten = iov_iter_count(iter) - round_up(...);\n\
+  \  for (const Decl *D : DS->decls()) {\n    const auto *VD = dyn_cast<VarDecl>(D);\n\
+  \    if (!VD || !VD->hasInit())\n      continue;\n\n    const Expr *Init = VD->getInit();\n\
+  \    recordShortenLike(VD, Init, C);\n  }\n}\n\nvoid SAGenTestChecker::maybeReport(const\
+  \ Stmt *S, const VarDecl *IterVD, const VarDecl *ShortenVD, CheckerContext &C) const\
+  \ {\n  if (!IterVD || !ShortenVD)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  // Is this ShortenVD known and tied to this IterVD?\n  const VarDecl *MappedIter\
+  \ = State->get<ShortenMap>(ShortenVD);\n  if (!MappedIter || MappedIter != IterVD)\n\
+  \    return;\n\n  // If there is a guard recorded, do not warn.\n  if (State->contains<SafeShortenSet>(ShortenVD))\n\
+  \    return;\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n\
+  \    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\n\
+  \      \"Possible size underflow: round_up(...) may exceed iov_iter_count(); \"\n\
+  \      \"subtracting it from iter->count can wrap\",\n      N);\n  if (S)\n    R->addRange(S->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n\n  // Optionally, erase to avoid duplicate reports\
+  \ along this path\n  State = State->remove<ShortenMap>(ShortenVD);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  if (!S)\n    return;\n\n  // Case A: Recognize non-declarative\
+  \ assignment for \"shorten-like\":\n  //   shorten = iov_iter_count(iter) - round_up(...);\n\
+  \  if (const auto *BO = dyn_cast<BinaryOperator>(S)) {\n    if (BO->getOpcode()\
+  \ == BO_Assign) {\n      const Expr *LHS = BO->getLHS();\n      const Expr *RHS\
+  \ = BO->getRHS();\n      if (const VarDecl *ShortenVD = getVarDeclFromExpr(LHS))\
+  \ {\n        recordShortenLike(ShortenVD, RHS, C);\n      }\n\n      // Case C2:\
+  \ iter->count = iter->count - shorten;\n      const Expr *AssignLHS = LHS ? LHS->IgnoreParenCasts()\
+  \ : nullptr;\n      const Expr *AssignRHS = RHS ? RHS->IgnoreParenCasts() : nullptr;\n\
+  \      const VarDecl *IterInLHS = nullptr;\n      if (AssignLHS && AssignRHS &&\
+  \ isCountMemberExprOfIter(AssignLHS, IterInLHS)) {\n        if (const auto *Sub\
+  \ = dyn_cast<BinaryOperator>(AssignRHS)) {\n          if (Sub->getOpcode() == BO_Sub)\
+  \ {\n            const Expr *SubLHS = Sub->getLHS();\n            const Expr *SubRHS\
+  \ = Sub->getRHS();\n            const VarDecl *IterInSubLHS = nullptr;\n       \
+  \     if (isCountMemberExprOfIter(SubLHS, IterInSubLHS) && IterInSubLHS == IterInLHS)\
+  \ {\n              if (const VarDecl *ShortenVD = getVarDeclFromExpr(SubRHS)) {\n\
+  \                maybeReport(S, IterInLHS, ShortenVD, C);\n              }\n   \
+  \         }\n          }\n        }\n      }\n    }\n  }\n\n  // Case C1: Compound\
+  \ subtract:\n  //   iter->count -= shorten;\n  if (const auto *CAO = dyn_cast<CompoundAssignOperator>(S))\
+  \ {\n    if (CAO->getOpcode() == BO_SubAssign) {\n      const Expr *LHS = CAO->getLHS();\n\
+  \      const Expr *RHS = CAO->getRHS();\n      const VarDecl *IterVD = nullptr;\n\
+  \      if (isCountMemberExprOfIter(LHS, IterVD)) {\n        if (const VarDecl *ShortenVD\
+  \ = getVarDeclFromExpr(RHS)) {\n          maybeReport(S, IterVD, ShortenVD, C);\n\
+  \        }\n      }\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition)\n    return;\n\n\
+  \  const Expr *CondE = dyn_cast<Expr>(Condition);\n  if (!CondE) {\n    return;\n\
+  \  }\n\n  CondE = CondE->IgnoreParenCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(CondE);\n\
+  \  if (!BO)\n    return;\n\n  BinaryOperator::Opcode Op = BO->getOpcode();\n  if\
+  \ (Op != BO_GE && Op != BO_GT)\n    return;\n\n  const Expr *L = BO->getLHS();\n\
+  \  const Expr *R = BO->getRHS();\n  if (!L || !R)\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  // Pattern 1: shorten >= iter->count  or > \n  const\
+  \ VarDecl *ShortenVD = nullptr;\n  const VarDecl *IterVD = nullptr;\n\n  // Try\
+  \ L is shorten, R is iter->count\n  ShortenVD = getVarDeclFromExpr(L);\n  if (ShortenVD\
+  \ && isCountMemberExprOfIter(R, IterVD)) {\n    const VarDecl *MappedIter = State->get<ShortenMap>(ShortenVD);\n\
+  \    if (MappedIter && MappedIter == IterVD) {\n      State = State->add<SafeShortenSet>(ShortenVD);\n\
+  \      C.addTransition(State);\n      return;\n    }\n  }\n\n  // Pattern 2: iter->count\
+  \ >= shorten\n  IterVD = nullptr;\n  ShortenVD = nullptr;\n  if (isCountMemberExprOfIter(L,\
+  \ IterVD)) {\n    ShortenVD = getVarDeclFromExpr(R);\n    if (ShortenVD) {\n   \
+  \   const VarDecl *MappedIter = State->get<ShortenMap>(ShortenVD);\n      if (MappedIter\
+  \ && MappedIter == IterVD) {\n        State = State->add<SafeShortenSet>(ShortenVD);\n\
+  \        C.addTransition(State);\n        return;\n      }\n    }\n  }\n}\n\n} //\
+  \ end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unsafe subtraction from iter->count using unsigned (iov_iter_count\
+  \ - round_up) without guard\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbcachefs: fix iov_iter count underflow on sub-block\
+  \ dio read\n\nbch2_direct_IO_read() checks the request offset and size for sector\n\
+  alignment and then falls through to a couple calculations to shrink\nthe size of\
+  \ the request based on the inode size. The problem is that\nthese checks round up\
+  \ to the fs block size, which runs the risk of\nunderflowing iter->count if the\
+  \ block size happens to be large\nenough. This is triggered by fstest generic/361\
+  \ with a 4k block\nsize, which subsequently leads to a crash. To avoid this crash,\n\
+  check that the shorten length doesn't exceed the overall length of\nthe iter.\n\n\
+  Fixes:\nSigned-off-by: Brian Foster <bfoster@redhat.com>\nReviewed-by: Su Yue <glass.su@suse.com>\n\
+  Signed-off-by: Kent Overstreet <kent.overstreet@linux.dev>\n\n## Buggy Code\n\n\
+  ```c\n// Function: bch2_direct_IO_read in fs/bcachefs/fs-io-direct.c\nstatic int\
+  \ bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)\n{\n\tstruct file\
+  \ *file = req->ki_filp;\n\tstruct bch_inode_info *inode = file_bch_inode(file);\n\
+  \tstruct bch_fs *c = inode->v.i_sb->s_fs_info;\n\tstruct bch_io_opts opts;\n\tstruct\
+  \ dio_read *dio;\n\tstruct bio *bio;\n\tloff_t offset = req->ki_pos;\n\tbool sync\
+  \ = is_sync_kiocb(req);\n\tsize_t shorten;\n\tssize_t ret;\n\n\tbch2_inode_opts_get(&opts,\
+  \ c, &inode->ei_inode);\n\n\t/* bios must be 512 byte aligned: */\n\tif ((offset|iter->count)\
+  \ & (SECTOR_SIZE - 1))\n\t\treturn -EINVAL;\n\n\tret = min_t(loff_t, iter->count,\n\
+  \t\t    max_t(loff_t, 0, i_size_read(&inode->v) - offset));\n\n\tif (!ret)\n\t\t\
+  return ret;\n\n\tshorten = iov_iter_count(iter) - round_up(ret, block_bytes(c));\n\
+  \titer->count -= shorten;\n\n\tbio = bio_alloc_bioset(NULL,\n\t\t\t       bio_iov_vecs_to_alloc(iter,\
+  \ BIO_MAX_VECS),\n\t\t\t       REQ_OP_READ,\n\t\t\t       GFP_KERNEL,\n\t\t\t  \
+  \     &c->dio_read_bioset);\n\n\tbio->bi_end_io = bch2_direct_IO_read_endio;\n\n\
+  \tdio = container_of(bio, struct dio_read, rbio.bio);\n\tclosure_init(&dio->cl,\
+  \ NULL);\n\n\t/*\n\t * this is a _really_ horrible hack just to avoid an atomic\
+  \ sub at the\n\t * end:\n\t */\n\tif (!sync) {\n\t\tset_closure_fn(&dio->cl, bch2_dio_read_complete,\
+  \ NULL);\n\t\tatomic_set(&dio->cl.remaining,\n\t\t\t   CLOSURE_REMAINING_INITIALIZER\
+  \ -\n\t\t\t   CLOSURE_RUNNING +\n\t\t\t   CLOSURE_DESTRUCTOR);\n\t} else {\n\t\t\
+  atomic_set(&dio->cl.remaining,\n\t\t\t   CLOSURE_REMAINING_INITIALIZER + 1);\n\t\
+  \tdio->cl.closure_get_happened = true;\n\t}\n\n\tdio->req\t= req;\n\tdio->ret\t\
+  = ret;\n\t/*\n\t * This is one of the sketchier things I've encountered: we have\
+  \ to skip\n\t * the dirtying of requests that are internal from the kernel (i.e.\
+  \ from\n\t * loopback), because we'll deadlock on page_lock.\n\t */\n\tdio->should_dirty\
+  \ = iter_is_iovec(iter);\n\n\tgoto start;\n\twhile (iter->count) {\n\t\tbio = bio_alloc_bioset(NULL,\n\
+  \t\t\t\t       bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS),\n\t\t\t\t       REQ_OP_READ,\n\
+  \t\t\t\t       GFP_KERNEL,\n\t\t\t\t       &c->bio_read);\n\t\tbio->bi_end_io\t\t\
+  = bch2_direct_IO_read_split_endio;\nstart:\n\t\tbio->bi_opf\t\t= REQ_OP_READ|REQ_SYNC;\n\
+  \t\tbio->bi_iter.bi_sector\t= offset >> 9;\n\t\tbio->bi_private\t\t= dio;\n\n\t\t\
+  ret = bio_iov_iter_get_pages(bio, iter);\n\t\tif (ret < 0) {\n\t\t\t/* XXX: fault\
+  \ inject this path */\n\t\t\tbio->bi_status = BLK_STS_RESOURCE;\n\t\t\tbio_endio(bio);\n\
+  \t\t\tbreak;\n\t\t}\n\n\t\toffset += bio->bi_iter.bi_size;\n\n\t\tif (dio->should_dirty)\n\
+  \t\t\tbio_set_pages_dirty(bio);\n\n\t\tif (iter->count)\n\t\t\tclosure_get(&dio->cl);\n\
+  \n\t\tbch2_read(c, rbio_init(bio, opts), inode_inum(inode));\n\t}\n\n\titer->count\
+  \ += shorten;\n\n\tif (sync) {\n\t\tclosure_sync(&dio->cl);\n\t\tclosure_debug_destroy(&dio->cl);\n\
+  \t\tret = dio->ret;\n\t\tbio_check_or_release(&dio->rbio.bio, dio->should_dirty);\n\
+  \t\treturn ret;\n\t} else {\n\t\treturn -EIOCBQUEUED;\n\t}\n}\n```\n\n## Bug Fix\
+  \ Patch\n\n```diff\ndiff --git a/fs/bcachefs/fs-io-direct.c b/fs/bcachefs/fs-io-direct.c\n\
+  index e3b219e19e10..33cb6da3a5ad 100644\n--- a/fs/bcachefs/fs-io-direct.c\n+++ b/fs/bcachefs/fs-io-direct.c\n\
+  @@ -88,6 +88,8 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter\
+  \ *iter)\n \t\treturn ret;\n \n \tshorten = iov_iter_count(iter) - round_up(ret,\
+  \ block_bytes(c));\n+\tif (shorten >= iter->count)\n+\t\tshorten = 0;\n \titer->count\
+  \ -= shorten;\n \n \tbio = bio_alloc_bioset(NULL,\n```\n"
+pattern: '## Bug Pattern
+
+
+  Computing a reduction amount as an unsigned difference between the current I/O length
+  and a rounded-up (to block size) target length, then subtracting it from iter->count
+  without first ensuring the difference is non-negative:
+
+
+  shorten = iov_iter_count(iter) - round_up(valid_len, block_size);
+
+  iter->count -= shorten;
+
+
+  If round_up(valid_len, block_size) > iov_iter_count(iter), the unsigned subtraction
+  underflows, causing iter->count to wrap and become invalidly large.'
+plan: "1) Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(ShortenMap, const VarDecl*,\
+  \ const VarDecl*)\n  - Key: the VarDecl of the \u201Cshorten-like\u201D variable.\n\
+  \  - Value: the VarDecl of the iov_iter pointer variable used to compute it.\n-\
+  \ REGISTER_SET_WITH_PROGRAMSTATE(SafeShortenSet, const VarDecl*)\n  - Contains \u201C\
+  shorten-like\u201D variables that are guarded by a comparison against iter->count.\n\
+  \n2) Callbacks and implementation details\n\nStep A \u2014 Record risky \u201Cshorten-like\u201D\
+  \ definitions\n- Use both:\n  - checkPostStmt(const DeclStmt *DS, CheckerContext\
+  \ &C)\n  - checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C)\n- In\
+  \ checkPostStmt:\n  - For each VarDecl VD in DS with an initializer:\n    - If the\
+  \ initializer is a BinaryOperator BO with opcode BO_Sub:\n      - Let L = BO->getLHS(),\
+  \ R = BO->getRHS().\n      - Require that L contains the call \u201Ciov_iter_count(\u2026\
+  )\u201D and R contains the name \u201Cround_up\u201D:\n        - Use ExprHasName(L,\
+  \ \"iov_iter_count\") and ExprHasName(R, \"round_up\").\n      - Extract the iov_iter\
+  \ variable used:\n        - From the call \u201Ciov_iter_count(arg)\u201D, find\
+  \ arg\u2019s DeclRefExpr via findSpecificTypeInChildren<DeclRefExpr>(L) and get\
+  \ its VarDecl* IterVD.\n      - Ensure VD\u2019s type is unsigned (VD->getType()->isUnsignedIntegerType()).\n\
+  \      - Record ShortenMap = ShortenMap->set(VD, IterVD).\n- In checkBind:\n  -\
+  \ Also catch non-declarative assignments \u201Cshorten = iov_iter_count(iter) -\
+  \ round_up(\u2026)\u201D:\n    - If S is a BinaryOperator with opcode BO_Assign:\n\
+  \      - If RHS is BO_Sub and matches ExprHasName(lhs, \"iov_iter_count\") and ExprHasName(rhs,\
+  \ \"round_up\"):\n        - Extract LHS DeclRefExpr \u201Cshorten\u201D VarDecl*\
+  \ ShortenVD.\n        - Extract iov_iter arg VarDecl* IterVD as above.\n       \
+  \ - Check ShortenVD is unsigned.\n        - Record in ShortenMap(ShortenVD -> IterVD).\n\
+  \nStep B \u2014 Mark when there is a guard\n- checkBranchCondition(const Stmt *Cond,\
+  \ CheckerContext &C)\n  - If Cond is a BinaryOperator with opcode BO_GE or BO_GT:\n\
+  \    - Identify if it compares a \u201Cshorten-like\u201D variable against \u201C\
+  iter->count\u201D.\n      - One side must be a DeclRefExpr ShortenDRE; get ShortenVD.\n\
+  \      - Other side must be a MemberExpr to field named \u201Ccount\u201D. From\
+  \ that MemberExpr, get the base expression\u2019s DeclRefExpr IterDRE and its VarDecl*\
+  \ IterVD.\n      - Check that ShortenVD exists in ShortenMap and ShortenMap[ShortenVD]\
+  \ == IterVD.\n    - If so, insert ShortenVD into SafeShortenSet (consider this as\
+  \ a sufficient guard).\n\nStep C \u2014 Detect and report the unsafe subtraction\
+  \ into iter->count\n- checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C)\n  - Case 1: Compound subtract \u201Citer->count -= shorten\u201D\n    - If\
+  \ S is a CompoundAssignOperator with opcode BO_SubAssign:\n      - LHS must be a\
+  \ MemberExpr to a field named \u201Ccount\u201D.\n      - RHS must be a DeclRefExpr\
+  \ to some VarDecl* ShortenVD.\n      - Extract iter variable from LHS base DeclRefExpr\
+  \ IterVD.\n      - If ShortenMap contains ShortenVD and ShortenMap[ShortenVD] ==\
+  \ IterVD and ShortenVD not in SafeShortenSet:\n        - Report bug: \u201CPossible\
+  \ unsigned underflow: subtracting a round_up(...) difference from iter->count without\
+  \ bounds check.\u201D\n        - Use generateNonFatalErrorNode and emit a PathSensitiveBugReport.\n\
+  \        - Optionally erase ShortenVD from ShortenMap to avoid duplicate reports.\n\
+  \  - Case 2: Simple assign \u201Citer->count = iter->count - shorten\u201D\n   \
+  \ - If S is a BinaryOperator with opcode BO_Assign:\n      - LHS must be a MemberExpr\
+  \ to field named \u201Ccount\u201D.\n      - RHS must be a BinaryOperator BO_Sub\
+  \ whose LHS is syntactically the same MemberExpr as the assignment LHS and whose\
+  \ RHS is a DeclRefExpr ShortenVD.\n      - Extract IterVD from LHS base DeclRefExpr.\n\
+  \      - Check ShortenMap[ShortenVD] == IterVD and ShortenVD not in SafeShortenSet,\
+  \ then report as above and optionally erase.\n\nNotes:\n- Use findSpecificTypeInChildren<DeclRefExpr>(\u2026\
+  ) to extract DeclRefExprs from both the iov_iter_count argument and from MemberExpr\
+  \ bases.\n- Use ExprHasName to detect \u201Ciov_iter_count\u201D and \u201Cround_up\u201D\
+  . This is robust even if round_up is a macro.\n- Only warn when:\n  - The \u201C\
+  shorten-like\u201D variable is unsigned.\n  - It is computed as iov_iter_count(iter)\
+  \ - round_up(...).\n  - It is later used to reduce iter->count for the same iter.\n\
+  \  - No guard was seen comparing shorten against iter->count with >= or >.\n\nStep\
+  \ D \u2014 Cleanup\n- No special cleanup needed; ProgramState is scoped per path/function.\
+  \ If desired, remove a ShortenVD from ShortenMap after reporting to suppress duplicates\
+  \ within a path.\n\n3) Bug report\n- Use a short message:\n  - \u201CPossible size\
+  \ underflow: round_up(...) may exceed iov_iter_count(); subtracting it from iter->count\
+  \ can wrap.\u201D\n- Attach the subtraction statement\u2019s SourceRange. Optionally,\
+  \ add a note at the \u201Cshorten = iov_iter_count(...) - round_up(...);\u201D definition\
+  \ site if available by using the checker context\u2019s source range on the initializer/assignment."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\n#include <memory>\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program state:\n//\
+  \ - Map \"shorten-like\" VarDecl* -> iov_iter VarDecl* used to compute it\nREGISTER_MAP_WITH_PROGRAMSTATE(ShortenMap,\
+  \ const VarDecl*, const VarDecl*)\n// - Set of \"shorten-like\" VarDecl* that are\
+  \ guarded by a comparison with iter->count\nREGISTER_SET_WITH_PROGRAMSTATE(SafeShortenSet,\
+  \ const VarDecl*)\n\nnamespace {\n\nstatic const VarDecl *getVarDeclFromExpr(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  E = E->IgnoreParenCasts();\n  if (const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n\
+  \      return VD;\n  }\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n \
+  \   return getVarDeclFromExpr(UO->getSubExpr());\n  }\n  if (const auto *ME = dyn_cast<MemberExpr>(E))\
+  \ {\n    return getVarDeclFromExpr(ME->getBase());\n  }\n  if (const auto *ASE =\
+  \ dyn_cast<ArraySubscriptExpr>(E)) {\n    return getVarDeclFromExpr(ASE->getBase());\n\
+  \  }\n  // Fallback: search downwards for a DeclRefExpr\n  if (const auto *DRE =\
+  \ findSpecificTypeInChildren<DeclRefExpr>(E)) {\n    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))\n\
+  \      return VD;\n  }\n  return nullptr;\n}\n\nstatic const VarDecl *extractIterFromIovCountExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return nullptr;\n  // Find a CallExpr\
+  \ below E which is iov_iter_count(...)\n  const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(E);\n\
+  \  if (!CE)\n    return nullptr;\n\n  if (!ExprHasName(CE, \"iov_iter_count\", C))\n\
+  \    return nullptr;\n\n  if (CE->getNumArgs() < 1)\n    return nullptr;\n\n  const\
+  \ Expr *Arg0 = CE->getArg(0);\n  return getVarDeclFromExpr(Arg0);\n}\n\nstatic bool\
+  \ isCountMemberExprOfIter(const Expr *E, const VarDecl *&OutIterVD) {\n  OutIterVD\
+  \ = nullptr;\n  if (!E) return false;\n  E = E->IgnoreParenCasts();\n  const auto\
+  \ *ME = dyn_cast<MemberExpr>(E);\n  if (!ME) return false;\n\n  const ValueDecl\
+  \ *Member = ME->getMemberDecl();\n  if (!Member) return false;\n\n  // Check field\
+  \ name is \"count\"\n  if (Member->getName() != \"count\")\n    return false;\n\n\
+  \  // Extract base variable (iter)\n  OutIterVD = getVarDeclFromExpr(ME->getBase());\n\
+  \  return OutIterVD != nullptr;\n}\n\nclass SAGenTestChecker : public Checker<\n\
+  \    check::PostStmt<DeclStmt>,\n    check::Bind,\n    check::BranchCondition> {\n\
+  \   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Size underflow in iov_iter->count\", \"Integer\")) {}\n\
+  \n      void checkPostStmt(const DeclStmt *DS, CheckerContext &C) const;\n     \
+  \ void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \      void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\
+  \n   private:\n      void recordShortenLike(const VarDecl *ShortenVD, const Expr\
+  \ *RHSorInit, CheckerContext &C) const;\n      void maybeReport(const Stmt *S, const\
+  \ VarDecl *IterVD, const VarDecl *ShortenVD, CheckerContext &C) const;\n};\n\nvoid\
+  \ SAGenTestChecker::recordShortenLike(const VarDecl *ShortenVD, const Expr *RHSorInit,\
+  \ CheckerContext &C) const {\n  if (!ShortenVD || !RHSorInit)\n    return;\n\n \
+  \ // Ensure the shorten-like variable is of unsigned integer type\n  if (!ShortenVD->getType()->isUnsignedIntegerType())\n\
+  \    return;\n\n  const Expr *E = RHSorInit->IgnoreParenCasts();\n  const auto *BO\
+  \ = dyn_cast<BinaryOperator>(E);\n  if (!BO || BO->getOpcode() != BO_Sub)\n    return;\n\
+  \n  const Expr *L = BO->getLHS();\n  const Expr *R = BO->getRHS();\n  if (!L ||\
+  \ !R)\n    return;\n\n  // Require that left contains iov_iter_count and right contains\
+  \ round_up\n  CheckerContext &CRef = const_cast<CheckerContext &>(C);\n  if (!ExprHasName(L,\
+  \ \"iov_iter_count\", CRef))\n    return;\n  if (!ExprHasName(R, \"round_up\", CRef))\n\
+  \    return;\n\n  // Extract iter var from the LHS call iov_iter_count(iter)\n \
+  \ const VarDecl *IterVD = extractIterFromIovCountExpr(L, CRef);\n  if (!IterVD)\n\
+  \    return;\n\n  ProgramStateRef State = C.getState();\n  State = State->set<ShortenMap>(ShortenVD,\
+  \ IterVD);\n  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPostStmt(const\
+  \ DeclStmt *DS, CheckerContext &C) const {\n  // For each declared variable with\
+  \ initializer, check for:\n  //   size_t shorten = iov_iter_count(iter) - round_up(...);\n\
+  \  for (const Decl *D : DS->decls()) {\n    const auto *VD = dyn_cast<VarDecl>(D);\n\
+  \    if (!VD || !VD->hasInit())\n      continue;\n\n    const Expr *Init = VD->getInit();\n\
+  \    recordShortenLike(VD, Init, C);\n  }\n}\n\nvoid SAGenTestChecker::maybeReport(const\
+  \ Stmt *S, const VarDecl *IterVD, const VarDecl *ShortenVD, CheckerContext &C) const\
+  \ {\n  if (!IterVD || !ShortenVD)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  // Is this ShortenVD known and tied to this IterVD?\n  const VarDecl *const *MappedIterPtr\
+  \ = State->get<ShortenMap>(ShortenVD);\n  if (!MappedIterPtr)\n    return;\n  const\
+  \ VarDecl *MappedIter = *MappedIterPtr;\n  if (!MappedIter || MappedIter != IterVD)\n\
+  \    return;\n\n  // If there is a guard recorded, do not warn.\n  if (State->contains<SafeShortenSet>(ShortenVD))\n\
+  \    return;\n\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N)\n\
+  \    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n      *BT,\n\
+  \      \"Possible size underflow: round_up(...) may exceed iov_iter_count(); \"\n\
+  \      \"subtracting it from iter->count can wrap\",\n      N);\n  if (S)\n    R->addRange(S->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n\n  // Optionally, erase to avoid duplicate reports\
+  \ along this path\n  State = State->remove<ShortenMap>(ShortenVD);\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  if (!S)\n    return;\n\n  // Case A: Recognize non-declarative\
+  \ assignment for \"shorten-like\":\n  //   shorten = iov_iter_count(iter) - round_up(...);\n\
+  \  if (const auto *BO = dyn_cast<BinaryOperator>(S)) {\n    if (BO->getOpcode()\
+  \ == BO_Assign) {\n      const Expr *LHS = BO->getLHS();\n      const Expr *RHS\
+  \ = BO->getRHS();\n      if (const VarDecl *ShortenVD = getVarDeclFromExpr(LHS))\
+  \ {\n        recordShortenLike(ShortenVD, RHS, C);\n      }\n\n      // Case C2:\
+  \ iter->count = iter->count - shorten;\n      const Expr *AssignLHS = LHS ? LHS->IgnoreParenCasts()\
+  \ : nullptr;\n      const Expr *AssignRHS = RHS ? RHS->IgnoreParenCasts() : nullptr;\n\
+  \      const VarDecl *IterInLHS = nullptr;\n      if (AssignLHS && AssignRHS &&\
+  \ isCountMemberExprOfIter(AssignLHS, IterInLHS)) {\n        if (const auto *Sub\
+  \ = dyn_cast<BinaryOperator>(AssignRHS)) {\n          if (Sub->getOpcode() == BO_Sub)\
+  \ {\n            const Expr *SubLHS = Sub->getLHS();\n            const Expr *SubRHS\
+  \ = Sub->getRHS();\n            const VarDecl *IterInSubLHS = nullptr;\n       \
+  \     if (isCountMemberExprOfIter(SubLHS, IterInSubLHS) && IterInSubLHS == IterInLHS)\
+  \ {\n              if (const VarDecl *ShortenVD = getVarDeclFromExpr(SubRHS)) {\n\
+  \                maybeReport(S, IterInLHS, ShortenVD, C);\n              }\n   \
+  \         }\n          }\n        }\n      }\n    }\n  }\n\n  // Case C1: Compound\
+  \ subtract:\n  //   iter->count -= shorten;\n  if (const auto *CAO = dyn_cast<CompoundAssignOperator>(S))\
+  \ {\n    if (CAO->getOpcode() == BO_SubAssign) {\n      const Expr *LHS = CAO->getLHS();\n\
+  \      const Expr *RHS = CAO->getRHS();\n      const VarDecl *IterVD = nullptr;\n\
+  \      if (isCountMemberExprOfIter(LHS, IterVD)) {\n        if (const VarDecl *ShortenVD\
+  \ = getVarDeclFromExpr(RHS)) {\n          maybeReport(S, IterVD, ShortenVD, C);\n\
+  \        }\n      }\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  if (!Condition)\n    return;\n\n\
+  \  const Expr *CondE = dyn_cast<Expr>(Condition);\n  if (!CondE) {\n    return;\n\
+  \  }\n\n  CondE = CondE->IgnoreParenCasts();\n  const auto *BO = dyn_cast<BinaryOperator>(CondE);\n\
+  \  if (!BO)\n    return;\n\n  BinaryOperator::Opcode Op = BO->getOpcode();\n  if\
+  \ (Op != BO_GE && Op != BO_GT)\n    return;\n\n  const Expr *L = BO->getLHS();\n\
+  \  const Expr *R = BO->getRHS();\n  if (!L || !R)\n    return;\n\n  ProgramStateRef\
+  \ State = C.getState();\n\n  // Pattern 1: shorten >= iter->count  or > \n  const\
+  \ VarDecl *ShortenVD = nullptr;\n  const VarDecl *IterVD = nullptr;\n\n  // Try\
+  \ L is shorten, R is iter->count\n  ShortenVD = getVarDeclFromExpr(L);\n  if (ShortenVD\
+  \ && isCountMemberExprOfIter(R, IterVD)) {\n    const VarDecl *const *MappedIterPtr\
+  \ = State->get<ShortenMap>(ShortenVD);\n    if (MappedIterPtr) {\n      const VarDecl\
+  \ *MappedIter = *MappedIterPtr;\n      if (MappedIter && MappedIter == IterVD) {\n\
+  \        State = State->add<SafeShortenSet>(ShortenVD);\n        C.addTransition(State);\n\
+  \        return;\n      }\n    }\n  }\n\n  // Pattern 2: iter->count >= shorten\n\
+  \  IterVD = nullptr;\n  ShortenVD = nullptr;\n  if (isCountMemberExprOfIter(L, IterVD))\
+  \ {\n    ShortenVD = getVarDeclFromExpr(R);\n    if (ShortenVD) {\n      const VarDecl\
+  \ *const *MappedIterPtr = State->get<ShortenMap>(ShortenVD);\n      if (MappedIterPtr)\
+  \ {\n        const VarDecl *MappedIter = *MappedIterPtr;\n        if (MappedIter\
+  \ && MappedIter == IterVD) {\n          State = State->add<SafeShortenSet>(ShortenVD);\n\
+  \          C.addTransition(State);\n          return;\n        }\n      }\n    }\n\
+  \  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unsafe subtraction from iter->count using unsigned (iov_iter_count\
+  \ - round_up) without guard\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

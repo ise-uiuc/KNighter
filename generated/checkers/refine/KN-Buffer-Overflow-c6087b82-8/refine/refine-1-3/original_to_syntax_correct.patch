@@ -1,0 +1,263 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -26,8 +26,37 @@ REGISTER_MAP_WITH_PROGRAMSTATE(ArraySafeLenMap, const MemRegion*, const MemRegion*)
+ // Optional fallback: symbols that we heuristically believe are bounded by some sizeof()
+ REGISTER_SET_WITH_PROGRAMSTATE(BoundedLenSyms, SymbolRef)
++// New: For a given destination array region (key), remember the current SymbolRef of a "safe length".
++REGISTER_MAP_WITH_PROGRAMSTATE(ArraySafeLenSymMap, const MemRegion*, SymbolRef)
+
+ namespace {
++
++// Utility functions provided by the prompt.
++template <typename T>
++const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
++
++template <typename T>
++const T* findSpecificTypeInChildren(const Stmt *S);
++
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C);
++
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C);
++
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E);
++
++bool getStringSize(llvm::APInt &StringSize, const Expr *E);
++
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C);
++
++struct KnownDerefFunction {
++  const char *Name;
++  llvm::SmallVector<unsigned, 4> Params;
++};
++
++bool functionKnownToDeref(const CallEvent &Call,
++                          llvm::SmallVectorImpl<unsigned> &DerefParams);
++
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
+
+ class SAGenTestChecker
+   : public Checker<check::PreCall, check::Bind> {
+@@ -58,13 +87,18 @@
+   void reportUnbounded(const CallEvent &Call, const Expr *Dst,
+                        const Expr *Len, CheckerContext &C) const;
++
++  // Helper to detect “safe” patterns to eliminate false positives.
++  bool isLengthSafelyBoundedForArray(const Expr *LenArg,
++                                     const MemRegion *ArrReg,
++                                     StringRef ArrName,
++                                     CheckerContext &C) const;
+ };
+
+ bool SAGenTestChecker::isCopyFromUser(const CallEvent &Call, CheckerContext &C) const {
+   const Expr *OE = Call.getOriginExpr();
+   if (!OE)
+     return false;
+-  // Use textual match as recommended to be robust with macros and wrappers.
+   if (ExprHasName(OE, "copy_from_user", C))
+     return true;
+   if (ExprHasName(OE, "__copy_from_user", C))
+@@ -80,11 +114,9 @@   ArrReg = nullptr;
+   ArrName.clear();
+
+-  // Identify that DstArg is a fixed-size array and retrieve its size
+   if (!getArraySizeFromExpr(ArraySize, DstArg))
+     return false;
+
+-  // Retrieve the region of the destination and normalize to base region
+   const MemRegion *MR = getMemRegionFromExpr(DstArg, C);
+   if (!MR)
+     return false;
+@@ -93,7 +125,6 @@     return false;
+   ArrReg = MR;
+
+-  // Try extracting the array variable name
+   if (const auto *DRE = dyn_cast<DeclRefExpr>(DstArg->IgnoreImplicit())) {
+     if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+       ArrName = VD->getNameAsString();
+@@ -108,7 +139,6 @@   if (!E || !ArrReg)
+     return false;
+
+-  // AST-based check: find a sizeof(...) inside E that references the same array
+   if (const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(E)) {
+     if (UE->getKind() == UETT_SizeOf) {
+       if (const Expr *Arg = UE->getArgumentExpr()) {
+@@ -122,7 +152,7 @@     }
+   }
+
+-  // Textual fallback heuristic: expression contains both "sizeof" and the array's name
++  // Heuristic textual fallback
+   if (!ArrName.empty() && ExprHasName(E, "sizeof", C) && ExprHasName(E, ArrName, C))
+     return true;
+
+@@ -136,14 +166,27 @@
+   ProgramStateRef State = C.getState();
+
+-  // Try to get region
++  // Try to get region directly from the expression (works for lvalues).
+   const MemRegion *MR = getMemRegionFromExpr(LenArg, C);
+   if (MR) {
+     MR = MR->getBaseRegion();
+     LenReg = MR;
+   }
+
+-  // Try to get symbol
++  // Fallback: for rvalue DeclRefExpr, reconstruct VarRegion via RegionManager.
++  if (!LenReg) {
++    if (const auto *DRE = dyn_cast<DeclRefExpr>(LenArg->IgnoreImpCasts())) {
++      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++        const MemRegion *VarMR =
++            C.getSValBuilder().getRegionManager().getVarRegion(VD, C.getLocationContext());
++        if (VarMR) {
++          LenReg = VarMR->getBaseRegion();
++        }
++      }
++    }
++  }
++
++  // Also extract the symbol for the current value.
+   SVal SV = State->getSVal(LenArg, C.getLocationContext());
+   LenSym = SV.getAsSymbol();
+ }
+@@ -166,6 +209,45 @@   C.emitReport(std::move(R));
+ }
+
++bool SAGenTestChecker::isLengthSafelyBoundedForArray(const Expr *LenArg,
++                                                     const MemRegion *ArrReg,
++                                                     StringRef ArrName,
++                                                     CheckerContext &C) const {
++  if (!LenArg || !ArrReg)
++    return false;
++
++  // Directly contains sizeof(array) in the length expression.
++  if (exprContainsSizeofOfArray(LenArg, ArrReg, ArrName, C))
++    return true;
++
++  ProgramStateRef State = C.getState();
++
++  // Region-based association: len variable computed from sizeof(array).
++  const MemRegion *LenReg = nullptr;
++  SymbolRef LenSym = nullptr;
++  getLenArgRegionOrSymbol(LenArg, C, LenReg, LenSym);
++
++  if (const MemRegion *const *BoundRegForArrayPtr = State->get<ArraySafeLenMap>(ArrReg)) {
++    const MemRegion *BoundRegForArray = BoundRegForArrayPtr ? *BoundRegForArrayPtr : nullptr;
++    if (BoundRegForArray && LenReg && (BoundRegForArray == LenReg))
++      return true;
++  }
++
++  // Symbol-based association: the current symbol equals the “safe” symbol for this array.
++  if (LenSym) {
++    if (const SymbolRef *SafeSymPtr = State->get<ArraySafeLenSymMap>(ArrReg)) {
++      SymbolRef SafeSym = *SafeSymPtr;
++      if (SafeSym && SafeSym == LenSym)
++        return true;
++    }
++    // Weak heuristic: a symbol we previously considered bounded by min(sizeof(...), ...)
++    if (State->contains<BoundedLenSyms>(LenSym))
++      return true;
++  }
++
++  return false;
++}
++
+ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+   if (!S)
+     return;
+@@ -186,6 +268,8 @@   const Expr *RHS = BO->getRHS();
+   if (!RHS)
+     return;
++
++  bool StateChanged = false;
+
+   // Look for sizeof(array) in RHS; if found, associate the array with this LHS length variable
+   if (const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(RHS)) {
+@@ -198,7 +282,14 @@           if (ArrMR) {
+             ArrMR = ArrMR->getBaseRegion();
+             if (ArrMR) {
++              // Record array -> LHS var region association
+               State = State->set<ArraySafeLenMap>(ArrMR, LHSReg);
++              StateChanged = true;
++
++              // Also record array -> LHS symbol association if available
++              if (SymbolRef LSym = Val.getAsSymbol()) {
++                State = State->set<ArraySafeLenSymMap>(ArrMR, LSym);
++              }
+             }
+           }
+         }
+@@ -207,12 +298,15 @@   } else {
+     // Weak heuristic: if RHS contains both min and sizeof, consider LHS symbol bounded
+     if (ExprHasName(RHS, "min", C) && ExprHasName(RHS, "sizeof", C)) {
+-      if (SymbolRef Sym = Val.getAsSymbol())
++      if (SymbolRef Sym = Val.getAsSymbol()) {
+         State = State->add<BoundedLenSyms>(Sym);
+-    }
+-  }
+-
+-  C.addTransition(State);
++        StateChanged = true;
++      }
++    }
++  }
++
++  if (StateChanged)
++    C.addTransition(State);
+ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+@@ -237,39 +331,33 @@   uint64_t ArraySize = ArraySizeAP.getZExtValue();
+   uint64_t SafeCopyLimit = (ArraySize > 0) ? (ArraySize - 1) : 0;
+
+-  // 1) Len directly contains sizeof(array)
+-  if (exprContainsSizeofOfArray(LenArg, ArrReg, ArrName, C))
++  // Eliminate cases bounded by sizeof(dest) at or before the call.
++  if (isLengthSafelyBoundedForArray(LenArg, ArrReg, ArrName, C))
+     return;
+
+   ProgramStateRef State = C.getState();
+
+-  // 2) Len is a variable that we already recorded as safe for this array
+-  const MemRegion *const *BoundRegForArrayPtr = State->get<ArraySafeLenMap>(ArrReg);
+-  const MemRegion *BoundRegForArray = BoundRegForArrayPtr ? *BoundRegForArrayPtr : nullptr;
+-  const MemRegion *LenReg = nullptr;
+-  SymbolRef LenSym = nullptr;
+-  getLenArgRegionOrSymbol(LenArg, C, LenReg, LenSym);
+-  if (BoundRegForArray && LenReg && (BoundRegForArray == LenReg))
+-    return;
+-
+-  // 3) Try to infer if Len is constant and exceeds the array size
++  // Try to infer if Len is constant
+   llvm::APSInt ConstLen;
+   if (EvaluateExprToInt(ConstLen, LenArg, C)) {
+-    // If definitely larger than the array, report.
+     if (ConstLen.isSigned() ? ConstLen.getSExtValue() > (int64_t)ArraySize
+                             : ConstLen.getZExtValue() > ArraySize) {
+       reportUnbounded(Call, DstArg, LenArg, C);
+       return;
+     }
+-    // If definitely <= SafeCopyLimit, consider safe.
+     if (ConstLen.isSigned() ? ConstLen.getSExtValue() <= (int64_t)SafeCopyLimit
+                             : ConstLen.getZExtValue() <= SafeCopyLimit) {
+       return;
+     }
+-    // Otherwise, do not early report here; continue checks.
+-  }
+-
+-  // 4) Infer maximal value for symbolic Len
++    // Otherwise, continue checks.
++  }
++
++  // Infer maximal value for symbolic Len
++  SymbolRef LenSym = nullptr;
++  {
++    SVal SV = State->getSVal(LenArg, C.getLocationContext());
++    LenSym = SV.getAsSymbol();
++  }
+   if (LenSym) {
+     if (const llvm::APSInt *MaxV = inferSymbolMaxVal(LenSym, C)) {
+       uint64_t MaxVal = MaxV->isSigned() ? (uint64_t)MaxV->getSExtValue() : MaxV->getZExtValue();
+@@ -286,7 +374,7 @@       return;
+   }
+
+-  // 5) If none of the above proved it's safe, warn.
++  // If none of the above proved it's safe, warn.
+   reportUnbounded(Call, DstArg, LenArg, C);
+ }

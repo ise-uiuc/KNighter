@@ -1,0 +1,373 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -20,7 +20,88 @@ using namespace ento;
+ using namespace taint;
+
+-// No custom program states needed.
++// Utility functions provided by the framework context (see problem statement).
++template <typename T>
++const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
++
++template <typename T>
++const T* findSpecificTypeInChildren(const Stmt *S);
++
++bool EvaluateExprToInt(llvm::APSInt &EvalRes, const Expr *expr, CheckerContext &C) {
++  Expr::EvalResult ExprRes;
++  if (expr->EvaluateAsInt(ExprRes, C.getASTContext())) {
++    EvalRes = ExprRes.Val.getInt();
++    return true;
++  }
++  return false;
++}
++
++const llvm::APSInt *inferSymbolMaxVal(SymbolRef Sym, CheckerContext &C) {
++  ProgramStateRef State = C.getState();
++  const llvm::APSInt *maxVal = State->getConstraintManager().getSymMaxVal(State, Sym);
++  return maxVal;
++}
++
++bool getArraySizeFromExpr(llvm::APInt &ArraySize, const Expr *E) {
++  if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E->IgnoreImplicit())) {
++    if (const VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
++      QualType QT = VD->getType();
++      if (const ConstantArrayType *ArrayType = dyn_cast<ConstantArrayType>(QT.getTypePtr())) {
++        ArraySize = ArrayType->getSize();
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool getStringSize(llvm::APInt &StringSize, const Expr *E) {
++  if (const auto *SL = dyn_cast<StringLiteral>(E->IgnoreImpCasts())) {
++    StringSize = llvm::APInt(32, SL->getLength());
++    return true;
++  }
++  return false;
++}
++
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C) {
++  ProgramStateRef State = C.getState();
++  return State->getSVal(E, C.getLocationContext()).getAsRegion();
++}
++
++struct KnownDerefFunction {
++  const char *Name;
++  llvm::SmallVector<unsigned, 4> Params;
++};
++
++// Assume there is a DerefTable defined somewhere else if used.
++extern KnownDerefFunction DerefTable[];
++
++bool functionKnownToDeref(const CallEvent &Call,
++                                 llvm::SmallVectorImpl<unsigned> &DerefParams) {
++  if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
++    StringRef FnName = ID->getName();
++
++    // Iterate until a sentinel entry with null Name is encountered.
++    for (const KnownDerefFunction *Entry = DerefTable; Entry && Entry->Name; ++Entry) {
++      if (FnName.equals(Entry->Name)) {
++        DerefParams.append(Entry->Params.begin(), Entry->Params.end());
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C) {
++  if (!E)
++    return false;
++
++  const SourceManager &SM = C.getSourceManager();
++  const LangOptions &LangOpts = C.getLangOpts();
++  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());
++  StringRef ExprText = Lexer::getSourceText(Range, SM, LangOpts);
++  return ExprText.contains(Name);
++}
+
+ namespace {
+
+@@ -34,7 +115,6 @@   void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;
+
+ private:
+-  // Helpers
+   static StringRef getExprText(const Expr *E, CheckerContext &C) {
+     if (!E)
+       return StringRef();
+@@ -44,8 +124,7 @@     return Lexer::getSourceText(Range, SM, LangOpts);
+   }
+
+-  // Tighter "MAX-like" bound name matcher to reduce FPs in buffer-size checks.
+-  // We explicitly exclude "size" which appears often in capacity comparisons.
++  // Conservative name matcher; prefers constant-like bounds.
+   static bool nameLooksLikeCountBound(StringRef Name) {
+     std::string Lower = Name.lower();
+     if (Lower.find("max") != std::string::npos)
+@@ -56,7 +135,6 @@       return true;
+     if (Lower.find("upper") != std::string::npos || Lower.find("bound") != std::string::npos)
+       return true;
+-    // keep some numeric-ish identifiers that show up as bounds
+     if (Lower.find("count") != std::string::npos || Lower.find("num") != std::string::npos)
+       return true;
+     return false;
+@@ -83,8 +161,6 @@   }
+
+   static bool isCompositeBoundExpr(const Expr *E) {
+-    // True if E is a non-trivial expression (e.g., MAX - 1, MAX + 1, sizeof...)
+-    // We only want to consider a plain DeclRefExpr/MemberExpr bound to reduce FPs.
+     E = E ? E->IgnoreParenCasts() : nullptr;
+     if (!E)
+       return false;
+@@ -107,12 +183,10 @@     if (!RV)
+       return false;
+
+-    // Try to evaluate to integer and see if it's negative.
+     llvm::APSInt Val;
+     if (EvaluateExprToInt(Val, RV, C))
+       return Val.isSigned() ? Val.isNegative() : false;
+
+-    // If not foldable, still consider it likely if source contains a known errno or negative.
+     StringRef Txt = getExprText(RV, C);
+     if (Txt.contains("-E") || Txt.contains("ERR_PTR") || Txt.contains("error") ||
+         Txt.contains("-EINVAL") || Txt.contains("-EFAULT") || Txt.contains("-ENODATA") ||
+@@ -128,17 +202,12 @@     const Stmt *ThenS = IS->getThen();
+     if (!ThenS)
+       return false;
+-
+-    // Look for a ReturnStmt somewhere in the Then branch and check if it's an error return.
+     const ReturnStmt *RS = findSpecificTypeInChildren<ReturnStmt>(ThenS);
+     if (!RS)
+       return false;
+-
+     return isLikelyErrorReturn(RS, C);
+   }
+
+-  // A more precise bound check predicate: 'Var > Bound' where Bound is a simple
+-  // MAX/COUNT/NUM-like identifier and not a composite expression or integer literal.
+   static bool isPlainMaxLikeBound(const Expr *Bound, CheckerContext &C) {
+     if (!Bound)
+       return false;
+@@ -146,19 +215,17 @@     Bound = Bound->IgnoreParenCasts();
+
+     if (isa<IntegerLiteral>(Bound))
+-      return false; // do not treat integer literal RHS as a MAX-like bound
+-
+-    // size-of based comparisons are typical for buffer capacity checks, not index validation.
++      return false; // reject literal RHS outright (avoids x > 0 style guards)
++
+     if (isUnarySizeOf(Bound))
+       return false;
+
+     if (isCompositeBoundExpr(Bound))
+-      return false; // do not accept 'MAX - 1' or other complex forms
++      return false;
+
+     return isDeclRefWithNameLikeCount(Bound);
+   }
+
+-  // Index-like expressions are generally simple variables, member refs, or array elements.
+   static bool isLikelyIndexExpr(const Expr *E) {
+     E = E ? E->IgnoreParenCasts() : nullptr;
+     if (!E)
+@@ -170,12 +237,9 @@     if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E) || isa<ArraySubscriptExpr>(E))
+       return true;
+
+-    // A simple implicit-cast around any of the above is okay (handled by IgnoreParenCasts).
+-    return false;
+-  }
+-
+-  // Guard against buffer-capacity comparisons, e.g.:
+-  //   if (strlen(buf) + k + 1 > sizeof(buf)) { ... }
++    return false;
++  }
++
+   static bool isBufferCapacityComparison(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+     if (!LHS || !RHS)
+       return false;
+@@ -183,31 +247,90 @@     if (isUnarySizeOf(RHS))
+       return true;
+
+-    // Heuristic textual scan for strlen/strnlen in LHS.
+     if (ExprHasName(LHS, "strlen", C) || ExprHasName(LHS, "strnlen", C))
+       return true;
+
+     return false;
+   }
+
+-  // Additional guard to reject obvious false positives.
+   static bool isFalsePositive(const Expr *LHS, const Expr *RHS, CheckerContext &C) {
+-    // Reject small integer literal RHS (<= 2); these are often last-index checks.
++    (void)LHS;
++
+     const Expr *R = RHS ? RHS->IgnoreParenCasts() : nullptr;
+     if (!R)
+       return true;
+
++    // Reject small integer literal RHS (common guards unrelated to array bounds).
+     if (const auto *IL = dyn_cast<IntegerLiteral>(R)) {
+       if (IL->getValue().ule(2))
+         return true;
+-    }
+-
+-    // If RHS text contains an explicit '- 1' pattern, it's likely correct: 'idx > MAX - 1'
++      // In general we don't want to flag literal bounds at all in this checker.
++      return true;
++    }
++
+     StringRef Txt = getExprText(RHS, C);
+     if (Txt.contains("- 1") || Txt.contains("-1"))
+       return true;
+
+     return false;
++  }
++
++  // Collect all potential '>' comparisons within a condition expression by
++  // descending into logical operators while keeping the top-level IfStmt context.
++  static void collectGtComparisons(const Expr *E,
++                                   llvm::SmallVectorImpl<const BinaryOperator*> &Out) {
++    if (!E)
++      return;
++    E = E->IgnoreParenImpCasts();
++
++    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++      if (BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr) {
++        collectGtComparisons(BO->getLHS(), Out);
++        collectGtComparisons(BO->getRHS(), Out);
++        return;
++      }
++      if (BO->getOpcode() == BO_GT) {
++        Out.push_back(BO);
++        return;
++      }
++    }
++
++    // Also traverse ternary conditions if ever present directly in the condition.
++    if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
++      collectGtComparisons(CO->getCond(), Out);
++      collectGtComparisons(CO->getTrueExpr(), Out);
++      collectGtComparisons(CO->getFalseExpr(), Out);
++      return;
++    }
++  }
++
++  // Decide if a BinaryOperator 'LHS > RHS' is our off-by-one candidate.
++  bool isCandidateGtComparison(const BinaryOperator *BO, CheckerContext &C) const {
++    if (!BO || BO->getOpcode() != BO_GT)
++      return false;
++
++    const Expr *LHS = BO->getLHS()->IgnoreParenCasts();
++    const Expr *RHS = BO->getRHS()->IgnoreParenCasts();
++
++    if (!LHS || !RHS)
++      return false;
++
++    if (!isLikelyIndexExpr(LHS))
++      return false;
++
++    if (!isPlainMaxLikeBound(RHS, C))
++      return false;
++
++    if (isBufferCapacityComparison(LHS, RHS, C))
++      return false;
++
++    if (isa<IntegerLiteral>(LHS))
++      return false;
++
++    if (isFalsePositive(LHS, RHS, C))
++      return false;
++
++    return true;
+   }
+ };
+
+@@ -216,7 +339,6 @@   if (!Condition)
+     return;
+
+-  // Only consider If conditions.
+   const IfStmt *IS = findSpecificTypeInParents<IfStmt>(Condition, C);
+   if (!IS)
+     return;
+@@ -225,58 +347,35 @@   if (!CondE)
+     return;
+
+-  CondE = CondE->IgnoreParenImpCasts();
+-
+-  // We only consider simple relational comparisons with '>'.
+-  const auto *BO = dyn_cast<BinaryOperator>(CondE);
+-  if (!BO)
+-    return;
+-
+-  BinaryOperator::Opcode Op = BO->getOpcode();
+-  if (Op != BO_GT)
+-    return;
+-
+-  const Expr *LHS = BO->getLHS()->IgnoreParenCasts();
+-  const Expr *RHS = BO->getRHS()->IgnoreParenCasts();
+-
+-  if (!LHS || !RHS)
+-    return;
+-
+-  // Filter out buffer-capacity guard patterns: strlen(...) + ... > sizeof(...)
+-  if (isBufferCapacityComparison(LHS, RHS, C))
+-    return;
+-
+-  // LHS should look like an index-like expression, not a capacity arithmetic.
+-  if (!isLikelyIndexExpr(LHS))
+-    return;
+-
+-  // Bound should be a simple MAX/COUNT/NUM-like identifier.
+-  if (!isPlainMaxLikeBound(RHS, C))
+-    return;
+-
+-  // The Then branch should look like an error path with early return.
++  // Look for any '>' comparisons inside the condition (handles &&/||).
++  llvm::SmallVector<const BinaryOperator*, 4> GtComps;
++  collectGtComparisons(CondE, GtComps);
++
++  if (GtComps.empty())
++    return;
++
++  // The Then branch should look like an error path with early negative return.
+   if (!thenBranchHasEarlyErrorReturn(IS, C))
+     return;
+
+-  // Skip degenerate cases like "5 > MAX".
+-  if (isa<IntegerLiteral>(LHS))
+-    return;
+-
+-  // Additional false-positive guards.
+-  if (isFalsePositive(LHS, RHS, C))
+-    return;
+-
+-  // Report the likely off-by-one check.
+-  ExplodedNode *N = C.generateNonFatalErrorNode();
+-  if (!N)
+-    return;
+-
+-  auto R = std::make_unique<PathSensitiveBugReport>(
+-      *BT,
+-      "Off-by-one bound check: use '>= MAX' instead of '> MAX' for index validation",
+-      N);
+-  R->addRange(Condition->getSourceRange());
+-  C.emitReport(std::move(R));
++  // If any candidate comparison satisfies our rules, report.
++  for (const BinaryOperator *BO : GtComps) {
++    if (!isCandidateGtComparison(BO, C))
++      continue;
++
++    ExplodedNode *N = C.generateNonFatalErrorNode();
++    if (!N)
++      return;
++
++    auto R = std::make_unique<PathSensitiveBugReport>(
++        *BT,
++        "Off-by-one bound check: use '>= MAX' instead of '> MAX' for index validation",
++        N);
++    R->addRange(BO->getSourceRange());
++    C.emitReport(std::move(R));
++    // Report only once per If condition.
++    return;
++  }
+ }
+
+ } // end anonymous namespace

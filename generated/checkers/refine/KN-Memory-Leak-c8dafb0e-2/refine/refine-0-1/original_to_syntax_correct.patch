@@ -1,0 +1,157 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -22,8 +22,15 @@
+ // Map: return-symbol of hwrm_req_init() -> req MemRegion*
+ REGISTER_MAP_WITH_PROGRAMSTATE(PendingInitMap, SymbolRef, const MemRegion *)
++
++// Map: return-symbol of hwrm_req_init() -> stack frame that made the call
++REGISTER_MAP_WITH_PROGRAMSTATE(PendingInitOwner, SymbolRef, const StackFrameContext *)
++
+ // Set: Acquired req MemRegion*s that require hwrm_req_drop() before exit
+ REGISTER_SET_WITH_PROGRAMSTATE(AcquiredReqs, const MemRegion *)
++
++// Map: req MemRegion* -> stack frame that successfully acquired it
++REGISTER_MAP_WITH_PROGRAMSTATE(ReqOwner, const MemRegion *, const StackFrameContext *)
+
+ namespace {
+
+@@ -32,6 +39,24 @@   if (!Origin)
+     return false;
+   return ExprHasName(Origin, Name, C);
++}
++
++static bool hasLeakInCurrentFrame(ProgramStateRef State,
++                                  const StackFrameContext *SFC) {
++  auto Set = State->get<AcquiredReqs>();
++  if (Set.isEmpty())
++    return false;
++
++  for (auto It = Set.begin(); It != Set.end(); ++It) {
++    const MemRegion *MR = *It;
++    if (!MR)
++      continue;
++    if (const StackFrameContext *const *OwnerPtr = State->get<ReqOwner>(MR)) {
++      if (*OwnerPtr == SFC)
++        return true;
++    }
++  }
++  return false;
+ }
+
+ /* The checker callbacks are to be decided. */
+@@ -56,7 +81,6 @@       ProgramStateRef evalAssume(ProgramStateRef State, SVal Cond, bool Assumption) const;
+
+    private:
+-
+       void reportLeak(CheckerContext &C, const Stmt *S) const;
+ };
+
+@@ -65,7 +89,6 @@
+   // Track hwrm_req_init(bp, req, ...)
+   if (isCallTo(Call, "hwrm_req_init", C)) {
+-    // Ensure we have at least 2 args: 0: bp, 1: req
+     if (Call.getNumArgs() < 2)
+       return;
+
+@@ -84,13 +107,15 @@     if (!RetSym)
+       return;
+
+-    // Record pending init: we'll determine success in evalAssume
++    // Record pending init and the stack frame that made the call.
++    const StackFrameContext *SFC = C.getLocationContext()->getStackFrame();
+     State = State->set<PendingInitMap>(RetSym, ReqMR);
++    State = State->set<PendingInitOwner>(RetSym, SFC);
+     C.addTransition(State);
+     return;
+   }
+
+-  // Track hwrm_req_drop(bp, req)
++  // Track hwrm_req_drop(bp, req) and clear any outstanding obligation.
+   if (isCallTo(Call, "hwrm_req_drop", C)) {
+     if (Call.getNumArgs() < 2)
+       return;
+@@ -106,10 +131,10 @@     if (!ReqMR)
+       return;
+
+-    // On drop, remove from acquired set (if present)
+     auto Set = State->get<AcquiredReqs>();
+     if (Set.contains(ReqMR)) {
+       State = State->remove<AcquiredReqs>(ReqMR);
++      State = State->remove<ReqOwner>(ReqMR);
+       C.addTransition(State);
+     }
+     return;
+@@ -120,23 +145,27 @@   if (!State)
+     return State;
+
+-  // Handle pattern: if (rc) or if (!rc) or if (rc == 0) / if (rc != 0)
++  // Handle 'if (rc)' or simple symbol conditions.
+   if (std::optional<NonLoc> NL = Cond.getAs<NonLoc>()) {
+-    // Case 1: plain symbolic value 'rc'
+     if (SymbolRef Sym = NL->getAsSymbol()) {
+-      const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
+-      if (PendingReq) {
++      // Check if this symbol is a pending init result.
++      if (const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym)) {
++        const StackFrameContext *const *OwnerPtr = State->get<PendingInitOwner>(Sym);
++        const StackFrameContext *Owner = OwnerPtr ? *OwnerPtr : nullptr;
++
+         // if (rc) with Assumption == false means rc == 0 (success)
+-        if (!Assumption) {
++        if (!Assumption && Owner) {
+           State = State->add<AcquiredReqs>(*PendingReq);
++          State = State->set<ReqOwner>(*PendingReq, Owner);
+         }
+         // Consume the pending mapping either way
+         State = State->remove<PendingInitMap>(Sym);
++        State = State->remove<PendingInitOwner>(Sym);
+       }
+       return State;
+     }
+
+-    // Case 2: symbolic comparison with integer, usually rc == 0 or rc != 0
++    // Case: comparison 'rc == 0' or 'rc != 0'
+     if (SymbolRef SE = Cond.getAsSymbol()) {
+       if (const auto *SIE = dyn_cast<SymIntExpr>(SE)) {
+         BinaryOperator::Opcode Op = SIE->getOpcode();
+@@ -144,6 +173,8 @@         const llvm::APSInt &RHS = SIE->getRHS();
+         if (Sym) {
+           const MemRegion *const *PendingReq = State->get<PendingInitMap>(Sym);
++          const StackFrameContext *const *OwnerPtr = State->get<PendingInitOwner>(Sym);
++          const StackFrameContext *Owner = OwnerPtr ? *OwnerPtr : nullptr;
+           if (PendingReq && RHS == 0) {
+             bool SuccessBranch = false;
+             if (Op == BO_EQ && Assumption)
+@@ -151,10 +182,12 @@             else if (Op == BO_NE && !Assumption)
+               SuccessBranch = true;        // (rc != 0) assumed false
+
+-            if (SuccessBranch) {
++            if (SuccessBranch && Owner) {
+               State = State->add<AcquiredReqs>(*PendingReq);
++              State = State->set<ReqOwner>(*PendingReq, Owner);
+             }
+             State = State->remove<PendingInitMap>(Sym);
++            State = State->remove<PendingInitOwner>(Sym);
+           }
+         }
+       }
+@@ -169,15 +202,19 @@     return;
+
+   ProgramStateRef State = C.getState();
+-  // If any acquired req is still live, report a leak.
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
++  const StackFrameContext *SFC = C.getLocationContext()->getStackFrame();
++
++  // Only report leaks owned by this stack frame.
++  if (hasLeakInCurrentFrame(State, SFC)) {
+     reportLeak(C, RS);
+   }
+ }
+
+ void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
+-  if (!State->get<AcquiredReqs>().isEmpty()) {
++  const StackFrameContext *SFC = C.getLocationContext()->getStackFrame();
++
++  if (hasLeakInCurrentFrame(State, SFC)) {
+     reportLeak(C, nullptr);
+   }
+ }

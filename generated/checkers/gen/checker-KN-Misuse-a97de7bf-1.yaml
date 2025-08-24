@@ -1,0 +1,354 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: a97de7bff13b1cc825c1b1344eaed8d6c2d3e695
+commit_type: Misuse
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/ExprCXX.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/Type.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\n#include\
+  \ \"clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing\
+  \ namespace taint;\n\n// Track variables that were computed via min(..., optlen)\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(MinLenVars, const MemRegion *)\n\nnamespace {\n\n\
+  class SAGenTestChecker : public Checker<check::PostCall, check::Bind> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Unsafe copy_from_sockptr in setsockopt\", \"API Misuse\")) {}\n\
+  \n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n  \
+  \    void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;\n\
+  \n   private:\n      // Helpers\n      static bool isCallNamed(const CallEvent &Call,\
+  \ StringRef Name, CheckerContext &C);\n      static bool isSetsockoptLike(const\
+  \ FunctionDecl *FD);\n      static bool isFixedSizeExpr(const Expr *E, CheckerContext\
+  \ &C);\n      static bool mentionsOptlen(const Expr *E, CheckerContext &C);\n  \
+  \    static bool mentionsMinWithOptlen(const Expr *E, CheckerContext &C);\n    \
+  \  static unsigned getSizeArgIndex(const CallEvent &Call, CheckerContext &C, bool\
+  \ &IsSockptrCopy) ;\n      void reportAtCall(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef Msg) const;\n};\n\nbool SAGenTestChecker::isCallNamed(const CallEvent\
+  \ &Call, StringRef Name, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  return ExprHasName(Origin, Name, C);\n}\n\n\
+  bool SAGenTestChecker::isSetsockoptLike(const FunctionDecl *FD) {\n  if (!FD)\n\
+  \    return false;\n\n  // Heuristic 1: function name contains \"setsockopt\"\n\
+  \  if (FD->getNameAsString().find(\"setsockopt\") != std::string::npos)\n    return\
+  \ true;\n\n  // Heuristic 2: has sockptr_t-like parameter and an \"optlen\"-like\
+  \ parameter\n  bool HasSockptr = false;\n  bool HasOptlen  = false;\n\n  for (const\
+  \ ParmVarDecl *P : FD->parameters()) {\n    if (!P)\n      continue;\n\n    // Check\
+  \ for sockptr_t by type name or parameter name \"optval\"\n    QualType PTy = P->getType();\n\
+  \    std::string TyStr = PTy.getAsString();\n    std::string ParamName = P->getNameAsString();\n\
+  \    if (TyStr.find(\"sockptr_t\") != std::string::npos || ParamName.find(\"optval\"\
+  ) != std::string::npos)\n      HasSockptr = true;\n\n    // Check for optlen: name\
+  \ contains \"optlen\" and integral type\n    if (ParamName.find(\"optlen\") != std::string::npos)\
+  \ {\n      if (PTy->isIntegerType() || PTy->isUnsignedIntegerType())\n        HasOptlen\
+  \ = true;\n    }\n  }\n\n  return HasSockptr && HasOptlen;\n}\n\nbool SAGenTestChecker::mentionsOptlen(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return false;\n  return ExprHasName(E,\
+  \ \"optlen\", C);\n}\n\nbool SAGenTestChecker::mentionsMinWithOptlen(const Expr\
+  \ *E, CheckerContext &C) {\n  if (!E) return false;\n  bool HasMin = ExprHasName(E,\
+  \ \"min\", C) || ExprHasName(E, \"min_t\", C);\n  if (!HasMin)\n    return false;\n\
+  \  return ExprHasName(E, \"optlen\", C);\n}\n\nbool SAGenTestChecker::isFixedSizeExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return false;\n\n  // If it mentions\
+  \ optlen, it's not fixed size in our sense.\n  if (mentionsOptlen(E, C))\n    return\
+  \ false;\n\n  llvm::APSInt Res;\n  if (EvaluateExprToInt(Res, E, C)) {\n    if (Res.isSigned())\n\
+  \      return Res.isStrictlyPositive();\n    return Res != 0;\n  }\n\n  // sizeof(...)\n\
+  \  if (isa<UnaryExprOrTypeTraitExpr>(E))\n    return true;\n\n  return false;\n\
+  }\n\nunsigned SAGenTestChecker::getSizeArgIndex(const CallEvent &Call, CheckerContext\
+  \ &C, bool &IsSockptrCopy) {\n  IsSockptrCopy = false;\n  if (isCallNamed(Call,\
+  \ \"copy_from_sockptr_offset\", C)) {\n    IsSockptrCopy = true;\n    // copy_from_sockptr_offset(dst,\
+  \ src, offset, size)\n    if (Call.getNumArgs() >= 4)\n      return 3;\n  } else\
+  \ if (isCallNamed(Call, \"copy_from_sockptr\", C)) {\n    IsSockptrCopy = true;\n\
+  \    // copy_from_sockptr(dst, src, size)\n    if (Call.getNumArgs() >= 3)\n   \
+  \   return 2;\n  }\n  // Not a target call or insufficient args\n  return UINT_MAX;\n\
+  }\n\nvoid SAGenTestChecker::reportAtCall(const CallEvent &Call, CheckerContext &C,\
+  \ StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n \
+  \ if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (const Expr *E = Call.getOriginExpr())\n    R->addRange(E->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  // Ignore safe helper\n  if (isCallNamed(Call,\
+  \ \"bt_copy_from_sockptr\", C))\n    return;\n\n  bool IsSockptrCopy = false;\n\
+  \  unsigned SzIdx = getSizeArgIndex(Call, C, IsSockptrCopy);\n  if (!IsSockptrCopy\
+  \ || SzIdx == UINT_MAX)\n    return;\n\n  // Ensure we are in a setsockopt-like\
+  \ handler to reduce noise\n  const LocationContext *LC = C.getLocationContext();\n\
+  \  if (!LC)\n    return;\n  const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(LC->getDecl());\n\
+  \  if (!isSetsockoptLike(FD))\n    return;\n\n  // Get size argument and destination\
+  \ argument\n  if (SzIdx >= Call.getNumArgs())\n    return;\n\n  const Expr *SzArg\
+  \ = Call.getArgExpr(SzIdx);\n  if (!SzArg)\n    return;\n\n  ProgramStateRef State\
+  \ = C.getState();\n\n  // A) Detect partial copy using min(optlen, ...)\n  if (mentionsMinWithOptlen(SzArg,\
+  \ C)) {\n    reportAtCall(Call, C, \"Partial copy from optval via min(optlen, ...);\
+  \ uninitialized fields possible\");\n    return;\n  } else {\n    // If size arg\
+  \ is a local variable that we tracked as min(optlen, ...)\n    SVal SzVal = Call.getArgSVal(SzIdx);\n\
+  \    if (const MemRegion *MR = SzVal.getAsRegion()) {\n      MR = MR->getBaseRegion();\n\
+  \      if (MR) {\n        if (State->contains<MinLenVars>(MR)) {\n          reportAtCall(Call,\
+  \ C, \"Partial copy from optval via min(optlen, ...); uninitialized fields possible\"\
+  );\n          return;\n        }\n      }\n    }\n  }\n\n  // B) Detect fixed-size\
+  \ copy without referencing optlen\n  if (isFixedSizeExpr(SzArg, C)) {\n    // If\
+  \ they explicitly used optlen (already checked), we would have returned.\n    //\
+  \ Here, no optlen in size => warn to use bt_copy_from_sockptr.\n    reportAtCall(Call,\
+  \ C, \"copy_from_sockptr lacks optlen >= size check; use bt_copy_from_sockptr\"\
+  );\n    return;\n  }\n\n  // Otherwise, do nothing.\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  const Expr\
+  \ *RHSLike = dyn_cast_or_null<Expr>(StoreE);\n  if (const auto *BO = dyn_cast_or_null<BinaryOperator>(StoreE))\
+  \ {\n    if (BO->getOpcode() == BO_Assign)\n      RHSLike = BO->getRHS();\n  }\n\
+  \n  bool Mark = false;\n  if (RHSLike) {\n    // If RHS contains min/min_t and also\
+  \ optlen, mark this variable.\n    if (mentionsMinWithOptlen(RHSLike, C))\n    \
+  \  Mark = true;\n  }\n\n  if (Mark) {\n    State = State->add<MinLenVars>(LHSReg);\n\
+  \  } else {\n    // If not a min/optlen assignment, clear old mark if present to\
+  \ avoid stale info.\n    if (State->contains<MinLenVars>(LHSReg))\n      State =\
+  \ State->remove<MinLenVars>(LHSReg);\n  }\n\n  C.addTransition(State);\n}\n\n} //\
+  \ end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unsafe copy_from_sockptr usage in setsockopt handlers (missing\
+  \ optlen validation or partial copy via min)\",\n      \"\");\n}\n\nextern \"C\"\
+  \ const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nBluetooth: RFCOMM: Fix not validating setsockopt user\
+  \ input\n\nsyzbot reported rfcomm_sock_setsockopt_old() is copying data without\n\
+  checking user input length.\n\nBUG: KASAN: slab-out-of-bounds in copy_from_sockptr_offset\n\
+  include/linux/sockptr.h:49 [inline]\nBUG: KASAN: slab-out-of-bounds in copy_from_sockptr\n\
+  include/linux/sockptr.h:55 [inline]\nBUG: KASAN: slab-out-of-bounds in rfcomm_sock_setsockopt_old\n\
+  net/bluetooth/rfcomm/sock.c:632 [inline]\nBUG: KASAN: slab-out-of-bounds in rfcomm_sock_setsockopt+0x893/0xa70\n\
+  net/bluetooth/rfcomm/sock.c:673\nRead of size 4 at addr ffff8880209a8bc3 by task\
+  \ syz-executor632/5064\n\nFixes: 9f2c8a03fbb3 (\"Bluetooth: Replace RFCOMM link\
+  \ mode with security level\")\nFixes: bb23c0ab8246 (\"Bluetooth: Add support for\
+  \ deferring RFCOMM connection setup\")\nReported-by: syzbot <syzkaller@googlegroups.com>\n\
+  Signed-off-by: Eric Dumazet <edumazet@google.com>\nSigned-off-by: Luiz Augusto von\
+  \ Dentz <luiz.von.dentz@intel.com>\n\n## Buggy Code\n\n```c\n// Function: rfcomm_sock_setsockopt\
+  \ in net/bluetooth/rfcomm/sock.c\nstatic int rfcomm_sock_setsockopt(struct socket\
+  \ *sock, int level, int optname,\n\t\tsockptr_t optval, unsigned int optlen)\n{\n\
+  \tstruct sock *sk = sock->sk;\n\tstruct bt_security sec;\n\tint err = 0;\n\tsize_t\
+  \ len;\n\tu32 opt;\n\n\tBT_DBG(\"sk %p\", sk);\n\n\tif (level == SOL_RFCOMM)\n\t\
+  \treturn rfcomm_sock_setsockopt_old(sock, optname, optval, optlen);\n\n\tif (level\
+  \ != SOL_BLUETOOTH)\n\t\treturn -ENOPROTOOPT;\n\n\tlock_sock(sk);\n\n\tswitch (optname)\
+  \ {\n\tcase BT_SECURITY:\n\t\tif (sk->sk_type != SOCK_STREAM) {\n\t\t\terr = -EINVAL;\n\
+  \t\t\tbreak;\n\t\t}\n\n\t\tsec.level = BT_SECURITY_LOW;\n\n\t\tlen = min_t(unsigned\
+  \ int, sizeof(sec), optlen);\n\t\tif (copy_from_sockptr(&sec, optval, len)) {\n\t\
+  \t\terr = -EFAULT;\n\t\t\tbreak;\n\t\t}\n\n\t\tif (sec.level > BT_SECURITY_HIGH)\
+  \ {\n\t\t\terr = -EINVAL;\n\t\t\tbreak;\n\t\t}\n\n\t\trfcomm_pi(sk)->sec_level =\
+  \ sec.level;\n\t\tbreak;\n\n\tcase BT_DEFER_SETUP:\n\t\tif (sk->sk_state != BT_BOUND\
+  \ && sk->sk_state != BT_LISTEN) {\n\t\t\terr = -EINVAL;\n\t\t\tbreak;\n\t\t}\n\n\
+  \t\tif (copy_from_sockptr(&opt, optval, sizeof(u32))) {\n\t\t\terr = -EFAULT;\n\t\
+  \t\tbreak;\n\t\t}\n\n\t\tif (opt)\n\t\t\tset_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags);\n\
+  \t\telse\n\t\t\tclear_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags);\n\n\t\tbreak;\n\
+  \n\tdefault:\n\t\terr = -ENOPROTOOPT;\n\t\tbreak;\n\t}\n\n\trelease_sock(sk);\n\t\
+  return err;\n}\n```\n\n```c\n// Function: rfcomm_sock_setsockopt_old in net/bluetooth/rfcomm/sock.c\n\
+  static int rfcomm_sock_setsockopt_old(struct socket *sock, int optname,\n\t\tsockptr_t\
+  \ optval, unsigned int optlen)\n{\n\tstruct sock *sk = sock->sk;\n\tint err = 0;\n\
+  \tu32 opt;\n\n\tBT_DBG(\"sk %p\", sk);\n\n\tlock_sock(sk);\n\n\tswitch (optname)\
+  \ {\n\tcase RFCOMM_LM:\n\t\tif (copy_from_sockptr(&opt, optval, sizeof(u32))) {\n\
+  \t\t\terr = -EFAULT;\n\t\t\tbreak;\n\t\t}\n\n\t\tif (opt & RFCOMM_LM_FIPS) {\n\t\
+  \t\terr = -EINVAL;\n\t\t\tbreak;\n\t\t}\n\n\t\tif (opt & RFCOMM_LM_AUTH)\n\t\t\t\
+  rfcomm_pi(sk)->sec_level = BT_SECURITY_LOW;\n\t\tif (opt & RFCOMM_LM_ENCRYPT)\n\t\
+  \t\trfcomm_pi(sk)->sec_level = BT_SECURITY_MEDIUM;\n\t\tif (opt & RFCOMM_LM_SECURE)\n\
+  \t\t\trfcomm_pi(sk)->sec_level = BT_SECURITY_HIGH;\n\n\t\trfcomm_pi(sk)->role_switch\
+  \ = (opt & RFCOMM_LM_MASTER);\n\t\tbreak;\n\n\tdefault:\n\t\terr = -ENOPROTOOPT;\n\
+  \t\tbreak;\n\t}\n\n\trelease_sock(sk);\n\treturn err;\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/net/bluetooth/rfcomm/sock.c b/net/bluetooth/rfcomm/sock.c\n\
+  index b54e8a530f55..29aa07e9db9d 100644\n--- a/net/bluetooth/rfcomm/sock.c\n+++\
+  \ b/net/bluetooth/rfcomm/sock.c\n@@ -629,7 +629,7 @@ static int rfcomm_sock_setsockopt_old(struct\
+  \ socket *sock, int optname,\n \n \tswitch (optname) {\n \tcase RFCOMM_LM:\n-\t\t\
+  if (copy_from_sockptr(&opt, optval, sizeof(u32))) {\n+\t\tif (bt_copy_from_sockptr(&opt,\
+  \ sizeof(opt), optval, optlen)) {\n \t\t\terr = -EFAULT;\n \t\t\tbreak;\n \t\t}\n\
+  @@ -664,7 +664,6 @@ static int rfcomm_sock_setsockopt(struct socket *sock, int level,\
+  \ int optname,\n \tstruct sock *sk = sock->sk;\n \tstruct bt_security sec;\n \t\
+  int err = 0;\n-\tsize_t len;\n \tu32 opt;\n \n \tBT_DBG(\"sk %p\", sk);\n@@ -686,11\
+  \ +685,9 @@ static int rfcomm_sock_setsockopt(struct socket *sock, int level, int\
+  \ optname,\n \n \t\tsec.level = BT_SECURITY_LOW;\n \n-\t\tlen = min_t(unsigned int,\
+  \ sizeof(sec), optlen);\n-\t\tif (copy_from_sockptr(&sec, optval, len)) {\n-\t\t\
+  \terr = -EFAULT;\n+\t\terr = bt_copy_from_sockptr(&sec, sizeof(sec), optval, optlen);\n\
+  +\t\tif (err)\n \t\t\tbreak;\n-\t\t}\n \n \t\tif (sec.level > BT_SECURITY_HIGH)\
+  \ {\n \t\t\terr = -EINVAL;\n@@ -706,10 +703,9 @@ static int rfcomm_sock_setsockopt(struct\
+  \ socket *sock, int level, int optname,\n \t\t\tbreak;\n \t\t}\n \n-\t\tif (copy_from_sockptr(&opt,\
+  \ optval, sizeof(u32))) {\n-\t\t\terr = -EFAULT;\n+\t\terr = bt_copy_from_sockptr(&opt,\
+  \ sizeof(opt), optval, optlen);\n+\t\tif (err)\n \t\t\tbreak;\n-\t\t}\n \n \t\t\
+  if (opt)\n \t\t\tset_bit(BT_SK_DEFER_SETUP, &bt_sk(sk)->flags);\n```\n"
+pattern: '## Bug Pattern
+
+
+  In a setsockopt handler, copying a fixed-size value/struct from optval using copy_from_sockptr
+  (or similar) without validating that the user-supplied optlen is at least the required
+  size (or using a helper that enforces this). Sometimes this appears as copying min(sizeof(dst),
+  optlen) bytes into dst, leaving parts of dst uninitialized. This can cause slab-out-of-bounds
+  reads or use of uninitialized fields.'
+plan: "Plan to detect unsafe copy_from_sockptr usage in setsockopt handlers\n\n1)\
+  \ Program state\n- Keep it minimal. Use a single set to remember size variables\
+  \ computed via min(optlen, ...):\n  - REGISTER_SET_WITH_PROGRAMSTATE(MinLenVars,\
+  \ const MemRegion *)\n  - Purpose: if code does len = min_t(..., optlen); then later\
+  \ uses len as size for copy_from_sockptr, we can flag it even if the call passes\
+  \ a plain variable.\n\n2) Chosen callbacks and how to implement them\n\nA) checkPostCall\
+  \ (main detection)\n- Goal: Flag calls that copy fixed-size values/structs from\
+  \ optval without validating optlen, and flag min-based partial copies.\n- Steps:\n\
+  \  1. Identify relevant calls:\n     - If callee name is bt_copy_from_sockptr: return\
+  \ (safe helper; do not warn).\n     - If callee name is copy_from_sockptr or copy_from_sockptr_offset:\
+  \ proceed.\n     - Otherwise ignore.\n  2. Ensure we are in a setsockopt-like handler\
+  \ to reduce false positives:\n     - Retrieve the current FunctionDecl via C.getLocationContext()->getDecl().\n\
+  \     - Consider it a handler if:\n       - The function name contains \"setsockopt\"\
+  \ (case-sensitive), or\n       - It has parameters: one of type sockptr_t (optval)\
+  \ and one unsigned int/size_t param whose name contains \"optlen\".\n     - If neither\
+  \ condition holds, ignore the call.\n  3. Locate the arguments:\n     - For copy_from_sockptr(dst,\
+  \ src, size): size is arg index 2.\n     - For copy_from_sockptr_offset(dst, src,\
+  \ offset, size): size is arg index 3.\n     - Keep a pointer to the size Expr SzArg\
+  \ and the destination Expr DstArg (arg index 0).\n  4. Detect \u201Cmin with optlen\u201D\
+  \ pattern (partial copy bug):\n     - If ExprHasName(SzArg, \"min\") or ExprHasName(SzArg,\
+  \ \"min_t\"), and also ExprHasName(SzArg, \"optlen\"), immediately report: \"length\
+  \ uses min(optlen, ...); may leave fields uninitialized\".\n     - Else if SzArg\
+  \ is a DeclRefExpr referring to a variable whose region is in MinLenVars, report\
+  \ the same message.\n  5. Detect \u201Cno optlen validation\u201D with fixed-size\
+  \ copy:\n     - If SzArg does not mention \"optlen\" (ExprHasName(SzArg, \"optlen\"\
+  ) is false), proceed to check if it is a fixed size:\n       - Try EvaluateExprToInt(SzVal,\
+  \ SzArg, C). If constant and > 0, consider it a fixed length.\n       - Else, if\
+  \ SzArg is a sizeof-like expression (UnaryExprOrTypeTraitExpr), treat it as fixed\
+  \ length.\n       - Optional refinement: try to compute sizeof(DstArg)\u2019s pointee\
+  \ type via ASTContext if DstArg is &var; treat as fixed length.\n     - If fixed\
+  \ length and the call is not bt_copy_from_sockptr, report: \"copy_from_sockptr without\
+  \ validating optlen >= size; use bt_copy_from_sockptr\".\n  6. Bug report:\n   \
+  \  - Use generateNonFatalErrorNode and a PathSensitiveBugReport.\n     - Keep messages\
+  \ short:\n       - For min-case: \"Partial copy from optval via min(optlen, ...);\
+  \ uninitialized fields possible.\"\n       - For fixed-size no-check: \"copy_from_sockptr\
+  \ lacks optlen >= size check; use bt_copy_from_sockptr.\"\n\nB) checkBind (track\
+  \ variables computed via min(optlen, ...))\n- Goal: If the size expression is assigned\
+  \ to a temporary (e.g., len = min_t(..., optlen)), remember that variable as \u201C\
+  min-derived\u201D.\n- Steps:\n  1. Only process bindings where both Loc and Val\
+  \ are non-null and S is an assignment.\n  2. Get the bound region for the LHS via\
+  \ getMemRegionFromExpr.\n  3. Inspect the RHS (Val\u2019s originating Expr; use\
+  \ findSpecificTypeInParents<const BinaryOperator> or the S as needed):\n     - If\
+  \ the RHS expression contains \"min\" or \"min_t\" (ExprHasName), and also contains\
+  \ \"optlen\", add the LHS MemRegion to MinLenVars.\n  4. Do not remove from the\
+  \ set unless that variable is reassigned with a non-min RHS; if you want, you can\
+  \ clear the mark on a rebind when RHS no longer has min/optlen.\n\nC) Optional minor\
+  \ refinements (keep simple)\n- You can also catch direct calls where SzArg itself\
+  \ is optlen: these are safe; do not warn.\n- If callee is memcpy and src is optval.ptr\
+  \ (rare with sockptr), ignore to reduce noise.\n\n3) Heuristics and helper logic\n\
+  \n- Recognizing setsockopt handlers:\n  - By name: FunctionDecl->getNameAsString().contains(\"\
+  setsockopt\").\n  - By signature: presence of a sockptr_t parameter and an unsigned\
+  \ int/size_t parameter named with \"optlen\".\n- Finding optlen or optval mentions\
+  \ in expressions:\n  - Use ExprHasName(E, \"optlen\") and ExprHasName(E, \"min\"\
+  ) / \"min_t\".\n  - If stronger matching is needed, scan children for DeclRefExpr\
+  \ to a ParamVarDecl whose name contains \"optlen\".\n- Distinguishing safe helper:\n\
+  \  - Any call to bt_copy_from_sockptr(...) should be treated as safe and not reported.\n\
+  \n4) What this detects\n- Copying a fixed-size amount (e.g., sizeof(u32), sizeof(struct))\
+  \ from optval with copy_from_sockptr in a setsockopt handler without using bt_copy_from_sockptr\
+  \ and without referencing optlen in the size argument. This matches the rfcomm_sock_setsockopt_old\
+  \ bug.\n- Using min(optlen, sizeof(...)) to compute size for copy_from_sockptr (either\
+  \ directly as the call arg or indirectly through a temporary). This matches the\
+  \ rfcomm_sock_setsockopt bug where min_t was used, potentially leaving part of the\
+  \ struct uninitialized.\n\n5) What it intentionally avoids (to stay simple and reduce\
+  \ false positives)\n- No path-sensitive reasoning to prove an earlier if (optlen\
+  \ < sizeof(...)) return; guard. This may cause occasional false positives; keeping\
+  \ messages actionable and specific helps.\n- No alias tracking for optlen beyond\
+  \ direct name match; kernel code conventionally uses the name \"optlen\".\n\n6)\
+  \ Reporting\n- Use std::make_unique<PathSensitiveBugReport>.\n- Keep messages short:\n\
+  \  - \"copy_from_sockptr lacks optlen >= size check; use bt_copy_from_sockptr\"\n\
+  \  - \"Partial copy from optval via min(optlen, ...); uninitialized fields possible\"\
+  \n- Anchor the report at the risky call expression."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/ExprCXX.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/Type.h\"\
+  \n#include \"clang/AST/Stmt.h\"\n#include \"clang/Basic/SourceManager.h\"\n#include\
+  \ \"clang/Lex/Lexer.h\"\n\nusing namespace clang;\nusing namespace ento;\nusing\
+  \ namespace taint;\n\n// Track variables that were computed via min(..., optlen)\n\
+  REGISTER_SET_WITH_PROGRAMSTATE(MinLenVars, const MemRegion *)\n\nnamespace {\n\n\
+  class SAGenTestChecker : public Checker<check::PostCall, check::Bind> {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Unsafe copy_from_sockptr in setsockopt\", \"API Misuse\")) {}\n\
+  \n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n  \
+  \    void checkBind(SVal Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const;\n\
+  \n   private:\n      // Helpers\n      static bool isCallNamed(const CallEvent &Call,\
+  \ StringRef Name, CheckerContext &C);\n      static bool isSetsockoptLike(const\
+  \ FunctionDecl *FD);\n      static bool isFixedSizeExpr(const Expr *E, CheckerContext\
+  \ &C);\n      static bool mentionsOptlen(const Expr *E, CheckerContext &C);\n  \
+  \    static bool mentionsMinWithOptlen(const Expr *E, CheckerContext &C);\n    \
+  \  static unsigned getSizeArgIndex(const CallEvent &Call, CheckerContext &C, bool\
+  \ &IsSockptrCopy) ;\n      void reportAtCall(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef Msg) const;\n};\n\nbool SAGenTestChecker::isCallNamed(const CallEvent\
+  \ &Call, StringRef Name, CheckerContext &C) {\n  const Expr *Origin = Call.getOriginExpr();\n\
+  \  if (!Origin)\n    return false;\n  return ExprHasName(Origin, Name, C);\n}\n\n\
+  bool SAGenTestChecker::isSetsockoptLike(const FunctionDecl *FD) {\n  if (!FD)\n\
+  \    return false;\n\n  // Heuristic 1: function name contains \"setsockopt\"\n\
+  \  if (FD->getNameAsString().find(\"setsockopt\") != std::string::npos)\n    return\
+  \ true;\n\n  // Heuristic 2: has sockptr_t-like parameter and an \"optlen\"-like\
+  \ parameter\n  bool HasSockptr = false;\n  bool HasOptlen  = false;\n\n  for (const\
+  \ ParmVarDecl *P : FD->parameters()) {\n    if (!P)\n      continue;\n\n    // Check\
+  \ for sockptr_t by type name or parameter name \"optval\"\n    QualType PTy = P->getType();\n\
+  \    std::string TyStr = PTy.getAsString();\n    std::string ParamName = P->getNameAsString();\n\
+  \    if (TyStr.find(\"sockptr_t\") != std::string::npos || ParamName.find(\"optval\"\
+  ) != std::string::npos)\n      HasSockptr = true;\n\n    // Check for optlen: name\
+  \ contains \"optlen\" and integral type\n    if (ParamName.find(\"optlen\") != std::string::npos)\
+  \ {\n      if (PTy->isIntegerType() || PTy->isUnsignedIntegerType())\n        HasOptlen\
+  \ = true;\n    }\n  }\n\n  return HasSockptr && HasOptlen;\n}\n\nbool SAGenTestChecker::mentionsOptlen(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return false;\n  return ExprHasName(E,\
+  \ \"optlen\", C);\n}\n\nbool SAGenTestChecker::mentionsMinWithOptlen(const Expr\
+  \ *E, CheckerContext &C) {\n  if (!E) return false;\n  bool HasMin = ExprHasName(E,\
+  \ \"min\", C) || ExprHasName(E, \"min_t\", C);\n  if (!HasMin)\n    return false;\n\
+  \  return ExprHasName(E, \"optlen\", C);\n}\n\nbool SAGenTestChecker::isFixedSizeExpr(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E)\n    return false;\n\n  // If it mentions\
+  \ optlen, it's not fixed size in our sense.\n  if (mentionsOptlen(E, C))\n    return\
+  \ false;\n\n  llvm::APSInt Res;\n  if (EvaluateExprToInt(Res, E, C)) {\n    if (Res.isSigned())\n\
+  \      return Res.isStrictlyPositive();\n    return Res != 0;\n  }\n\n  // sizeof(...)\n\
+  \  if (isa<UnaryExprOrTypeTraitExpr>(E))\n    return true;\n\n  return false;\n\
+  }\n\nunsigned SAGenTestChecker::getSizeArgIndex(const CallEvent &Call, CheckerContext\
+  \ &C, bool &IsSockptrCopy) {\n  IsSockptrCopy = false;\n  if (isCallNamed(Call,\
+  \ \"copy_from_sockptr_offset\", C)) {\n    IsSockptrCopy = true;\n    // copy_from_sockptr_offset(dst,\
+  \ src, offset, size)\n    if (Call.getNumArgs() >= 4)\n      return 3;\n  } else\
+  \ if (isCallNamed(Call, \"copy_from_sockptr\", C)) {\n    IsSockptrCopy = true;\n\
+  \    // copy_from_sockptr(dst, src, size)\n    if (Call.getNumArgs() >= 3)\n   \
+  \   return 2;\n  }\n  // Not a target call or insufficient args\n  return UINT_MAX;\n\
+  }\n\nvoid SAGenTestChecker::reportAtCall(const CallEvent &Call, CheckerContext &C,\
+  \ StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n \
+  \ if (!N)\n    return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (const Expr *E = Call.getOriginExpr())\n    R->addRange(E->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  // Ignore safe helper\n  if (isCallNamed(Call,\
+  \ \"bt_copy_from_sockptr\", C))\n    return;\n\n  bool IsSockptrCopy = false;\n\
+  \  unsigned SzIdx = getSizeArgIndex(Call, C, IsSockptrCopy);\n  if (!IsSockptrCopy\
+  \ || SzIdx == UINT_MAX)\n    return;\n\n  // Ensure we are in a setsockopt-like\
+  \ handler to reduce noise\n  const LocationContext *LC = C.getLocationContext();\n\
+  \  if (!LC)\n    return;\n  const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(LC->getDecl());\n\
+  \  if (!isSetsockoptLike(FD))\n    return;\n\n  // Get size argument and destination\
+  \ argument\n  if (SzIdx >= Call.getNumArgs())\n    return;\n\n  const Expr *SzArg\
+  \ = Call.getArgExpr(SzIdx);\n  if (!SzArg)\n    return;\n\n  ProgramStateRef State\
+  \ = C.getState();\n\n  // A) Detect partial copy using min(optlen, ...)\n  if (mentionsMinWithOptlen(SzArg,\
+  \ C)) {\n    reportAtCall(Call, C, \"Partial copy from optval via min(optlen, ...);\
+  \ uninitialized fields possible\");\n    return;\n  } else {\n    // If size arg\
+  \ is a local variable that we tracked as min(optlen, ...)\n    SVal SzVal = Call.getArgSVal(SzIdx);\n\
+  \    if (const MemRegion *MR = SzVal.getAsRegion()) {\n      MR = MR->getBaseRegion();\n\
+  \      if (MR) {\n        if (State->contains<MinLenVars>(MR)) {\n          reportAtCall(Call,\
+  \ C, \"Partial copy from optval via min(optlen, ...); uninitialized fields possible\"\
+  );\n          return;\n        }\n      }\n    }\n  }\n\n  // B) Detect fixed-size\
+  \ copy without referencing optlen\n  if (isFixedSizeExpr(SzArg, C)) {\n    // If\
+  \ they explicitly used optlen (already checked), we would have returned.\n    //\
+  \ Here, no optlen in size => warn to use bt_copy_from_sockptr.\n    reportAtCall(Call,\
+  \ C, \"copy_from_sockptr lacks optlen >= size check; use bt_copy_from_sockptr\"\
+  );\n    return;\n  }\n\n  // Otherwise, do nothing.\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *StoreE, CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  const Expr\
+  \ *RHSLike = dyn_cast_or_null<Expr>(StoreE);\n  if (const auto *BO = dyn_cast_or_null<BinaryOperator>(StoreE))\
+  \ {\n    if (BO->getOpcode() == BO_Assign)\n      RHSLike = BO->getRHS();\n  }\n\
+  \n  bool Mark = false;\n  if (RHSLike) {\n    // If RHS contains min/min_t and also\
+  \ optlen, mark this variable.\n    if (mentionsMinWithOptlen(RHSLike, C))\n    \
+  \  Mark = true;\n  }\n\n  if (Mark) {\n    State = State->add<MinLenVars>(LHSReg);\n\
+  \  } else {\n    // If not a min/optlen assignment, clear old mark if present to\
+  \ avoid stale info.\n    if (State->contains<MinLenVars>(LHSReg))\n      State =\
+  \ State->remove<MinLenVars>(LHSReg);\n  }\n\n  C.addTransition(State);\n}\n\n} //\
+  \ end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects unsafe copy_from_sockptr usage in setsockopt handlers (missing\
+  \ optlen validation or partial copy via min)\",\n      \"\");\n}\n\nextern \"C\"\
+  \ const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

@@ -1,0 +1,538 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 0336f8ffece62f882ab3012820965a786a983f70
+commit_type: UAF
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\nREGISTER_MAP_WITH_PROGRAMSTATE(Priv2DevMap,\
+  \ const MemRegion*, const MemRegion*)\nREGISTER_SET_WITH_PROGRAMSTATE(FreedDevs,\
+  \ const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*,\
+  \ const MemRegion*)\n\nnamespace {\n/* The checker callbacks are to be decided.\
+  \ */\nclass SAGenTestChecker : public Checker<check::PostCall,\n               \
+  \                         check::PreCall,\n                                    \
+  \    check::Location,\n                                        check::Bind> {\n\
+  \   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Use-after-free (net_device private)\", \"Memory error\"\
+  )) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n    \
+  \  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \n   private:\n\n      // Helpers\n      static bool callHasName(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name);\n      static const MemRegion *getBaseRegionOrSelf(const\
+  \ MemRegion *R);\n      static const MemRegion *resolveAlias(ProgramStateRef State,\
+  \ const MemRegion *R);\n      static const MemRegion *exprToBaseRegion(const Expr\
+  \ *E, CheckerContext &C);\n      static const MemRegion *privBaseToDevBase(ProgramStateRef\
+  \ State, const MemRegion *PrivBase);\n      static bool devIsFreed(ProgramStateRef\
+  \ State, const MemRegion *DevBase);\n\n      static bool knownWorkOrTimerDeref(const\
+  \ CallEvent &Call, CheckerContext &C,\n                                        llvm::SmallVectorImpl<unsigned>\
+  \ &OutIdx);\n\n      void reportUAFAtCall(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef Msg) const;\n      void reportUAFAtStmt(const Stmt *S, CheckerContext\
+  \ &C, StringRef Msg) const;\n};\n\nbool SAGenTestChecker::callHasName(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name) {\n  const Expr *OriginExpr = Call.getOriginExpr();\n\
+  \  if (!OriginExpr)\n    return false;\n  return ExprHasName(OriginExpr, Name, C);\n\
+  }\n\nconst MemRegion *SAGenTestChecker::getBaseRegionOrSelf(const MemRegion *R)\
+  \ {\n  if (!R) return nullptr;\n  const MemRegion *Prev = nullptr;\n  const MemRegion\
+  \ *Cur = R;\n  while (Cur && Cur != Prev) {\n    Prev = Cur;\n    Cur = Cur->getBaseRegion();\n\
+  \  }\n  return Cur;\n}\n\nconst MemRegion *SAGenTestChecker::resolveAlias(ProgramStateRef\
+  \ State, const MemRegion *R) {\n  if (!R) return nullptr;\n  llvm::SmallPtrSet<const\
+  \ MemRegion*, 8> Visited;\n  const MemRegion *Cur = R;\n  while (Cur) {\n    if\
+  \ (!Visited.insert(Cur).second)\n      break; // cycle\n    const MemRegion *Next\
+  \ = State->get<PtrAliasMap>(Cur);\n    if (!Next)\n      break;\n    Cur = Next;\n\
+  \  }\n  return Cur ? Cur : R;\n}\n\nconst MemRegion *SAGenTestChecker::exprToBaseRegion(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return nullptr;\n  const MemRegion *MR\
+  \ = getMemRegionFromExpr(E, C);\n  if (!MR) return nullptr;\n  MR = getBaseRegionOrSelf(MR);\n\
+  \  ProgramStateRef State = C.getState();\n  MR = resolveAlias(State, MR);\n  return\
+  \ MR;\n}\n\nconst MemRegion *SAGenTestChecker::privBaseToDevBase(ProgramStateRef\
+  \ State, const MemRegion *PrivBase) {\n  if (!PrivBase) return nullptr;\n  const\
+  \ MemRegion *Mapped = State->get<Priv2DevMap>(PrivBase);\n  if (!Mapped) return\
+  \ nullptr;\n  return resolveAlias(State, Mapped);\n}\n\nbool SAGenTestChecker::devIsFreed(ProgramStateRef\
+  \ State, const MemRegion *DevBase) {\n  if (!DevBase) return false;\n  return State->contains<FreedDevs>(DevBase);\n\
+  }\n\nbool SAGenTestChecker::knownWorkOrTimerDeref(const CallEvent &Call, CheckerContext\
+  \ &C,\n                                             llvm::SmallVectorImpl<unsigned>\
+  \ &OutIdx) {\n  // Functions that dereference their argument(s) which typically\
+  \ point\n  // to work/timer structures stored in netdev private data.\n  // We target\
+  \ index 0 for these common kernel helpers.\n  static const char *Names[] = {\n \
+  \   \"cancel_work_sync\",\n    \"cancel_delayed_work_sync\",\n    \"flush_work\"\
+  ,\n    \"flush_delayed_work\",\n    \"del_timer_sync\",\n    \"del_timer\",\n  };\n\
+  \  const Expr *OriginExpr = Call.getOriginExpr();\n  if (!OriginExpr)\n    return\
+  \ false;\n\n  bool Found = false;\n  for (const char *N : Names) {\n    if (ExprHasName(OriginExpr,\
+  \ N, C)) {\n      OutIdx.push_back(0);\n      Found = true;\n      break;\n    }\n\
+  \  }\n  return Found;\n}\n\nvoid SAGenTestChecker::reportUAFAtCall(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg,\
+  \ N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\
+  \nvoid SAGenTestChecker::reportUAFAtStmt(const Stmt *S, CheckerContext &C, StringRef\
+  \ Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N) return;\n\
+  \  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);\n  if (S)\n \
+  \   R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\nvoid\
+  \ SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  ProgramStateRef State = C.getState();\n\n  // Record dev free when free_netdev(dev)\
+  \ is called.\n  if (callHasName(Call, C, \"free_netdev\")) {\n    if (Call.getNumArgs()\
+  \ >= 1) {\n      const Expr *DevE = Call.getArgExpr(0);\n      const MemRegion *DevBase\
+  \ = exprToBaseRegion(DevE, C);\n      if (DevBase) {\n        DevBase = getBaseRegionOrSelf(DevBase);\n\
+  \        DevBase = resolveAlias(State, DevBase);\n        State = State->add<FreedDevs>(DevBase);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  // Learn\
+  \ priv->dev mapping for netdev_priv(dev).\n  if (callHasName(Call, C, \"netdev_priv\"\
+  )) {\n    // Get dev base\n    const Expr *DevE = (Call.getNumArgs() >= 1) ? Call.getArgExpr(0)\
+  \ : nullptr;\n    const MemRegion *DevBase = exprToBaseRegion(DevE, C);\n\n    //\
+  \ Get return region (priv)\n    const Expr *Origin = Call.getOriginExpr();\n   \
+  \ const MemRegion *RetReg = Origin ? getMemRegionFromExpr(Origin, C) : nullptr;\n\
+  \    if (!RetReg) {\n      // Fallback to using return value region if available\n\
+  \      RetReg = Call.getReturnValue().getAsRegion();\n    }\n    if (RetReg)\n \
+  \     RetReg = getBaseRegionOrSelf(RetReg);\n    if (RetReg)\n      RetReg = resolveAlias(State,\
+  \ RetReg);\n\n    // If dev already freed, flag \"netdev_priv(dev) after free_netdev\"\
+  .\n    if (DevBase && devIsFreed(State, DevBase)) {\n      reportUAFAtCall(Call,\
+  \ C, \"netdev_priv(dev) after free_netdev\");\n      return;\n    }\n\n    // Record\
+  \ mapping priv -> dev\n    if (RetReg && DevBase) {\n      State = State->set<Priv2DevMap>(RetReg,\
+  \ DevBase);\n      C.addTransition(State);\n    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Detect uses of priv-derived pointers after free_netdev() via known-deref\
+  \ functions.\n  llvm::SmallVector<unsigned, 4> DerefParams;\n  if (!knownWorkOrTimerDeref(Call,\
+  \ C, DerefParams))\n    return;\n\n  for (unsigned Idx : DerefParams) {\n    if\
+  \ (Idx >= Call.getNumArgs())\n      continue;\n\n    const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \    const MemRegion *ArgBase = exprToBaseRegion(ArgE, C);\n    if (!ArgBase)\n\
+  \      continue;\n\n    const MemRegion *DevBase = privBaseToDevBase(State, ArgBase);\n\
+  \    if (!DevBase)\n      continue;\n\n    if (devIsFreed(State, DevBase)) {\n \
+  \     reportUAFAtCall(Call, C, \"Use of netdev priv after free_netdev\");\n    \
+  \  return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkLocation(SVal Loc, bool\
+  \ IsLoad, const Stmt *S, CheckerContext &C) const {\n  // Catch direct dereferences\
+  \ of priv-derived memory after free_netdev().\n  const MemRegion *R = Loc.getAsRegion();\n\
+  \  if (!R)\n    return;\n\n  ProgramStateRef State = C.getState();\n  const MemRegion\
+  \ *Base = getBaseRegionOrSelf(R);\n  Base = resolveAlias(State, Base);\n\n  const\
+  \ MemRegion *DevBase = privBaseToDevBase(State, Base);\n  if (!DevBase)\n    return;\n\
+  \n  if (devIsFreed(State, DevBase)) {\n    reportUAFAtStmt(S, C, \"Use of netdev\
+  \ priv after free_netdev\");\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc,\
+  \ SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State =\
+  \ C.getState();\n\n  const MemRegion *LHS = Loc.getAsRegion();\n  if (!LHS)\n  \
+  \  return;\n  LHS = getBaseRegionOrSelf(LHS);\n  LHS = resolveAlias(State, LHS);\n\
+  \  if (!LHS)\n    return;\n\n  const MemRegion *RHS = Val.getAsRegion();\n  if (!RHS)\n\
+  \    return;\n  RHS = getBaseRegionOrSelf(RHS);\n  RHS = resolveAlias(State, RHS);\n\
+  \  if (!RHS)\n    return;\n\n  // Record alias both directions to simplify lookups.\n\
+  \  State = State->set<PtrAliasMap>(LHS, RHS);\n  State = State->set<PtrAliasMap>(RHS,\
+  \ LHS);\n\n  // Propagate priv->dev mapping across alias\n  if (const MemRegion\
+  \ *DevBase = State->get<Priv2DevMap>(RHS)) {\n    State = State->set<Priv2DevMap>(LHS,\
+  \ DevBase);\n  }\n  if (const MemRegion *DevBase2 = State->get<Priv2DevMap>(LHS))\
+  \ {\n    State = State->set<Priv2DevMap>(RHS, DevBase2);\n  }\n\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects use of netdev private data after free_netdev (e.g., cancel_work_sync\
+  \ on priv fields)\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nnet: ti: fix UAF in tlan_remove_one\n\npriv is netdev\
+  \ private data and it cannot be\nused after free_netdev() call. Using priv after\
+  \ free_netdev()\ncan cause UAF bug. Fix it by moving free_netdev() at the end of\
+  \ the\nfunction.\n\nFixes: 1e0a8b13d355 (\"tlan: cancel work at remove path\")\n\
+  Signed-off-by: Pavel Skripkin <paskripkin@gmail.com>\nSigned-off-by: David S. Miller\
+  \ <davem@davemloft.net>\n\n## Buggy Code\n\n```c\n// Complete file: drivers/net/ethernet/ti/tlan.c\
+  \ (tree-sitter fallback)\n/*******************************************************************************\n\
+  \ *\n *  Linux ThunderLAN Driver\n *\n *  tlan.c\n *  by James Banks\n *\n *  (C)\
+  \ 1997-1998 Caldera, Inc.\n *  (C) 1998 James Banks\n *  (C) 1999-2001 Torben Mathiasen\n\
+  \ *  (C) 2002 Samuel Chessman\n *\n *  This software may be used and distributed\
+  \ according to the terms\n *  of the GNU General Public License, incorporated herein\
+  \ by reference.\n *\n ** Useful (if not required) reading:\n *\n *\t\tTexas Instruments,\
+  \ ThunderLAN Programmer's Guide,\n *\t\t\tTI Literature Number SPWU013A\n *\t\t\t\
+  available in PDF format from www.ti.com\n *\t\tLevel One, LXT901 and LXT970 Data\
+  \ Sheets\n *\t\t\tavailable in PDF format from www.level1.com\n *\t\tNational Semiconductor,\
+  \ DP83840A Data Sheet\n *\t\t\tavailable in PDF format from www.national.com\n *\t\
+  \tMicrochip Technology, 24C01A/02A/04A Data Sheet\n *\t\t\tavailable in PDF format\
+  \ from www.microchip.com\n *\n ******************************************************************************/\n\
+  \n#define pr_fmt(fmt) KBUILD_MODNAME \": \" fmt\n\n#include <linux/hardirq.h>\n\
+  #include <linux/module.h>\n#include <linux/init.h>\n#include <linux/interrupt.h>\n\
+  #include <linux/ioport.h>\n#include <linux/eisa.h>\n#include <linux/pci.h>\n#include\
+  \ <linux/dma-mapping.h>\n#include <linux/netdevice.h>\n#include <linux/etherdevice.h>\n\
+  #include <linux/delay.h>\n#include <linux/spinlock.h>\n#include <linux/workqueue.h>\n\
+  #include <linux/mii.h>\n\n#include \"tlan.h\"\n\n\n/* For removing EISA devices\
+  \ */\nstatic\tstruct net_device\t*tlan_eisa_devices;\n\nstatic\tint\t\ttlan_devices_installed;\n\
+  \n/* Set speed, duplex and aui settings */\nstatic  int aui[MAX_TLAN_BOARDS];\n\
+  static  int duplex[MAX_TLAN_BOARDS];\nstatic  int speed[MAX_TLAN_BOARDS];\nstatic\
+  \  int boards_found;\nmodule_param_array(aui, int, NULL, 0);\nmodule_param_array(duplex,\
+  \ int, NULL, 0);\nmodule_param_array(speed, int, NULL, 0);\nMODULE_PARM_DESC(aui,\
+  \ \"ThunderLAN use AUI port(s) (0-1)\");\nMODULE_PARM_DESC(duplex,\n\t\t \"ThunderLAN\
+  \ duplex setting(s) (0-default, 1-half, 2-full)\");\nMODULE_PARM_DESC(speed, \"\
+  ThunderLAN port speed setting(s) (0,10,100)\");\n\nMODULE_AUTHOR(\"Maintainer: Samuel\
+  \ Chessman <chessman@tux.org>\");\nMODULE_DESCRIPTION(\"Driver for TI ThunderLAN\
+  \ based ethernet PCI adapters\");\nMODULE_LICENSE(\"GPL\");\n\n/* Turn on debugging.\n\
+  \ * See Documentation/networking/device_drivers/ethernet/ti/tlan.rst for details\n\
+  \ */\nstatic  int\t\tdebug;\nmodule_param(debug, int, 0);\nMODULE_PARM_DESC(debug,\
+  \ \"ThunderLAN debug mask\");\n\nstatic\tconst char tlan_signature[] = \"TLAN\"\
+  ;\nstatic  const char tlan_banner[] = \"ThunderLAN driver v1.17\\n\";\nstatic  int\
+  \ tlan_have_pci;\nstatic  int tlan_have_eisa;\n\nstatic const char * const media[]\
+  \ = {\n\t\"10BaseT-HD\", \"10BaseT-FD\", \"100baseTx-HD\",\n\t\"100BaseTx-FD\",\
+  \ \"100BaseT4\", NULL\n};\n\nstatic struct board {\n\tconst char\t*device_label;\n\
+  \tu32\t\tflags;\n\tu16\t\taddr_ofs;\n} board_info[] = {\n\t{ \"Compaq Netelligent\
+  \ 10 T PCI UTP\", TLAN_ADAPTER_ACTIVITY_LED, 0x83 },\n\t{ \"Compaq Netelligent 10/100\
+  \ TX PCI UTP\",\n\t  TLAN_ADAPTER_ACTIVITY_LED, 0x83 },\n\t{ \"Compaq Integrated\
+  \ NetFlex-3/P\", TLAN_ADAPTER_NONE, 0x83 },\n\t{ \"Compaq NetFlex-3/P\",\n\t  TLAN_ADAPTER_UNMANAGED_PHY\
+  \ | TLAN_ADAPTER_BIT_RATE_PHY, 0x83 },\n\t{ \"Compaq NetFlex-3/P\", TLAN_ADAPTER_NONE,\
+  \ 0x83 },\n\t{ \"Compaq Netelligent Integrated 10/100 TX UTP\",\n\t  TLAN_ADAPTER_ACTIVITY_LED,\
+  \ 0x83 },\n\t{ \"Compaq Netelligent Dual 10/100 TX PCI UTP\",\n\t  TLAN_ADAPTER_NONE,\
+  \ 0x83 },\n\t{ \"Compaq Netelligent 10/100 TX Embedded UTP\",\n\t  TLAN_ADAPTER_NONE,\
+  \ 0x83 },\n\t{ \"Olicom OC-2183/2185\", TLAN_ADAPTER_USE_INTERN_10, 0x83 },\n\t\
+  { \"Olicom OC-2325\", TLAN_ADAPTER_ACTIVITY_LED |\n\t  TLAN_ADAPTER_UNMANAGED_PHY,\
+  \ 0xf8 },\n\t{ \"Olicom OC-2326\", TLAN_ADAPTER_ACTIVITY_LED |\n\t  TLAN_ADAPTER_USE_INTERN_10,\
+  \ 0xf8 },\n\t{ \"Compaq Netelligent 10/100 TX UTP\", TLAN_ADAPTER_ACTIVITY_LED,\
+  \ 0x83 },\n\t{ \"Compaq Netelligent 10 T/2 PCI UTP/coax\", TLAN_ADAPTER_NONE, 0x83\
+  \ },\n\t{ \"Compaq NetFlex-3/E\",\n\t  TLAN_ADAPTER_ACTIVITY_LED |\t/* EISA card\
+  \ */\n\t  TLAN_ADAPTER_UNMANAGED_PHY | TLAN_ADAPTER_BIT_RATE_PHY, 0x83 },\n\t{ \"\
+  Compaq NetFlex-3/E\",\n\t  TLAN_ADAPTER_ACTIVITY_LED, 0x83 }, /* EISA card */\n\
+  };\n\nstatic const struct pci_device_id tlan_pci_tbl[] = {\n\t{ PCI_VENDOR_ID_COMPAQ,\
+  \ PCI_DEVICE_ID_COMPAQ_NETEL10,\n\t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },\n\t{ PCI_VENDOR_ID_COMPAQ,\
+  \ PCI_DEVICE_ID_COMPAQ_NETEL100,\n\t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 1 },\n\t{ PCI_VENDOR_ID_COMPAQ,\
+  \ PCI_DEVICE_ID_COMPAQ_NETFLEX3I,\n\t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 2 },\n\t{ PCI_VENDOR_ID_COMPAQ,\
+  \ PCI_DEVICE_ID_COMPAQ_THUNDER,\n\t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 3 },\n\t{ PCI_VENDOR_ID_COMPAQ,\
+  \ PCI_DEVICE_ID_COMPAQ_NETFLEX3B,\n\t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 4 },\n\t{ PCI_VENDOR_ID_COMPAQ,\
+  \ PCI_DEVICE_ID_COMPAQ_NETEL100PI,\n\t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 5 },\n\t{\
+  \ PCI_VENDOR_ID_COMPAQ, PCI_DEVICE_ID_COMPAQ_NETEL100D,\n\t  PCI_ANY_ID, PCI_ANY_ID,\
+  \ 0, 0, 6 },\n\t{ PCI_VENDOR_ID_COMPAQ, PCI_DEVICE_ID_COMPAQ_NETEL100I,\n\t  PCI_ANY_ID,\
+  \ PCI_ANY_ID, 0, 0, 7 },\n\t{ PCI_VENDOR_ID_OLICOM, PCI_DEVICE_ID_OLICOM_OC2183,\n\
+  \t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 8 },\n\t{ PCI_VENDOR_ID_OLICOM, PCI_DEVICE_ID_OLICOM_OC2325,\n\
+  \t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 9 },\n\t{ PCI_VENDOR_ID_OLICOM, PCI_DEVICE_ID_OLICOM_OC2326,\n\
+  \t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 10 },\n\t{ PCI_VENDOR_ID_COMPAQ, PCI_DEVICE_ID_NETELLIGENT_10_100_WS_5100,\n\
+  \t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 11 },\n\t{ PCI_VENDOR_ID_COMPAQ, PCI_DEVICE_ID_NETELLIGENT_10_T2,\n\
+  \t  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 12 },\n\t{ 0,}\n};\nMODULE_DEVICE_TABLE(pci, tlan_pci_tbl);\n\
+  \nstatic void\ttlan_eisa_probe(void);\nstatic void\ttlan_eisa_cleanup(void);\nstatic\
+  \ int      tlan_init(struct net_device *);\nstatic int\ttlan_open(struct net_device\
+  \ *dev);\nstatic netdev_tx_t tlan_start_tx(struct sk_buff *, struct net_device *);\n\
+  static irqreturn_t tlan_handle_interrupt(int, void *);\nstatic int\ttlan_close(struct\
+  \ net_device *);\nstatic struct\tnet_device_stats *tlan_get_stats(struct net_device\
+  \ *);\nstatic void\ttlan_set_multicast_list(struct net_device *);\nstatic int\t\
+  tlan_ioctl(struct net_device *dev, struct ifreq *rq, int cmd);\nstatic int     \
+  \ tlan_probe1(struct pci_dev *pdev, long ioaddr,\n\t\t\t    int irq, int rev, const\
+  \ struct pci_device_id *ent);\nstatic void\ttlan_tx_timeout(struct net_device *dev,\
+  \ unsigned int txqueue);\nstatic void\ttlan_tx_timeout_work(struct work_struct *work);\n\
+  static int\ttlan_init_one(struct pci_dev *pdev,\n\t\t\t      const struct pci_device_id\
+  \ *ent);\n\nstatic u32\ttlan_handle_tx_eof(struct net_device *, u16);\nstatic u32\t\
+  tlan_handle_stat_overflow(struct net_device *, u16);\nstatic u32\ttlan_handle_rx_eof(struct\
+  \ net_device *, u16);\nstatic u32\ttlan_handle_dummy(struct net_device *, u16);\n\
+  static u32\ttlan_handle_tx_eoc(struct net_device *, u16);\nstatic u32\ttlan_handle_status_check(struct\
+  \ net_device *, u16);\nstatic u32\ttlan_handle_rx_eoc(struct net_device *, u16);\n\
+  \nstatic void\ttlan_timer(struct timer_list *t);\nstatic void\ttlan_phy_monitor(struct\
+  \ timer_list *t);\n\nstatic void\ttlan_reset_lists(struct net_device *);\nstatic\
+  \ void\ttlan_free_lists(struct net_device *);\nstatic void\ttlan_print_dio(u16);\n\
+  static void\ttlan_print_list(struct tlan_list *, char *, int);\nstatic void\ttlan_read_and_clear_stats(struct\
+  \ net_device *, int);\nstatic void\ttlan_reset_adapter(struct net_device *);\nstatic\
+  \ void\ttlan_finish_reset(struct net_device *);\nstatic void\ttlan_set_mac(struct\
+  \ net_device *, int areg, char *mac);\n\nstatic void\t__tlan_phy_print(struct net_device\
+  \ *);\nstatic void\ttlan_phy_print(struct net_device *);\nstatic void\ttlan_phy_detect(struct\
+  \ net_device *);\nstatic void\ttlan_phy_power_down(struct net_device *);\nstatic\
+  \ void\ttlan_phy_power_up(struct net_device *);\nstatic void\ttlan_phy_reset(struct\
+  \ net_device *);\nstatic void\ttlan_phy_start_link(struct net_device *);\nstatic\
+  \ void\ttlan_phy_finish_auto_neg(struct net_device *);\n\n/*\n  static int\ttlan_phy_nop(struct\
+  \ net_device *);\n  static int\ttlan_phy_internal_check(struct net_device *);\n\
+  \  static int\ttlan_phy_internal_service(struct net_device *);\n  static int\ttlan_phy_dp83840a_check(struct\
+  \ net_device *);\n*/\n\nstatic bool\t__tlan_mii_read_reg(struct net_device *, u16,\
+  \ u16, u16 *);\nstatic void\ttlan_mii_read_reg(struct net_device *, u16, u16, u16\
+  \ *);\nstatic void\ttlan_mii_send_data(u16, u32, unsigned);\nstatic void\ttlan_mii_sync(u16);\n\
+  static void\t__tlan_mii_write_reg(struct net_device *, u16, u16, u16);\nstatic void\t\
+  tlan_mii_write_reg(struct net_device *, u16, u16, u16);\n\nstatic void\ttlan_ee_send_start(u16);\n\
+  static int\ttlan_ee_send_byte(u16, u8, int);\nstatic void\ttlan_ee_receive_byte(u16,\
+  \ u8 *, int);\nstatic int\ttlan_ee_read_byte(struct net_device *, u8, u8 *);\n\n\
+  \nstatic inline void\ntlan_store_skb(struct tlan_list *tag, struct sk_buff *skb)\n\
+  {\n\tunsigned long addr = (unsigned long)skb;\n\ttag->buffer[9].address = addr;\n\
+  \ttag->buffer[8].address = upper_32_bits(addr);\n}\n\nstatic inline struct sk_buff\
+  \ *\ntlan_get_skb(const struct tlan_list *tag)\n{\n\tunsigned long addr;\n\n\taddr\
+  \ = tag->buffer[9].address;\n\taddr |= ((unsigned long) tag->buffer[8].address <<\
+  \ 16) << 16;\n\treturn (struct sk_buff *) addr;\n}\n\nstatic u32\n(*tlan_int_vector[TLAN_INT_NUMBER_OF_INTS])(struct\
+  \ net_device *, u16) = {\n\tNULL,\n\ttlan_handle_tx_eof,\n\ttlan_handle_stat_overflow,\n\
+  \ttlan_handle_rx_eof,\n\ttlan_handle_dummy,\n\ttlan_handle_tx_eoc,\n\ttlan_handle_status_check,\n\
+  \ttlan_handle_rx_eoc\n};\n\nstatic void\ntlan_set_timer(struct net_device *dev,\
+  \ u32 ticks, u32 type)\n{\n\n// ... [TRUNCATED: 2776 lines omitted] ...\n\n\n\t\
+  tlan_mii_send_data(dev->base_addr, 0x2, 2);\t/* send ACK */\n\ttlan_mii_send_data(dev->base_addr,\
+  \ val, 16);\t/* send data */\n\n\ttlan_clear_bit(TLAN_NET_SIO_MCLK, sio);\t/* idle\
+  \ cycle */\n\ttlan_set_bit(TLAN_NET_SIO_MCLK, sio);\n\n\tif (minten)\n\t\ttlan_set_bit(TLAN_NET_SIO_MINTEN,\
+  \ sio);\n\n}\n\nstatic void\ntlan_mii_write_reg(struct net_device *dev, u16 phy,\
+  \ u16 reg, u16 val)\n{\n\tstruct tlan_priv *priv = netdev_priv(dev);\n\tunsigned\
+  \ long flags;\n\n\tspin_lock_irqsave(&priv->lock, flags);\n\t__tlan_mii_write_reg(dev,\
+  \ phy, reg, val);\n\tspin_unlock_irqrestore(&priv->lock, flags);\n}\n\n\n/*****************************************************************************\n\
+  ******************************************************************************\n\
+  \nThunderLAN driver eeprom routines\n\nthe Compaq netelligent 10 and 10/100 cards\
+  \ use a microchip 24C02A\nEEPROM.  these functions are based on information in microchip's\n\
+  data sheet.  I don't know how well this functions will work with\nother Eeproms.\n\
+  \n******************************************************************************\n\
+  *****************************************************************************/\n\
+  \n\n/***************************************************************\n *\ttlan_ee_send_start\n\
+  \ *\n *\tReturns:\n *\t\tNothing\n *\tParms:\n *\t\tio_base\t\tThe IO port base\
+  \ address for the\n *\t\t\t\tTLAN device with the EEPROM to\n *\t\t\t\tuse.\n *\n\
+  \ *\tThis function sends a start cycle to an EEPROM attached\n *\tto a TLAN chip.\n\
+  \ *\n **************************************************************/\n\nstatic\
+  \ void tlan_ee_send_start(u16 io_base)\n{\n\tu16\tsio;\n\n\toutw(TLAN_NET_SIO, io_base\
+  \ + TLAN_DIO_ADR);\n\tsio = io_base + TLAN_DIO_DATA + TLAN_NET_SIO;\n\n\ttlan_set_bit(TLAN_NET_SIO_ECLOK,\
+  \ sio);\n\ttlan_set_bit(TLAN_NET_SIO_EDATA, sio);\n\ttlan_set_bit(TLAN_NET_SIO_ETXEN,\
+  \ sio);\n\ttlan_clear_bit(TLAN_NET_SIO_EDATA, sio);\n\ttlan_clear_bit(TLAN_NET_SIO_ECLOK,\
+  \ sio);\n\n}\n\n\n\n\n/***************************************************************\n\
+  \ *\ttlan_ee_send_byte\n *\n *\tReturns:\n *\t\tIf the correct ack was received,\
+  \ 0, otherwise 1\n *\tParms:\tio_base\t\tThe IO port base address for the\n *\t\t\
+  \t\tTLAN device with the EEPROM to\n *\t\t\t\tuse.\n *\t\tdata\t\tThe 8 bits of\
+  \ information to\n *\t\t\t\tsend to the EEPROM.\n *\t\tstop\t\tIf TLAN_EEPROM_STOP\
+  \ is passed, a\n *\t\t\t\tstop cycle is sent after the\n *\t\t\t\tbyte is sent after\
+  \ the ack is\n *\t\t\t\tread.\n *\n *\tThis function sends a byte on the serial\
+  \ EEPROM line,\n *\tdriving the clock to send each bit. The function then\n *\t\
+  reverses transmission direction and reads an acknowledge\n *\tbit.\n *\n **************************************************************/\n\
+  \nstatic int tlan_ee_send_byte(u16 io_base, u8 data, int stop)\n{\n\tint\terr;\n\
+  \tu8\tplace;\n\tu16\tsio;\n\n\toutw(TLAN_NET_SIO, io_base + TLAN_DIO_ADR);\n\tsio\
+  \ = io_base + TLAN_DIO_DATA + TLAN_NET_SIO;\n\n\t/* Assume clock is low, tx is enabled;\
+  \ */\n\tfor (place = 0x80; place != 0; place >>= 1) {\n\t\tif (place & data)\n\t\
+  \t\ttlan_set_bit(TLAN_NET_SIO_EDATA, sio);\n\t\telse\n\t\t\ttlan_clear_bit(TLAN_NET_SIO_EDATA,\
+  \ sio);\n\t\ttlan_set_bit(TLAN_NET_SIO_ECLOK, sio);\n\t\ttlan_clear_bit(TLAN_NET_SIO_ECLOK,\
+  \ sio);\n\t}\n\ttlan_clear_bit(TLAN_NET_SIO_ETXEN, sio);\n\ttlan_set_bit(TLAN_NET_SIO_ECLOK,\
+  \ sio);\n\terr = tlan_get_bit(TLAN_NET_SIO_EDATA, sio);\n\ttlan_clear_bit(TLAN_NET_SIO_ECLOK,\
+  \ sio);\n\ttlan_set_bit(TLAN_NET_SIO_ETXEN, sio);\n\n\tif ((!err) && stop) {\n\t\
+  \t/* STOP, raise data while clock is high */\n\t\ttlan_clear_bit(TLAN_NET_SIO_EDATA,\
+  \ sio);\n\t\ttlan_set_bit(TLAN_NET_SIO_ECLOK, sio);\n\t\ttlan_set_bit(TLAN_NET_SIO_EDATA,\
+  \ sio);\n\t}\n\n\treturn err;\n\n}\n\n\n\n\n/***************************************************************\n\
+  \ *\ttlan_ee_receive_byte\n *\n *\tReturns:\n *\t\tNothing\n *\tParms:\n *\t\tio_base\t\
+  \tThe IO port base address for the\n *\t\t\t\tTLAN device with the EEPROM to\n *\t\
+  \t\t\tuse.\n *\t\tdata\t\tAn address to a char to hold the\n *\t\t\t\tdata sent\
+  \ from the EEPROM.\n *\t\tstop\t\tIf TLAN_EEPROM_STOP is passed, a\n *\t\t\t\tstop\
+  \ cycle is sent after the\n *\t\t\t\tbyte is received, and no ack is\n *\t\t\t\t\
+  sent.\n *\n *\tThis function receives 8 bits of data from the EEPROM\n *\tover the\
+  \ serial link.  It then sends and ack bit, or no\n *\tack and a stop bit.  This\
+  \ function is used to retrieve\n *\tdata after the address of a byte in the EEPROM\
+  \ has been\n *\tsent.\n *\n **************************************************************/\n\
+  \nstatic void tlan_ee_receive_byte(u16 io_base, u8 *data, int stop)\n{\n\tu8  place;\n\
+  \tu16 sio;\n\n\toutw(TLAN_NET_SIO, io_base + TLAN_DIO_ADR);\n\tsio = io_base + TLAN_DIO_DATA\
+  \ + TLAN_NET_SIO;\n\t*data = 0;\n\n\t/* Assume clock is low, tx is enabled; */\n\
+  \ttlan_clear_bit(TLAN_NET_SIO_ETXEN, sio);\n\tfor (place = 0x80; place; place >>=\
+  \ 1) {\n\t\ttlan_set_bit(TLAN_NET_SIO_ECLOK, sio);\n\t\tif (tlan_get_bit(TLAN_NET_SIO_EDATA,\
+  \ sio))\n\t\t\t*data |= place;\n\t\ttlan_clear_bit(TLAN_NET_SIO_ECLOK, sio);\n\t\
+  }\n\n\ttlan_set_bit(TLAN_NET_SIO_ETXEN, sio);\n\tif (!stop) {\n\t\ttlan_clear_bit(TLAN_NET_SIO_EDATA,\
+  \ sio); /* ack = 0 */\n\t\ttlan_set_bit(TLAN_NET_SIO_ECLOK, sio);\n\t\ttlan_clear_bit(TLAN_NET_SIO_ECLOK,\
+  \ sio);\n\t} else {\n\t\ttlan_set_bit(TLAN_NET_SIO_EDATA, sio);\t/* no ack = 1 (?)\
+  \ */\n\t\ttlan_set_bit(TLAN_NET_SIO_ECLOK, sio);\n\t\ttlan_clear_bit(TLAN_NET_SIO_ECLOK,\
+  \ sio);\n\t\t/* STOP, raise data while clock is high */\n\t\ttlan_clear_bit(TLAN_NET_SIO_EDATA,\
+  \ sio);\n\t\ttlan_set_bit(TLAN_NET_SIO_ECLOK, sio);\n\t\ttlan_set_bit(TLAN_NET_SIO_EDATA,\
+  \ sio);\n\t}\n\n}\n\n\n\n\n/***************************************************************\n\
+  \ *\ttlan_ee_read_byte\n *\n *\tReturns:\n *\t\tNo error = 0, else, the stage at\
+  \ which the error\n *\t\toccurred.\n *\tParms:\n *\t\tio_base\t\tThe IO port base\
+  \ address for the\n *\t\t\t\tTLAN device with the EEPROM to\n *\t\t\t\tuse.\n *\t\
+  \tee_addr\t\tThe address of the byte in the\n *\t\t\t\tEEPROM whose contents are\
+  \ to be\n *\t\t\t\tretrieved.\n *\t\tdata\t\tAn address to a char to hold the\n\
+  \ *\t\t\t\tdata obtained from the EEPROM.\n *\n *\tThis function reads a byte of\
+  \ information from an byte\n *\tcell in the EEPROM.\n *\n **************************************************************/\n\
+  \nstatic int tlan_ee_read_byte(struct net_device *dev, u8 ee_addr, u8 *data)\n{\n\
+  \tint err;\n\tstruct tlan_priv *priv = netdev_priv(dev);\n\tunsigned long flags\
+  \ = 0;\n\tint ret = 0;\n\n\tspin_lock_irqsave(&priv->lock, flags);\n\n\ttlan_ee_send_start(dev->base_addr);\n\
+  \terr = tlan_ee_send_byte(dev->base_addr, 0xa0, TLAN_EEPROM_ACK);\n\tif (err) {\n\
+  \t\tret = 1;\n\t\tgoto fail;\n\t}\n\terr = tlan_ee_send_byte(dev->base_addr, ee_addr,\
+  \ TLAN_EEPROM_ACK);\n\tif (err) {\n\t\tret = 2;\n\t\tgoto fail;\n\t}\n\ttlan_ee_send_start(dev->base_addr);\n\
+  \terr = tlan_ee_send_byte(dev->base_addr, 0xa1, TLAN_EEPROM_ACK);\n\tif (err) {\n\
+  \t\tret = 3;\n\t\tgoto fail;\n\t}\n\ttlan_ee_receive_byte(dev->base_addr, data,\
+  \ TLAN_EEPROM_STOP);\nfail:\n\tspin_unlock_irqrestore(&priv->lock, flags);\n\n\t\
+  return ret;\n\n}\n\n\n\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/net/ethernet/ti/tlan.c\
+  \ b/drivers/net/ethernet/ti/tlan.c\nindex 0b2ce4bdc2c3..e0cb713193ea 100644\n---\
+  \ a/drivers/net/ethernet/ti/tlan.c\n+++ b/drivers/net/ethernet/ti/tlan.c\n@@ -313,9\
+  \ +313,8 @@ static void tlan_remove_one(struct pci_dev *pdev)\n \tpci_release_regions(pdev);\n\
+  \ #endif\n \n-\tfree_netdev(dev);\n-\n \tcancel_work_sync(&priv->tlan_tqueue);\n\
+  +\tfree_netdev(dev);\n }\n \n static void tlan_start(struct net_device *dev)\n```\n"
+pattern: "## Bug Pattern\n\nCalling free_netdev(dev) before canceling/flushing deferred\
+  \ work that resides in or accesses netdev\u2019s private data. Specifically:\n-\
+  \ priv = netdev_priv(dev) is used after free_netdev(dev)\n- Example: free_netdev(dev);\
+  \ cancel_work_sync(&priv->work);\nThis order frees the net_device (and its private\
+  \ area), then uses priv, causing a use-after-free. The correct pattern is to cancel/flush\
+  \ all work/timers/IRQs that may touch priv before calling free_netdev()."
+plan: "1) Program state\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(Priv2DevMap, const MemRegion*,\
+  \ const MemRegion*)\n  - Maps a \u201Cpriv pointer\u201D base region to its owning\
+  \ net_device base region. Key is the base MemRegion of the priv pointer; value is\
+  \ the base MemRegion of the dev passed to netdev_priv().\n\n- REGISTER_SET_WITH_PROGRAMSTATE(FreedDevs,\
+  \ const MemRegion*)\n  - Set of net_device base regions that have been freed via\
+  \ free_netdev().\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*,\
+  \ const MemRegion*)\n  - Tracks pointer aliases (LHS pointer region -> RHS pointer\
+  \ region). This lets us canonicalize both dev and priv pointers across assignments.\n\
+  \nHelpers (small, internal):\n- resolveAlias(State, R): follow PtrAliasMap chains\
+  \ until a fixed point; return representative region (or R if none).\n- getBaseRegionOrSelf(R):\
+  \ if R is a subregion (FieldRegion/ElementRegion), return R->getBaseRegion() repeatedly;\
+  \ else return R. Use MemRegion APIs.\n- exprToBaseRegion(E, C): getMemRegionFromExpr(E,\
+  \ C), then getBaseRegionOrSelf on it, then resolveAlias.\n- privBaseToDevBase(State,\
+  \ PrivBase): State->get<Priv2DevMap>(PrivBase) if present; otherwise nullptr.\n\
+  - devIsFreed(State, DevBase): check if FreedDevs contains resolveAlias(DevBase).\n\
+  \n2) Callbacks and logic\n\nA) checkPostCall (record relationships + immediate misuse)\n\
+  - Goal:\n  - Learn priv->dev mapping when netdev_priv() is called.\n  - Record dev\
+  \ free when free_netdev() is called.\n  - Catch netdev_priv() used after free_netdev()\
+  \ immediately.\n\n- Implementation:\n  - Get callee name via Call.getCalleeIdentifier()->getName().\n\
+  \  - If callee is \"netdev_priv\":\n    - Arg0 is the dev expression. Compute DevBase\
+  \ = exprToBaseRegion(Arg0, C).\n    - RetRegion = getMemRegionFromExpr(Call.getOriginExpr(),\
+  \ C). Compute PrivBase = getBaseRegionOrSelf(RetRegion); then PrivBase = resolveAlias(State,\
+  \ PrivBase).\n    - If DevBase is non-null and devIsFreed(State, DevBase) is true:\n\
+  \      - Emit bug: \"netdev_priv(dev) after free_netdev\".\n    - Else if both PrivBase\
+  \ and DevBase are non-null:\n      - State = State->set<Priv2DevMap>(PrivBase, DevBase).\
+  \ Bind new state.\n\n  - If callee is \"free_netdev\":\n    - Arg0 is the dev expression.\
+  \ Compute DevBase = exprToBaseRegion(Arg0, C).\n    - If DevBase is non-null:\n\
+  \      - State = State->add<FreedDevs>(DevBase). Bind new state.\n\nB) checkBind\
+  \ (track pointer aliases + propagate priv mapping)\n- Goal: Record pointer-to-pointer\
+  \ assignments to follow aliases; also propagate known Priv2Dev mapping across aliases\
+  \ to simplify lookups.\n- Implementation:\n  - If both Loc and Val correspond to\
+  \ pointer-typed memory regions:\n    - LHSBase = getBaseRegionOrSelf(Loc.getAsRegion());\
+  \ LHSBase = resolveAlias(State, LHSBase).\n    - RHSBase = getBaseRegionOrSelf(Val.getAsRegion());\
+  \ RHSBase = resolveAlias(State, RHSBase).\n    - If both non-null: State = State->set<PtrAliasMap>(LHSBase,\
+  \ RHSBase).\n    - If RHSBase exists in Priv2DevMap mapping to DevBase, also set\
+  \ Priv2DevMap[LHSBase] = DevBase (so that direct lookups on the alias work even\
+  \ without resolving).\n\nC) checkPreCall (detect unsafe uses of priv after free_netdev)\n\
+  - Goal: Detect when a function known to dereference pointer arguments is called\
+  \ with an argument that is derived from a priv pointer whose owning net_device has\
+  \ already been freed.\n- Implementation:\n  - Use functionKnownToDeref(Call, DerefParams).\
+  \ If false, return.\n  - For each index i in DerefParams:\n    - E = Call.getArgExpr(i).\n\
+  \    - ArgBase = exprToBaseRegion(E, C).\n    - If ArgBase is null, continue.\n\
+  \    - If PrivDev = State->get<Priv2DevMap>(ArgBase) (direct hit) then DevBase =\
+  \ resolveAlias(State, PrivDev).\n      - Else, if ArgBase is a subregion, use getBaseRegionOrSelf\
+  \ before lookup (already done by exprToBaseRegion).\n    - If DevBase is non-null\
+  \ and devIsFreed(State, DevBase) is true:\n      - Emit bug. Message: \"Use of netdev\
+  \ priv after free_netdev\".\n      - Anchor the report at the current call expression.\n\
+  \n  - Populate DerefTable to include at least:\n    - cancel_work_sync(arg0)\n \
+  \   - cancel_delayed_work_sync(arg0)\n    - flush_work(arg0)\n    - flush_delayed_work(arg0)\n\
+  \    - del_timer_sync(arg0)\n    - del_timer(arg0)\n    - Any other kernel primitives\
+  \ that dereference work/timer structures.\n    - Index 0 is typically the param\
+  \ that dereferences the passed work/timer pointer.\n\nD) checkLocation (catch raw\
+  \ dereferences)\n- Goal: If there is a direct memory read/write of a priv-derived\
+  \ region after free_netdev(), report.\n- Implementation:\n  - For Loc.getAsRegion():\n\
+  \    - R = Loc.getAsRegion(); if null, return.\n    - Base = getBaseRegionOrSelf(R);\
+  \ Base = resolveAlias(State, Base).\n    - If PrivDev = State->get<Priv2DevMap>(Base),\
+  \ then DevBase = resolveAlias(State, PrivDev).\n    - If DevBase and devIsFreed(State,\
+  \ DevBase):\n      - Emit bug. Message: \"Use of netdev priv after free_netdev\"\
+  .\n      - Anchor at current Stmt.\n\n3) Reporting\n\n- Use generateNonFatalErrorNode(State)\
+  \ and create PathSensitiveBugReport.\n- Bug type: \"Use-after-free (net_device private)\"\
+  \n- Short messages:\n  - \"Use of netdev priv after free_netdev\"\n  - \"netdev_priv(dev)\
+  \ after free_netdev\"\n\n4) Notes and simplifications\n\n- Key normalization: Always\
+  \ convert any region to its base region and resolve aliases in every step (dev and\
+  \ priv).\n- Priv mapping creation is only via netdev_priv() post-call.\n- dev free\
+  \ marking is only via free_netdev() post-call.\n- Uses are flagged either:\n  -\
+  \ At pre-call on known deref APIs (using functionKnownToDeref).\n  - At location\
+  \ deref (loads/stores).\n  - Immediately at netdev_priv() call if the dev is already\
+  \ freed.\n\n- This plan intentionally focuses on the simplest reliable path-sensitive\
+  \ signals for the target pattern and avoids complex interprocedural modeling."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\nREGISTER_MAP_WITH_PROGRAMSTATE(Priv2DevMap,\
+  \ const MemRegion*, const MemRegion*)\nREGISTER_SET_WITH_PROGRAMSTATE(FreedDevs,\
+  \ const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const MemRegion*,\
+  \ const MemRegion*)\n\nnamespace {\n/* The checker callbacks are to be decided.\
+  \ */\nclass SAGenTestChecker : public Checker<check::PostCall,\n               \
+  \                         check::PreCall,\n                                    \
+  \    check::Location,\n                                        check::Bind> {\n\
+  \   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Use-after-free (net_device private)\", \"Memory error\"\
+  )) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n    \
+  \  void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const;\n\
+  \      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \n   private:\n\n      // Helpers\n      static bool callHasName(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name);\n      static const MemRegion *getBaseRegionOrSelf(const\
+  \ MemRegion *R);\n      static const MemRegion *resolveAlias(ProgramStateRef State,\
+  \ const MemRegion *R);\n      static const MemRegion *exprToBaseRegion(const Expr\
+  \ *E, CheckerContext &C);\n      static const MemRegion *privBaseToDevBase(ProgramStateRef\
+  \ State, const MemRegion *PrivBase);\n      static bool devIsFreed(ProgramStateRef\
+  \ State, const MemRegion *DevBase);\n\n      static bool knownWorkOrTimerDeref(const\
+  \ CallEvent &Call, CheckerContext &C,\n                                        llvm::SmallVectorImpl<unsigned>\
+  \ &OutIdx);\n\n      void reportUAFAtCall(const CallEvent &Call, CheckerContext\
+  \ &C, StringRef Msg) const;\n      void reportUAFAtStmt(const Stmt *S, CheckerContext\
+  \ &C, StringRef Msg) const;\n};\n\nbool SAGenTestChecker::callHasName(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Name) {\n  const Expr *OriginExpr = Call.getOriginExpr();\n\
+  \  if (!OriginExpr)\n    return false;\n  return ExprHasName(OriginExpr, Name, C);\n\
+  }\n\nconst MemRegion *SAGenTestChecker::getBaseRegionOrSelf(const MemRegion *R)\
+  \ {\n  if (!R) return nullptr;\n  const MemRegion *Prev = nullptr;\n  const MemRegion\
+  \ *Cur = R;\n  while (Cur && Cur != Prev) {\n    Prev = Cur;\n    Cur = Cur->getBaseRegion();\n\
+  \  }\n  return Cur;\n}\n\nconst MemRegion *SAGenTestChecker::resolveAlias(ProgramStateRef\
+  \ State, const MemRegion *R) {\n  if (!R) return nullptr;\n  llvm::SmallPtrSet<const\
+  \ MemRegion*, 8> Visited;\n  const MemRegion *Cur = R;\n  while (Cur) {\n    if\
+  \ (!Visited.insert(Cur).second)\n      break; // cycle\n    const MemRegion *const\
+  \ *NextPtr = State->get<PtrAliasMap>(Cur);\n    const MemRegion *Next = NextPtr\
+  \ ? *NextPtr : nullptr;\n    if (!Next)\n      break;\n    Cur = Next;\n  }\n  return\
+  \ Cur ? Cur : R;\n}\n\nconst MemRegion *SAGenTestChecker::exprToBaseRegion(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return nullptr;\n  const MemRegion *MR\
+  \ = getMemRegionFromExpr(E, C);\n  if (!MR) return nullptr;\n  MR = getBaseRegionOrSelf(MR);\n\
+  \  ProgramStateRef State = C.getState();\n  MR = resolveAlias(State, MR);\n  return\
+  \ MR;\n}\n\nconst MemRegion *SAGenTestChecker::privBaseToDevBase(ProgramStateRef\
+  \ State, const MemRegion *PrivBase) {\n  if (!PrivBase) return nullptr;\n  const\
+  \ MemRegion *const *MappedPtr = State->get<Priv2DevMap>(PrivBase);\n  const MemRegion\
+  \ *Mapped = MappedPtr ? *MappedPtr : nullptr;\n  if (!Mapped) return nullptr;\n\
+  \  return resolveAlias(State, Mapped);\n}\n\nbool SAGenTestChecker::devIsFreed(ProgramStateRef\
+  \ State, const MemRegion *DevBase) {\n  if (!DevBase) return false;\n  return State->contains<FreedDevs>(DevBase);\n\
+  }\n\nbool SAGenTestChecker::knownWorkOrTimerDeref(const CallEvent &Call, CheckerContext\
+  \ &C,\n                                             llvm::SmallVectorImpl<unsigned>\
+  \ &OutIdx) {\n  // Functions that dereference their argument(s) which typically\
+  \ point\n  // to work/timer structures stored in netdev private data.\n  // We target\
+  \ index 0 for these common kernel helpers.\n  static const char *Names[] = {\n \
+  \   \"cancel_work_sync\",\n    \"cancel_delayed_work_sync\",\n    \"flush_work\"\
+  ,\n    \"flush_delayed_work\",\n    \"del_timer_sync\",\n    \"del_timer\",\n  };\n\
+  \  const Expr *OriginExpr = Call.getOriginExpr();\n  if (!OriginExpr)\n    return\
+  \ false;\n\n  bool Found = false;\n  for (const char *N : Names) {\n    if (ExprHasName(OriginExpr,\
+  \ N, C)) {\n      OutIdx.push_back(0);\n      Found = true;\n      break;\n    }\n\
+  \  }\n  return Found;\n}\n\nvoid SAGenTestChecker::reportUAFAtCall(const CallEvent\
+  \ &Call, CheckerContext &C, StringRef Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg,\
+  \ N);\n  R->addRange(Call.getSourceRange());\n  C.emitReport(std::move(R));\n}\n\
+  \nvoid SAGenTestChecker::reportUAFAtStmt(const Stmt *S, CheckerContext &C, StringRef\
+  \ Msg) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n  if (!N) return;\n\
+  \  auto R = std::make_unique<PathSensitiveBugReport>(*BT, Msg, N);\n  if (S)\n \
+  \   R->addRange(S->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\nvoid\
+  \ SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  ProgramStateRef State = C.getState();\n\n  // Record dev free when free_netdev(dev)\
+  \ is called.\n  if (callHasName(Call, C, \"free_netdev\")) {\n    if (Call.getNumArgs()\
+  \ >= 1) {\n      const Expr *DevE = Call.getArgExpr(0);\n      const MemRegion *DevBase\
+  \ = exprToBaseRegion(DevE, C);\n      if (DevBase) {\n        DevBase = getBaseRegionOrSelf(DevBase);\n\
+  \        DevBase = resolveAlias(State, DevBase);\n        State = State->add<FreedDevs>(DevBase);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  // Learn\
+  \ priv->dev mapping for netdev_priv(dev).\n  if (callHasName(Call, C, \"netdev_priv\"\
+  )) {\n    // Get dev base\n    const Expr *DevE = (Call.getNumArgs() >= 1) ? Call.getArgExpr(0)\
+  \ : nullptr;\n    const MemRegion *DevBase = exprToBaseRegion(DevE, C);\n\n    //\
+  \ Get return region (priv)\n    const Expr *Origin = Call.getOriginExpr();\n   \
+  \ const MemRegion *RetReg = Origin ? getMemRegionFromExpr(Origin, C) : nullptr;\n\
+  \    if (!RetReg) {\n      // Fallback to using return value region if available\n\
+  \      RetReg = Call.getReturnValue().getAsRegion();\n    }\n    if (RetReg)\n \
+  \     RetReg = getBaseRegionOrSelf(RetReg);\n    if (RetReg)\n      RetReg = resolveAlias(State,\
+  \ RetReg);\n\n    // If dev already freed, flag \"netdev_priv(dev) after free_netdev\"\
+  .\n    if (DevBase && devIsFreed(State, DevBase)) {\n      reportUAFAtCall(Call,\
+  \ C, \"netdev_priv(dev) after free_netdev\");\n      return;\n    }\n\n    // Record\
+  \ mapping priv -> dev\n    if (RetReg && DevBase) {\n      State = State->set<Priv2DevMap>(RetReg,\
+  \ DevBase);\n      C.addTransition(State);\n    }\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Detect uses of priv-derived pointers after free_netdev() via known-deref\
+  \ functions.\n  llvm::SmallVector<unsigned, 4> DerefParams;\n  if (!knownWorkOrTimerDeref(Call,\
+  \ C, DerefParams))\n    return;\n\n  for (unsigned Idx : DerefParams) {\n    if\
+  \ (Idx >= Call.getNumArgs())\n      continue;\n\n    const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \    const MemRegion *ArgBase = exprToBaseRegion(ArgE, C);\n    if (!ArgBase)\n\
+  \      continue;\n\n    const MemRegion *DevBase = privBaseToDevBase(State, ArgBase);\n\
+  \    if (!DevBase)\n      continue;\n\n    if (devIsFreed(State, DevBase)) {\n \
+  \     reportUAFAtCall(Call, C, \"Use of netdev priv after free_netdev\");\n    \
+  \  return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkLocation(SVal Loc, bool\
+  \ IsLoad, const Stmt *S, CheckerContext &C) const {\n  // Catch direct dereferences\
+  \ of priv-derived memory after free_netdev().\n  const MemRegion *R = Loc.getAsRegion();\n\
+  \  if (!R)\n    return;\n\n  ProgramStateRef State = C.getState();\n  const MemRegion\
+  \ *Base = getBaseRegionOrSelf(R);\n  Base = resolveAlias(State, Base);\n\n  const\
+  \ MemRegion *DevBase = privBaseToDevBase(State, Base);\n  if (!DevBase)\n    return;\n\
+  \n  if (devIsFreed(State, DevBase)) {\n    reportUAFAtStmt(S, C, \"Use of netdev\
+  \ priv after free_netdev\");\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc,\
+  \ SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State =\
+  \ C.getState();\n\n  const MemRegion *LHS = Loc.getAsRegion();\n  if (!LHS)\n  \
+  \  return;\n  LHS = getBaseRegionOrSelf(LHS);\n  LHS = resolveAlias(State, LHS);\n\
+  \  if (!LHS)\n    return;\n\n  const MemRegion *RHS = Val.getAsRegion();\n  if (!RHS)\n\
+  \    return;\n  RHS = getBaseRegionOrSelf(RHS);\n  RHS = resolveAlias(State, RHS);\n\
+  \  if (!RHS)\n    return;\n\n  // Record alias both directions to simplify lookups.\n\
+  \  State = State->set<PtrAliasMap>(LHS, RHS);\n  State = State->set<PtrAliasMap>(RHS,\
+  \ LHS);\n\n  // Propagate priv->dev mapping across alias\n  if (const MemRegion\
+  \ *const *DevBase = State->get<Priv2DevMap>(RHS)) {\n    State = State->set<Priv2DevMap>(LHS,\
+  \ *DevBase);\n  }\n  if (const MemRegion *const *DevBase2 = State->get<Priv2DevMap>(LHS))\
+  \ {\n    State = State->set<Priv2DevMap>(RHS, *DevBase2);\n  }\n\n  C.addTransition(State);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects use of netdev private data after free_netdev (e.g., cancel_work_sync\
+  \ on priv fields)\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

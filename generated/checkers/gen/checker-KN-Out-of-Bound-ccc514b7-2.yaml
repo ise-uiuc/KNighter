@@ -1,0 +1,456 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ccc514b7e7acbd301219cbaec0fc0bfe5741acee
+commit_type: Out-of-Bound
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/ExprCXX.h\"\n#include \"clang/AST/Type.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/DenseMap.h\"\n#include \"\
+  llvm/ADT/SmallVector.h\"\n#include <optional>\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// No custom program state is needed.\n\nnamespace\
+  \ {\n\nclass SAGenTestChecker : public Checker< check::ASTCodeBody > {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Mismatched loop bound and array size\", \"Array Bounds\")) {}\n\
+  \n      void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR)\
+  \ const;\n\n   private:\n      struct ArrayUseInfo {\n        const ValueDecl *VD\
+  \ = nullptr;               // VarDecl or FieldDecl\n        uint64_t Size = 0; \
+  \                          // Constant array size\n        const ArraySubscriptExpr\
+  \ *ExampleUse = nullptr; // Example use site for diagnostics\n      };\n\n     \
+  \ static bool evalToUInt64(const Expr *E, ASTContext &ACtx, uint64_t &Out);\n  \
+  \    static bool isSimpleIncreasingIncrement(const Stmt *Inc, const VarDecl *IVar,\
+  \ ASTContext &ACtx);\n      static bool isZeroInitOfVar(const Stmt *InitS, const\
+  \ VarDecl *IVar, ASTContext &ACtx);\n      static bool isVarRefTo(const Expr *E,\
+  \ const VarDecl *VD);\n      static bool getArrayDeclAndSizeFromBase(const Expr\
+  \ *Base, uint64_t &Size, const ValueDecl *&OutDecl);\n\n      void processForStmt(const\
+  \ ForStmt *FS, ASTContext &ACtx, BugReporter &BR) const;\n      void collectArrayUsesIndexedBy(const\
+  \ Stmt *Body, const VarDecl *IVar, ASTContext &ACtx,\n                         \
+  \            llvm::DenseMap<const ValueDecl*, ArrayUseInfo> &Out) const;\n     \
+  \ bool hasGuardForBound(const Stmt *Body, const VarDecl *IVar, uint64_t SmallSize,\
+  \ ASTContext &ACtx) const;\n      static bool condHasIVarAgainstConst(const Expr\
+  \ *CondE, const VarDecl *IVar, uint64_t ConstVal, ASTContext &ACtx);\n};\n\nbool\
+  \ SAGenTestChecker::evalToUInt64(const Expr *E, ASTContext &ACtx, uint64_t &Out)\
+  \ {\n  if (!E) return false;\n  Expr::EvalResult R;\n  if (E->EvaluateAsInt(R, ACtx))\
+  \ {\n    const llvm::APSInt &V = R.Val.getInt();\n    Out = V.getZExtValue();\n\
+  \    return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isVarRefTo(const\
+  \ Expr *E, const VarDecl *VD) {\n  if (!E || !VD) return false;\n  E = E->IgnoreParenImpCasts();\n\
+  \  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    return DRE->getDecl()\
+  \ == VD;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isZeroInitOfVar(const\
+  \ Stmt *InitS, const VarDecl *IVar, ASTContext &ACtx) {\n  if (!InitS || !IVar)\
+  \ return false;\n\n  // Case: declaration with initializer, e.g. \"int i = 0;\"\n\
+  \  if (const auto *DS = dyn_cast<DeclStmt>(InitS)) {\n    for (const Decl *Di :\
+  \ DS->decls()) {\n      if (const auto *VD = dyn_cast<VarDecl>(Di)) {\n        if\
+  \ (VD == IVar) {\n          const Expr *Init = VD->getInit();\n          uint64_t\
+  \ Val;\n          if (Init && evalToUInt64(Init, ACtx, Val) && Val == 0)\n     \
+  \       return true;\n        }\n      }\n    }\n  }\n\n  // Case: assignment, e.g.\
+  \ \"i = 0;\"\n  if (const auto *BO = dyn_cast<BinaryOperator>(InitS)) {\n    if\
+  \ (BO->getOpcode() == BO_Assign && isVarRefTo(BO->getLHS(), IVar)) {\n      uint64_t\
+  \ Val;\n      if (evalToUInt64(BO->getRHS(), ACtx, Val) && Val == 0)\n        return\
+  \ true;\n    }\n  }\n\n  return false;\n}\n\nbool SAGenTestChecker::isSimpleIncreasingIncrement(const\
+  \ Stmt *Inc, const VarDecl *IVar, ASTContext &ACtx) {\n  if (!Inc || !IVar) return\
+  \ false;\n\n  // i++, ++i\n  if (const auto *UO = dyn_cast<UnaryOperator>(Inc))\
+  \ {\n    if ((UO->getOpcode() == UO_PostInc || UO->getOpcode() == UO_PreInc) &&\n\
+  \        isVarRefTo(UO->getSubExpr(), IVar))\n      return true;\n  }\n\n  // i\
+  \ += 1;\n  if (const auto *CAO = dyn_cast<CompoundAssignOperator>(Inc)) {\n    if\
+  \ (CAO->getOpcode() == BO_AddAssign && isVarRefTo(CAO->getLHS(), IVar)) {\n    \
+  \  uint64_t Val;\n      if (evalToUInt64(CAO->getRHS(), ACtx, Val) && Val == 1)\n\
+  \        return true;\n    }\n  }\n\n  // i = i + 1; or i = 1 + i;\n  if (const\
+  \ auto *BO = dyn_cast<BinaryOperator>(Inc)) {\n    if (BO->getOpcode() == BO_Assign\
+  \ && isVarRefTo(BO->getLHS(), IVar)) {\n      const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \      if (const auto *Add = dyn_cast<BinaryOperator>(RHS)) {\n        if (Add->getOpcode()\
+  \ == BO_Add) {\n          // i + 1\n          if (isVarRefTo(Add->getLHS(), IVar))\
+  \ {\n            uint64_t Val;\n            if (evalToUInt64(Add->getRHS(), ACtx,\
+  \ Val) && Val == 1)\n              return true;\n          }\n          // 1 + i\n\
+  \          if (isVarRefTo(Add->getRHS(), IVar)) {\n            uint64_t Val;\n \
+  \           if (evalToUInt64(Add->getLHS(), ACtx, Val) && Val == 1)\n          \
+  \    return true;\n          }\n        }\n      }\n    }\n  }\n\n  return false;\n\
+  }\n\nbool SAGenTestChecker::getArrayDeclAndSizeFromBase(const Expr *Base, uint64_t\
+  \ &Size, const ValueDecl *&OutDecl) {\n  if (!Base) return false;\n  Base = Base->IgnoreParenImpCasts();\n\
+  \n  if (const auto *DRE = dyn_cast<DeclRefExpr>(Base)) {\n    if (const auto *VD\
+  \ = dyn_cast<VarDecl>(DRE->getDecl())) {\n      QualType QT = VD->getType();\n \
+  \     if (const auto *CAT = dyn_cast<ConstantArrayType>(QT.getTypePtr())) {\n  \
+  \      Size = CAT->getSize().getLimitedValue();\n        OutDecl = VD;\n       \
+  \ return true;\n      }\n    }\n  }\n\n  if (const auto *ME = dyn_cast<MemberExpr>(Base))\
+  \ {\n    if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {\n    \
+  \  QualType QT = FD->getType();\n      if (const auto *CAT = dyn_cast<ConstantArrayType>(QT.getTypePtr()))\
+  \ {\n        Size = CAT->getSize().getLimitedValue();\n        OutDecl = FD;\n \
+  \       return true;\n      }\n    }\n  }\n\n  return false;\n}\n\nvoid SAGenTestChecker::collectArrayUsesIndexedBy(const\
+  \ Stmt *Body, const VarDecl *IVar, ASTContext &ACtx,\n                         \
+  \                        llvm::DenseMap<const ValueDecl*, ArrayUseInfo> &Out) const\
+  \ {\n  if (!Body || !IVar) return;\n\n  // Recursive walk\n  for (const Stmt *Child\
+  \ : Body->children()) {\n    if (!Child) continue;\n\n    if (const auto *ASE =\
+  \ dyn_cast<ArraySubscriptExpr>(Child)) {\n      const Expr *Idx = ASE->getIdx()->IgnoreParenImpCasts();\n\
+  \      if (isVarRefTo(Idx, IVar)) {\n        uint64_t Sz = 0;\n        const ValueDecl\
+  \ *V = nullptr;\n        const Expr *Base = ASE->getBase();\n        if (getArrayDeclAndSizeFromBase(Base,\
+  \ Sz, V)) {\n          auto It = Out.find(V);\n          if (It == Out.end()) {\n\
+  \            ArrayUseInfo AU;\n            AU.VD = V;\n            AU.Size = Sz;\n\
+  \            AU.ExampleUse = ASE;\n            Out.insert({V, AU});\n          }\
+  \ else {\n            // Sizes should match for the same decl; keep the example\
+  \ if not set.\n            if (!It->second.ExampleUse)\n              It->second.ExampleUse\
+  \ = ASE;\n          }\n        }\n      }\n    }\n\n    // Recurse\n    collectArrayUsesIndexedBy(Child,\
+  \ IVar, ACtx, Out);\n  }\n}\n\nbool SAGenTestChecker::condHasIVarAgainstConst(const\
+  \ Expr *CondE, const VarDecl *IVar, uint64_t ConstVal, ASTContext &ACtx) {\n  if\
+  \ (!CondE || !IVar) return false;\n\n  CondE = CondE->IgnoreParenImpCasts();\n \
+  \ if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {\n    // i >= ConstVal\
+  \ OR i == ConstVal\n    if (isVarRefTo(BO->getLHS(), IVar)) {\n      uint64_t Val;\n\
+  \      if (evalToUInt64(BO->getRHS(), ACtx, Val) && Val == ConstVal) {\n       \
+  \ if (BO->getOpcode() == BO_GE || BO->getOpcode() == BO_EQ)\n          return true;\n\
+  \      }\n    }\n    // ConstVal <= i (commuted form of i >= ConstVal)\n    if (isVarRefTo(BO->getRHS(),\
+  \ IVar)) {\n      uint64_t Val;\n      if (evalToUInt64(BO->getLHS(), ACtx, Val)\
+  \ && Val == ConstVal) {\n        if (BO->getOpcode() == BO_LE || BO->getOpcode()\
+  \ == BO_EQ)\n          return true;\n      }\n    }\n  }\n  return false;\n}\n\n\
+  bool SAGenTestChecker::hasGuardForBound(const Stmt *Body, const VarDecl *IVar, uint64_t\
+  \ SmallSize, ASTContext &ACtx) const {\n  if (!Body) return false;\n\n  for (const\
+  \ Stmt *Child : Body->children()) {\n    if (!Child) continue;\n\n    if (const\
+  \ auto *IS = dyn_cast<IfStmt>(Child)) {\n      const Expr *Cond = IS->getCond();\n\
+  \      if (condHasIVarAgainstConst(Cond, IVar, SmallSize, ACtx)) {\n        // Check\
+  \ then-branch for break or return\n        const Stmt *Then = IS->getThen();\n \
+  \       if (!Then) continue;\n        if (findSpecificTypeInChildren<BreakStmt>(Then)\
+  \ ||\n            findSpecificTypeInChildren<ReturnStmt>(Then)) {\n          return\
+  \ true;\n        }\n      }\n      // Also check nested statements within If\n \
+  \     if (hasGuardForBound(IS->getThen(), IVar, SmallSize, ACtx))\n        return\
+  \ true;\n      if (hasGuardForBound(IS->getElse(), IVar, SmallSize, ACtx))\n   \
+  \     return true;\n    } else {\n      // Recurse\n      if (hasGuardForBound(Child,\
+  \ IVar, SmallSize, ACtx))\n        return true;\n    }\n  }\n\n  return false;\n\
+  }\n\nvoid SAGenTestChecker::processForStmt(const ForStmt *FS, ASTContext &ACtx,\
+  \ BugReporter &BR) const {\n  if (!FS) return;\n\n  // Extract loop condition: expect\
+  \ i < UB or i <= UB\n  const Expr *Cond = FS->getCond();\n  if (!Cond) return;\n\
+  \n  const auto *BO = dyn_cast<BinaryOperator>(Cond->IgnoreParenImpCasts());\n  if\
+  \ (!BO) return;\n\n  BinaryOperator::Opcode Op = BO->getOpcode();\n  if (Op != BO_LT\
+  \ && Op != BO_LE)\n    return;\n\n  const auto *LHSRef = dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreParenImpCasts());\n\
+  \  if (!LHSRef) return;\n  const auto *IVar = dyn_cast<VarDecl>(LHSRef->getDecl());\n\
+  \  if (!IVar) return;\n\n  uint64_t UB = 0;\n  if (!evalToUInt64(BO->getRHS(), ACtx,\
+  \ UB))\n    return;\n\n  // Adjust for <= bound: effective iteration count\n  if\
+  \ (Op == BO_LE)\n    UB = UB + 1;\n\n  // Check increment is a simple increasing\
+  \ increment\n  if (!isSimpleIncreasingIncrement(FS->getInc(), IVar, ACtx))\n   \
+  \ return;\n\n  // Check initializer sets i = 0\n  if (!isZeroInitOfVar(FS->getInit(),\
+  \ IVar, ACtx))\n    return;\n\n  // Collect array uses indexed by i\n  llvm::DenseMap<const\
+  \ ValueDecl*, ArrayUseInfo> Uses;\n  collectArrayUsesIndexedBy(FS->getBody(), IVar,\
+  \ ACtx, Uses);\n  if (Uses.size() < 2)\n    return; // Need at least two arrays\
+  \ A[i], B[i]\n\n  // Find any array with size == UB\n  bool HasBoundArray = false;\n\
+  \  for (const auto &It : Uses) {\n    if (It.second.Size == UB) {\n      HasBoundArray\
+  \ = true;\n      break;\n    }\n  }\n  if (!HasBoundArray)\n    return;\n\n  //\
+  \ Find a smaller array with size < UB\n  const ArrayUseInfo *Small = nullptr;\n\
+  \  for (const auto &It : Uses) {\n    if (It.second.Size < UB) {\n      Small =\
+  \ &It.second;\n      break;\n    }\n  }\n  if (!Small)\n    return;\n\n  // Suppress\
+  \ if there is a guard like: if (i >= SmallSize) break/return;\n  if (hasGuardForBound(FS->getBody(),\
+  \ IVar, Small->Size, ACtx))\n    return;\n\n  // Report bug at the smaller array\
+  \ access site (if available), otherwise at the for condition\n  SourceLocation Loc;\n\
+  \  if (Small->ExampleUse)\n    Loc = Small->ExampleUse->getExprLoc();\n  else\n\
+  \    Loc = FS->getLParenLoc();\n\n  std::string Msg = \"Loop bound uses size of\
+  \ one array but also indexes a smaller array with the same index; possible out-of-bounds\"\
+  ;\n  if (const auto *ND = dyn_cast<NamedDecl>(Small->VD)) {\n    llvm::SmallString<128>\
+  \ Buf;\n    llvm::raw_svector_ostream OS(Buf);\n    OS << \" (bound=\" << UB <<\
+  \ \", array '\" << ND->getName() << \"' size=\" << Small->Size << \")\";\n    Msg\
+  \ += OS.str().str();\n  } else {\n    llvm::SmallString<64> Buf;\n    llvm::raw_svector_ostream\
+  \ OS(Buf);\n    OS << \" (bound=\" << UB << \", smaller array size=\" << Small->Size\
+  \ << \")\";\n    Msg += OS.str().str();\n  }\n\n  auto R = std::make_unique<BasicBugReport>(*BT,\
+  \ Msg, PathDiagnosticLocation::createBegin(Loc, BR.getSourceManager()));\n  if (Small->ExampleUse)\n\
+  \    R->addRange(Small->ExampleUse->getSourceRange());\n  R->setDeclWithIssue(FS->getBeginLoc());\n\
+  \  BR.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  if (!D) return;\n \
+  \ const Stmt *Body = D->getBody();\n  if (!Body) return;\n\n  ASTContext &ACtx =\
+  \ Mgr.getASTContext();\n\n  // Simple recursive traversal to find ForStmt\n  llvm::SmallVector<const\
+  \ Stmt*, 16> Stack;\n  Stack.push_back(Body);\n  while (!Stack.empty()) {\n    const\
+  \ Stmt *S = Stack.pop_back_val();\n    if (!S) continue;\n\n    if (const auto *FS\
+  \ = dyn_cast<ForStmt>(S)) {\n      processForStmt(FS, ACtx, BR);\n    }\n\n    for\
+  \ (const Stmt *Child : S->children()) {\n      if (Child)\n        Stack.push_back(Child);\n\
+  \    }\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects loops bounded by one array's size while indexing a smaller array\
+  \ with the same index\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ndrm/amd/display: Fix possible buffer overflow in 'find_dcfclk_for_voltage()'\n\
+  \nwhen 'find_dcfclk_for_voltage()' function is looping over\nVG_NUM_SOC_VOLTAGE_LEVELS\
+  \ (which is 8), but the size of the DcfClocks\narray is VG_NUM_DCFCLK_DPM_LEVELS\
+  \ (which is 7).\n\nWhen the loop variable i reaches 7, the function tries to access\n\
+  clock_table->DcfClocks[7]. However, since the size of the DcfClocks\narray is 7,\
+  \ the valid indices are 0 to 6. Index 7 is beyond the size of\nthe array, leading\
+  \ to a buffer overflow.\n\nReported by smatch & thus fixing the below:\ndrivers/gpu/drm/amd/amdgpu/../display/dc/clk_mgr/dcn301/vg_clk_mgr.c:550\
+  \ find_dcfclk_for_voltage() error: buffer overflow 'clock_table->DcfClocks' 7 <=\
+  \ 7\n\nFixes: 3a83e4e64bb1 (\"drm/amd/display: Add dcn3.01 support to DC (v2)\"\
+  )\nCc: Roman Li <Roman.Li@amd.com>\nCc: Rodrigo Siqueira <Rodrigo.Siqueira@amd.com>\n\
+  Cc: Aurabindo Pillai <aurabindo.pillai@amd.com>\nSigned-off-by: Srinivasan Shanmugam\
+  \ <srinivasan.shanmugam@amd.com>\nReviewed-by: Roman Li <roman.li@amd.com>\nSigned-off-by:\
+  \ Alex Deucher <alexander.deucher@amd.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ find_dcfclk_for_voltage in drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/vg_clk_mgr.c\n\
+  static unsigned int find_dcfclk_for_voltage(const struct vg_dpm_clocks *clock_table,\n\
+  \t\tunsigned int voltage)\n{\n\tint i;\n\n\tfor (i = 0; i < VG_NUM_SOC_VOLTAGE_LEVELS;\
+  \ i++) {\n\t\tif (clock_table->SocVoltage[i] == voltage)\n\t\t\treturn clock_table->DcfClocks[i];\n\
+  \t}\n\n\tASSERT(0);\n\treturn 0;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git\
+  \ a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/vg_clk_mgr.c b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/vg_clk_mgr.c\n\
+  index a5489fe6875f..aa9fd1dc550a 100644\n--- a/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/vg_clk_mgr.c\n\
+  +++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/vg_clk_mgr.c\n@@ -546,6 +546,8\
+  \ @@ static unsigned int find_dcfclk_for_voltage(const struct vg_dpm_clocks *clock_ta\n\
+  \ \tint i;\n \n \tfor (i = 0; i < VG_NUM_SOC_VOLTAGE_LEVELS; i++) {\n+\t\tif (i\
+  \ >= VG_NUM_DCFCLK_DPM_LEVELS)\n+\t\t\tbreak;\n \t\tif (clock_table->SocVoltage[i]\
+  \ == voltage)\n \t\t\treturn clock_table->DcfClocks[i];\n \t}\n```\n"
+pattern: "## Bug Pattern\n\nIterating over one array using its size as the loop bound\
+  \ while indexing a second, smaller array with the same loop index, leading to out-of-bounds\
+  \ access of the smaller array.\n\nExample pattern:\nfor (i = 0; i < SIZE_A; i++)\
+  \ {        // SIZE_A > SIZE_B\n    if (A[i] == condition)\n        return B[i];\
+  \                   // B has only SIZE_B elements\n}\n\nRoot cause: assuming two\
+  \ \u201Cparallel\u201D arrays have identical lengths and using a single bound (SIZE_A)\
+  \ for both, instead of limiting iteration to min(SIZE_A, SIZE_B) or guarding accesses\
+  \ to the smaller array."
+plan: "1) Program state\n- No custom program state is necessary. This is an AST-level\
+  \ structural bug: a loop bound is derived from one array\u2019s size but another,\
+  \ smaller array is indexed with the same induction variable. We can detect it without\
+  \ tracking symbolic execution.\n\n2) Callbacks\n- Use only checkASTCodeBody. We\u2019\
+  ll perform a focused AST walk over loop statements in each function body and check\
+  \ their conditions and body for the target pattern.\n\n3) Detailed plan for checkASTCodeBody\n\
+  - Overview:\n  - Traverse the body of the declaration D to find ForStmt (and optionally\
+  \ WhileStmt/DoStmt if you want to extend later).\n  - For each ForStmt FS, extract:\n\
+  \    - The induction variable VarDecl* (i).\n    - The loop upper bound UB expression\
+  \ and iteration direction (we\u2019ll support i < UB and i <= UB).\n  - Within the\
+  \ loop body, collect all array subscript expressions E[i] where the index expression\
+  \ refers to this induction variable i.\n  - For each such array, determine its compile-time\
+  \ constant length if possible.\n  - If the loop upper bound equals the size of one\
+  \ accessed array (call it A), but there exists another accessed array (B) with a\
+  \ smaller compile-time size, and both are indexed by i, report a warning on the\
+  \ use of B[i].\n\n- Extracting loop shape (ForStmt):\n  - Condition:\n    - Expect\
+  \ a BinaryOperator (BO) with operator < or <=.\n    - LHS must be a DeclRefExpr\
+  \ to the same loop variable i (VarDecl*).\n    - RHS is UB expression.\n    - Evaluate\
+  \ RHS to an integer with EvaluateExprToInt. If <, UBval = RHS; if <=, UBval = RHS\
+  \ + 1.\n    - If evaluation fails, skip this loop to avoid false positives.\n  -\
+  \ Induction variable:\n    - From condition\u2019s LHS DeclRefExpr get VarDecl*\
+  \ IVar.\n  - Increment:\n    - Prefer i++/++i/i+=1/i=i+1. If increment does not\
+  \ reference the same IVar or is not a positive step, skip to avoid complex cases.\
+  \ This narrowing is fine for the target pattern.\n\n- Collecting array subscript\
+  \ uses indexed by i:\n  - Recursively walk the loop body Stmt.\n  - For each ArraySubscriptExpr\
+  \ ASE:\n    - Check index expression: IgnoreParenImpCasts, it must be a DeclRefExpr\
+  \ to IVar.\n    - Identify the array base (IgnoreParenImpCasts on ASE->getBase()):\n\
+  \      - If it is a MemberExpr to a FieldDecl FD, get FD->getType(); if ConstantArrayType,\
+  \ store:\n        - A key identifying the array (FD pointer is enough).\n      \
+  \  - Its constant length S = ConstantArrayType->getSize().\n        - An example\
+  \ source location (the ASE) for later reporting.\n      - Else if it is a DeclRefExpr\
+  \ to a VarDecl VD, and VD->getType() is ConstantArrayType, similarly record VD as\
+  \ the key with its size.\n      - Otherwise (pointer, unknown, VLA, etc.), skip\
+  \ this array access since we can\u2019t reliably get a size.\n  - Deduplicate arrays\
+  \ by key (FieldDecl* or VarDecl*). Keep the smallest S we see for each key (they\
+  \ should be equal anyway).\n\n- Decide if this loop is buggy:\n  - We now have:\n\
+  \    - UBval: the loop\u2019s upper bound (number of iterations if starting from\
+  \ 0 and using < or <=).\n    - A set of arrays {Ai} with sizes Si that are indexed\
+  \ by i.\n  - Heuristic to minimize false positives and match the target pattern:\n\
+  \    - Check if there exists an array A with size exactly equal to UBval (Si ==\
+  \ UBval). This is the \u201Cbig\u201D or \u201Cbound\u201D array that likely determines\
+  \ the loop bound.\n    - Check if there exists another array B with a strictly smaller\
+  \ size (Sj < UBval).\n    - If both exist, flag a bug.\n  - Optional guard suppression\
+  \ (to avoid flagging already-fixed code):\n    - Scan the loop body for a guard\
+  \ that prevents out-of-bounds on the smaller array:\n      - Find an IfStmt whose\
+  \ condition compares i against Sj (operators >=, >, or == are typical), and whose\
+  \ then-branch contains a BreakStmt or ReturnStmt.\n      - A simple approach:\n\
+  \        - For each Sj of a \u201Csmall\u201D array candidate, look for BinaryOperator\
+  \ on the If condition that references IVar and a constant equal to Sj, with operator\
+  \ >=, >, or == (consider commuted forms too).\n        - Use findSpecificTypeInChildren<BreakStmt>(Then)\
+  \ or findSpecificTypeInChildren<ReturnStmt>(Then) to check for early exit.\n   \
+  \   - If such a guard exists, suppress the warning for that pair.\n    - This is\
+  \ a best-effort, not path-sensitive, but it suppresses the common fixed pattern\
+  \ \u201Cif (i >= SIZE_B) break;\u201D.\n\n- Reporting:\n  - Create a single BugType\
+  \ for the checker, e.g., \u201CMismatched loop bound and array size\u201D.\n  -\
+  \ For the diagnostic location, use the ArraySubscriptExpr of the smaller array (B[i])\
+  \ if available; otherwise the ForStmt condition.\n  - Message should be short and\
+  \ clear:\n    - \u201CLoop bound uses size of one array but also indexes a smaller\
+  \ array with the same index; possible out-of-bounds.\u201D\n    - Optionally include\
+  \ array names (FieldDecl/VarDecl getNameAsString()) and sizes when known, e.g.,\
+  \ \u201Cbound=8, array \u2018DcfClocks\u2019 size=7\u201D.\n  - Use std::make_unique<BasicBugReport>\
+  \ and emit once per loop (optionally per smaller array if multiple are present).\n\
+  \n4) Helper logic details\n- Getting constant array size:\n  - For MemberExpr base\
+  \ ending at FieldDecl FD:\n    - QualType T = FD->getType();\n    - If const ConstantArrayType*\
+  \ CAT = dyn_cast<ConstantArrayType>(T.getTypePtr()), size = CAT->getSize().\n  -\
+  \ For DeclRefExpr to VarDecl VD:\n    - QualType T = VD->getType();\n    - If ConstantArrayType,\
+  \ size = getSize().\n  - Note: getArraySizeFromExpr utility works for DeclRefExpr\
+  \ but not MemberExpr; implement a small helper that handles MemberExpr as above\
+  \ and fallback to getArraySizeFromExpr(E) for DeclRefExpr.\n\n- Matching the index\
+  \ variable:\n  - For ArraySubscriptExpr::getIdx():\n    - IgnoreParenImpCasts and\
+  \ check for DeclRefExpr.\n    - Compare DRE->getDecl() pointer to the loop\u2019\
+  s VarDecl* IVar.\n\n- Evaluating the loop bound:\n  - Use EvaluateExprToInt to get\
+  \ UB; if operator is <=, add 1 to the APInt as the effective iteration count.\n\
+  \  - Only proceed if evaluation succeeds.\n\n- Optional: Lower bound and step:\n\
+  \  - To keep it simple and robust for the kernel pattern, assume loops start at\
+  \ 0 or small non-negative values.\n  - You may check init is i=0 (BinaryOperator\
+  \ with i on LHS and integer literal 0 on RHS). If not found, you can still proceed;\
+  \ the critical comparison is UBval vs. array size.\n\n5) Minimal use of other callbacks\n\
+  - No need for checkPreCall/checkPostCall/checkBind/checkLocation/etc. The analysis\
+  \ is syntactic and confined within a loop\u2019s AST.\n\n6) Summary of detection\
+  \ rule\n- If a for loop iterates i from 0 up to UB (i < UB or i <= UB), and inside\
+  \ the loop body there are at least two array subscripts A[i] and B[i] where A and\
+  \ B are distinct constant-sized arrays, and:\n  - size(A) == UB, and size(B) < UB,\n\
+  \  - and there is no in-loop guard that breaks/returns when i reaches size(B),\n\
+  \  then report: \u201CLoop bound uses size of one array but also indexes a smaller\
+  \ array with the same index; possible out-of-bounds.\u201D"
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/ExprCXX.h\"\n#include \"clang/AST/Type.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/DenseMap.h\"\n#include \"\
+  llvm/ADT/SmallVector.h\"\n#include <optional>\n\nusing namespace clang;\nusing namespace\
+  \ ento;\nusing namespace taint;\n\n// No custom program state is needed.\n\nnamespace\
+  \ {\n\nclass SAGenTestChecker : public Checker< check::ASTCodeBody > {\n   mutable\
+  \ std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker() : BT(new\
+  \ BugType(this, \"Mismatched loop bound and array size\", \"Array Bounds\")) {}\n\
+  \n      void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR)\
+  \ const;\n\n   private:\n      struct ArrayUseInfo {\n        const ValueDecl *VD\
+  \ = nullptr;               // VarDecl or FieldDecl\n        uint64_t Size = 0; \
+  \                          // Constant array size\n        const ArraySubscriptExpr\
+  \ *ExampleUse = nullptr; // Example use site for diagnostics\n      };\n\n     \
+  \ static bool evalToUInt64(const Expr *E, ASTContext &ACtx, uint64_t &Out);\n  \
+  \    static bool isSimpleIncreasingIncrement(const Stmt *Inc, const VarDecl *IVar,\
+  \ ASTContext &ACtx);\n      static bool isZeroInitOfVar(const Stmt *InitS, const\
+  \ VarDecl *IVar, ASTContext &ACtx);\n      static bool isVarRefTo(const Expr *E,\
+  \ const VarDecl *VD);\n      static bool getArrayDeclAndSizeFromBase(const Expr\
+  \ *Base, uint64_t &Size, const ValueDecl *&OutDecl);\n\n      void processForStmt(const\
+  \ ForStmt *FS, ASTContext &ACtx, BugReporter &BR) const;\n      void collectArrayUsesIndexedBy(const\
+  \ Stmt *Body, const VarDecl *IVar, ASTContext &ACtx,\n                         \
+  \            llvm::DenseMap<const ValueDecl*, ArrayUseInfo> &Out) const;\n     \
+  \ bool hasGuardForBound(const Stmt *Body, const VarDecl *IVar, uint64_t SmallSize,\
+  \ ASTContext &ACtx) const;\n      static bool condHasIVarAgainstConst(const Expr\
+  \ *CondE, const VarDecl *IVar, uint64_t ConstVal, ASTContext &ACtx);\n};\n\nbool\
+  \ SAGenTestChecker::evalToUInt64(const Expr *E, ASTContext &ACtx, uint64_t &Out)\
+  \ {\n  if (!E) return false;\n  Expr::EvalResult R;\n  if (E->EvaluateAsInt(R, ACtx))\
+  \ {\n    const llvm::APSInt &V = R.Val.getInt();\n    Out = V.getZExtValue();\n\
+  \    return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isVarRefTo(const\
+  \ Expr *E, const VarDecl *VD) {\n  if (!E || !VD) return false;\n  E = E->IgnoreParenImpCasts();\n\
+  \  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {\n    return DRE->getDecl()\
+  \ == VD;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isZeroInitOfVar(const\
+  \ Stmt *InitS, const VarDecl *IVar, ASTContext &ACtx) {\n  if (!InitS || !IVar)\
+  \ return false;\n\n  // Case: declaration with initializer, e.g. \"int i = 0;\"\n\
+  \  if (const auto *DS = dyn_cast<DeclStmt>(InitS)) {\n    for (const Decl *Di :\
+  \ DS->decls()) {\n      if (const auto *VD = dyn_cast<VarDecl>(Di)) {\n        if\
+  \ (VD == IVar) {\n          const Expr *Init = VD->getInit();\n          uint64_t\
+  \ Val;\n          if (Init && evalToUInt64(Init, ACtx, Val) && Val == 0)\n     \
+  \       return true;\n        }\n      }\n    }\n  }\n\n  // Case: assignment, e.g.\
+  \ \"i = 0;\"\n  if (const auto *BO = dyn_cast<BinaryOperator>(InitS)) {\n    if\
+  \ (BO->getOpcode() == BO_Assign && isVarRefTo(BO->getLHS(), IVar)) {\n      uint64_t\
+  \ Val;\n      if (evalToUInt64(BO->getRHS(), ACtx, Val) && Val == 0)\n        return\
+  \ true;\n    }\n  }\n\n  return false;\n}\n\nbool SAGenTestChecker::isSimpleIncreasingIncrement(const\
+  \ Stmt *Inc, const VarDecl *IVar, ASTContext &ACtx) {\n  if (!Inc || !IVar) return\
+  \ false;\n\n  // i++, ++i\n  if (const auto *UO = dyn_cast<UnaryOperator>(Inc))\
+  \ {\n    if ((UO->getOpcode() == UO_PostInc || UO->getOpcode() == UO_PreInc) &&\n\
+  \        isVarRefTo(UO->getSubExpr(), IVar))\n      return true;\n  }\n\n  // i\
+  \ += 1;\n  if (const auto *CAO = dyn_cast<CompoundAssignOperator>(Inc)) {\n    if\
+  \ (CAO->getOpcode() == BO_AddAssign && isVarRefTo(CAO->getLHS(), IVar)) {\n    \
+  \  uint64_t Val;\n      if (evalToUInt64(CAO->getRHS(), ACtx, Val) && Val == 1)\n\
+  \        return true;\n    }\n  }\n\n  // i = i + 1; or i = 1 + i;\n  if (const\
+  \ auto *BO = dyn_cast<BinaryOperator>(Inc)) {\n    if (BO->getOpcode() == BO_Assign\
+  \ && isVarRefTo(BO->getLHS(), IVar)) {\n      const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();\n\
+  \      if (const auto *Add = dyn_cast<BinaryOperator>(RHS)) {\n        if (Add->getOpcode()\
+  \ == BO_Add) {\n          // i + 1\n          if (isVarRefTo(Add->getLHS(), IVar))\
+  \ {\n            uint64_t Val;\n            if (evalToUInt64(Add->getRHS(), ACtx,\
+  \ Val) && Val == 1)\n              return true;\n          }\n          // 1 + i\n\
+  \          if (isVarRefTo(Add->getRHS(), IVar)) {\n            uint64_t Val;\n \
+  \           if (evalToUInt64(Add->getLHS(), ACtx, Val) && Val == 1)\n          \
+  \    return true;\n          }\n        }\n      }\n    }\n  }\n\n  return false;\n\
+  }\n\nbool SAGenTestChecker::getArrayDeclAndSizeFromBase(const Expr *Base, uint64_t\
+  \ &Size, const ValueDecl *&OutDecl) {\n  if (!Base) return false;\n  Base = Base->IgnoreParenImpCasts();\n\
+  \n  if (const auto *DRE = dyn_cast<DeclRefExpr>(Base)) {\n    if (const auto *VD\
+  \ = dyn_cast<VarDecl>(DRE->getDecl())) {\n      QualType QT = VD->getType();\n \
+  \     if (const auto *CAT = dyn_cast<ConstantArrayType>(QT.getTypePtr())) {\n  \
+  \      Size = CAT->getSize().getLimitedValue();\n        OutDecl = VD;\n       \
+  \ return true;\n      }\n    }\n  }\n\n  if (const auto *ME = dyn_cast<MemberExpr>(Base))\
+  \ {\n    if (const auto *FD = dyn_cast<FieldDecl>(ME->getMemberDecl())) {\n    \
+  \  QualType QT = FD->getType();\n      if (const auto *CAT = dyn_cast<ConstantArrayType>(QT.getTypePtr()))\
+  \ {\n        Size = CAT->getSize().getLimitedValue();\n        OutDecl = FD;\n \
+  \       return true;\n      }\n    }\n  }\n\n  return false;\n}\n\nvoid SAGenTestChecker::collectArrayUsesIndexedBy(const\
+  \ Stmt *Body, const VarDecl *IVar, ASTContext &ACtx,\n                         \
+  \                        llvm::DenseMap<const ValueDecl*, ArrayUseInfo> &Out) const\
+  \ {\n  if (!Body || !IVar) return;\n\n  // Recursive walk\n  for (const Stmt *Child\
+  \ : Body->children()) {\n    if (!Child) continue;\n\n    if (const auto *ASE =\
+  \ dyn_cast<ArraySubscriptExpr>(Child)) {\n      const Expr *Idx = ASE->getIdx()->IgnoreParenImpCasts();\n\
+  \      if (isVarRefTo(Idx, IVar)) {\n        uint64_t Sz = 0;\n        const ValueDecl\
+  \ *V = nullptr;\n        const Expr *Base = ASE->getBase();\n        if (getArrayDeclAndSizeFromBase(Base,\
+  \ Sz, V)) {\n          auto It = Out.find(V);\n          if (It == Out.end()) {\n\
+  \            ArrayUseInfo AU;\n            AU.VD = V;\n            AU.Size = Sz;\n\
+  \            AU.ExampleUse = ASE;\n            Out.insert({V, AU});\n          }\
+  \ else {\n            // Sizes should match for the same decl; keep the example\
+  \ if not set.\n            if (!It->second.ExampleUse)\n              It->second.ExampleUse\
+  \ = ASE;\n          }\n        }\n      }\n    }\n\n    // Recurse\n    collectArrayUsesIndexedBy(Child,\
+  \ IVar, ACtx, Out);\n  }\n}\n\nbool SAGenTestChecker::condHasIVarAgainstConst(const\
+  \ Expr *CondE, const VarDecl *IVar, uint64_t ConstVal, ASTContext &ACtx) {\n  if\
+  \ (!CondE || !IVar) return false;\n\n  CondE = CondE->IgnoreParenImpCasts();\n \
+  \ if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {\n    // i >= ConstVal\
+  \ OR i == ConstVal\n    if (isVarRefTo(BO->getLHS(), IVar)) {\n      uint64_t Val;\n\
+  \      if (evalToUInt64(BO->getRHS(), ACtx, Val) && Val == ConstVal) {\n       \
+  \ if (BO->getOpcode() == BO_GE || BO->getOpcode() == BO_EQ)\n          return true;\n\
+  \      }\n    }\n    // ConstVal <= i (commuted form of i >= ConstVal)\n    if (isVarRefTo(BO->getRHS(),\
+  \ IVar)) {\n      uint64_t Val;\n      if (evalToUInt64(BO->getLHS(), ACtx, Val)\
+  \ && Val == ConstVal) {\n        if (BO->getOpcode() == BO_LE || BO->getOpcode()\
+  \ == BO_EQ)\n          return true;\n      }\n    }\n  }\n  return false;\n}\n\n\
+  bool SAGenTestChecker::hasGuardForBound(const Stmt *Body, const VarDecl *IVar, uint64_t\
+  \ SmallSize, ASTContext &ACtx) const {\n  if (!Body) return false;\n\n  for (const\
+  \ Stmt *Child : Body->children()) {\n    if (!Child) continue;\n\n    if (const\
+  \ auto *IS = dyn_cast<IfStmt>(Child)) {\n      const Expr *Cond = IS->getCond();\n\
+  \      if (condHasIVarAgainstConst(Cond, IVar, SmallSize, ACtx)) {\n        // Check\
+  \ then-branch for break or return\n        const Stmt *Then = IS->getThen();\n \
+  \       if (!Then) continue;\n        if (findSpecificTypeInChildren<BreakStmt>(Then)\
+  \ ||\n            findSpecificTypeInChildren<ReturnStmt>(Then)) {\n          return\
+  \ true;\n        }\n      }\n      // Also check nested statements within If\n \
+  \     if (hasGuardForBound(IS->getThen(), IVar, SmallSize, ACtx))\n        return\
+  \ true;\n      if (hasGuardForBound(IS->getElse(), IVar, SmallSize, ACtx))\n   \
+  \     return true;\n    } else {\n      // Recurse\n      if (hasGuardForBound(Child,\
+  \ IVar, SmallSize, ACtx))\n        return true;\n    }\n  }\n\n  return false;\n\
+  }\n\nvoid SAGenTestChecker::processForStmt(const ForStmt *FS, ASTContext &ACtx,\
+  \ BugReporter &BR) const {\n  if (!FS) return;\n\n  // Extract loop condition: expect\
+  \ i < UB or i <= UB\n  const Expr *Cond = FS->getCond();\n  if (!Cond) return;\n\
+  \n  const auto *BO = dyn_cast<BinaryOperator>(Cond->IgnoreParenImpCasts());\n  if\
+  \ (!BO) return;\n\n  BinaryOperator::Opcode Op = BO->getOpcode();\n  if (Op != BO_LT\
+  \ && Op != BO_LE)\n    return;\n\n  const auto *LHSRef = dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreParenImpCasts());\n\
+  \  if (!LHSRef) return;\n  const auto *IVar = dyn_cast<VarDecl>(LHSRef->getDecl());\n\
+  \  if (!IVar) return;\n\n  uint64_t UB = 0;\n  if (!evalToUInt64(BO->getRHS(), ACtx,\
+  \ UB))\n    return;\n\n  // Adjust for <= bound: effective iteration count\n  if\
+  \ (Op == BO_LE)\n    UB = UB + 1;\n\n  // Check increment is a simple increasing\
+  \ increment\n  if (!isSimpleIncreasingIncrement(FS->getInc(), IVar, ACtx))\n   \
+  \ return;\n\n  // Check initializer sets i = 0\n  if (!isZeroInitOfVar(FS->getInit(),\
+  \ IVar, ACtx))\n    return;\n\n  // Collect array uses indexed by i\n  llvm::DenseMap<const\
+  \ ValueDecl*, ArrayUseInfo> Uses;\n  collectArrayUsesIndexedBy(FS->getBody(), IVar,\
+  \ ACtx, Uses);\n  if (Uses.size() < 2)\n    return; // Need at least two arrays\
+  \ A[i], B[i]\n\n  // Find any array with size == UB\n  bool HasBoundArray = false;\n\
+  \  for (const auto &It : Uses) {\n    if (It.second.Size == UB) {\n      HasBoundArray\
+  \ = true;\n      break;\n    }\n  }\n  if (!HasBoundArray)\n    return;\n\n  //\
+  \ Find a smaller array with size < UB\n  const ArrayUseInfo *Small = nullptr;\n\
+  \  for (const auto &It : Uses) {\n    if (It.second.Size < UB) {\n      Small =\
+  \ &It.second;\n      break;\n    }\n  }\n  if (!Small)\n    return;\n\n  // Suppress\
+  \ if there is a guard like: if (i >= SmallSize) break/return;\n  if (hasGuardForBound(FS->getBody(),\
+  \ IVar, Small->Size, ACtx))\n    return;\n\n  // Report bug at the smaller array\
+  \ access site (if available), otherwise at the for condition\n  SourceLocation Loc;\n\
+  \  if (Small->ExampleUse)\n    Loc = Small->ExampleUse->getExprLoc();\n  else\n\
+  \    Loc = FS->getLParenLoc();\n\n  std::string Msg = \"Loop bound uses size of\
+  \ one array but also indexes a smaller array with the same index; possible out-of-bounds\"\
+  ;\n  if (const auto *ND = dyn_cast<NamedDecl>(Small->VD)) {\n    llvm::SmallString<128>\
+  \ Buf;\n    llvm::raw_svector_ostream OS(Buf);\n    OS << \" (bound=\" << UB <<\
+  \ \", array '\" << ND->getName() << \"' size=\" << Small->Size << \")\";\n    Msg\
+  \ += OS.str().str();\n  } else {\n    llvm::SmallString<64> Buf;\n    llvm::raw_svector_ostream\
+  \ OS(Buf);\n    OS << \" (bound=\" << UB << \", smaller array size=\" << Small->Size\
+  \ << \")\";\n    Msg += OS.str().str();\n  }\n\n  PathDiagnosticLocation PDL(Loc,\
+  \ BR.getSourceManager());\n  auto R = std::make_unique<BasicBugReport>(*BT, Msg,\
+  \ PDL);\n  if (Small->ExampleUse)\n    R->addRange(Small->ExampleUse->getSourceRange());\n\
+  \  BR.emitReport(std::move(R));\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  if (!D) return;\n \
+  \ const Stmt *Body = D->getBody();\n  if (!Body) return;\n\n  ASTContext &ACtx =\
+  \ Mgr.getASTContext();\n\n  // Simple recursive traversal to find ForStmt\n  llvm::SmallVector<const\
+  \ Stmt*, 16> Stack;\n  Stack.push_back(Body);\n  while (!Stack.empty()) {\n    const\
+  \ Stmt *S = Stack.pop_back_val();\n    if (!S) continue;\n\n    if (const auto *FS\
+  \ = dyn_cast<ForStmt>(S)) {\n      processForStmt(FS, ACtx, BR);\n    }\n\n    for\
+  \ (const Stmt *Child : S->children()) {\n      if (Child)\n        Stack.push_back(Child);\n\
+  \    }\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects loops bounded by one array's size while indexing a smaller array\
+  \ with the same index\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

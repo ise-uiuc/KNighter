@@ -1,0 +1,5 @@
+- Decision: NotABug
+- Reason: The reported line dereferences chip->mem (chip->mem->phys/virt) inside gpio_read_data_reg(), not the result of a devm_kzalloc()/devm_kcalloc() call. All allocations in this file are properly NULL-checked:
+  - chip is allocated with devm_kzalloc() and immediately checked: if (!chip) return ERR_PTR(-ENOMEM).
+  - chip->regs and chip->pins are allocated with devm_kcalloc() and both are checked for NULL with early -ENOMEM returns.
+  chip->mem is not allocated via devm_kzalloc() here; it’s assigned from the caller as &pfc->windows[i] after a search ensures i < pfc->num_windows. Thus chip->mem points to a valid struct in the windows array, not a potentially NULL devm_* allocation. Even if one considered the possibility of a NULL window mapping (virt), that would be a different issue (mapping failure handling), not the target bug pattern. Therefore, the warning does not match the specified bug pattern (immediate dereference of devm_kzalloc result without NULL check) and does not indicate a real bug in this context.

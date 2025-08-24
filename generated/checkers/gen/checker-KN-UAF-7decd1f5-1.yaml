@@ -1,0 +1,406 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 7decd1f5904a489d3ccdcf131972f94645681689
+commit_type: UAF
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/Regions.h\"\n#include <string>\n\
+  \nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nREGISTER_SET_WITH_PROGRAMSTATE(FreedRegions,\
+  \ const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(FreedByFuncMap, const MemRegion*,\
+  \ const char*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n    check::PostCall,\n\
+  \    check::Location\n> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Use-after-free\", \"Memory Error\"\
+  )) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C)\
+  \ const;\n\n   private:\n\n      // Known free-like functions table and matcher\n\
+  \      bool functionKnownToFree(const CallEvent &Call,\n                       \
+  \        llvm::SmallVectorImpl<unsigned> &FreedParams,\n                       \
+  \        const char* &Name,\n                               CheckerContext &C) const;\n\
+  \n      // Helpers\n      const MemRegion *getBase(const MemRegion *R) const {\n\
+  \        if (!R) return nullptr;\n        return R->getBaseRegion();\n      }\n\n\
+  \      const MemRegion *getPointeeBaseRegionFromArg(const Expr *E, CheckerContext\
+  \ &C) const {\n        if (!E)\n          return nullptr;\n        const MemRegion\
+  \ *R = getMemRegionFromExpr(E, C);\n        if (!R)\n          return nullptr;\n\
+  \        // Normalize to the object's base region (owning object)\n        return\
+  \ getBase(R);\n      }\n\n      ProgramStateRef markFreed(ProgramStateRef State,\
+  \ const MemRegion *R, const char *FnName) const {\n        if (!R) return State;\n\
+  \        const MemRegion *Base = getBase(R);\n        if (!Base) return State;\n\
+  \        State = State->add<FreedRegions>(Base);\n        State = State->set<FreedByFuncMap>(Base,\
+  \ FnName);\n        return State;\n      }\n\n      bool isFreed(const MemRegion\
+  \ *R, ProgramStateRef State) const {\n        if (!R) return false;\n        const\
+  \ MemRegion *Base = getBase(R);\n        if (!Base) return false;\n        return\
+  \ State->contains<FreedRegions>(Base);\n      }\n};\n\n// Known free-like functions\
+  \ that free/schedule-free of their pointer params.\nbool SAGenTestChecker::functionKnownToFree(const\
+  \ CallEvent &Call,\n                                           llvm::SmallVectorImpl<unsigned>\
+  \ &FreedParams,\n                                           const char* &Name,\n\
+  \                                           CheckerContext &C) const {\n  struct\
+  \ FreeEntry {\n    const char *Name;\n    unsigned Params[3];\n    unsigned Count;\n\
+  \  };\n\n  static const FreeEntry Table[] = {\n    {\"kfree\",           {0}, 1},\n\
+  \    {\"kvfree\",          {0}, 1},\n    {\"kvfree_rcu\",      {0}, 1},\n    //\
+  \ Target-specific: frees/schedules freeing of the subflow context\n    {\"mptcp_close_ssk\"\
+  , {2}, 1}\n  };\n\n  const Expr *Orig = Call.getOriginExpr();\n  const IdentifierInfo\
+  \ *ID = Call.getCalleeIdentifier();\n\n  for (const auto &E : Table) {\n    bool\
+  \ match = false;\n    if (Orig && ExprHasName(Orig, E.Name, C)) {\n      match =\
+  \ true;\n    } else if (ID && ID->getName() == E.Name) {\n      match = true;\n\
+  \    }\n    if (!match)\n      continue;\n\n    FreedParams.clear();\n    for (unsigned\
+  \ i = 0; i < E.Count; ++i)\n      FreedParams.push_back(E.Params[i]);\n    Name\
+  \ = E.Name;\n    return true;\n  }\n\n  return false;\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  llvm::SmallVector<unsigned, 4>\
+  \ FreedParams;\n  const char *FnName = nullptr;\n\n  if (!functionKnownToFree(Call,\
+  \ FreedParams, FnName, C))\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  for (unsigned Idx : FreedParams) {\n    if (Idx >=\
+  \ Call.getNumArgs())\n      continue;\n\n    const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \    const MemRegion *PointeeBase = getPointeeBaseRegionFromArg(ArgE, C);\n    if\
+  \ (!PointeeBase)\n      continue;\n\n    State = markFreed(State, PointeeBase, FnName);\n\
+  \    Changed = true;\n  }\n\n  if (Changed)\n    C.addTransition(State);\n}\n\n\
+  void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const {\n  if (!IsLoad || !S)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  const MemRegion *R = Loc.getAsRegion();\n  if (!R)\n    return;\n\n  if (!isFreed(R,\
+  \ State))\n    return;\n\n  // Prepare a concise message\n  const MemRegion *Base\
+  \ = R->getBaseRegion();\n  const char *const *FnNamePtr = State->get<FreedByFuncMap>(Base);\n\
+  \  std::string Msg;\n  if (FnNamePtr && *FnNamePtr) {\n    Msg = \"Use-after-free:\
+  \ read after call to '\";\n    Msg += *FnNamePtr;\n    Msg += \"'\";\n  } else {\n\
+  \    Msg = \"Use-after-free: read from freed object\";\n  }\n\n  ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto Report = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  Report->addRange(S->getSourceRange());\n  C.emitReport(std::move(Report));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects reads from objects after free-like calls (e.g., mptcp_close_ssk)\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nmptcp: pm: fix UaF read in mptcp_pm_nl_rm_addr_or_subflow\n\
+  \nSyzkaller reported this splat:\n\n  ==================================================================\n\
+  \  BUG: KASAN: slab-use-after-free in mptcp_pm_nl_rm_addr_or_subflow+0xb44/0xcc0\
+  \ net/mptcp/pm_netlink.c:881\n  Read of size 4 at addr ffff8880569ac858 by task\
+  \ syz.1.2799/14662\n\n  CPU: 0 UID: 0 PID: 14662 Comm: syz.1.2799 Not tainted 6.12.0-rc2-syzkaller-00307-g36c254515dc6\
+  \ #0\n  Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 1.16.3-debian-1.16.3-2~bpo12+1\
+  \ 04/01/2014\n  Call Trace:\n   <TASK>\n   __dump_stack lib/dump_stack.c:94 [inline]\n\
+  \   dump_stack_lvl+0x116/0x1f0 lib/dump_stack.c:120\n   print_address_description\
+  \ mm/kasan/report.c:377 [inline]\n   print_report+0xc3/0x620 mm/kasan/report.c:488\n\
+  \   kasan_report+0xd9/0x110 mm/kasan/report.c:601\n   mptcp_pm_nl_rm_addr_or_subflow+0xb44/0xcc0\
+  \ net/mptcp/pm_netlink.c:881\n   mptcp_pm_nl_rm_subflow_received net/mptcp/pm_netlink.c:914\
+  \ [inline]\n   mptcp_nl_remove_id_zero_address+0x305/0x4a0 net/mptcp/pm_netlink.c:1572\n\
+  \   mptcp_pm_nl_del_addr_doit+0x5c9/0x770 net/mptcp/pm_netlink.c:1603\n   genl_family_rcv_msg_doit+0x202/0x2f0\
+  \ net/netlink/genetlink.c:1115\n   genl_family_rcv_msg net/netlink/genetlink.c:1195\
+  \ [inline]\n   genl_rcv_msg+0x565/0x800 net/netlink/genetlink.c:1210\n   netlink_rcv_skb+0x165/0x410\
+  \ net/netlink/af_netlink.c:2551\n   genl_rcv+0x28/0x40 net/netlink/genetlink.c:1219\n\
+  \   netlink_unicast_kernel net/netlink/af_netlink.c:1331 [inline]\n   netlink_unicast+0x53c/0x7f0\
+  \ net/netlink/af_netlink.c:1357\n   netlink_sendmsg+0x8b8/0xd70 net/netlink/af_netlink.c:1901\n\
+  \   sock_sendmsg_nosec net/socket.c:729 [inline]\n   __sock_sendmsg net/socket.c:744\
+  \ [inline]\n   ____sys_sendmsg+0x9ae/0xb40 net/socket.c:2607\n   ___sys_sendmsg+0x135/0x1e0\
+  \ net/socket.c:2661\n   __sys_sendmsg+0x117/0x1f0 net/socket.c:2690\n   do_syscall_32_irqs_on\
+  \ arch/x86/entry/common.c:165 [inline]\n   __do_fast_syscall_32+0x73/0x120 arch/x86/entry/common.c:386\n\
+  \   do_fast_syscall_32+0x32/0x80 arch/x86/entry/common.c:411\n   entry_SYSENTER_compat_after_hwframe+0x84/0x8e\n\
+  \  RIP: 0023:0xf7fe4579\n  Code: b8 01 10 06 03 74 b4 01 10 07 03 74 b0 01 10 08\
+  \ 03 74 d8 01 00 00 00 00 00 00 00 00 00 00 00 00 00 51 52 55 89 e5 0f 34 cd 80\
+  \ <5d> 5a 59 c3 90 90 90 90 8d b4 26 00 00 00 00 8d b4 26 00 00 00 00\n  RSP: 002b:00000000f574556c\
+  \ EFLAGS: 00000296 ORIG_RAX: 0000000000000172\n  RAX: ffffffffffffffda RBX: 000000000000000b\
+  \ RCX: 0000000020000140\n  RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000000000000\n\
+  \  RBP: 0000000000000000 R08: 0000000000000000 R09: 0000000000000000\n  R10: 0000000000000000\
+  \ R11: 0000000000000296 R12: 0000000000000000\n  R13: 0000000000000000 R14: 0000000000000000\
+  \ R15: 0000000000000000\n   </TASK>\n\n  Allocated by task 5387:\n   kasan_save_stack+0x33/0x60\
+  \ mm/kasan/common.c:47\n   kasan_save_track+0x14/0x30 mm/kasan/common.c:68\n   poison_kmalloc_redzone\
+  \ mm/kasan/common.c:377 [inline]\n   __kasan_kmalloc+0xaa/0xb0 mm/kasan/common.c:394\n\
+  \   kmalloc_noprof include/linux/slab.h:878 [inline]\n   kzalloc_noprof include/linux/slab.h:1014\
+  \ [inline]\n   subflow_create_ctx+0x87/0x2a0 net/mptcp/subflow.c:1803\n   subflow_ulp_init+0xc3/0x4d0\
+  \ net/mptcp/subflow.c:1956\n   __tcp_set_ulp net/ipv4/tcp_ulp.c:146 [inline]\n \
+  \  tcp_set_ulp+0x326/0x7f0 net/ipv4/tcp_ulp.c:167\n   mptcp_subflow_create_socket+0x4ae/0x10a0\
+  \ net/mptcp/subflow.c:1764\n   __mptcp_subflow_connect+0x3cc/0x1490 net/mptcp/subflow.c:1592\n\
+  \   mptcp_pm_create_subflow_or_signal_addr+0xbda/0x23a0 net/mptcp/pm_netlink.c:642\n\
+  \   mptcp_pm_nl_fully_established net/mptcp/pm_netlink.c:650 [inline]\n   mptcp_pm_nl_work+0x3a1/0x4f0\
+  \ net/mptcp/pm_netlink.c:943\n   mptcp_worker+0x15a/0x1240 net/mptcp/protocol.c:2777\n\
+  \   process_one_work+0x958/0x1b30 kernel/workqueue.c:3229\n   process_scheduled_works\
+  \ kernel/workqueue.c:3310 [inline]\n   worker_thread+0x6c8/0xf00 kernel/workqueue.c:3391\n\
+  \   kthread+0x2c1/0x3a0 kernel/kthread.c:389\n   ret_from_fork+0x45/0x80 arch/x86/kernel/process.c:147\n\
+  \   ret_from_fork_asm+0x1a/0x30 arch/x86/entry/entry_64.S:244\n\n  Freed by task\
+  \ 113:\n   kasan_save_stack+0x33/0x60 mm/kasan/common.c:47\n   kasan_save_track+0x14/0x30\
+  \ mm/kasan/common.c:68\n   kasan_save_free_info+0x3b/0x60 mm/kasan/generic.c:579\n\
+  \   poison_slab_object mm/kasan/common.c:247 [inline]\n   __kasan_slab_free+0x51/0x70\
+  \ mm/kasan/common.c:264\n   kasan_slab_free include/linux/kasan.h:230 [inline]\n\
+  \   slab_free_hook mm/slub.c:2342 [inline]\n   slab_free mm/slub.c:4579 [inline]\n\
+  \   kfree+0x14f/0x4b0 mm/slub.c:4727\n   kvfree+0x47/0x50 mm/util.c:701\n   kvfree_rcu_list+0xf5/0x2c0\
+  \ kernel/rcu/tree.c:3423\n   kvfree_rcu_drain_ready kernel/rcu/tree.c:3563 [inline]\n\
+  \   kfree_rcu_monitor+0x503/0x8b0 kernel/rcu/tree.c:3632\n   kfree_rcu_shrink_scan+0x245/0x3a0\
+  \ kernel/rcu/tree.c:3966\n   do_shrink_slab+0x44f/0x11c0 mm/shrinker.c:435\n   shrink_slab+0x32b/0x12a0\
+  \ mm/shrinker.c:662\n   shrink_one+0x47e/0x7b0 mm/vmscan.c:4818\n   shrink_many\
+  \ mm/vmscan.c:4879 [inline]\n   lru_gen_shrink_node mm/vmscan.c:4957 [inline]\n\
+  \   shrink_node+0x2452/0x39d0 mm/vmscan.c:5937\n   kswapd_shrink_node mm/vmscan.c:6765\
+  \ [inline]\n   balance_pgdat+0xc19/0x18f0 mm/vmscan.c:6957\n   kswapd+0x5ea/0xbf0\
+  \ mm/vmscan.c:7226\n   kthread+0x2c1/0x3a0 kernel/kthread.c:389\n   ret_from_fork+0x45/0x80\
+  \ arch/x86/kernel/process.c:147\n   ret_from_fork_asm+0x1a/0x30 arch/x86/entry/entry_64.S:244\n\
+  \n  Last potentially related work creation:\n   kasan_save_stack+0x33/0x60 mm/kasan/common.c:47\n\
+  \   __kasan_record_aux_stack+0xba/0xd0 mm/kasan/generic.c:541\n   kvfree_call_rcu+0x74/0xbe0\
+  \ kernel/rcu/tree.c:3810\n   subflow_ulp_release+0x2ae/0x350 net/mptcp/subflow.c:2009\n\
+  \   tcp_cleanup_ulp+0x7c/0x130 net/ipv4/tcp_ulp.c:124\n   tcp_v4_destroy_sock+0x1c5/0x6a0\
+  \ net/ipv4/tcp_ipv4.c:2541\n   inet_csk_destroy_sock+0x1a3/0x440 net/ipv4/inet_connection_sock.c:1293\n\
+  \   tcp_done+0x252/0x350 net/ipv4/tcp.c:4870\n   tcp_rcv_state_process+0x379b/0x4f30\
+  \ net/ipv4/tcp_input.c:6933\n   tcp_v4_do_rcv+0x1ad/0xa90 net/ipv4/tcp_ipv4.c:1938\n\
+  \   sk_backlog_rcv include/net/sock.h:1115 [inline]\n   __release_sock+0x31b/0x400\
+  \ net/core/sock.c:3072\n   __tcp_close+0x4f3/0xff0 net/ipv4/tcp.c:3142\n   __mptcp_close_ssk+0x331/0x14d0\
+  \ net/mptcp/protocol.c:2489\n   mptcp_close_ssk net/mptcp/protocol.c:2543 [inline]\n\
+  \   mptcp_close_ssk+0x150/0x220 net/mptcp/protocol.c:2526\n   mptcp_pm_nl_rm_addr_or_subflow+0x2be/0xcc0\
+  \ net/mptcp/pm_netlink.c:878\n   mptcp_pm_nl_rm_subflow_received net/mptcp/pm_netlink.c:914\
+  \ [inline]\n   mptcp_nl_remove_id_zero_address+0x305/0x4a0 net/mptcp/pm_netlink.c:1572\n\
+  \   mptcp_pm_nl_del_addr_doit+0x5c9/0x770 net/mptcp/pm_netlink.c:1603\n   genl_family_rcv_msg_doit+0x202/0x2f0\
+  \ net/netlink/genetlink.c:1115\n   genl_family_rcv_msg net/netlink/genetlink.c:1195\
+  \ [inline]\n   genl_rcv_msg+0x565/0x800 net/netlink/genetlink.c:1210\n   netlink_rcv_skb+0x165/0x410\
+  \ net/netlink/af_netlink.c:2551\n   genl_rcv+0x28/0x40 net/netlink/genetlink.c:1219\n\
+  \   netlink_unicast_kernel net/netlink/af_netlink.c:1331 [inline]\n   netlink_unicast+0x53c/0x7f0\
+  \ net/netlink/af_netlink.c:1357\n   netlink_sendmsg+0x8b8/0xd70 net/netlink/af_netlink.c:1901\n\
+  \   sock_sendmsg_nosec net/socket.c:729 [inline]\n   __sock_sendmsg net/socket.c:744\
+  \ [inline]\n   ____sys_sendmsg+0x9ae/0xb40 net/socket.c:2607\n   ___sys_sendmsg+0x135/0x1e0\
+  \ net/socket.c:2661\n   __sys_sendmsg+0x117/0x1f0 net/socket.c:2690\n   do_syscall_32_irqs_on\
+  \ arch/x86/entry/common.c:165 [inline]\n   __do_fast_syscall_32+0x73/0x120 arch/x86/entry/common.c:386\n\
+  \   do_fast_syscall_32+0x32/0x80 arch/x86/entry/common.c:411\n   entry_SYSENTER_compat_after_hwframe+0x84/0x8e\n\
+  \n  The buggy address belongs to the object at ffff8880569ac800\n   which belongs\
+  \ to the cache kmalloc-512 of size 512\n  The buggy address is located 88 bytes\
+  \ inside of\n   freed 512-byte region [ffff8880569ac800, ffff8880569aca00)\n\n \
+  \ The buggy address belongs to the physical page:\n  page: refcount:1 mapcount:0\
+  \ mapping:0000000000000000 index:0x0 pfn:0x569ac\n  head: order:2 mapcount:0 entire_mapcount:0\
+  \ nr_pages_mapped:0 pincount:0\n  flags: 0x4fff00000000040(head|node=1|zone=1|lastcpupid=0x7ff)\n\
+  \  page_type: f5(slab)\n  raw: 04fff00000000040 ffff88801ac42c80 dead000000000100\
+  \ dead000000000122\n  raw: 0000000000000000 0000000080100010 00000001f5000000 0000000000000000\n\
+  \  head: 04fff00000000040 ffff88801ac42c80 dead000000000100 dead000000000122\n \
+  \ head: 0000000000000000 0000000080100010 00000001f5000000 0000000000000000\n  head:\
+  \ 04fff00000000002 ffffea00015a6b01 ffffffffffffffff 0000000000000000\n  head: 0000000000000004\
+  \ 0000000000000000 00000000ffffffff 0000000000000000\n  page dumped because: kasan:\
+  \ bad access detected\n  page_owner tracks the page as allocated\n  page last allocated\
+  \ via order 2, migratetype Unmovable, gfp_mask 0xd20c0(__GFP_IO|__GFP_FS|__GFP_NOWARN|__GFP_NORETRY|__GFP_COMP|__GFP_NOMEMALLOC),\
+  \ pid 10238, tgid 10238 (kworker/u32:6), ts 597403252405, free_ts 597177952947\n\
+  \   set_page_owner include/linux/page_owner.h:32 [inline]\n   post_alloc_hook+0x2d1/0x350\
+  \ mm/page_alloc.c:1537\n   prep_new_page mm/page_alloc.c:1545 [inline]\n   get_page_from_freelist+0x101e/0x3070\
+  \ mm/page_alloc.c:3457\n   __alloc_pages_noprof+0x223/0x25a0 mm/page_alloc.c:4733\n\
+  \   alloc_pages_mpol_noprof+0x2c9/0x610 mm/mempolicy.c:2265\n   alloc_slab_page\
+  \ mm/slub.c:2412 [inline]\n   allocate_slab mm/slub.c:2578 [inline]\n   new_slab+0x2ba/0x3f0\
+  \ mm/slub.c:2631\n   ___slab_alloc+0xd1d/0x16f0 mm/slub.c:3818\n   __slab_alloc.constprop.0+0x56/0xb0\
+  \ mm/slub.c:3908\n   __slab_alloc_node mm/slub.c:3961 [inline]\n   slab_alloc_node\
+  \ mm/slub.c:4122 [inline]\n   __kmalloc_cache_noprof+0x2c5/0x310 mm/slub.c:4290\n\
+  \   kmalloc_noprof include/linux/slab.h:878 [inline]\n   kzalloc_noprof include/linux/slab.h:1014\
+  \ [inline]\n   mld_add_delrec net/ipv6/mcast.c:743 [inline]\n   igmp6_leave_group\
+  \ net/ipv6/mcast.c:2625 [inline]\n   igmp6_group_dropped+0x4ab/0xe40 net/ipv6/mcast.c:723\n\
+  \   __ipv6_dev_mc_dec+0x281/0x360 net/ipv6/mcast.c:979\n   addrconf_leave_solict\
+  \ net/ipv6/addrconf.c:2253 [inline]\n   __ipv6_ifa_notify+0x3f6/0xc30 net/ipv6/addrconf.c:6283\n\
+  \   addrconf_ifdown.isra.0+0xef9/0x1a20 net/ipv6/addrconf.c:3982\n   addrconf_notify+0x220/0x19c0\
+  \ net/ipv6/addrconf.c:3781\n   notifier_call_chain+0xb9/0x410 kernel/notifier.c:93\n\
+  \   call_netdevice_notifiers_info+0xbe/0x140 net/core/dev.c:1996\n   call_netdevice_notifiers_extack\
+  \ net/core/dev.c:2034 [inline]\n   call_netdevice_notifiers net/core/dev.c:2048\
+  \ [inline]\n   dev_close_many+0x333/0x6a0 net/core/dev.c:1589\n  page last free\
+  \ pid 13136 tgid 13136 stack trace:\n   reset_page_owner include/linux/page_owner.h:25\
+  \ [inline]\n   free_pages_prepare mm/page_alloc.c:1108 [inline]\n   free_unref_page+0x5f4/0xdc0\
+  \ mm/page_alloc.c:2638\n   stack_depot_save_flags+0x2da/0x900 lib/stackdepot.c:666\n\
+  \   kasan_save_stack+0x42/0x60 mm/kasan/common.c:48\n   kasan_save_track+0x14/0x30\
+  \ mm/kasan/common.c:68\n   unpoison_slab_object mm/kasan/common.c:319 [inline]\n\
+  \   __kasan_slab_alloc+0x89/0x90 mm/kasan/common.c:345\n   kasan_slab_alloc include/linux/kasan.h:247\
+  \ [inline]\n   slab_post_alloc_hook mm/slub.c:4085 [inline]\n   slab_alloc_node\
+  \ mm/slub.c:4134 [inline]\n   kmem_cache_alloc_noprof+0x121/0x2f0 mm/slub.c:4141\n\
+  \   skb_clone+0x190/0x3f0 net/core/skbuff.c:2084\n   do_one_broadcast net/netlink/af_netlink.c:1462\
+  \ [inline]\n   netlink_broadcast_filtered+0xb11/0xef0 net/netlink/af_netlink.c:1540\n\
+  \   netlink_broadcast+0x39/0x50 net/netlink/af_netlink.c:1564\n   uevent_net_broadcast_untagged\
+  \ lib/kobject_uevent.c:331 [inline]\n   kobject_uevent_net_broadcast lib/kobject_uevent.c:410\
+  \ [inline]\n   kobject_uevent_env+0xacd/0x1670 lib/kobject_uevent.c:608\n   device_del+0x623/0x9f0\
+  \ drivers/base/core.c:3882\n   snd_card_disconnect.part.0+0x58a/0x7c0 sound/core/init.c:546\n\
+  \   snd_card_disconnect+0x1f/0x30 sound/core/init.c:495\n   snd_usx2y_disconnect+0xe9/0x1f0\
+  \ sound/usb/usx2y/usbusx2y.c:417\n   usb_unbind_interface+0x1e8/0x970 drivers/usb/core/driver.c:461\n\
+  \   device_remove drivers/base/dd.c:569 [inline]\n   device_remove+0x122/0x170 drivers/base/dd.c:561\n\
+  \nThat's because 'subflow' is used just after 'mptcp_close_ssk(subflow)',\nwhich\
+  \ will initiate the release of its memory. Even if it is very likely\nthe release\
+  \ and the re-utilisation will be done later on, it is of\ncourse better to avoid\
+  \ any issues and read the content of 'subflow'\nbefore closing it.\n\nFixes: 1c1f72137598\
+  \ (\"mptcp: pm: only decrement add_addr_accepted for MPJ req\")\nCc: stable@vger.kernel.org\n\
+  Reported-by: syzbot+3c8b7a8e7df6a2a226ca@syzkaller.appspotmail.com\nCloses: https://lore.kernel.org/670d7337.050a0220.4cbc0.004f.GAE@google.com\n\
+  Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>\nAcked-by: Paolo Abeni\
+  \ <pabeni@redhat.com>\nLink: https://patch.msgid.link/20241015-net-mptcp-uaf-pm-rm-v1-1-c4ee5d987a64@kernel.org\n\
+  Signed-off-by: Paolo Abeni <pabeni@redhat.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ mptcp_pm_nl_rm_addr_or_subflow in net/mptcp/pm_netlink.c\nstatic void mptcp_pm_nl_rm_addr_or_subflow(struct\
+  \ mptcp_sock *msk,\n\t\t\t\t\t   const struct mptcp_rm_list *rm_list,\n\t\t\t\t\t\
+  \   enum linux_mptcp_mib_field rm_type)\n{\n\tstruct mptcp_subflow_context *subflow,\
+  \ *tmp;\n\tstruct sock *sk = (struct sock *)msk;\n\tu8 i;\n\n\tpr_debug(\"%s rm_list_nr\
+  \ %d\\n\",\n\t\t rm_type == MPTCP_MIB_RMADDR ? \"address\" : \"subflow\", rm_list->nr);\n\
+  \n\tmsk_owned_by_me(msk);\n\n\tif (sk->sk_state == TCP_LISTEN)\n\t\treturn;\n\n\t\
+  if (!rm_list->nr)\n\t\treturn;\n\n\tif (list_empty(&msk->conn_list))\n\t\treturn;\n\
+  \n\tfor (i = 0; i < rm_list->nr; i++) {\n\t\tu8 rm_id = rm_list->ids[i];\n\t\tbool\
+  \ removed = false;\n\n\t\tmptcp_for_each_subflow_safe(msk, subflow, tmp) {\n\t\t\
+  \tstruct sock *ssk = mptcp_subflow_tcp_sock(subflow);\n\t\t\tu8 remote_id = READ_ONCE(subflow->remote_id);\n\
+  \t\t\tint how = RCV_SHUTDOWN | SEND_SHUTDOWN;\n\t\t\tu8 id = subflow_get_local_id(subflow);\n\
+  \n\t\t\tif ((1 << inet_sk_state_load(ssk)) &\n\t\t\t    (TCPF_FIN_WAIT1 | TCPF_FIN_WAIT2\
+  \ | TCPF_CLOSING | TCPF_CLOSE))\n\t\t\t\tcontinue;\n\t\t\tif (rm_type == MPTCP_MIB_RMADDR\
+  \ && remote_id != rm_id)\n\t\t\t\tcontinue;\n\t\t\tif (rm_type == MPTCP_MIB_RMSUBFLOW\
+  \ && id != rm_id)\n\t\t\t\tcontinue;\n\n\t\t\tpr_debug(\" -> %s rm_list_ids[%d]=%u\
+  \ local_id=%u remote_id=%u mpc_id=%u\\n\",\n\t\t\t\t rm_type == MPTCP_MIB_RMADDR\
+  \ ? \"address\" : \"subflow\",\n\t\t\t\t i, rm_id, id, remote_id, msk->mpc_endpoint_id);\n\
+  \t\t\tspin_unlock_bh(&msk->pm.lock);\n\t\t\tmptcp_subflow_shutdown(sk, ssk, how);\n\
+  \n\t\t\t/* the following takes care of updating the subflows counter */\n\t\t\t\
+  mptcp_close_ssk(sk, ssk, subflow);\n\t\t\tspin_lock_bh(&msk->pm.lock);\n\n\t\t\t\
+  removed |= subflow->request_join;\n\t\t\tif (rm_type == MPTCP_MIB_RMSUBFLOW)\n\t\
+  \t\t\t__MPTCP_INC_STATS(sock_net(sk), rm_type);\n\t\t}\n\n\t\tif (rm_type == MPTCP_MIB_RMADDR)\n\
+  \t\t\t__MPTCP_INC_STATS(sock_net(sk), rm_type);\n\n\t\tif (!removed)\n\t\t\tcontinue;\n\
+  \n\t\tif (!mptcp_pm_is_kernel(msk))\n\t\t\tcontinue;\n\n\t\tif (rm_type == MPTCP_MIB_RMADDR\
+  \ && rm_id &&\n\t\t    !WARN_ON_ONCE(msk->pm.add_addr_accepted == 0)) {\n\t\t\t\
+  /* Note: if the subflow has been closed before, this\n\t\t\t * add_addr_accepted\
+  \ counter will not be decremented.\n\t\t\t */\n\t\t\tif (--msk->pm.add_addr_accepted\
+  \ < mptcp_pm_get_add_addr_accept_max(msk))\n\t\t\t\tWRITE_ONCE(msk->pm.accept_addr,\
+  \ true);\n\t\t}\n\t}\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/net/mptcp/pm_netlink.c\
+  \ b/net/mptcp/pm_netlink.c\nindex 1a78998fe1f4..db586a5b3866 100644\n--- a/net/mptcp/pm_netlink.c\n\
+  +++ b/net/mptcp/pm_netlink.c\n@@ -873,12 +873,12 @@ static void mptcp_pm_nl_rm_addr_or_subflow(struct\
+  \ mptcp_sock *msk,\n \t\t\t\t i, rm_id, id, remote_id, msk->mpc_endpoint_id);\n\
+  \ \t\t\tspin_unlock_bh(&msk->pm.lock);\n \t\t\tmptcp_subflow_shutdown(sk, ssk, how);\n\
+  +\t\t\tremoved |= subflow->request_join;\n \n \t\t\t/* the following takes care\
+  \ of updating the subflows counter */\n \t\t\tmptcp_close_ssk(sk, ssk, subflow);\n\
+  \ \t\t\tspin_lock_bh(&msk->pm.lock);\n \n-\t\t\tremoved |= subflow->request_join;\n\
+  \ \t\t\tif (rm_type == MPTCP_MIB_RMSUBFLOW)\n \t\t\t\t__MPTCP_INC_STATS(sock_net(sk),\
+  \ rm_type);\n \t\t}\n```\n"
+pattern: '## Bug Pattern
+
+
+  Reading fields of an object after calling a function that may free (or schedule
+  freeing of) that object.
+
+
+  In this case, subflow->request_join is read after mptcp_close_ssk(sk, ssk, subflow),
+  which can release the subflow context, leading to a use-after-free. The correct
+  pattern is to cache any needed fields from subflow before invoking mptcp_close_ssk().'
+plan: "Plan\n\n1. Program State\n- REGISTER_SET_WITH_PROGRAMSTATE(FreedRegions, const\
+  \ MemRegion*)\n  - Tracks pointee regions that have been freed (or scheduled to\
+  \ be freed) by known free/close-like functions.\n- (Optional, for better messages)\
+  \ REGISTER_MAP_WITH_PROGRAMSTATE(FreedByFuncMap, const MemRegion*, const char*)\n\
+  \  - Maps a freed region to the name of the function that freed it. Keep the function\
+  \ names as static const char* literals to be storable in program state.\n\n2. Known\
+  \ \u201Cfree-like\u201D functions table\n- Maintain a small static table of functions\
+  \ known to free or schedule freeing of their pointer parameters, with the indices\
+  \ of those parameters:\n  - kfree: param 0\n  - kvfree: param 0\n  - kvfree_rcu:\
+  \ param 0\n  - mptcp_close_ssk: param 2 (the subflow argument)\n- Provide a helper\
+  \ similar to functionKnownToDeref:\n  - bool functionKnownToFree(const CallEvent\
+  \ &Call, SmallVectorImpl<unsigned> &FreedParams, const char* &Name)\n  - Looks up\
+  \ Call.getCalleeIdentifier()->getName() in the table and fills FreedParams with\
+  \ 0-based parameter indices and Name with the function name literal.\n\n3. Helper\
+  \ functions (inside the checker)\n- const MemRegion* getPointeeRegion(const Expr\
+  \ *E, CheckerContext &C)\n  - Use getMemRegionFromExpr(E, C) from Utility Functions.\
+  \ It returns the region the pointer expression E points to (the pointee region).\
+  \ If null, do nothing.\n- const MemRegion* getBaseRegion(const MemRegion *R)\n \
+  \ - Climb super regions: while (const SubRegion *SR = dyn_cast<SubRegion>(R)) R\
+  \ = SR->getSuperRegion();\n  - Returns the \u201Croot\u201D region representing\
+  \ the whole object. This normalizes field/element regions to the owning object\u2019\
+  s region.\n- bool isFreed(const MemRegion *R, ProgramStateRef State)\n  - Compute\
+  \ Base = getBaseRegion(R). Iterate over all entries F in FreedRegions; return true\
+  \ if Base == F or Base->isSubRegionOf(F) or F->isSubRegionOf(Base).\n  - This ensures\
+  \ both base and subregion relationships are caught.\n- ProgramStateRef markFreed(ProgramStateRef\
+  \ State, const MemRegion *R, const char *FnName)\n  - Base = getBaseRegion(R); State\
+  \ = State->add<FreedRegions>(Base);\n  - If using FreedByFuncMap: State = State->set<FreedByFuncMap>(Base,\
+  \ FnName);\n  - Return updated State.\n\n4. Callback: checkPostCall\n- Purpose:\
+  \ Record regions freed by known free-like functions.\n- Steps:\n  - Extract the\
+  \ callee name. Call functionKnownToFree(...). If false, return.\n  - For each freed\
+  \ parameter index i:\n    - const Expr *ArgE = Call.getArgExpr(i);\n    - const\
+  \ MemRegion *Pointee = getPointeeRegion(ArgE, C);\n    - If Pointee is null, continue\
+  \ (unknown pointer).\n    - State = markFreed(State, Pointee, Name);\n  - Generate\
+  \ a new node with C.addTransition(State).\n\n5. Callback: checkLocation\n- Purpose:\
+  \ Detect reads from a freed object (field/element/member load).\n- Trigger: IsLoad\
+  \ == true.\n- Steps:\n  - const MemRegion *R = Loc.getAsRegion(); if (!R) return.\n\
+  \  - If isFreed(R, State):\n    - Create ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \    - If (!N) return.\n    - Prepare a concise message:\n      - If using FreedByFuncMap\
+  \ and there is a mapping for getBaseRegion(R), include the function name:\n    \
+  \    - \"Use-after-free: read after call to \u2018<func>\u2019\"\n      - Else:\
+  \ \"Use-after-free: read from freed object\"\n    - Emit report: auto BR = std::make_unique<PathSensitiveBugReport>(...).\n\
+  \    - Attach S as the interesting location; C.emitReport(std::move(BR)).\n\n6.\
+  \ (Optional) Callback: checkEndFunction\n- Clear per-path knowledge at function\
+  \ exit if desired (not strictly necessary; CSA path-sensitivity keeps it local anyway):\n\
+  \  - State = State->remove<FreedRegions>(all); State = State->remove<FreedByFuncMap>(all);\n\
+  \  - C.addTransition(State).\n\n7. Notes to improve precision and reduce false positives\n\
+  - The approach is path-sensitive: we only warn on dereferences that happen after\
+  \ the free-like call along the same path.\n- We do not require alias tracking via\
+  \ a PtrAliasMap because we store the pointee MemRegion in FreedRegions and compare\
+  \ by region identity and subregion relation. Any alias dereferencing the same object\
+  \ will resolve to the same base region.\n- We intentionally do not warn for \u201C\
+  cache before free\u201D patterns because the read happens before the markFreed in\
+  \ checkPostCall.\n- We do not attempt to model re-allocation of the same variable:\
+  \ if a new allocation creates a new region, subsequent reads will no longer match\
+  \ the freed region, so no false positive is produced.\n\n8. How this catches the\
+  \ target bug\n- In mptcp_pm_nl_rm_addr_or_subflow:\n  - checkPostCall sees mptcp_close_ssk(sk,\
+  \ ssk, subflow) and marks the pointee region of subflow as freed.\n  - The subsequent\
+  \ load of subflow->request_join triggers checkLocation. The loaded FieldRegion\u2019\
+  s base region matches the FreedRegions entry, so the checker reports:\n    - \"\
+  Use-after-free: read after call to \u2018mptcp_close_ssk\u2019\"\n  - Moving the\
+  \ read (removed |= subflow->request_join) before mptcp_close_ssk prevents the warning,\
+  \ matching the provided fix."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\n#include <string>\n\
+  #include <memory>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\nREGISTER_SET_WITH_PROGRAMSTATE(FreedRegions, const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(FreedByFuncMap,\
+  \ const MemRegion*, const char*)\n\nnamespace {\n\nclass SAGenTestChecker : public\
+  \ Checker<\n    check::PostCall,\n    check::Location\n> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Use-after-free\"\
+  , \"Memory Error\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const;\n\n   private:\n\n      // Known free-like functions table and matcher\n\
+  \      bool functionKnownToFree(const CallEvent &Call,\n                       \
+  \        llvm::SmallVectorImpl<unsigned> &FreedParams,\n                       \
+  \        const char* &Name,\n                               CheckerContext &C) const;\n\
+  \n      // Helpers\n      const MemRegion *getBase(const MemRegion *R) const {\n\
+  \        if (!R) return nullptr;\n        return R->getBaseRegion();\n      }\n\n\
+  \      const MemRegion *getPointeeBaseRegionFromArg(const Expr *E, CheckerContext\
+  \ &C) const {\n        if (!E)\n          return nullptr;\n        const MemRegion\
+  \ *R = C.getSVal(E).getAsRegion();\n        if (!R)\n          return nullptr;\n\
+  \        // Normalize to the object's base region (owning object)\n        return\
+  \ getBase(R);\n      }\n\n      ProgramStateRef markFreed(ProgramStateRef State,\
+  \ const MemRegion *R, const char *FnName) const {\n        if (!R) return State;\n\
+  \        const MemRegion *Base = getBase(R);\n        if (!Base) return State;\n\
+  \        State = State->add<FreedRegions>(Base);\n        State = State->set<FreedByFuncMap>(Base,\
+  \ FnName);\n        return State;\n      }\n\n      bool isFreed(const MemRegion\
+  \ *R, ProgramStateRef State) const {\n        if (!R) return false;\n        const\
+  \ MemRegion *Base = getBase(R);\n        if (!Base) return false;\n        return\
+  \ State->contains<FreedRegions>(Base);\n      }\n};\n\n// Known free-like functions\
+  \ that free/schedule-free of their pointer params.\nbool SAGenTestChecker::functionKnownToFree(const\
+  \ CallEvent &Call,\n                                           llvm::SmallVectorImpl<unsigned>\
+  \ &FreedParams,\n                                           const char* &Name,\n\
+  \                                           CheckerContext &C) const {\n  struct\
+  \ FreeEntry {\n    const char *Name;\n    unsigned Params[3];\n    unsigned Count;\n\
+  \  };\n\n  static const FreeEntry Table[] = {\n    {\"kfree\",           {0}, 1},\n\
+  \    {\"kvfree\",          {0}, 1},\n    {\"kvfree_rcu\",      {0}, 1},\n    //\
+  \ Target-specific: frees/schedules freeing of the subflow context\n    {\"mptcp_close_ssk\"\
+  , {2}, 1}\n  };\n\n  const Expr *Orig = Call.getOriginExpr();\n  const IdentifierInfo\
+  \ *ID = Call.getCalleeIdentifier();\n\n  for (const auto &E : Table) {\n    bool\
+  \ match = false;\n    if (Orig && ExprHasName(Orig, E.Name, C)) {\n      match =\
+  \ true;\n    } else if (ID && ID->getName() == E.Name) {\n      match = true;\n\
+  \    }\n    if (!match)\n      continue;\n\n    FreedParams.clear();\n    for (unsigned\
+  \ i = 0; i < E.Count; ++i)\n      FreedParams.push_back(E.Params[i]);\n    Name\
+  \ = E.Name;\n    return true;\n  }\n\n  return false;\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  llvm::SmallVector<unsigned, 4>\
+  \ FreedParams;\n  const char *FnName = nullptr;\n\n  if (!functionKnownToFree(Call,\
+  \ FreedParams, FnName, C))\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  bool Changed = false;\n\n  for (unsigned Idx : FreedParams) {\n    if (Idx >=\
+  \ Call.getNumArgs())\n      continue;\n\n    const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \    const MemRegion *PointeeBase = getPointeeBaseRegionFromArg(ArgE, C);\n    if\
+  \ (!PointeeBase)\n      continue;\n\n    State = markFreed(State, PointeeBase, FnName);\n\
+  \    Changed = true;\n  }\n\n  if (Changed)\n    C.addTransition(State);\n}\n\n\
+  void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const {\n  if (!IsLoad || !S)\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  const MemRegion *R = Loc.getAsRegion();\n  if (!R)\n    return;\n\n  if (!isFreed(R,\
+  \ State))\n    return;\n\n  // Prepare a concise message\n  const MemRegion *Base\
+  \ = R->getBaseRegion();\n  const char *const *FnNamePtr = State->get<FreedByFuncMap>(Base);\n\
+  \  std::string Msg;\n  if (FnNamePtr && *FnNamePtr) {\n    Msg = \"Use-after-free:\
+  \ read after call to '\";\n    Msg += *FnNamePtr;\n    Msg += \"'\";\n  } else {\n\
+  \    Msg = \"Use-after-free: read from freed object\";\n  }\n\n  ExplodedNode *N\
+  \ = C.generateNonFatalErrorNode();\n  if (!N)\n    return;\n\n  auto Report = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  Report->addRange(S->getSourceRange());\n  C.emitReport(std::move(Report));\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects reads from objects after free-like calls (e.g., mptcp_close_ssk)\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

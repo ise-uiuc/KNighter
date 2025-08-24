@@ -1,0 +1,705 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 7d42e097607c4d246d99225bf2b195b6167a210c
+commit_type: Concurrency
+index: 2
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/StringRef.h\"\
+  \n#include <string>\n#include <unordered_map>\n#include <vector>\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\nnamespace {\n/* The checker\
+  \ callbacks are to be decided. */\nclass SAGenTestChecker : public Checker<check::ASTCodeBody,\
+  \ check::EndAnalysis> {\n   mutable std::unique_ptr<BugType> BT;\n\n   // Data collected\
+  \ across functions (per translation unit)\n   struct WorkerInfo {\n     std::string\
+  \ RecordName;\n     std::string CtxVarName;\n     bool HasCompletionDoneGuard =\
+  \ false;\n     bool UsesCompleteOrKfree = false;\n     SourceLocation AnyUseLoc;\n\
+  \     bool AnyUseLocValid = false;\n   };\n\n   struct SchedInfo {\n     std::string\
+  \ RecordName;\n     bool HasQueueWorkWithSameCtx = false;\n     bool HasWaitTimeoutOnSameCtx\
+  \ = false;\n     bool FreesCtxOnTimeout = false;\n     SourceLocation FreeLoc;\n\
+  \     bool FreeLocValid = false;\n   };\n\n   // Keyed by RecordName (struct tag)\n\
+  \   mutable std::unordered_map<std::string, WorkerInfo> WorkerByRecord;\n   mutable\
+  \ std::unordered_map<std::string, SchedInfo> SchedByRecord;\n\n   public:\n    \
+  \  SAGenTestChecker() : BT(new BugType(this, \"Workqueue context race (missing completion_done)\"\
+  , \"Concurrency\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n      void checkEndAnalysis(ExplodedGraph &G, BugReporter\
+  \ &BR, ExprEngine &Eng) const;\n\n   private:\n\n      // Helper predicates and\
+  \ extractors\n      static bool getRecordNameFromPtrType(QualType QT, std::string\
+  \ &OutName) {\n        if (QT.isNull())\n          return false;\n        QualType\
+  \ Pointee = QT->getPointeeType();\n        if (Pointee.isNull())\n          return\
+  \ false;\n        if (const auto *RT = Pointee->getAs<RecordType>()) {\n       \
+  \   const RecordDecl *RD = RT->getDecl();\n          if (!RD)\n            return\
+  \ false;\n          std::string N = RD->getNameAsString();\n          if (N.empty())\n\
+  \            return false;\n          OutName = N;\n          return true;\n   \
+  \     }\n        return false;\n      }\n\n      static bool exprTextContains(const\
+  \ Expr *E, StringRef Name,\n                                   const SourceManager\
+  \ &SM,\n                                   const LangOptions &LO) {\n        if\
+  \ (!E)\n          return false;\n        CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \        StringRef Txt = Lexer::getSourceText(Range, SM, LO);\n        return Txt.contains(Name);\n\
+  \      }\n\n      static const CallExpr* findCallInCond(const Expr *CondE, StringRef\
+  \ CalleeName) {\n        if (!CondE) return nullptr;\n        CondE = CondE->IgnoreParenCasts();\n\
+  \        if (const auto *CE = dyn_cast<CallExpr>(CondE)) {\n          if (const\
+  \ FunctionDecl *FD = CE->getDirectCallee()) {\n            if (FD->getIdentifier()\
+  \ && FD->getName() == CalleeName)\n              return CE;\n          }\n     \
+  \   } else if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {\n          if\
+  \ (UO->getOpcode() == UO_LNot) {\n            if (const auto *CE = dyn_cast<CallExpr>(UO->getSubExpr()->IgnoreParenCasts()))\
+  \ {\n              if (const FunctionDecl *FD = CE->getDirectCallee()) {\n     \
+  \           if (FD->getIdentifier() && FD->getName() == CalleeName)\n          \
+  \        return CE;\n              }\n            }\n          }\n        } else\
+  \ if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {\n          const Expr\
+  \ *L = BO->getLHS()->IgnoreParenCasts();\n          const Expr *R = BO->getRHS()->IgnoreParenCasts();\n\
+  \          const CallExpr *LC = dyn_cast<CallExpr>(L);\n          const CallExpr\
+  \ *RC = dyn_cast<CallExpr>(R);\n          auto IsZero = [](const Expr *E) -> bool\
+  \ {\n            if (const auto *IL = dyn_cast<IntegerLiteral>(E))\n           \
+  \   return IL->getValue() == 0;\n            return false;\n          };\n     \
+  \     if (LC && BO->getOpcode() == BO_EQ && IsZero(R)) {\n            if (const\
+  \ FunctionDecl *FD = LC->getDirectCallee()) {\n              if (FD->getIdentifier()\
+  \ && FD->getName() == CalleeName)\n                return LC;\n            }\n \
+  \         }\n          if (RC && BO->getOpcode() == BO_EQ && IsZero(L)) {\n    \
+  \        if (const FunctionDecl *FD = RC->getDirectCallee()) {\n              if\
+  \ (FD->getIdentifier() && FD->getName() == CalleeName)\n                return RC;\n\
+  \            }\n          }\n        }\n        return nullptr;\n      }\n\n   \
+  \   static bool isThenBranchTimeout(const IfStmt *IfS) {\n        // Determine which\
+  \ branch is timeout, based on common idioms.\n        // Returns true if 'then'\
+  \ is timeout branch, false if 'else' is timeout branch.\n        // If cannot determine\
+  \ (e.g., no else and no negation/==0), default to 'then' as not-timeout.\n     \
+  \   const Expr *Cond = IfS->getCond();\n        Cond = Cond ? Cond->IgnoreParenCasts()\
+  \ : nullptr;\n\n        // if (!wait(...)) => then is timeout\n        if (const\
+  \ auto *UO = dyn_cast_or_null<UnaryOperator>(Cond)) {\n            if (UO->getOpcode()\
+  \ == UO_LNot) {\n              if (const auto *CE = dyn_cast<CallExpr>(UO->getSubExpr()->IgnoreParenCasts()))\
+  \ {\n                if (const FunctionDecl *FD = CE->getDirectCallee()) {\n   \
+  \               if (FD->getIdentifier() && FD->getName() == \"wait_for_completion_timeout\"\
+  )\n                    return true;\n                }\n              }\n      \
+  \      }\n        }\n\n        // if (wait(...) == 0) => then is timeout\n     \
+  \   if (const auto *BO = dyn_cast_or_null<BinaryOperator>(Cond)) {\n          const\
+  \ Expr *L = BO->getLHS()->IgnoreParenCasts();\n          const Expr *R = BO->getRHS()->IgnoreParenCasts();\n\
+  \          auto IsZero = [](const Expr *E) -> bool {\n            if (const auto\
+  \ *IL = dyn_cast<IntegerLiteral>(E))\n              return IL->getValue() == 0;\n\
+  \            return false;\n          };\n          if (BO->getOpcode() == BO_EQ)\
+  \ {\n            if (const auto *LC = dyn_cast<CallExpr>(L)) {\n              if\
+  \ (const FunctionDecl *FD = LC->getDirectCallee()) {\n                if (FD->getIdentifier()\
+  \ && FD->getName() == \"wait_for_completion_timeout\" && IsZero(R))\n          \
+  \        return true;\n              }\n            }\n            if (const auto\
+  \ *RC = dyn_cast<CallExpr>(R)) {\n              if (const FunctionDecl *FD = RC->getDirectCallee())\
+  \ {\n                if (FD->getIdentifier() && FD->getName() == \"wait_for_completion_timeout\"\
+  \ && IsZero(L))\n                  return true;\n              }\n            }\n\
+  \          }\n        }\n\n        // if (wait(...)) => else is timeout\n      \
+  \  if (const auto *CE = dyn_cast_or_null<CallExpr>(Cond)) {\n          if (const\
+  \ FunctionDecl *FD = CE->getDirectCallee()) {\n            if (FD->getIdentifier()\
+  \ && FD->getName() == \"wait_for_completion_timeout\")\n              return false;\
+  \ // then is success, else is timeout\n          }\n        }\n\n        // Default:\
+  \ else is timeout (conservative)\n        return false;\n      }\n\n      static\
+  \ bool isAddrOfMemberOnCtx(const Expr *Arg,\n                                  \
+  \    StringRef CtxVarName,\n                                      StringRef MemberSubstring)\
+  \ {\n        if (!Arg) return false;\n        Arg = Arg->IgnoreParenCasts();\n \
+  \       const UnaryOperator *UO = dyn_cast<UnaryOperator>(Arg);\n        if (!UO\
+  \ || UO->getOpcode() != UO_AddrOf)\n          return false;\n\n        const Expr\
+  \ *Sub = UO->getSubExpr()->IgnoreParenCasts();\n        const auto *ME = dyn_cast<MemberExpr>(Sub);\n\
+  \        if (!ME)\n          return false;\n\n        const ValueDecl *MD = ME->getMemberDecl();\n\
+  \        if (!MD)\n          return false;\n        std::string MName = MD->getNameAsString();\n\
+  \        if (MName.find(MemberSubstring.str()) == std::string::npos)\n         \
+  \ return false;\n\n        const Expr *Base = ME->getBase()->IgnoreParenCasts();\n\
+  \        if (const auto *DRE = dyn_cast<DeclRefExpr>(Base)) {\n          const ValueDecl\
+  \ *VD = DRE->getDecl();\n          if (!VD)\n            return false;\n       \
+  \   return VD->getName() == CtxVarName;\n        }\n        return false;\n    \
+  \  }\n\n      static bool getCtxFromAddrOfMember(const Expr *Arg,\n            \
+  \                             std::string &OutCtxVar,\n                        \
+  \                 std::string &OutRecordName) {\n        if (!Arg) return false;\n\
+  \        Arg = Arg->IgnoreParenCasts();\n        const auto *UO = dyn_cast<UnaryOperator>(Arg);\n\
+  \        if (!UO || UO->getOpcode() != UO_AddrOf)\n          return false;\n\n \
+  \       const Expr *Sub = UO->getSubExpr()->IgnoreParenCasts();\n        const auto\
+  \ *ME = dyn_cast<MemberExpr>(Sub);\n        if (!ME)\n          return false;\n\n\
+  \        const Expr *Base = ME->getBase()->IgnoreParenCasts();\n        const auto\
+  \ *DRE = dyn_cast<DeclRefExpr>(Base);\n        if (!DRE)\n          return false;\n\
+  \n        const ValueDecl *VD = DRE->getDecl();\n        if (!VD)\n          return\
+  \ false;\n\n        OutCtxVar = VD->getNameAsString();\n        return getRecordNameFromPtrType(VD->getType(),\
+  \ OutRecordName);\n      }\n\n      static bool isKfreeOfVar(const CallExpr *CE,\
+  \ StringRef VarName) {\n        if (!CE) return false;\n        const FunctionDecl\
+  \ *FD = CE->getDirectCallee();\n        if (!FD || !FD->getIdentifier())\n     \
+  \     return false;\n        if (FD->getName() != \"kfree\")\n          return false;\n\
+  \        if (CE->getNumArgs() < 1)\n          return false;\n        const Expr\
+  \ *A0 = CE->getArg(0)->IgnoreParenCasts();\n        if (const auto *DRE = dyn_cast<DeclRefExpr>(A0))\
+  \ {\n          const ValueDecl *VD = DRE->getDecl();\n          return VD && VD->getName()\
+  \ == VarName;\n        }\n        return false;\n      }\n\n      static const CallExpr*\
+  \ findKfreeOfVarInSubtree(const Stmt *S, StringRef VarName) {\n        if (!S) return\
+  \ nullptr;\n        if (const auto *CE = dyn_cast<CallExpr>(S)) {\n          if\
+  \ (isKfreeOfVar(CE, VarName))\n            return CE;\n        }\n        for (const\
+  \ Stmt *Child : S->children()) {\n          if (!Child) continue;\n          if\
+  \ (const CallExpr *Found = findKfreeOfVarInSubtree(Child, VarName))\n          \
+  \  return Found;\n        }\n        return nullptr;\n      }\n\n      // AST scanning\
+  \ utilities\n      static bool isContainerOfInit(const VarDecl *VD,\n          \
+  \                          const SourceManager &SM,\n                          \
+  \          const LangOptions &LO) {\n        if (!VD || !VD->hasInit())\n      \
+  \    return false;\n        const Expr *Init = VD->getInit();\n        return exprTextContains(Init,\
+  \ \"container_of\", SM, LO);\n      }\n\n      static std::string getCalleeName(const\
+  \ CallExpr *CE) {\n        if (!CE) return \"\";\n        if (const FunctionDecl\
+  \ *FD = CE->getDirectCallee()) {\n          if (const IdentifierInfo *II = FD->getIdentifier())\n\
+  \            return II->getName().str();\n        }\n        return \"\";\n    \
+  \  }\n\n      static bool isQueueWorkLike(StringRef Name) {\n        return Name\
+  \ == \"queue_work\" ||\n               Name == \"queue_work_on\" ||\n          \
+  \     Name == \"schedule_work\" ||\n               Name == \"queue_delayed_work\"\
+  \ ||\n               Name == \"queue_delayed_work_on\" ||\n               Name ==\
+  \ \"schedule_delayed_work\";\n      }\n};\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  const Stmt *Body = FD->getBody();\n\
+  \  ASTContext &ACtx = Mgr.getASTContext();\n  const SourceManager &SM = ACtx.getSourceManager();\n\
+  \  const LangOptions &LO = ACtx.getLangOpts();\n\n  // Worker role detection: find\
+  \ VarDecl initialized via container_of(...)\n  bool WorkerRoleActive = false;\n\
+  \  std::string WorkerCtxVarName;\n  std::string WorkerRecordName;\n\n  // Scan DeclStmts\
+  \ to find container_of init\n  for (const Stmt *Child : Body->children()) {\n  \
+  \  if (!Child) continue;\n    if (const auto *DS = dyn_cast<DeclStmt>(Child)) {\n\
+  \      for (const Decl *SD : DS->decls()) {\n        const auto *VD = dyn_cast<VarDecl>(SD);\n\
+  \        if (!VD) continue;\n        // Must be pointer to some struct\n       \
+  \ std::string RN;\n        if (!getRecordNameFromPtrType(VD->getType(), RN))\n \
+  \         continue;\n        if (!VD->hasInit())\n          continue;\n        if\
+  \ (isContainerOfInit(VD, SM, LO)) {\n          WorkerRoleActive = true;\n      \
+  \    WorkerCtxVarName = VD->getNameAsString();\n          WorkerRecordName = RN;\n\
+  \          break;\n        }\n      }\n    }\n    if (WorkerRoleActive)\n      break;\n\
+  \  }\n\n  // Prepare aggregation holders for this function\n  bool FoundCompletionDoneGuard\
+  \ = false;\n  bool FoundUsesCompleteOrKfree = false;\n  SourceLocation FirstUseLoc;\n\
+  \n  // Scheduler role detection structures for this function\n  // Map RecordName\
+  \ -> ctx var name used with wait/queue\n  std::unordered_map<std::string, std::string>\
+  \ RecToCtxVar_Wait;\n  std::unordered_map<std::string, bool> RecHasWait;\n  std::unordered_map<std::string,\
+  \ bool> RecHasQueue;\n  std::unordered_map<std::string, SourceLocation> RecTimeoutFreeLoc;\n\
+  \  std::unordered_map<std::string, bool> RecHasTimeoutFree;\n\n  // Walk all CallExpr\
+  \ and IfStmt in the function body to collect info\n  // Simple recursive lambda\n\
+  \  std::function<void(const Stmt*)> Walk;\n  Walk = [&](const Stmt *S) {\n    if\
+  \ (!S) return;\n\n    if (const auto *CE = dyn_cast<CallExpr>(S)) {\n      std::string\
+  \ Callee = getCalleeName(CE);\n\n      if (WorkerRoleActive) {\n        if (Callee\
+  \ == \"completion_done\") {\n          if (CE->getNumArgs() >= 1 &&\n          \
+  \    isAddrOfMemberOnCtx(CE->getArg(0), WorkerCtxVarName, \"compl\")) {\n      \
+  \      FoundCompletionDoneGuard = true;\n          }\n        } else if (Callee\
+  \ == \"complete\") {\n          if (CE->getNumArgs() >= 1 &&\n              isAddrOfMemberOnCtx(CE->getArg(0),\
+  \ WorkerCtxVarName, \"compl\")) {\n            if (!FoundUsesCompleteOrKfree) {\n\
+  \              FirstUseLoc = CE->getBeginLoc();\n            }\n            FoundUsesCompleteOrKfree\
+  \ = true;\n          }\n        } else if (Callee == \"kfree\") {\n          if\
+  \ (CE->getNumArgs() >= 1) {\n            const Expr *A0 = CE->getArg(0)->IgnoreParenCasts();\n\
+  \            if (const auto *DRE = dyn_cast<DeclRefExpr>(A0)) {\n              if\
+  \ (const ValueDecl *VD = DRE->getDecl()) {\n                if (VD->getName() ==\
+  \ WorkerCtxVarName) {\n                  if (!FoundUsesCompleteOrKfree) {\n    \
+  \                FirstUseLoc = CE->getBeginLoc();\n                  }\n       \
+  \           FoundUsesCompleteOrKfree = true;\n                }\n              }\n\
+  \            }\n          }\n        }\n      }\n\n      // Scheduler: wait_for_completion_timeout\
+  \ to capture ctx and record\n      if (Callee == \"wait_for_completion_timeout\"\
+  ) {\n        if (CE->getNumArgs() >= 1) {\n          std::string CtxVar, RecName;\n\
+  \          if (getCtxFromAddrOfMember(CE->getArg(0), CtxVar, RecName)) {\n     \
+  \       RecToCtxVar_Wait[RecName] = CtxVar;\n            RecHasWait[RecName] = true;\n\
+  \          }\n        }\n      }\n\n      // Scheduler: queue_* or schedule_* with\
+  \ &ctx->work\n      if (isQueueWorkLike(Callee)) {\n        for (unsigned i = 0;\
+  \ i < CE->getNumArgs(); ++i) {\n          const Expr *Arg = CE->getArg(i);\n   \
+  \       Arg = Arg ? Arg->IgnoreParenCasts() : nullptr;\n          const auto *UO\
+  \ = dyn_cast_or_null<UnaryOperator>(Arg);\n          if (!UO || UO->getOpcode()\
+  \ != UO_AddrOf)\n            continue;\n          const Expr *Sub = UO->getSubExpr()->IgnoreParenCasts();\n\
+  \          const auto *ME = dyn_cast<MemberExpr>(Sub);\n          if (!ME)\n   \
+  \         continue;\n          const ValueDecl *MD = ME->getMemberDecl();\n    \
+  \      if (!MD)\n            continue;\n          std::string MemName = MD->getNameAsString();\n\
+  \          if (MemName.find(\"work\") == std::string::npos)\n            continue;\n\
+  \          const Expr *Base = ME->getBase()->IgnoreParenCasts();\n          const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(Base);\n          if (!DRE)\n            continue;\n\
+  \          const ValueDecl *VD = DRE->getDecl();\n          if (!VD)\n         \
+  \   continue;\n          std::string CtxVar = VD->getNameAsString();\n         \
+  \ std::string RecName;\n          if (getRecordNameFromPtrType(VD->getType(), RecName))\
+  \ {\n            RecHasQueue[RecName] = true;\n            // If no wait seen yet,\
+  \ we may not know if it's the same ctx, but we correlate by RecordName later.\n\
+  \          }\n        }\n      }\n    } else if (const auto *IfS = dyn_cast<IfStmt>(S))\
+  \ {\n      // If condition involves wait_for_completion_timeout\n      const CallExpr\
+  \ *WaitC = findCallInCond(IfS->getCond(), \"wait_for_completion_timeout\");\n  \
+  \    if (WaitC && WaitC->getNumArgs() >= 1) {\n        std::string CtxVar, RecName;\n\
+  \        if (getCtxFromAddrOfMember(WaitC->getArg(0), CtxVar, RecName)) {\n    \
+  \      RecToCtxVar_Wait[RecName] = CtxVar;\n          RecHasWait[RecName] = true;\n\
+  \n          bool ThenIsTimeout = isThenBranchTimeout(IfS);\n          const Stmt\
+  \ *TimeoutBranch = ThenIsTimeout ? IfS->getThen() : IfS->getElse();\n          if\
+  \ (TimeoutBranch) {\n            if (const CallExpr *KF = findKfreeOfVarInSubtree(TimeoutBranch,\
+  \ CtxVar)) {\n              RecHasTimeoutFree[RecName] = true;\n              RecTimeoutFreeLoc[RecName]\
+  \ = KF->getBeginLoc();\n            }\n          }\n        }\n      }\n    }\n\n\
+  \    for (const Stmt *Child : S->children())\n      Walk(Child);\n  };\n\n  Walk(Body);\n\
+  \n  // Commit worker info if applicable\n  if (WorkerRoleActive) {\n    auto It\
+  \ = WorkerByRecord.find(WorkerRecordName);\n    if (It == WorkerByRecord.end())\
+  \ {\n      WorkerInfo WI;\n      WI.RecordName = WorkerRecordName;\n      WI.CtxVarName\
+  \ = WorkerCtxVarName;\n      WI.HasCompletionDoneGuard = FoundCompletionDoneGuard;\n\
+  \      WI.UsesCompleteOrKfree = FoundUsesCompleteOrKfree;\n      WI.AnyUseLoc =\
+  \ FirstUseLoc;\n      WI.AnyUseLocValid = FoundUsesCompleteOrKfree;\n      WorkerByRecord.emplace(WorkerRecordName,\
+  \ WI);\n    } else {\n      // Merge conservatively\n      It->second.HasCompletionDoneGuard\
+  \ = It->second.HasCompletionDoneGuard || FoundCompletionDoneGuard;\n      if (FoundUsesCompleteOrKfree)\
+  \ {\n        It->second.UsesCompleteOrKfree = true;\n        if (!It->second.AnyUseLocValid)\
+  \ {\n          It->second.AnyUseLoc = FirstUseLoc;\n          It->second.AnyUseLocValid\
+  \ = true;\n        }\n      }\n    }\n  }\n\n  // Commit scheduler info for each\
+  \ record that has wait+queue and has timeout-free\n  for (const auto &P : RecHasWait)\
+  \ {\n    const std::string &RecName = P.first;\n    bool HasWait = P.second;\n \
+  \   bool HasQueue = RecHasQueue.count(RecName) ? RecHasQueue[RecName] : false;\n\
+  \    bool HasFree = RecHasTimeoutFree.count(RecName) ? RecHasTimeoutFree[RecName]\
+  \ : false;\n    if (HasWait && HasQueue && HasFree) {\n      auto It = SchedByRecord.find(RecName);\n\
+  \      if (It == SchedByRecord.end()) {\n        SchedInfo SI;\n        SI.RecordName\
+  \ = RecName;\n        SI.HasQueueWorkWithSameCtx = true;\n        SI.HasWaitTimeoutOnSameCtx\
+  \ = true;\n        SI.FreesCtxOnTimeout = true;\n        SI.FreeLoc = RecTimeoutFreeLoc[RecName];\n\
+  \        SI.FreeLocValid = true;\n        SchedByRecord.emplace(RecName, SI);\n\
+  \      } else {\n        It->second.HasQueueWorkWithSameCtx = true;\n        It->second.HasWaitTimeoutOnSameCtx\
+  \ = true;\n        It->second.FreesCtxOnTimeout = true;\n        if (!It->second.FreeLocValid\
+  \ && RecTimeoutFreeLoc.count(RecName)) {\n          It->second.FreeLoc = RecTimeoutFreeLoc[RecName];\n\
+  \          It->second.FreeLocValid = true;\n        }\n      }\n    }\n  }\n}\n\n\
+  void SAGenTestChecker::checkEndAnalysis(ExplodedGraph &G, BugReporter &BR, ExprEngine\
+  \ &Eng) const {\n  // Correlate worker and scheduler info by RecordName\n  for (const\
+  \ auto &SP : SchedByRecord) {\n    const std::string &RecName = SP.first;\n    const\
+  \ SchedInfo &SI = SP.second;\n\n    if (!(SI.HasWaitTimeoutOnSameCtx && SI.HasQueueWorkWithSameCtx\
+  \ && SI.FreesCtxOnTimeout && SI.FreeLocValid))\n      continue;\n\n    auto WIt\
+  \ = WorkerByRecord.find(RecName);\n    if (WIt == WorkerByRecord.end())\n      continue;\n\
+  \n    const WorkerInfo &WI = WIt->second;\n    if (!(WI.UsesCompleteOrKfree && !WI.HasCompletionDoneGuard))\n\
+  \      continue;\n\n    // Report\n    PathDiagnosticLocation Loc =\n        PathDiagnosticLocation::createBegin(SI.FreeLoc,\
+  \ BR.getSourceManager());\n\n    auto R = std::make_unique<BasicBugReport>(\n  \
+  \      *BT,\n        \"Workqueue context may be freed on timeout while worker still\
+  \ uses it; missing completion_done() guard\",\n        Loc);\n    BR.emitReport(std::move(R));\n\
+  \  }\n\n  // Clear collected data to avoid cross-TU mixing (defensive)\n  WorkerByRecord.clear();\n\
+  \  SchedByRecord.clear();\n}\n\n} // end anonymous namespace\n\nextern \"C\" void\
+  \ clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects race: scheduler frees workqueue\
+  \ context on timeout while worker uses it without completion_done() guard\",\n \
+  \     \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ncrypto: qat - resolve race condition during AER recovery\n\
+  \nDuring the PCI AER system's error recovery process, the kernel driver\nmay encounter\
+  \ a race condition with freeing the reset_data structure's\nmemory. If the device\
+  \ restart will take more than 10 seconds the function\nscheduling that restart will\
+  \ exit due to a timeout, and the reset_data\nstructure will be freed. However, this\
+  \ data structure is used for\ncompletion notification after the restart is completed,\
+  \ which leads\nto a UAF bug.\n\nThis results in a KFENCE bug notice.\n\n  BUG: KFENCE:\
+  \ use-after-free read in adf_device_reset_worker+0x38/0xa0 [intel_qat]\n  Use-after-free\
+  \ read at 0x00000000bc56fddf (in kfence-#142):\n  adf_device_reset_worker+0x38/0xa0\
+  \ [intel_qat]\n  process_one_work+0x173/0x340\n\nTo resolve this race condition,\
+  \ the memory associated to the container\nof the work_struct is freed on the worker\
+  \ if the timeout expired,\notherwise on the function that schedules the worker.\n\
+  The timeout detection can be done by checking if the caller is\nstill waiting for\
+  \ completion or not by using completion_done() function.\n\nFixes: d8cba25d2c68\
+  \ (\"crypto: qat - Intel(R) QAT driver framework\")\nCc: <stable@vger.kernel.org>\n\
+  Signed-off-by: Damian Muszynski <damian.muszynski@intel.com>\nReviewed-by: Giovanni\
+  \ Cabiddu <giovanni.cabiddu@intel.com>\nSigned-off-by: Herbert Xu <herbert@gondor.apana.org.au>\n\
+  \n## Buggy Code\n\n```c\n// Function: adf_device_reset_worker in drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  static void adf_device_reset_worker(struct work_struct *work)\n{\n\tstruct adf_reset_dev_data\
+  \ *reset_data =\n\t\t  container_of(work, struct adf_reset_dev_data, reset_work);\n\
+  \tstruct adf_accel_dev *accel_dev = reset_data->accel_dev;\n\tunsigned long wait_jiffies\
+  \ = msecs_to_jiffies(10000);\n\tstruct adf_sriov_dev_data sriov_data;\n\n\tadf_dev_restarting_notify(accel_dev);\n\
+  \tif (adf_dev_restart(accel_dev)) {\n\t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n\t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n\t\t\tkfree(reset_data);\n\
+  \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\n\");\n\t\treturn;\n\
+  \t}\n\n\tsriov_data.accel_dev = accel_dev;\n\tinit_completion(&sriov_data.compl);\n\
+  \tINIT_WORK(&sriov_data.sriov_work, adf_device_sriov_worker);\n\tqueue_work(device_sriov_wq,\
+  \ &sriov_data.sriov_work);\n\tif (wait_for_completion_timeout(&sriov_data.compl,\
+  \ wait_jiffies))\n\t\tadf_pf2vf_notify_restarted(accel_dev);\n\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\n\t/* The dev is back\
+  \ alive. Notify the caller if in sync mode */\n\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n\
+  \t\tcomplete(&reset_data->compl);\n\telse\n\t\tkfree(reset_data);\n}\n```\n\n```c\n\
+  // Function: adf_slot_reset in drivers/crypto/intel/qat/qat_common/adf_aer.c\nstatic\
+  \ pci_ers_result_t adf_slot_reset(struct pci_dev *pdev)\n{\n\tstruct adf_accel_dev\
+  \ *accel_dev = adf_devmgr_pci_to_accel_dev(pdev);\n\tint res = 0;\n\n\tif (!accel_dev)\
+  \ {\n\t\tpr_err(\"QAT: Can't find acceleration device\\n\");\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\
+  \t}\n\n\tif (!pdev->is_busmaster)\n\t\tpci_set_master(pdev);\n\tpci_restore_state(pdev);\n\
+  \tpci_save_state(pdev);\n\tres = adf_dev_up(accel_dev, false);\n\tif (res && res\
+  \ != -EALREADY)\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\n\tadf_reenable_sriov(accel_dev);\n\
+  \tadf_pf2vf_notify_restarted(accel_dev);\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\treturn PCI_ERS_RESULT_RECOVERED;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/crypto/intel/qat/qat_common/adf_aer.c\
+  \ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\nindex 3597e7605a14..9da2278bd5b7\
+  \ 100644\n--- a/drivers/crypto/intel/qat/qat_common/adf_aer.c\n+++ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  @@ -130,7 +130,8 @@ static void adf_device_reset_worker(struct work_struct *work)\n\
+  \ \tif (adf_dev_restart(accel_dev)) {\n \t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n \t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n-\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n+\t\tif (reset_data->mode\
+  \ == ADF_DEV_RESET_ASYNC ||\n+\t\t    completion_done(&reset_data->compl))\n \t\t\
+  \tkfree(reset_data);\n \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\\
+  n\");\n \t\treturn;\n@@ -146,11 +147,19 @@ static void adf_device_reset_worker(struct\
+  \ work_struct *work)\n \tadf_dev_restarted_notify(accel_dev);\n \tclear_bit(ADF_STATUS_RESTARTING,\
+  \ &accel_dev->status);\n \n-\t/* The dev is back alive. Notify the caller if in\
+  \ sync mode */\n-\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n-\t\tcomplete(&reset_data->compl);\n\
+  -\telse\n+\t/*\n+\t * The dev is back alive. Notify the caller if in sync mode\n\
+  +\t *\n+\t * If device restart will take a more time than expected,\n+\t * the schedule_reset()\
+  \ function can timeout and exit. This can be\n+\t * detected by calling the completion_done()\
+  \ function. In this case\n+\t * the reset_data structure needs to be freed here.\n\
+  +\t */\n+\tif (reset_data->mode == ADF_DEV_RESET_ASYNC ||\n+\t    completion_done(&reset_data->compl))\n\
+  \ \t\tkfree(reset_data);\n+\telse\n+\t\tcomplete(&reset_data->compl);\n }\n \n static\
+  \ int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n@@ -183,8 +192,9\
+  \ @@ static int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n \t\
+  \t\tdev_err(&GET_DEV(accel_dev),\n \t\t\t\t\"Reset device timeout expired\\n\");\n\
+  \ \t\t\tret = -EFAULT;\n+\t\t} else {\n+\t\t\tkfree(reset_data);\n \t\t}\n-\t\t\
+  kfree(reset_data);\n \t\treturn ret;\n \t}\n \treturn 0;\n```\n"
+pattern: '## Bug Pattern
+
+
+  Workqueue context (container_of(work, struct ctx, work)) is shared between the worker
+  and the thread that schedules it, with a completion used to synchronize. The scheduling
+  thread calls wait_for_completion_timeout() and frees the context on timeout, while
+  the worker still dereferences the same context later (e.g., to complete() or free
+  it), causing a use-after-free. The root cause is missing ownership coordination
+  of the context across timeout paths: both sides may free or the worker may access
+  memory already freed by the waiter. The fix ensures a single owner frees the context
+  by checking completion_done() to decide whether the waiter timed out (worker frees)
+  or is still waiting (waiter frees after completion).'
+plan: "Plan\n\n1. Program state\n- No custom program state is required. We will detect\
+  \ this purely from the AST (per-function body scanning) and correlate information\
+  \ across functions at end-of-analysis.\n\n2. Chosen callbacks\n- checkASTCodeBody:\
+  \ Scan each function body for two roles:\n  - Worker role: a workqueue worker that\
+  \ obtains its context via container_of(work, struct T, work_member) and later uses\
+  \ complete() and/or kfree() on that context, with or without a completion_done()\
+  \ guard.\n  - Scheduling role: a function that allocates/uses a context struct T,\
+  \ schedules its work, waits with wait_for_completion_timeout(), and frees the context\
+  \ on the timeout path.\n- checkEndAnalysis: Correlate the collected worker and scheduling\
+  \ information by struct type T and emit a report if we find a scheduling function\
+  \ that frees on timeout and a worker for the same T that uses the context without\
+  \ a completion_done() guard.\n\n3. Data to collect (checker member data, not ProgramState)\n\
+  - For workers (keyed by RecordName, i.e., struct tag name):\n  - RecordName: string\
+  \ (e.g., \"adf_reset_dev_data\") taken from the pointee type of the variable initialized\
+  \ via container_of.\n  - CtxVarName: string, the local variable name holding the\
+  \ context pointer (e.g., \"reset_data\"). Used to match calls.\n  - HasCompletionDoneGuard:\
+  \ bool. True if the function calls completion_done(&ctx->compl).\n  - UsesCompleteOrKfree:\
+  \ bool. True if it calls complete(&ctx->compl) or kfree(ctx).\n  - AnyUseLoc: SourceLocation\
+  \ for an unguarded action (complete()/kfree()) to reference in diagnostics if needed.\n\
+  \n- For schedulers (keyed by RecordName):\n  - RecordName: string (same as above).\n\
+  \  - HasQueueWorkWithSameCtx: bool. True if the function calls queue_* or schedule_*\
+  \ APIs with &ctx->work for the same ctx variable.\n  - HasWaitTimeoutOnSameCtx:\
+  \ bool. True if it calls wait_for_completion_timeout(&ctx->compl) for the same ctx\
+  \ variable.\n  - FreesCtxOnTimeout: bool. True if there is a kfree(ctx) in a path\
+  \ that may correspond to timeout.\n  - FreeLoc: SourceLocation of the suspicious\
+  \ kfree(ctx).\n\nImplementation details:\n\n4. checkASTCodeBody: Worker role detection\
+  \ (per function)\n- Step W1: Detect container_of context extraction.\n  - Find a\
+  \ DeclStmt with a VarDecl of pointer-to-RecordType whose initializer source contains\
+  \ \"container_of\" (use ExprHasName on the initializer).\n  - Extract:\n    - RecordName:\
+  \ from the VarDecl\u2019s pointee RecordType (getDecl()->getNameAsString()).\n \
+  \   - CtxVarName: from the VarDecl\u2019s name.\n  - If not found, this function\
+  \ is not a worker; return.\n\n- Step W2: Scan the function body for calls that refer\
+  \ to the same context.\n  - For each CallExpr:\n    - Identify callee by name via\
+  \ CallEvent/IdentifierInfo or callee FunctionDecl:\n      - completion_done:\n \
+  \       - Check if the first argument is &ctx->compl:\n          - Use findSpecificTypeInChildren<MemberExpr>(Arg0)\
+  \ and validate:\n            - The base of the MemberExpr is a DeclRefExpr matching\
+  \ CtxVarName.\n          - If matched, set HasCompletionDoneGuard = true.\n    \
+  \  - complete:\n        - Check if the first argument is &ctx->compl (same way as\
+  \ above). If matched, set UsesCompleteOrKfree = true. If HasCompletionDoneGuard\
+  \ is false at this point, keep the Call\u2019s location as AnyUseLoc (first occurrence).\n\
+  \      - kfree:\n        - Check if the first argument is a DeclRefExpr matching\
+  \ CtxVarName. If matched, set UsesCompleteOrKfree = true and record AnyUseLoc if\
+  \ not set.\n\n- Step W3: Store WorkerInfo[RecordName]:\n  - RecordName\n  - HasCompletionDoneGuard\n\
+  \  - UsesCompleteOrKfree\n  - AnyUseLoc\n\n5. checkASTCodeBody: Scheduling role\
+  \ detection (per function)\n- Step S1: Detect wait_for_completion_timeout on a context.\n\
+  \  - For each CallExpr to wait_for_completion_timeout:\n    - Extract the first\
+  \ argument; ensure it\u2019s &X->compl (MemberExpr under UnaryOperator \u2018&\u2019\
+  ):\n      - Get the MemberExpr and its base DeclRefExpr; the base variable name\
+  \ is X.\n      - Extract RecordName from the base\u2019s type (pointer to record).\n\
+  \    - If found, set HasWaitTimeoutOnSameCtx = true for this RecordName in this\
+  \ function.\n\n- Step S2: Detect that the same function schedules the worker on\
+  \ the same context.\n  - Look for calls to queue_work, queue_delayed_work, schedule_work,\
+  \ schedule_delayed_work, etc.:\n    - Check if any argument is &X->work for the\
+  \ same base ctx variable X (MemberExpr under \u2018&\u2019 and member name contains\
+  \ \u201Cwork\u201D).\n    - If found, set HasQueueWorkWithSameCtx = true.\n\n- Step\
+  \ S3: Detect that ctx is freed on the timeout path.\n  - Primary pattern (If-statement\
+  \ around the wait):\n    - Find an enclosing IfStmt where the condition contains\
+  \ \u201Cwait_for_completion_timeout\u201D (ExprHasName).\n    - Heuristics to decide\
+  \ which branch is timeout:\n      - If the condition is a UnaryOperator \u2018!\u2019\
+  \ over the call, then the \u2018then\u2019 branch is timeout.\n      - If the condition\
+  \ is BinaryOperator \u2018== 0\u2019 with the call on one side, then the \u2018\
+  then\u2019 branch is timeout.\n      - If the condition is just the call (no negation),\
+  \ then the \u2018else\u2019 branch is timeout (i.e., call returns 0 -> timeout).\n\
+  \    - In the identified timeout branch, search for kfree(X) where the argument\
+  \ is DeclRefExpr matching X. If found, set FreesCtxOnTimeout = true and FreeLoc\
+  \ = that call\u2019s location.\n\n  - Secondary pattern (unconditional or later\
+  \ free after the If):\n    - If an IfStmt condition contains wait_for_completion_timeout\
+  \ and neither branch returns, scan the subsequent sibling statements in the same\
+  \ CompoundStmt for kfree(X).\n      - Use findSpecificTypeInParents to get the parent\
+  \ CompoundStmt of the IfStmt, iterate statements after it; if any kfree(X) is found,\
+  \ treat it as \u201Cpotentially after timeout\u201D and set FreesCtxOnTimeout =\
+  \ true and FreeLoc accordingly.\n\n- Step S4: Store SchedulingInfo[RecordName] for\
+  \ this function only if:\n  - HasWaitTimeoutOnSameCtx == true\n  - HasQueueWorkWithSameCtx\
+  \ == true\n  - FreesCtxOnTimeout == true\n\n6. checkEndAnalysis: Correlate and report\n\
+  - For each RecordName that appears in both:\n  - WorkerInfo[RecordName] with:\n\
+  \    - UsesCompleteOrKfree == true\n    - HasCompletionDoneGuard == false\n  - and\
+  \ SchedulingInfo[RecordName] with:\n    - FreesCtxOnTimeout == true\n  - Emit a\
+  \ BasicBugReport:\n    - Short message: \u201CWorkqueue context may be freed on\
+  \ timeout while worker still uses it; missing completion_done() guard.\u201D\n \
+  \   - Primary location: SchedulingInfo[RecordName].FreeLoc (the kfree on timeout).\n\
+  \    - Optionally, add a note pointing to WorkerInfo[RecordName].AnyUseLoc if available\
+  \ (complete()/kfree() use in worker).\n\n7. Utilities and matching details\n- Use\
+  \ ExprHasName to:\n  - Detect \u201Ccontainer_of\u201D usage in the worker\u2019\
+  s initializer expression.\n  - Detect \u201Cwait_for_completion_timeout\u201D in\
+  \ If conditions.\n- Use findSpecificTypeInChildren to extract MemberExpr from call\
+  \ arguments and verify:\n  - Base is DeclRefExpr whose name equals the ctx variable\
+  \ name we\u2019re tracking.\n  - Member name equals or contains \u201Ccompl\u201D\
+  \ for completion and \u201Cwork\u201D for the work_struct field.\n- Use getNameAsString/getDecl()->getNameAsString\
+  \ on RecordType to derive RecordName in a normalization form (e.g., without \u201C\
+  struct \u201D prefix).\n- Recognized API names (callee identifiers):\n  - Worker\
+  \ side: completion_done, complete, kfree.\n  - Scheduler side: wait_for_completion_timeout,\
+  \ queue_work, schedule_work, queue_delayed_work, schedule_delayed_work.\n\n8. Reporting\
+  \ policy\n- Report only when both sides match on RecordName: this keeps false positives\
+  \ low.\n- Do not attempt path-sensitive ownership proofs; rely on the clear syntactic\
+  \ pattern: wait_for_completion_timeout + timeout-free on scheduler side, combined\
+  \ with missing completion_done() check in the worker.\n\n9. Notes and limitations\n\
+  - The guard detection is conservative: if the worker calls completion_done(&ctx->compl)\
+  \ anywhere, we treat it as \u201Cguard present,\u201D assuming it participates in\
+  \ gating the free/complete logic.\n- The timeout-branch identification uses common\
+  \ idioms: if (wait_for_completion_timeout(...)) vs if (!...) and (== 0). If unusual\
+  \ forms appear, the secondary pattern (free after the If) still detects suspicious\
+  \ frees."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"llvm/ADT/StringRef.h\"\
+  \n#include <string>\n#include <unordered_map>\n#include <vector>\n#include <functional>\n\
+  #include <memory>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\nnamespace {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker\
+  \ : public Checker<check::ASTCodeBody, check::EndAnalysis> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   // Data collected across functions (per translation unit)\n   struct\
+  \ WorkerInfo {\n     std::string RecordName;\n     std::string CtxVarName;\n   \
+  \  bool HasCompletionDoneGuard = false;\n     bool UsesCompleteOrKfree = false;\n\
+  \     SourceLocation AnyUseLoc;\n     bool AnyUseLocValid = false;\n   };\n\n  \
+  \ struct SchedInfo {\n     std::string RecordName;\n     bool HasQueueWorkWithSameCtx\
+  \ = false;\n     bool HasWaitTimeoutOnSameCtx = false;\n     bool FreesCtxOnTimeout\
+  \ = false;\n     SourceLocation FreeLoc;\n     bool FreeLocValid = false;\n   };\n\
+  \n   // Keyed by RecordName (struct tag)\n   mutable std::unordered_map<std::string,\
+  \ WorkerInfo> WorkerByRecord;\n   mutable std::unordered_map<std::string, SchedInfo>\
+  \ SchedByRecord;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this,\
+  \ \"Workqueue context race (missing completion_done)\", \"Concurrency\")) {}\n\n\
+  \      void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR)\
+  \ const;\n      void checkEndAnalysis(ExplodedGraph &G, BugReporter &BR, ExprEngine\
+  \ &Eng) const;\n\n   private:\n\n      // Helper predicates and extractors\n   \
+  \   static bool getRecordNameFromPtrType(QualType QT, std::string &OutName) {\n\
+  \        if (QT.isNull())\n          return false;\n        QualType Pointee = QT->getPointeeType();\n\
+  \        if (Pointee.isNull())\n          return false;\n        if (const auto\
+  \ *RT = Pointee->getAs<RecordType>()) {\n          const RecordDecl *RD = RT->getDecl();\n\
+  \          if (!RD)\n            return false;\n          std::string N = RD->getNameAsString();\n\
+  \          if (N.empty())\n            return false;\n          OutName = N;\n \
+  \         return true;\n        }\n        return false;\n      }\n\n      static\
+  \ bool exprTextContains(const Expr *E, StringRef Name,\n                       \
+  \            const SourceManager &SM,\n                                   const\
+  \ LangOptions &LO) {\n        if (!E)\n          return false;\n        CharSourceRange\
+  \ Range = CharSourceRange::getTokenRange(E->getSourceRange());\n        StringRef\
+  \ Txt = Lexer::getSourceText(Range, SM, LO);\n        return Txt.contains(Name);\n\
+  \      }\n\n      static const CallExpr* findCallInCond(const Expr *CondE, StringRef\
+  \ CalleeName) {\n        if (!CondE) return nullptr;\n        CondE = CondE->IgnoreParenCasts();\n\
+  \        if (const auto *CE = dyn_cast<CallExpr>(CondE)) {\n          if (const\
+  \ FunctionDecl *FD = CE->getDirectCallee()) {\n            if (FD->getIdentifier()\
+  \ && FD->getName() == CalleeName)\n              return CE;\n          }\n     \
+  \   } else if (const auto *UO = dyn_cast<UnaryOperator>(CondE)) {\n          if\
+  \ (UO->getOpcode() == UO_LNot) {\n            if (const auto *CE = dyn_cast<CallExpr>(UO->getSubExpr()->IgnoreParenCasts()))\
+  \ {\n              if (const FunctionDecl *FD = CE->getDirectCallee()) {\n     \
+  \           if (FD->getIdentifier() && FD->getName() == CalleeName)\n          \
+  \        return CE;\n              }\n            }\n          }\n        } else\
+  \ if (const auto *BO = dyn_cast<BinaryOperator>(CondE)) {\n          const Expr\
+  \ *L = BO->getLHS()->IgnoreParenCasts();\n          const Expr *R = BO->getRHS()->IgnoreParenCasts();\n\
+  \          const CallExpr *LC = dyn_cast<CallExpr>(L);\n          const CallExpr\
+  \ *RC = dyn_cast<CallExpr>(R);\n          auto IsZero = [](const Expr *E) -> bool\
+  \ {\n            if (const auto *IL = dyn_cast<IntegerLiteral>(E))\n           \
+  \   return IL->getValue() == 0;\n            return false;\n          };\n     \
+  \     if (LC && BO->getOpcode() == BO_EQ && IsZero(R)) {\n            if (const\
+  \ FunctionDecl *FD = LC->getDirectCallee()) {\n              if (FD->getIdentifier()\
+  \ && FD->getName() == CalleeName)\n                return LC;\n            }\n \
+  \         }\n          if (RC && BO->getOpcode() == BO_EQ && IsZero(L)) {\n    \
+  \        if (const FunctionDecl *FD = RC->getDirectCallee()) {\n              if\
+  \ (FD->getIdentifier() && FD->getName() == CalleeName)\n                return RC;\n\
+  \            }\n          }\n        }\n        return nullptr;\n      }\n\n   \
+  \   static bool isThenBranchTimeout(const IfStmt *IfS) {\n        // Determine which\
+  \ branch is timeout, based on common idioms.\n        // Returns true if 'then'\
+  \ is timeout branch, false if 'else' is timeout branch.\n        // If cannot determine\
+  \ (e.g., no else and no negation/==0), default to 'then' as not-timeout.\n     \
+  \   const Expr *Cond = IfS->getCond();\n        Cond = Cond ? Cond->IgnoreParenCasts()\
+  \ : nullptr;\n\n        // if (!wait(...)) => then is timeout\n        if (const\
+  \ auto *UO = dyn_cast_or_null<UnaryOperator>(Cond)) {\n            if (UO->getOpcode()\
+  \ == UO_LNot) {\n              if (const auto *CE = dyn_cast<CallExpr>(UO->getSubExpr()->IgnoreParenCasts()))\
+  \ {\n                if (const FunctionDecl *FD = CE->getDirectCallee()) {\n   \
+  \               if (FD->getIdentifier() && FD->getName() == \"wait_for_completion_timeout\"\
+  )\n                    return true;\n                }\n              }\n      \
+  \      }\n        }\n\n        // if (wait(...) == 0) => then is timeout\n     \
+  \   if (const auto *BO = dyn_cast_or_null<BinaryOperator>(Cond)) {\n          const\
+  \ Expr *L = BO->getLHS()->IgnoreParenCasts();\n          const Expr *R = BO->getRHS()->IgnoreParenCasts();\n\
+  \          auto IsZero = [](const Expr *E) -> bool {\n            if (const auto\
+  \ *IL = dyn_cast<IntegerLiteral>(E))\n              return IL->getValue() == 0;\n\
+  \            return false;\n          };\n          if (BO->getOpcode() == BO_EQ)\
+  \ {\n            if (const auto *LC = dyn_cast<CallExpr>(L)) {\n              if\
+  \ (const FunctionDecl *FD = LC->getDirectCallee()) {\n                if (FD->getIdentifier()\
+  \ && FD->getName() == \"wait_for_completion_timeout\" && IsZero(R))\n          \
+  \        return true;\n              }\n            }\n            if (const auto\
+  \ *RC = dyn_cast<CallExpr>(R)) {\n              if (const FunctionDecl *FD = RC->getDirectCallee())\
+  \ {\n                if (FD->getIdentifier() && FD->getName() == \"wait_for_completion_timeout\"\
+  \ && IsZero(L))\n                  return true;\n              }\n            }\n\
+  \          }\n        }\n\n        // if (wait(...)) => else is timeout\n      \
+  \  if (const auto *CE = dyn_cast_or_null<CallExpr>(Cond)) {\n          if (const\
+  \ FunctionDecl *FD = CE->getDirectCallee()) {\n            if (FD->getIdentifier()\
+  \ && FD->getName() == \"wait_for_completion_timeout\")\n              return false;\
+  \ // then is success, else is timeout\n          }\n        }\n\n        // Default:\
+  \ else is timeout (conservative)\n        return false;\n      }\n\n      static\
+  \ bool isAddrOfMemberOnCtx(const Expr *Arg,\n                                  \
+  \    StringRef CtxVarName,\n                                      StringRef MemberSubstring)\
+  \ {\n        if (!Arg) return false;\n        Arg = Arg->IgnoreParenCasts();\n \
+  \       const UnaryOperator *UO = dyn_cast<UnaryOperator>(Arg);\n        if (!UO\
+  \ || UO->getOpcode() != UO_AddrOf)\n          return false;\n\n        const Expr\
+  \ *Sub = UO->getSubExpr()->IgnoreParenCasts();\n        const auto *ME = dyn_cast<MemberExpr>(Sub);\n\
+  \        if (!ME)\n          return false;\n\n        const ValueDecl *MD = ME->getMemberDecl();\n\
+  \        if (!MD)\n          return false;\n        std::string MName = MD->getNameAsString();\n\
+  \        if (MName.find(MemberSubstring.str()) == std::string::npos)\n         \
+  \ return false;\n\n        const Expr *Base = ME->getBase()->IgnoreParenCasts();\n\
+  \        if (const auto *DRE = dyn_cast<DeclRefExpr>(Base)) {\n          const ValueDecl\
+  \ *VD = DRE->getDecl();\n          if (!VD)\n            return false;\n       \
+  \   return VD->getName() == CtxVarName;\n        }\n        return false;\n    \
+  \  }\n\n      static bool getCtxFromAddrOfMember(const Expr *Arg,\n            \
+  \                             std::string &OutCtxVar,\n                        \
+  \                 std::string &OutRecordName) {\n        if (!Arg) return false;\n\
+  \        Arg = Arg->IgnoreParenCasts();\n        const auto *UO = dyn_cast<UnaryOperator>(Arg);\n\
+  \        if (!UO || UO->getOpcode() != UO_AddrOf)\n          return false;\n\n \
+  \       const Expr *Sub = UO->getSubExpr()->IgnoreParenCasts();\n        const auto\
+  \ *ME = dyn_cast<MemberExpr>(Sub);\n        if (!ME)\n          return false;\n\n\
+  \        const Expr *Base = ME->getBase()->IgnoreParenCasts();\n        const auto\
+  \ *DRE = dyn_cast<DeclRefExpr>(Base);\n        if (!DRE)\n          return false;\n\
+  \n        const ValueDecl *VD = DRE->getDecl();\n        if (!VD)\n          return\
+  \ false;\n\n        OutCtxVar = VD->getNameAsString();\n        return getRecordNameFromPtrType(VD->getType(),\
+  \ OutRecordName);\n      }\n\n      static bool isKfreeOfVar(const CallExpr *CE,\
+  \ StringRef VarName) {\n        if (!CE) return false;\n        const FunctionDecl\
+  \ *FD = CE->getDirectCallee();\n        if (!FD || !FD->getIdentifier())\n     \
+  \     return false;\n        if (FD->getName() != \"kfree\")\n          return false;\n\
+  \        if (CE->getNumArgs() < 1)\n          return false;\n        const Expr\
+  \ *A0 = CE->getArg(0)->IgnoreParenCasts();\n        if (const auto *DRE = dyn_cast<DeclRefExpr>(A0))\
+  \ {\n          const ValueDecl *VD = DRE->getDecl();\n          return VD && VD->getName()\
+  \ == VarName;\n        }\n        return false;\n      }\n\n      static const CallExpr*\
+  \ findKfreeOfVarInSubtree(const Stmt *S, StringRef VarName) {\n        if (!S) return\
+  \ nullptr;\n        if (const auto *CE = dyn_cast<CallExpr>(S)) {\n          if\
+  \ (isKfreeOfVar(CE, VarName))\n            return CE;\n        }\n        for (const\
+  \ Stmt *Child : S->children()) {\n          if (!Child) continue;\n          if\
+  \ (const CallExpr *Found = findKfreeOfVarInSubtree(Child, VarName))\n          \
+  \  return Found;\n        }\n        return nullptr;\n      }\n\n      // AST scanning\
+  \ utilities\n      static bool isContainerOfInit(const VarDecl *VD,\n          \
+  \                          const SourceManager &SM,\n                          \
+  \          const LangOptions &LO) {\n        if (!VD || !VD->hasInit())\n      \
+  \    return false;\n        const Expr *Init = VD->getInit();\n        return exprTextContains(Init,\
+  \ \"container_of\", SM, LO);\n      }\n\n      static std::string getCalleeName(const\
+  \ CallExpr *CE) {\n        if (!CE) return \"\";\n        if (const FunctionDecl\
+  \ *FD = CE->getDirectCallee()) {\n          if (const IdentifierInfo *II = FD->getIdentifier())\n\
+  \            return II->getName().str();\n        }\n        return \"\";\n    \
+  \  }\n\n      static bool isQueueWorkLike(StringRef Name) {\n        return Name\
+  \ == \"queue_work\" ||\n               Name == \"queue_work_on\" ||\n          \
+  \     Name == \"schedule_work\" ||\n               Name == \"queue_delayed_work\"\
+  \ ||\n               Name == \"queue_delayed_work_on\" ||\n               Name ==\
+  \ \"schedule_delayed_work\";\n      }\n};\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD || !FD->hasBody())\n    return;\n\n  const Stmt *Body = FD->getBody();\n\
+  \  ASTContext &ACtx = Mgr.getASTContext();\n  const SourceManager &SM = ACtx.getSourceManager();\n\
+  \  const LangOptions &LO = ACtx.getLangOpts();\n\n  // Worker role detection: find\
+  \ VarDecl initialized via container_of(...)\n  bool WorkerRoleActive = false;\n\
+  \  std::string WorkerCtxVarName;\n  std::string WorkerRecordName;\n\n  // Scan DeclStmts\
+  \ to find container_of init\n  for (const Stmt *Child : Body->children()) {\n  \
+  \  if (!Child) continue;\n    if (const auto *DS = dyn_cast<DeclStmt>(Child)) {\n\
+  \      for (const Decl *SD : DS->decls()) {\n        const auto *VD = dyn_cast<VarDecl>(SD);\n\
+  \        if (!VD) continue;\n        // Must be pointer to some struct\n       \
+  \ std::string RN;\n        if (!getRecordNameFromPtrType(VD->getType(), RN))\n \
+  \         continue;\n        if (!VD->hasInit())\n          continue;\n        if\
+  \ (isContainerOfInit(VD, SM, LO)) {\n          WorkerRoleActive = true;\n      \
+  \    WorkerCtxVarName = VD->getNameAsString();\n          WorkerRecordName = RN;\n\
+  \          break;\n        }\n      }\n    }\n    if (WorkerRoleActive)\n      break;\n\
+  \  }\n\n  // Prepare aggregation holders for this function\n  bool FoundCompletionDoneGuard\
+  \ = false;\n  bool FoundUsesCompleteOrKfree = false;\n  SourceLocation FirstUseLoc;\n\
+  \n  // Scheduler role detection structures for this function\n  // Map RecordName\
+  \ -> ctx var name used with wait/queue\n  std::unordered_map<std::string, std::string>\
+  \ RecToCtxVar_Wait;\n  std::unordered_map<std::string, bool> RecHasWait;\n  std::unordered_map<std::string,\
+  \ bool> RecHasQueue;\n  std::unordered_map<std::string, SourceLocation> RecTimeoutFreeLoc;\n\
+  \  std::unordered_map<std::string, bool> RecHasTimeoutFree;\n\n  // Walk all CallExpr\
+  \ and IfStmt in the function body to collect info\n  // Simple recursive lambda\n\
+  \  std::function<void(const Stmt*)> Walk;\n  Walk = [&](const Stmt *S) {\n    if\
+  \ (!S) return;\n\n    if (const auto *CE = dyn_cast<CallExpr>(S)) {\n      std::string\
+  \ Callee = getCalleeName(CE);\n\n      if (WorkerRoleActive) {\n        if (Callee\
+  \ == \"completion_done\") {\n          if (CE->getNumArgs() >= 1 &&\n          \
+  \    isAddrOfMemberOnCtx(CE->getArg(0), WorkerCtxVarName, \"compl\")) {\n      \
+  \      FoundCompletionDoneGuard = true;\n          }\n        } else if (Callee\
+  \ == \"complete\") {\n          if (CE->getNumArgs() >= 1 &&\n              isAddrOfMemberOnCtx(CE->getArg(0),\
+  \ WorkerCtxVarName, \"compl\")) {\n            if (!FoundUsesCompleteOrKfree) {\n\
+  \              FirstUseLoc = CE->getBeginLoc();\n            }\n            FoundUsesCompleteOrKfree\
+  \ = true;\n          }\n        } else if (Callee == \"kfree\") {\n          if\
+  \ (CE->getNumArgs() >= 1) {\n            const Expr *A0 = CE->getArg(0)->IgnoreParenCasts();\n\
+  \            if (const auto *DRE = dyn_cast<DeclRefExpr>(A0)) {\n              if\
+  \ (const ValueDecl *VD = DRE->getDecl()) {\n                if (VD->getName() ==\
+  \ WorkerCtxVarName) {\n                  if (!FoundUsesCompleteOrKfree) {\n    \
+  \                FirstUseLoc = CE->getBeginLoc();\n                  }\n       \
+  \           FoundUsesCompleteOrKfree = true;\n                }\n              }\n\
+  \            }\n          }\n        }\n      }\n\n      // Scheduler: wait_for_completion_timeout\
+  \ to capture ctx and record\n      if (Callee == \"wait_for_completion_timeout\"\
+  ) {\n        if (CE->getNumArgs() >= 1) {\n          std::string CtxVar, RecName;\n\
+  \          if (getCtxFromAddrOfMember(CE->getArg(0), CtxVar, RecName)) {\n     \
+  \       RecToCtxVar_Wait[RecName] = CtxVar;\n            RecHasWait[RecName] = true;\n\
+  \          }\n        }\n      }\n\n      // Scheduler: queue_* or schedule_* with\
+  \ &ctx->work\n      if (isQueueWorkLike(Callee)) {\n        for (unsigned i = 0;\
+  \ i < CE->getNumArgs(); ++i) {\n          const Expr *Arg = CE->getArg(i);\n   \
+  \       Arg = Arg ? Arg->IgnoreParenCasts() : nullptr;\n          const auto *UO\
+  \ = dyn_cast_or_null<UnaryOperator>(Arg);\n          if (!UO || UO->getOpcode()\
+  \ != UO_AddrOf)\n            continue;\n          const Expr *Sub = UO->getSubExpr()->IgnoreParenCasts();\n\
+  \          const auto *ME = dyn_cast<MemberExpr>(Sub);\n          if (!ME)\n   \
+  \         continue;\n          const ValueDecl *MD = ME->getMemberDecl();\n    \
+  \      if (!MD)\n            continue;\n          std::string MemName = MD->getNameAsString();\n\
+  \          if (MemName.find(\"work\") == std::string::npos)\n            continue;\n\
+  \          const Expr *Base = ME->getBase()->IgnoreParenCasts();\n          const\
+  \ auto *DRE = dyn_cast<DeclRefExpr>(Base);\n          if (!DRE)\n            continue;\n\
+  \          const ValueDecl *VD = DRE->getDecl();\n          if (!VD)\n         \
+  \   continue;\n          std::string CtxVar = VD->getNameAsString();\n         \
+  \ std::string RecName;\n          if (getRecordNameFromPtrType(VD->getType(), RecName))\
+  \ {\n            RecHasQueue[RecName] = true;\n            // If no wait seen yet,\
+  \ we may not know if it's the same ctx, but we correlate by RecordName later.\n\
+  \          }\n        }\n      }\n    } else if (const auto *IfS = dyn_cast<IfStmt>(S))\
+  \ {\n      // If condition involves wait_for_completion_timeout\n      const CallExpr\
+  \ *WaitC = findCallInCond(IfS->getCond(), \"wait_for_completion_timeout\");\n  \
+  \    if (WaitC && WaitC->getNumArgs() >= 1) {\n        std::string CtxVar, RecName;\n\
+  \        if (getCtxFromAddrOfMember(WaitC->getArg(0), CtxVar, RecName)) {\n    \
+  \      RecToCtxVar_Wait[RecName] = CtxVar;\n          RecHasWait[RecName] = true;\n\
+  \n          bool ThenIsTimeout = isThenBranchTimeout(IfS);\n          const Stmt\
+  \ *TimeoutBranch = ThenIsTimeout ? IfS->getThen() : IfS->getElse();\n          if\
+  \ (TimeoutBranch) {\n            if (const CallExpr *KF = findKfreeOfVarInSubtree(TimeoutBranch,\
+  \ CtxVar)) {\n              RecHasTimeoutFree[RecName] = true;\n              RecTimeoutFreeLoc[RecName]\
+  \ = KF->getBeginLoc();\n            }\n          }\n        }\n      }\n    }\n\n\
+  \    for (const Stmt *Child : S->children())\n      Walk(Child);\n  };\n\n  Walk(Body);\n\
+  \n  // Commit worker info if applicable\n  if (WorkerRoleActive) {\n    auto It\
+  \ = WorkerByRecord.find(WorkerRecordName);\n    if (It == WorkerByRecord.end())\
+  \ {\n      WorkerInfo WI;\n      WI.RecordName = WorkerRecordName;\n      WI.CtxVarName\
+  \ = WorkerCtxVarName;\n      WI.HasCompletionDoneGuard = FoundCompletionDoneGuard;\n\
+  \      WI.UsesCompleteOrKfree = FoundUsesCompleteOrKfree;\n      WI.AnyUseLoc =\
+  \ FirstUseLoc;\n      WI.AnyUseLocValid = FoundUsesCompleteOrKfree;\n      WorkerByRecord.emplace(WorkerRecordName,\
+  \ WI);\n    } else {\n      // Merge conservatively\n      It->second.HasCompletionDoneGuard\
+  \ = It->second.HasCompletionDoneGuard || FoundCompletionDoneGuard;\n      if (FoundUsesCompleteOrKfree)\
+  \ {\n        It->second.UsesCompleteOrKfree = true;\n        if (!It->second.AnyUseLocValid)\
+  \ {\n          It->second.AnyUseLoc = FirstUseLoc;\n          It->second.AnyUseLocValid\
+  \ = true;\n        }\n      }\n    }\n  }\n\n  // Commit scheduler info for each\
+  \ record that has wait+queue and has timeout-free\n  for (const auto &P : RecHasWait)\
+  \ {\n    const std::string &RecName = P.first;\n    bool HasWait = P.second;\n \
+  \   bool HasQueue = RecHasQueue.count(RecName) ? RecHasQueue[RecName] : false;\n\
+  \    bool HasFree = RecHasTimeoutFree.count(RecName) ? RecHasTimeoutFree[RecName]\
+  \ : false;\n    if (HasWait && HasQueue && HasFree) {\n      auto It = SchedByRecord.find(RecName);\n\
+  \      if (It == SchedByRecord.end()) {\n        SchedInfo SI;\n        SI.RecordName\
+  \ = RecName;\n        SI.HasQueueWorkWithSameCtx = true;\n        SI.HasWaitTimeoutOnSameCtx\
+  \ = true;\n        SI.FreesCtxOnTimeout = true;\n        SI.FreeLoc = RecTimeoutFreeLoc[RecName];\n\
+  \        SI.FreeLocValid = true;\n        SchedByRecord.emplace(RecName, SI);\n\
+  \      } else {\n        It->second.HasQueueWorkWithSameCtx = true;\n        It->second.HasWaitTimeoutOnSameCtx\
+  \ = true;\n        It->second.FreesCtxOnTimeout = true;\n        if (!It->second.FreeLocValid\
+  \ && RecTimeoutFreeLoc.count(RecName)) {\n          It->second.FreeLoc = RecTimeoutFreeLoc[RecName];\n\
+  \          It->second.FreeLocValid = true;\n        }\n      }\n    }\n  }\n}\n\n\
+  void SAGenTestChecker::checkEndAnalysis(ExplodedGraph &G, BugReporter &BR, ExprEngine\
+  \ &Eng) const {\n  // Correlate worker and scheduler info by RecordName\n  for (const\
+  \ auto &SP : SchedByRecord) {\n    const std::string &RecName = SP.first;\n    const\
+  \ SchedInfo &SI = SP.second;\n\n    if (!(SI.HasWaitTimeoutOnSameCtx && SI.HasQueueWorkWithSameCtx\
+  \ && SI.FreesCtxOnTimeout && SI.FreeLocValid))\n      continue;\n\n    auto WIt\
+  \ = WorkerByRecord.find(RecName);\n    if (WIt == WorkerByRecord.end())\n      continue;\n\
+  \n    const WorkerInfo &WI = WIt->second;\n    if (!(WI.UsesCompleteOrKfree && !WI.HasCompletionDoneGuard))\n\
+  \      continue;\n\n    // Report\n    PathDiagnosticLocation Loc(SI.FreeLoc, BR.getSourceManager());\n\
+  \n    auto R = std::make_unique<BasicBugReport>(\n        *BT,\n        \"Workqueue\
+  \ context may be freed on timeout while worker still uses it; missing completion_done()\
+  \ guard\",\n        Loc);\n    BR.emitReport(std::move(R));\n  }\n\n  // Clear collected\
+  \ data to avoid cross-TU mixing (defensive)\n  WorkerByRecord.clear();\n  SchedByRecord.clear();\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects race: scheduler frees workqueue context on timeout while worker\
+  \ uses it without completion_done() guard\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

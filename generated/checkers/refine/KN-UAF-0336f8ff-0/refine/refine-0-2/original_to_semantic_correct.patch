@@ -1,0 +1,236 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -20,13 +20,20 @@ using namespace ento;
+ using namespace taint;
+
++// Utility functions provided by the framework snippet
++template <typename T>
++const T* findSpecificTypeInParents(const Stmt *S, CheckerContext &C);
++
++template <typename T>
++const T* findSpecificTypeInChildren(const Stmt *S);
++
++bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
++const MemRegion* getMemRegionFromExpr(const Expr* E, CheckerContext &C);
++
+ REGISTER_MAP_WITH_PROGRAMSTATE(Priv2DevMap, const MemRegion*, const MemRegion*)
+ REGISTER_SET_WITH_PROGRAMSTATE(FreedDevs, const MemRegion*)
+
+-// We keep a directed mapping from pointer-typed storage (Var/Field) to the
+-// pointee region only if needed later. Currently, we avoid chasing aliases
+-// in reports to prevent false positives.
+-// (Kept for potential future use; no alias chasing is currently performed.)
++// Directed map: pointer-typed storage region -> pointee region (optional tracking).
+ REGISTER_MAP_WITH_PROGRAMSTATE(PtrPointsTo, const MemRegion*, const MemRegion*)
+
+ namespace {
+@@ -61,14 +68,24 @@                                                       const MemRegion *R,
+                                                       const MemRegion **OutPrivBase = nullptr);
+
++  // Known functions that synchronously deref work/timer structures.
+   static bool knownWorkOrTimerDeref(const CallEvent &Call, CheckerContext &C,
+                                     llvm::SmallVectorImpl<unsigned> &OutIdx);
++
++  // AST-only variant used from checkLocation gating (no CallEvent available).
++  static bool knownWorkOrTimerDerefCE(const CallExpr *CE, CheckerContext &C,
++                                      llvm::SmallVectorImpl<unsigned> &OutIdx);
+
+   static bool isWithinRegion(const MemRegion *R, const MemRegion *Container);
+
+   // FP filter: accessing a pointer-typed lvalue (reading/writing the pointer
+   // variable or field itself) is not a dereference of its pointee.
+   static bool isPointerLValueRegion(const MemRegion *R);
++
++  // Returns true and fills OutCE+OutArgIdx if S is within argument OutArgIdx
++  // of enclosing call expression.
++  static bool findEnclosingCallArg(const Stmt *S, CheckerContext &C,
++                                   const CallExpr *&OutCE, unsigned &OutArgIdx);
+
+   void reportUAFAtCall(const CallEvent &Call, CheckerContext &C, StringRef Msg) const;
+   void reportUAFAtStmt(const Stmt *S, CheckerContext &C, StringRef Msg) const;
+@@ -121,7 +138,6 @@   const MemRegion *Cur = R;
+   llvm::SmallPtrSet<const MemRegion*, 8> Visited;
+   while (Cur && Visited.insert(Cur).second) {
+-    // Try exact key in the priv->dev map.
+     if (const MemRegion *const *DevBase = State->get<Priv2DevMap>(Cur)) {
+       if (OutPrivBase)
+         *OutPrivBase = Cur;
+@@ -143,7 +159,6 @@
+ bool SAGenTestChecker::knownWorkOrTimerDeref(const CallEvent &Call, CheckerContext &C,
+                                              llvm::SmallVectorImpl<unsigned> &OutIdx) {
+-  // Common Linux helpers that synchronously dereference work/timer structures.
+   static const char *Names[] = {
+       "cancel_work_sync",
+       "cancel_delayed_work_sync",
+@@ -152,6 +167,7 @@       "del_timer_sync",
+       "del_timer",
+   };
++
+   if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
+     StringRef Fn = ID->getName();
+     for (const char *N : Names) {
+@@ -162,7 +178,6 @@     }
+   }
+
+-  // Fallback: textual match if identifier not available.
+   const Expr *OriginExpr = Call.getOriginExpr();
+   if (!OriginExpr)
+     return false;
+@@ -175,6 +190,53 @@   return false;
+ }
+
++bool SAGenTestChecker::knownWorkOrTimerDerefCE(const CallExpr *CE, CheckerContext &C,
++                                               llvm::SmallVectorImpl<unsigned> &OutIdx) {
++  if (!CE)
++    return false;
++
++  // Try identifier of direct callee decl.
++  if (const FunctionDecl *FD = CE->getDirectCallee()) {
++    if (const IdentifierInfo *ID = FD->getIdentifier()) {
++      StringRef Fn = ID->getName();
++      static const char *Names[] = {
++          "cancel_work_sync",
++          "cancel_delayed_work_sync",
++          "flush_work",
++          "flush_delayed_work",
++          "del_timer_sync",
++          "del_timer",
++      };
++      for (const char *N : Names) {
++        if (Fn.equals(N)) {
++          OutIdx.push_back(0);
++          return true;
++        }
++      }
++    }
++  }
++
++  // Fallback to textual match on callee subexpression.
++  if (const Expr *Callee = CE->getCallee()) {
++    static const char *Names[] = {
++        "cancel_work_sync",
++        "cancel_delayed_work_sync",
++        "flush_work",
++        "flush_delayed_work",
++        "del_timer_sync",
++        "del_timer",
++    };
++    for (const char *N : Names) {
++      if (ExprHasName(Callee, N, C)) {
++        OutIdx.push_back(0);
++        return true;
++      }
++    }
++  }
++
++  return false;
++}
++
+ bool SAGenTestChecker::isWithinRegion(const MemRegion *R, const MemRegion *Container) {
+   if (!R || !Container) return false;
+   if (R == Container) return true;
+@@ -190,6 +252,43 @@     return false;
+   QualType Ty = TVR->getValueType();
+   return Ty->isPointerType();
++}
++
++bool SAGenTestChecker::findEnclosingCallArg(const Stmt *S, CheckerContext &C,
++                                            const CallExpr *&OutCE, unsigned &OutArgIdx) {
++  OutCE = findSpecificTypeInParents<CallExpr>(S, C);
++  if (!OutCE)
++    return false;
++
++  const SourceManager &SM = C.getSourceManager();
++  SourceRange SR = S->getSourceRange();
++  SourceLocation SBegin = SR.getBegin();
++  SourceLocation SEnd = SR.getEnd();
++
++  unsigned NumArgs = OutCE->getNumArgs();
++  for (unsigned i = 0; i < NumArgs; ++i) {
++    const Expr *Arg = OutCE->getArg(i);
++    if (!Arg) continue;
++    SourceRange AR = Arg->getSourceRange();
++    // Check if S is within the source range of this argument (best-effort).
++    if (!AR.isValid())
++      continue;
++
++    SourceLocation ABegin = AR.getBegin();
++    SourceLocation AEnd = AR.getEnd();
++
++    bool BeginInside = !SM.isBeforeInTranslationUnit(SBegin, ABegin) &&
++                       !SM.isBeforeInTranslationUnit(AEnd, SBegin);
++    bool EndInside = !SM.isBeforeInTranslationUnit(SEnd, ABegin) &&
++                     !SM.isBeforeInTranslationUnit(AEnd, SEnd);
++
++    if (BeginInside || EndInside) {
++      OutArgIdx = i;
++      return true;
++    }
++  }
++
++  return false;
+ }
+
+ void SAGenTestChecker::reportUAFAtCall(const CallEvent &Call, CheckerContext &C, StringRef Msg) const {
+@@ -279,29 +378,43 @@ }
+
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+-  const MemRegion *R = Loc.getAsRegion();
+-  if (!R)
+-    return;
+-
+-  // If we are reading or writing a pointer-typed lvalue (like "port->user"),
+-  // this is not a dereference of its pointee; ignore to avoid false positives.
+-  if (isPointerLValueRegion(R))
++  // To avoid false positives (e.g., loads from shared 'hw' objects that are
++  // not inside netdev priv), only consider loads that happen as part of
++  // arguments to functions that are known to synchronously dereference
++  // work/timer objects (cancel_work_sync, etc.). All other loads are ignored.
++  const CallExpr *CE = nullptr;
++  unsigned ArgIdx = 0;
++  if (!findEnclosingCallArg(S, C, CE, ArgIdx))
++    return;
++
++  llvm::SmallVector<unsigned, 4> DerefParams;
++  if (!knownWorkOrTimerDerefCE(CE, C, DerefParams))
++    return;
++
++  // Only proceed if the accessed location belongs to an argument that
++  // is known to be dereferenced by the callee.
++  bool Matches = llvm::is_contained(DerefParams, ArgIdx);
++  if (!Matches)
++    return;
++
++  const Expr *ArgE = CE->getArg(ArgIdx);
++  if (!ArgE)
++    return;
++
++  const MemRegion *ArgReg = exprToRegion(ArgE, C);
++  if (!ArgReg)
+     return;
+
+   ProgramStateRef State = C.getState();
+
+-  // See if the accessed region is within a tracked netdev priv region.
+   const MemRegion *PrivBase = nullptr;
+-  const MemRegion *DevBase = findDevForPrivDerivedRegion(State, R, &PrivBase);
++  const MemRegion *DevBase = findDevForPrivDerivedRegion(State, ArgReg, &PrivBase);
+   if (!DevBase || !PrivBase)
+     return;
+
+-  // Double-check we are truly touching memory inside the priv object.
+-  if (!isWithinRegion(R, PrivBase))
+-    return;
+-
++  // If the dev is freed, report at the call site.
+   if (devIsFreed(State, DevBase)) {
+-    reportUAFAtStmt(S, C, "Use of netdev priv after free_netdev");
++    reportUAFAtStmt(CE, C, "Use of netdev priv after free_netdev");
+   }
+ }
+
+@@ -323,7 +436,6 @@   if (!Pointee)
+     return;
+
+-  // Map pointer storage region to the pointee region (directed).
+   State = State->set<PtrPointsTo>(LHS, getBaseRegionOrSelf(Pointee));
+   C.addTransition(State);
+ }

@@ -1,0 +1,338 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -40,7 +40,7 @@   llvm::SmallVector<unsigned, 4> Params;
+ };
+ bool functionKnownToDeref(const CallEvent &Call,
+-                                 llvm::SmallVectorImpl<unsigned> &DerefParams);
++                          llvm::SmallVectorImpl<unsigned> &DerefParams);
+ bool ExprHasName(const Expr *E, StringRef Name, CheckerContext &C);
+
+ namespace {
+@@ -68,10 +68,12 @@   static bool isWideTargetType(QualType QT, CheckerContext &C);
+   static bool isConstantFolded(const Expr *E, CheckerContext &C);
+
+-  // Range reasoning helpers to suppress FPs when product fits in the mul's type.
+-  static bool getMaxForExpr(const Expr *E, CheckerContext &C,
+-                            llvm::APSInt &Max, bool &IsNonNegative, bool &Known);
+-  static llvm::APSInt getMaxForType(QualType QT, CheckerContext &C);
++  // New: Range reasoning helpers to suppress FPs when product fits in the mul's type.
++  static void getTypeRange128(QualType QT, CheckerContext &C,
++                              llvm::APInt &Min, llvm::APInt &Max);
++  static bool getExprRange128(const Expr *E, CheckerContext &C,
++                              llvm::APInt &Min, llvm::APInt &Max,
++                              unsigned Depth = 0);
+   static bool productDefinitelyFitsInType(const Expr *L, const Expr *R,
+                                           QualType MulType, CheckerContext &C);
+
+@@ -159,110 +161,196 @@   return EvaluateExprToInt(EvalRes, E, C);
+ }
+
+-// Compute max value representable by a type (signed or unsigned).
+-llvm::APSInt SAGenTestChecker::getMaxForType(QualType QT, CheckerContext &C) {
++// Compute min and max representable by a type in 128-bit APInt.
++void SAGenTestChecker::getTypeRange128(QualType QT, CheckerContext &C,
++                                       llvm::APInt &Min, llvm::APInt &Max) {
+   unsigned Bits = getTypeBitWidth(QT, C);
+-  bool IsUnsigned = QT->isUnsignedIntegerType();
+-  llvm::APInt MaxAP = IsUnsigned ? llvm::APInt::getMaxValue(Bits)
+-                                 : llvm::APInt::getSignedMaxValue(Bits);
+-  return llvm::APSInt(MaxAP, IsUnsigned);
+-}
+-
+-// Obtain a conservative maximum for an expression and whether it is non-negative.
+-// Known is true if we could establish a bound; false if unknown.
+-bool SAGenTestChecker::getMaxForExpr(const Expr *E, CheckerContext &C,
+-                                     llvm::APSInt &Max, bool &IsNonNegative, bool &Known) {
+-  if (!E) {
+-    Known = false;
+-    IsNonNegative = false;
+-    return false;
+-  }
+-
+-  E = E->IgnoreParenImpCasts();
+-
+-  // 1) Integer literal or compile-time constant.
+-  if (const auto *IL = dyn_cast<IntegerLiteral>(E)) {
+-    Max = llvm::APSInt(IL->getValue(), /*IsUnsigned=*/false);
+-    IsNonNegative = !Max.isSigned() || Max.isNonNegative();
+-    Known = true;
+-    return true;
+-  }
+-
+-  // Attempt constant-fold.
+-  llvm::APSInt EvalRes;
+-  if (EvaluateExprToInt(EvalRes, E, C)) {
+-    Max = EvalRes;
+-    IsNonNegative = !Max.isSigned() || Max.isNonNegative();
+-    Known = true;
+-    return true;
+-  }
+-
+-  // 2) Concrete SVal from the engine.
+-  ProgramStateRef State = C.getState();
+-  SVal SV = State->getSVal(E, C.getLocationContext());
+-
+-  if (auto CI = SV.getAs<nonloc::ConcreteInt>()) {
+-    Max = CI->getValue();
+-    IsNonNegative = !Max.isSigned() || Max.isNonNegative();
+-    Known = true;
+-    return true;
+-  }
+-
+-  // 3) Symbolic upper bound from constraints.
+-  if (SymbolRef Sym = SV.getAsSymbol()) {
+-    if (const llvm::APSInt *MaxVal = inferSymbolMaxVal(Sym, C)) {
+-      Max = *MaxVal;
+-      IsNonNegative = !Max.isSigned() || Max.isNonNegative();
+-      Known = true;
+-      return true;
+-    }
+-  }
+-
+-  // 4) Fallback: type-based bound.
+-  QualType QT = E->getType();
+-  if (isIntegerLike(QT)) {
+-    Max = getMaxForType(QT, C);
+-    // For unsigned integer types, we know it's non-negative.
+-    IsNonNegative = QT->isUnsignedIntegerType();
+-    Known = true;
+-    return true;
+-  }
+-
+-  Known = false;
+-  IsNonNegative = false;
+-  return false;
+-}
+-
+-// If both operands are known non-negative and we can bound their maxima,
+-// check if the product of these maxima definitely fits in MulType.
+-// Return true only if we can prove it fits (hence no overflow possible).
++  bool IsUnsigned = QT->isUnsignedIntegerOrEnumerationType();
++  if (IsUnsigned) {
++    llvm::APInt TMin(Bits, 0, /*isSigned=*/false);
++    llvm::APInt TMax = llvm::APInt::getMaxValue(Bits);
++    Min = TMin.zextOrTrunc(128);
++    Max = TMax.zextOrTrunc(128);
++  } else {
++    llvm::APInt TMin = llvm::APInt::getSignedMinValue(Bits);
++    llvm::APInt TMax = llvm::APInt::getSignedMaxValue(Bits);
++    Min = TMin.sextOrTrunc(128);
++    Max = TMax.sextOrTrunc(128);
++  }
++}
++
++// Lightweight interval analysis for expressions. Always returns true,
++// providing a conservative range, falling back to type-based ranges.
++// Depth-limited to avoid pathological recursion.
++bool SAGenTestChecker::getExprRange128(const Expr *E, CheckerContext &C,
++                                       llvm::APInt &Min, llvm::APInt &Max,
++                                       unsigned Depth) {
++  const unsigned MaxDepth = 8;
++  if (!E || Depth > MaxDepth) {
++    getTypeRange128(E ? E->getType() : C.getASTContext().IntTy, C, Min, Max);
++    return true;
++  }
++
++  // Parens: skip
++  if (const auto *PE = dyn_cast<ParenExpr>(E)) {
++    return getExprRange128(PE->getSubExpr(), C, Min, Max, Depth + 1);
++  }
++
++  // Casts: get sub-range and clamp to destination type.
++  if (const auto *CE = dyn_cast<CastExpr>(E)) {
++    llvm::APInt SMin(128, 0), SMax(128, 0);
++    (void)getExprRange128(CE->getSubExpr(), C, SMin, SMax, Depth + 1);
++    llvm::APInt TMin(128, 0), TMax(128, 0);
++    getTypeRange128(CE->getType(), C, TMin, TMax);
++    // Intersect [SMin, SMax] with [TMin, TMax].
++    Min = SMin;
++    Max = SMax;
++    if (Min.slt(TMin)) Min = TMin;
++    if (Max.sgt(TMax)) Max = TMax;
++    if (Min.sgt(Max)) { Min = TMin; Max = TMax; }
++    return true;
++  }
++
++  // Integer literal
++  if (const auto *IL = dyn_cast<IntegerLiteral>(E->IgnoreParenCasts())) {
++    llvm::APInt V = IL->getValue();
++    V = V.sextOrTrunc(128);
++    Min = V;
++    Max = V;
++    return true;
++  }
++
++  // Character literal
++  if (const auto *CL = dyn_cast<CharacterLiteral>(E->IgnoreParenCasts())) {
++    uint64_t V = static_cast<uint64_t>(CL->getValue());
++    llvm::APInt A(128, V, /*isSigned=*/false);
++    Min = A;
++    Max = A;
++    return true;
++  }
++
++  // Unary operator handling
++  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    UnaryOperatorKind K = UO->getOpcode();
++    if (K == UO_Plus) {
++      return getExprRange128(UO->getSubExpr(), C, Min, Max, Depth + 1);
++    }
++    if (K == UO_Minus) {
++      llvm::APInt SMin(128, 0), SMax(128, 0);
++      (void)getExprRange128(UO->getSubExpr(), C, SMin, SMax, Depth + 1);
++      // Negate reverses bounds: [-b, -a]
++      Min = -SMax;
++      Max = -SMin;
++      return true;
++    }
++    // Address/deref or other: fallback to type range
++    getTypeRange128(UO->getType(), C, Min, Max);
++    return true;
++  }
++
++  // Binary operators
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++    BinaryOperatorKind Op = BO->getOpcode();
++
++    // RHS path for comma
++    if (Op == BO_Comma) {
++      return getExprRange128(BO->getRHS(), C, Min, Max, Depth + 1);
++    }
++
++    // Assign: resulting value is RHS
++    if (Op == BO_Assign) {
++      return getExprRange128(BO->getRHS(), C, Min, Max, Depth + 1);
++    }
++
++    llvm::APInt LMin(128, 0), LMax(128, 0), RMin(128, 0), RMax(128, 0);
++    (void)getExprRange128(BO->getLHS(), C, LMin, LMax, Depth + 1);
++    (void)getExprRange128(BO->getRHS(), C, RMin, RMax, Depth + 1);
++
++    switch (Op) {
++    case BO_Add: {
++      Min = LMin + RMin;
++      Max = LMax + RMax;
++      return true;
++    }
++    case BO_Sub: {
++      Min = LMin - RMax;
++      Max = LMax - RMin;
++      return true;
++    }
++    case BO_Mul: {
++      // Conservative: range of product = hull of endpoints.
++      llvm::APInt Cands[4] = { LMin * RMin, LMin * RMax, LMax * RMin, LMax * RMax };
++      Min = Cands[0];
++      Max = Cands[0];
++      for (int i = 1; i < 4; ++i) {
++        if (Cands[i].slt(Min)) Min = Cands[i];
++        if (Cands[i].sgt(Max)) Max = Cands[i];
++      }
++      return true;
++    }
++    case BO_Shl:
++    case BO_Shr:
++    case BO_And:
++    case BO_Or:
++    case BO_Xor:
++    default:
++      // Fallback for complex ops
++      getTypeRange128(BO->getType(), C, Min, Max);
++      return true;
++    }
++  }
++
++  // Conditional operator ?:
++  if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
++    llvm::APInt TMin(128, 0), TMax(128, 0), FMin(128, 0), FMax(128, 0);
++    (void)getExprRange128(CO->getTrueExpr(), C, TMin, TMax, Depth + 1);
++    (void)getExprRange128(CO->getFalseExpr(), C, FMin, FMax, Depth + 1);
++    Min = TMin.slt(FMin) ? TMin : FMin;
++    Max = TMax.sgt(FMax) ? TMax : FMax;
++    return true;
++  }
++
++  // Array subscripts: use element type range.
++  if (isa<ArraySubscriptExpr>(E)) {
++    getTypeRange128(E->getType(), C, Min, Max);
++    return true;
++  }
++
++  // Member access / decl ref: use their type ranges.
++  if (isa<MemberExpr>(E) || isa<DeclRefExpr>(E)) {
++    getTypeRange128(E->getType(), C, Min, Max);
++    return true;
++  }
++
++  // CallExpr or anything else: fallback to type-based range.
++  getTypeRange128(E->getType(), C, Min, Max);
++  return true;
++}
++
++// If we can bound both operands, compute the product interval and verify it fits
++// entirely in the multiplication's result type. No non-negativity requirement.
+ bool SAGenTestChecker::productDefinitelyFitsInType(const Expr *L, const Expr *R,
+                                                    QualType MulType, CheckerContext &C) {
+-  llvm::APSInt MaxL, MaxR;
+-  bool NN_L = false, NN_R = false, KnownL = false, KnownR = false;
+-
+-  getMaxForExpr(L, C, MaxL, NN_L, KnownL);
+-  getMaxForExpr(R, C, MaxR, NN_R, KnownR);
+-
+-  if (!(KnownL && KnownR && NN_L && NN_R))
+-    return false; // Cannot prove safety.
+-
+-  // Compute product in a sufficiently wide unsigned APInt domain.
+-  const unsigned WideBits = 128;
+-  llvm::APInt LExt = MaxL.isSigned() ? MaxL.sext(WideBits) : MaxL.zext(WideBits);
+-  llvm::APInt RExt = MaxR.isSigned() ? MaxR.sext(WideBits) : MaxR.zext(WideBits);
+-  llvm::APInt Prod = LExt * RExt;
+-
+-  // Compare against maximum representable in the mul's (promoted) result type.
+-  unsigned MulBits = getTypeBitWidth(MulType, C);
+-  bool MulUnsigned = MulType->isUnsignedIntegerType();
+-  llvm::APInt MulMax = MulUnsigned ? llvm::APInt::getMaxValue(MulBits)
+-                                   : llvm::APInt::getSignedMaxValue(MulBits);
+-  llvm::APInt MulMaxExt = MulMax.zextOrTrunc(WideBits);
+-
+-  // Since product is non-negative, unsigned compare suffices.
+-  if (Prod.ule(MulMaxExt))
+-    return true; // Definitely fits -> no overflow in narrower mul type.
++  llvm::APInt LMin(128, 0), LMax(128, 0), RMin(128, 0), RMax(128, 0);
++  (void)getExprRange128(L, C, LMin, LMax);
++  (void)getExprRange128(R, C, RMin, RMax);
++
++  // Compute product bounds (signed).
++  llvm::APInt Cands[4] = { LMin * RMin, LMin * RMax, LMax * RMin, LMax * RMax };
++  llvm::APInt PMin = Cands[0];
++  llvm::APInt PMax = Cands[0];
++  for (int i = 1; i < 4; ++i) {
++    if (Cands[i].slt(PMin)) PMin = Cands[i];
++    if (Cands[i].sgt(PMax)) PMax = Cands[i];
++  }
++
++  // MulType range.
++  llvm::APInt TMin(128, 0), TMax(128, 0);
++  getTypeRange128(MulType, C, TMin, TMax);
++
++  // Product definitely fits if entire [PMin, PMax] within [TMin, TMax].
++  if (PMin.sge(TMin) && PMax.sle(TMax))
++    return true;
+
+   return false;
+ }
+@@ -286,15 +374,14 @@       if (isIntegerLike(ResT)) {
+         unsigned MulBits = getTypeBitWidth(ResT, C);
+         if (MulBits < TargetBits) {
+-          // New guard: if we can prove the product cannot overflow in ResT,
+-          // then it is safe and should not be considered suspicious.
++          // Guard: if we can prove the product cannot overflow in ResT, skip.
+           if (!productDefinitelyFitsInType(BO->getLHS(), BO->getRHS(), ResT, C)) {
+             OutMul = BO;
+             return true;
+           }
+         }
+       }
+-      // Even if not suspicious, continue searching sub-expressions.
++      // Continue searching sub-expressions.
+       if (findFirstSuspiciousMulOnValuePath(BO->getLHS(), TargetBits, OutMul, C))
+         return true;
+       if (findFirstSuspiciousMulOnValuePath(BO->getRHS(), TargetBits, OutMul, C))

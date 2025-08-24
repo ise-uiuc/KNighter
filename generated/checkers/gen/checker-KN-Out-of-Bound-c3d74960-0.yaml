@@ -1,0 +1,415 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: c3d749609472ba0b217b42ab66f80459847e2bcb
+commit_type: Out-of-Bound
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"clang/AST/DeclStmt.h\"\n#include \"clang/Lex/Lexer.h\"\n#include \"\
+  llvm/ADT/DenseMap.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\n#include \"llvm/ADT/SmallVector.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ No custom program state is needed. This checker is a mostly-syntactic matcher.\n\
+  \nnamespace {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker\
+  \ : public Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\
+  \n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Per-CRTC array indexed\
+  \ by max_links\", \"Memory Error\")) {}\n\n      void checkASTCodeBody(const Decl\
+  \ *D, AnalysisManager &Mgr, BugReporter &BR) const;\n\n   private:\n\n      // (no\
+  \ ProgramState helpers needed)\n};\n\n// ---- Helper functions and visitor implementation\
+  \ ----\n\nstatic bool ExprHasNameAST(const Expr *E, StringRef Name, ASTContext &AC)\
+  \ {\n  if (!E)\n    return false;\n  const SourceManager &SM = AC.getSourceManager();\n\
+  \  const LangOptions &LangOpts = AC.getLangOpts();\n  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, LangOpts);\n  return Text.contains(Name);\n\
+  }\n\nstatic StringRef getCalleeName(const CallExpr *CE) {\n  if (!CE)\n    return\
+  \ StringRef();\n  if (const FunctionDecl *FD = CE->getDirectCallee()) {\n    if\
+  \ (const IdentifierInfo *II = FD->getIdentifier())\n      return II->getName();\n\
+  \  }\n  return StringRef();\n}\n\nstatic bool isAllocCallOfInterest(const Expr *InitE,\
+  \ const CallExpr *&OutCE, const Expr *&OutCountArg, ASTContext &AC) {\n  OutCE =\
+  \ nullptr;\n  OutCountArg = nullptr;\n  if (!InitE)\n    return false;\n\n  const\
+  \ Expr *E = InitE->IgnoreParenImpCasts();\n  const CallExpr *CE = dyn_cast<CallExpr>(E);\n\
+  \  if (!CE)\n    return false;\n\n  StringRef Name = getCalleeName(CE);\n  if (Name.empty())\
+  \ {\n    // Fallback: try textual match if we couldn't get a direct callee (rare)\n\
+  \    if (!ExprHasNameAST(CE, \"kcalloc\", AC) && !ExprHasNameAST(CE, \"kmalloc_array\"\
+  , AC))\n      return false;\n  } else {\n    if (!(Name == \"kcalloc\" || Name ==\
+  \ \"kmalloc_array\"))\n      return false;\n  }\n\n  if (CE->getNumArgs() < 1)\n\
+  \    return false;\n\n  OutCE = CE;\n  OutCountArg = CE->getArg(0);\n  return true;\n\
+  }\n\nclass MaxLinksLoopVisitor : public RecursiveASTVisitor<MaxLinksLoopVisitor>\
+  \ {\npublic:\n  MaxLinksLoopVisitor(ASTContext &AC, BugReporter &BR, BugType &BT,\n\
+  \                      AnalysisDeclContext *ADC)\n      : AC(AC), BR(BR), BT(BT),\
+  \ ADC(ADC) {}\n\n  bool VisitDeclStmt(const DeclStmt *DS) {\n    // Look for: Type\
+  \ *p = kcalloc(num_crtc or AMDGPU_MAX_CRTCS, ...);\n    for (const Decl *D : DS->decls())\
+  \ {\n      const VarDecl *VD = dyn_cast<VarDecl>(D);\n      if (!VD)\n        continue;\n\
+  \      const Expr *Init = VD->getInit();\n      const CallExpr *CE = nullptr;\n\
+  \      const Expr *CountArg = nullptr;\n      if (isAllocCallOfInterest(Init, CE,\
+  \ CountArg, AC)) {\n        if (CountArg &&\n            (ExprHasNameAST(CountArg,\
+  \ \"num_crtc\", AC) ||\n             ExprHasNameAST(CountArg, \"AMDGPU_MAX_CRTCS\"\
+  , AC))) {\n          PerCrtcSizedLocals[VD] = true;\n        }\n      }\n    }\n\
+  \    return true;\n  }\n\n  bool VisitBinaryOperator(const BinaryOperator *BO) {\n\
+  \    if (!BO || !BO->isAssignmentOp())\n      return true;\n\n    const Expr *RHS\
+  \ = BO->getRHS();\n    const CallExpr *CE = nullptr;\n    const Expr *CountArg =\
+  \ nullptr;\n    if (!isAllocCallOfInterest(RHS, CE, CountArg, AC))\n      return\
+  \ true;\n\n    const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n    const DeclRefExpr\
+  \ *DRE = dyn_cast<DeclRefExpr>(LHS);\n    if (!DRE)\n      return true;\n    const\
+  \ VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl());\n    if (!VD)\n      return true;\n\
+  \n    if (CountArg &&\n        (ExprHasNameAST(CountArg, \"num_crtc\", AC) ||\n\
+  \         ExprHasNameAST(CountArg, \"AMDGPU_MAX_CRTCS\", AC))) {\n      PerCrtcSizedLocals[VD]\
+  \ = true;\n    }\n\n    return true;\n  }\n\n  bool VisitForStmt(const ForStmt *FS)\
+  \ {\n    if (!FS)\n      return true;\n    processLoop(FS->getCond(), FS->getBody());\n\
+  \    return true;\n  }\n\n  bool VisitWhileStmt(const WhileStmt *WS) {\n    if (!WS)\n\
+  \      return true;\n    processLoop(WS->getCond(), WS->getBody());\n    return\
+  \ true;\n  }\n\nprivate:\n  ASTContext &AC;\n  BugReporter &BR;\n  BugType &BT;\n\
+  \  AnalysisDeclContext *ADC;\n\n  llvm::DenseMap<const VarDecl *, bool> PerCrtcSizedLocals;\n\
+  \  llvm::SmallPtrSet<const Stmt *, 16> Reported;\n\n  void collectVarsInExpr(const\
+  \ Expr *E, llvm::SmallVectorImpl<const VarDecl *> &Out) {\n    if (!E)\n      return;\n\
+  \    class VarCollector : public RecursiveASTVisitor<VarCollector> {\n    public:\n\
+  \      VarCollector(llvm::SmallVectorImpl<const VarDecl *> &Out) : Out(Out) {}\n\
+  \      bool VisitDeclRefExpr(const DeclRefExpr *DRE) {\n        if (const VarDecl\
+  \ *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n          if (VD->getType().getTypePtrOrNull()\
+  \ &&\n              VD->getType()->isIntegerType())\n            Out.push_back(VD);\n\
+  \        }\n        return true;\n      }\n    private:\n      llvm::SmallVectorImpl<const\
+  \ VarDecl *> &Out;\n    } VC(Out);\n    VC.TraverseStmt(const_cast<Expr *>(E));\n\
+  \  }\n\n  bool baseIsPerCrtc(const Expr *Base) {\n    if (!Base)\n      return false;\n\
+  \    Base = Base->IgnoreParenImpCasts();\n\n    // If base is a known local allocated\
+  \ by num_crtc/AMDGPU_MAX_CRTCS\n    if (const auto *DRE = dyn_cast<DeclRefExpr>(Base))\
+  \ {\n      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n        auto\
+  \ It = PerCrtcSizedLocals.find(VD);\n        if (It != PerCrtcSizedLocals.end()\
+  \ && It->second)\n          return true;\n      }\n    }\n\n    // Heuristic name\
+  \ matches for known per-CRTC arrays\n    if (ExprHasNameAST(Base, \"secure_display_ctxs\"\
+  , AC))\n      return true;\n\n    if (ExprHasNameAST(Base, \"crtcs\", AC) && ExprHasNameAST(Base,\
+  \ \"mode_info\", AC))\n      return true;\n\n    return false;\n  }\n\n  void processLoop(const\
+  \ Expr *Cond, const Stmt *Body) {\n    if (!Cond || !Body)\n      return;\n\n  \
+  \  // We only care about loops whose condition involves max_links.\n    if (!ExprHasNameAST(Cond,\
+  \ \"max_links\", AC))\n      return;\n\n    llvm::SmallVector<const VarDecl *, 8>\
+  \ CandidateIdxVars;\n    collectVarsInExpr(Cond, CandidateIdxVars);\n    if (CandidateIdxVars.empty())\n\
+  \      return;\n\n    // Scan loop body for array subscripts using those variables\
+  \ as indices.\n    class BodyScanner : public RecursiveASTVisitor<BodyScanner> {\n\
+  \    public:\n      BodyScanner(MaxLinksLoopVisitor &Parent,\n                 \
+  \ ArrayRef<const VarDecl *> IdxVars,\n                  const Expr *Cond)\n    \
+  \      : P(Parent), Cond(Cond) {\n        for (const VarDecl *VD : IdxVars)\n  \
+  \        IdxSet.insert(VD);\n      }\n\n      bool VisitArraySubscriptExpr(const\
+  \ ArraySubscriptExpr *ASE) {\n        if (!ASE)\n          return true;\n      \
+  \  const Expr *Idx = ASE->getIdx()->IgnoreParenImpCasts();\n        const DeclRefExpr\
+  \ *IdxDRE = dyn_cast<DeclRefExpr>(Idx);\n        if (!IdxDRE)\n          return\
+  \ true;\n        const VarDecl *VD = dyn_cast<VarDecl>(IdxDRE->getDecl());\n   \
+  \     if (!VD || !IdxSet.count(VD))\n          return true;\n\n        const Expr\
+  \ *Base = ASE->getBase()->IgnoreParenImpCasts();\n        if (!Base)\n         \
+  \ return true;\n\n        if (P.baseIsPerCrtc(Base)) {\n          // Report once\
+  \ per subscript site.\n          if (!P.Reported.count(ASE)) {\n            P.Reported.insert(ASE);\n\
+  \n            PathDiagnosticLocation Loc =\n                PathDiagnosticLocation::createBegin(ASE,\
+  \ P.BR.getSourceManager(), P.ADC);\n            auto R = std::make_unique<BasicBugReport>(\n\
+  \                P.BT,\n                \"Possible out-of-bounds: loop bound uses\
+  \ dc->caps.max_links but \"\n                \"indexes a per-CRTC array; use adev->mode_info.num_crtc.\"\
+  ,\n                Loc);\n            R->addRange(ASE->getSourceRange());\n    \
+  \        if (Cond)\n              R->addRange(Cond->getSourceRange());\n       \
+  \     P.BR.emitReport(std::move(R));\n          }\n        }\n\n        return true;\n\
+  \      }\n\n    private:\n      MaxLinksLoopVisitor &P;\n      const Expr *Cond;\n\
+  \      llvm::SmallPtrSet<const VarDecl *, 8> IdxSet;\n    } Scanner(*this, CandidateIdxVars,\
+  \ Cond);\n\n    Scanner.TraverseStmt(const_cast<Stmt *>(Body));\n  }\n};\n\nvoid\
+  \ SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD || !FD->doesThisDeclarationHaveABody())\n\
+  \    return;\n\n  Stmt *Body = FD->getBody();\n  if (!Body)\n    return;\n\n  MaxLinksLoopVisitor\
+  \ V(Mgr.getASTContext(), BR, *BT, Mgr.getAnalysisDeclContext(D));\n  V.TraverseStmt(Body);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects loops bounded by dc->caps.max_links that index per-CRTC arrays\
+  \ (possible OOB); use num_crtc\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ndrm/amd/display: fix possible buffer overflow relating\
+  \ to secure display\n\nIt is possible that adev->dm.dc->caps.max_links is greater\
+  \ than\nAMDGPU_MAX_CRTCS. So, to not potentially access unallocated memory use\n\
+  adev->mode_info.num_crtc to do the bounds check instead of\nadev->dm.dc->caps.max_links.\n\
+  \nFixes: 1b11ff764aef (\"drm/amd/display: Implement multiple secure display\")\n\
+  Fixes: b8ff7e08bab9 (\"drm/amd/display: Fix when disabling secure_display\")\nReviewed-by:\
+  \ Alan Liu <HaoPing.Liu@amd.com>\nSigned-off-by: Hamza Mahfooz <hamza.mahfooz@amd.com>\n\
+  Signed-off-by: Alex Deucher <alexander.deucher@amd.com>\n\n## Buggy Code\n\n```c\n\
+  // Function: amdgpu_dm_crtc_secure_display_create_contexts in drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c\n\
+  struct secure_display_context *\namdgpu_dm_crtc_secure_display_create_contexts(struct\
+  \ amdgpu_device *adev)\n{\n\tstruct secure_display_context *secure_display_ctxs\
+  \ = NULL;\n\tint i;\n\n\tsecure_display_ctxs = kcalloc(AMDGPU_MAX_CRTCS, sizeof(struct\
+  \ secure_display_context), GFP_KERNEL);\n\n\tif (!secure_display_ctxs)\n\t\treturn\
+  \ NULL;\n\n\tfor (i = 0; i < adev->dm.dc->caps.max_links; i++) {\n\t\tINIT_WORK(&secure_display_ctxs[i].forward_roi_work,\
+  \ amdgpu_dm_forward_crc_window);\n\t\tINIT_WORK(&secure_display_ctxs[i].notify_ta_work,\
+  \ amdgpu_dm_crtc_notify_ta_to_read);\n\t\tsecure_display_ctxs[i].crtc = &adev->mode_info.crtcs[i]->base;\n\
+  \t}\n\n\treturn secure_display_ctxs;\n}\n```\n\n```c\n// Function: amdgpu_dm_fini\
+  \ in drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c\nstatic void amdgpu_dm_fini(struct\
+  \ amdgpu_device *adev)\n{\n\tint i;\n\n\tif (adev->dm.vblank_control_workqueue)\
+  \ {\n\t\tdestroy_workqueue(adev->dm.vblank_control_workqueue);\n\t\tadev->dm.vblank_control_workqueue\
+  \ = NULL;\n\t}\n\n\tfor (i = 0; i < adev->dm.display_indexes_num; i++) {\n\t\tdrm_encoder_cleanup(&adev->dm.mst_encoders[i].base);\n\
+  \t}\n\n\tamdgpu_dm_destroy_drm_device(&adev->dm);\n\n#if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)\n\
+  \tif (adev->dm.secure_display_ctxs) {\n\t\tfor (i = 0; i < adev->dm.dc->caps.max_links;\
+  \ i++) {\n\t\t\tif (adev->dm.secure_display_ctxs[i].crtc) {\n\t\t\t\tflush_work(&adev->dm.secure_display_ctxs[i].notify_ta_work);\n\
+  \t\t\t\tflush_work(&adev->dm.secure_display_ctxs[i].forward_roi_work);\n\t\t\t}\n\
+  \t\t}\n\t\tkfree(adev->dm.secure_display_ctxs);\n\t\tadev->dm.secure_display_ctxs\
+  \ = NULL;\n\t}\n#endif\n#ifdef CONFIG_DRM_AMD_DC_HDCP\n\tif (adev->dm.hdcp_workqueue)\
+  \ {\n\t\thdcp_destroy(&adev->dev->kobj, adev->dm.hdcp_workqueue);\n\t\tadev->dm.hdcp_workqueue\
+  \ = NULL;\n\t}\n\n\tif (adev->dm.dc)\n\t\tdc_deinit_callbacks(adev->dm.dc);\n#endif\n\
+  \n\tdc_dmub_srv_destroy(&adev->dm.dc->ctx->dmub_srv);\n\n\tif (dc_enable_dmub_notifications(adev->dm.dc))\
+  \ {\n\t\tkfree(adev->dm.dmub_notify);\n\t\tadev->dm.dmub_notify = NULL;\n\t\tdestroy_workqueue(adev->dm.delayed_hpd_wq);\n\
+  \t\tadev->dm.delayed_hpd_wq = NULL;\n\t}\n\n\tif (adev->dm.dmub_bo)\n\t\tamdgpu_bo_free_kernel(&adev->dm.dmub_bo,\n\
+  \t\t\t\t      &adev->dm.dmub_bo_gpu_addr,\n\t\t\t\t      &adev->dm.dmub_bo_cpu_addr);\n\
+  \n\tif (adev->dm.hpd_rx_offload_wq) {\n\t\tfor (i = 0; i < adev->dm.dc->caps.max_links;\
+  \ i++) {\n\t\t\tif (adev->dm.hpd_rx_offload_wq[i].wq) {\n\t\t\t\tdestroy_workqueue(adev->dm.hpd_rx_offload_wq[i].wq);\n\
+  \t\t\t\tadev->dm.hpd_rx_offload_wq[i].wq = NULL;\n\t\t\t}\n\t\t}\n\n\t\tkfree(adev->dm.hpd_rx_offload_wq);\n\
+  \t\tadev->dm.hpd_rx_offload_wq = NULL;\n\t}\n\n\t/* DC Destroy TODO: Replace destroy\
+  \ DAL */\n\tif (adev->dm.dc)\n\t\tdc_destroy(&adev->dm.dc);\n\t/*\n\t * TODO: pageflip,\
+  \ vlank interrupt\n\t *\n\t * amdgpu_dm_irq_fini(adev);\n\t */\n\n\tif (adev->dm.cgs_device)\
+  \ {\n\t\tamdgpu_cgs_destroy_device(adev->dm.cgs_device);\n\t\tadev->dm.cgs_device\
+  \ = NULL;\n\t}\n\tif (adev->dm.freesync_module) {\n\t\tmod_freesync_destroy(adev->dm.freesync_module);\n\
+  \t\tadev->dm.freesync_module = NULL;\n\t}\n\n\tmutex_destroy(&adev->dm.audio_lock);\n\
+  \tmutex_destroy(&adev->dm.dc_lock);\n\tmutex_destroy(&adev->dm.dpia_aux_lock);\n\
+  \n\treturn;\n}\n```\n\n```c\n// Function: amdgpu_dm_crtc_configure_crc_source in\
+  \ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c\nint amdgpu_dm_crtc_configure_crc_source(struct\
+  \ drm_crtc *crtc,\n\t\t\t\t\tstruct dm_crtc_state *dm_crtc_state,\n\t\t\t\t\tenum\
+  \ amdgpu_dm_pipe_crc_source source)\n{\n#if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)\n\
+  \tint i;\n#endif\n\tstruct amdgpu_device *adev = drm_to_adev(crtc->dev);\n\tstruct\
+  \ dc_stream_state *stream_state = dm_crtc_state->stream;\n\tbool enable = amdgpu_dm_is_valid_crc_source(source);\n\
+  \tint ret = 0;\n\n\t/* Configuration will be deferred to stream enable. */\n\tif\
+  \ (!stream_state)\n\t\treturn -EINVAL;\n\n\tmutex_lock(&adev->dm.dc_lock);\n\n\t\
+  /* Enable or disable CRTC CRC generation */\n\tif (dm_is_crc_source_crtc(source)\
+  \ || source == AMDGPU_DM_PIPE_CRC_SOURCE_NONE) {\n#if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)\n\
+  \t\t/* Disable secure_display if it was enabled */\n\t\tif (!enable) {\n\t\t\tfor\
+  \ (i = 0; i < adev->dm.dc->caps.max_links; i++) {\n\t\t\t\tif (adev->dm.secure_display_ctxs[i].crtc\
+  \ == crtc) {\n\t\t\t\t\t/* stop ROI update on this crtc */\n\t\t\t\t\tflush_work(&adev->dm.secure_display_ctxs[i].notify_ta_work);\n\
+  \t\t\t\t\tflush_work(&adev->dm.secure_display_ctxs[i].forward_roi_work);\n\t\t\t\
+  \t\tdc_stream_forward_crc_window(stream_state, NULL, true);\n\t\t\t\t}\n\t\t\t}\n\
+  \t\t}\n#endif\n\t\tif (!dc_stream_configure_crc(stream_state->ctx->dc,\n\t\t\t\t\
+  \t     stream_state, NULL, enable, enable)) {\n\t\t\tret = -EINVAL;\n\t\t\tgoto\
+  \ unlock;\n\t\t}\n\t}\n\n\t/* Configure dithering */\n\tif (!dm_need_crc_dither(source))\
+  \ {\n\t\tdc_stream_set_dither_option(stream_state, DITHER_OPTION_TRUN8);\n\t\tdc_stream_set_dyn_expansion(stream_state->ctx->dc,\
+  \ stream_state,\n\t\t\t\t\t    DYN_EXPANSION_DISABLE);\n\t} else {\n\t\tdc_stream_set_dither_option(stream_state,\n\
+  \t\t\t\t\t    DITHER_OPTION_DEFAULT);\n\t\tdc_stream_set_dyn_expansion(stream_state->ctx->dc,\
+  \ stream_state,\n\t\t\t\t\t    DYN_EXPANSION_AUTO);\n\t}\n\nunlock:\n\tmutex_unlock(&adev->dm.dc_lock);\n\
+  \n\treturn ret;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c\
+  \ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c\nindex b4197b5f51fb..247e783d32ae\
+  \ 100644\n--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c\n+++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c\n\
+  @@ -1741,7 +1741,7 @@ static void amdgpu_dm_fini(struct amdgpu_device *adev)\n \n\
+  \ #if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)\n \tif (adev->dm.secure_display_ctxs)\
+  \ {\n-\t\tfor (i = 0; i < adev->dm.dc->caps.max_links; i++) {\n+\t\tfor (i = 0;\
+  \ i < adev->mode_info.num_crtc; i++) {\n \t\t\tif (adev->dm.secure_display_ctxs[i].crtc)\
+  \ {\n \t\t\t\tflush_work(&adev->dm.secure_display_ctxs[i].notify_ta_work);\n \t\t\
+  \t\tflush_work(&adev->dm.secure_display_ctxs[i].forward_roi_work);\ndiff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c\
+  \ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c\nindex 8841c447d0e2..8873ecada27c\
+  \ 100644\n--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c\n+++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c\n\
+  @@ -223,7 +223,7 @@ int amdgpu_dm_crtc_configure_crc_source(struct drm_crtc *crtc,\n\
+  \ #if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)\n \t\t/* Disable secure_display if\
+  \ it was enabled */\n \t\tif (!enable) {\n-\t\t\tfor (i = 0; i < adev->dm.dc->caps.max_links;\
+  \ i++) {\n+\t\t\tfor (i = 0; i < adev->mode_info.num_crtc; i++) {\n \t\t\t\tif (adev->dm.secure_display_ctxs[i].crtc\
+  \ == crtc) {\n \t\t\t\t\t/* stop ROI update on this crtc */\n \t\t\t\t\tflush_work(&adev->dm.secure_display_ctxs[i].notify_ta_work);\n\
+  @@ -544,12 +544,14 @@ amdgpu_dm_crtc_secure_display_create_contexts(struct amdgpu_device\
+  \ *adev)\n \tstruct secure_display_context *secure_display_ctxs = NULL;\n \tint\
+  \ i;\n \n-\tsecure_display_ctxs = kcalloc(AMDGPU_MAX_CRTCS, sizeof(struct secure_display_context),\
+  \ GFP_KERNEL);\n+\tsecure_display_ctxs = kcalloc(adev->mode_info.num_crtc,\n+\t\t\
+  \t\t      sizeof(struct secure_display_context),\n+\t\t\t\t      GFP_KERNEL);\n\
+  \ \n \tif (!secure_display_ctxs)\n \t\treturn NULL;\n \n-\tfor (i = 0; i < adev->dm.dc->caps.max_links;\
+  \ i++) {\n+\tfor (i = 0; i < adev->mode_info.num_crtc; i++) {\n \t\tINIT_WORK(&secure_display_ctxs[i].forward_roi_work,\
+  \ amdgpu_dm_forward_crc_window);\n \t\tINIT_WORK(&secure_display_ctxs[i].notify_ta_work,\
+  \ amdgpu_dm_crtc_notify_ta_to_read);\n \t\tsecure_display_ctxs[i].crtc = &adev->mode_info.crtcs[i]->base;\n\
+  ```\n"
+pattern: '## Bug Pattern
+
+
+  Using dc->caps.max_links as the loop bound to index per-CRTC arrays/structures that
+  are allocated and valid only up to adev->mode_info.num_crtc (or AMDGPU_MAX_CRTCS).
+  When max_links > num_crtc, the code iterates past the allocated array bounds (e.g.,
+  secure_display_ctxs[i], crtcs[i]), causing out-of-bounds access.'
+plan: "1) Program state\n- No custom program state is needed. This checker is a targeted,\
+  \ mostly-syntactic pattern matcher over loop constructs and array subscripts.\n\n\
+  2) Callbacks and implementation steps\n\nStep A: Use checkASTCodeBody to analyze\
+  \ each function body\n- Rationale: We need to correlate a loop bound expression\
+  \ (containing dc->caps.max_links) with array subscripts inside the loop body that\
+  \ index per-CRTC arrays (e.g., crtcs[], secure_display_ctxs[]). This correlation\
+  \ is easiest with an AST traversal over the function body.\n- Implementation:\n\
+  \  - Build a lightweight AST visitor that runs within checkASTCodeBody for the current\
+  \ Decl with a statement body.\n  - The visitor performs two passes (or one pass\
+  \ with two tasks):\n    1) Collect per-CRTC-sized locals created via kcalloc/kmalloc_array.\n\
+  \    2) Find loops whose conditions use dc->caps.max_links and whose bodies index\
+  \ per-CRTC arrays with the same induction variable.\n\nStep B: Collect per-CRTC-sized\
+  \ local arrays/pointers (within checkASTCodeBody)\n- Purpose: Recognize locals sized\
+  \ by num_crtc or AMDGPU_MAX_CRTCS so indexing those with max_links is suspicious.\n\
+  - How:\n  - Traverse all statements to find:\n    - Variable declarations with initializer\
+  \ being a call to kcalloc/kmalloc_array, e.g.:\n      - Type *p = kcalloc(Count,\
+  \ ElemSize, Flags);\n      - Type *p = kmalloc_array(Count, ElemSize, Flags);\n\
+  \    - Assignments where LHS is a variable and RHS is a call to kcalloc/kmalloc_array.\n\
+  \  - Extract:\n    - The callee name (match \u201Ckcalloc\u201D or \u201Ckmalloc_array\u201D\
+  ).\n    - The \u201CCount\u201D expression (first arg for kcalloc/kmalloc_array).\n\
+  \  - Heuristically mark the variable as \u201Cper-CRTC sized\u201D if the Count\
+  \ expression\u2019s source text indicates:\n    - ExprHasName(Count, \"num_crtc\"\
+  , C) OR\n    - ExprHasName(Count, \"AMDGPU_MAX_CRTCS\", C)\n  - Store in a local\
+  \ map (e.g., llvm::DenseMap<const VarDecl*, bool>) available during the current\
+  \ checkASTCodeBody invocation: PerCrtcSizedLocals[varVD] = true.\n\nStep C: Detect\
+  \ suspicious loops (ForStmt and WhileStmt) with max_links bound (within checkASTCodeBody)\n\
+  - Purpose: Find loops where the condition involves max_links and inside the body\
+  \ we index per-CRTC arrays with the induction variable.\n- How:\n  - For each ForStmt\
+  \ and WhileStmt:\n    - Let CondE be the loop condition expression.\n    - If !ExprHasName(CondE,\
+  \ \"max_links\", C), skip.\n    - Optional precision filter: also require ExprHasName(CondE,\
+  \ \"dc->caps\", C) to better match dc->caps.max_links.\n  - Determine candidate\
+  \ induction variables used in the condition:\n    - Traverse CondE and collect all\
+  \ DeclRefExpr that refer to integral VarDecls (commonly the induction variable,\
+  \ e.g., i or link).\n    - For each VarDecl* candidateVD, search the loop body for\
+  \ ArraySubscriptExpr whose index is this exact DeclRefExpr to candidateVD (IgnoreParenImpCasts).\n\
+  \  - For each ArraySubscriptExpr indexed by candidateVD:\n    - Retrieve the base\
+  \ expression (ASE->getBase()->IgnoreParenImpCasts()).\n    - Classify the base as\
+  \ per-CRTC if any holds:\n      - ExprHasName(Base, \"crtcs\", C) AND ExprHasName(Base,\
+  \ \"mode_info\", C). This matches adev->mode_info.crtcs[i].\n      - ExprHasName(Base,\
+  \ \"secure_display_ctxs\", C). This matches adev->dm.secure_display_ctxs[i] and\
+  \ local secure_display_ctxs[i].\n      - Base is a DeclRefExpr to a local VarDecl\
+  \ that is flagged in PerCrtcSizedLocals as true.\n    - Optional precision filter:\
+  \ if both CondE and Base contain \u201Cadev\u201D (ExprHasName(CondE,\"adev\",C)\
+  \ and ExprHasName(Base,\"adev\",C)) then prefer to report; this ties both sides\
+  \ to the same device object and reduces false positives.\n  - If any per-CRTC base\
+  \ is indexed by candidateVD and CondE contains max_links, trigger a report.\n\n\
+  Notes:\n- This approach catches:\n  - for (i = 0; i < adev->dm.dc->caps.max_links;\
+  \ i++) { secure_display_ctxs[i] ... }\n  - for (i = 0; i < adev->dm.dc->caps.max_links;\
+  \ i++) { adev->mode_info.crtcs[i] ... }\n- It avoids flagging arrays that are intentionally\
+  \ sized by max_links (e.g., hpd_rx_offload_wq) because we restrict to well-known\
+  \ per-CRTC arrays by name and locals sized by num_crtc/AMDGPU_MAX_CRTCS.\n\nStep\
+  \ D: Reporting\n- When a match is found in Step C:\n  - Create a BugType once, e.g.,\
+  \ static std::unique_ptr<BugType> BT(new BugType(this, \"Per-CRTC array indexed\
+  \ by max_links\", \"Memory Error\"));\n  - Emit a BasicBugReport with message:\n\
+  \    - \u201CPossible out-of-bounds: loop bound uses dc->caps.max_links but indexes\
+  \ a per-CRTC array; use adev->mode_info.num_crtc.\u201D\n  - Anchor the report location\
+  \ at:\n    - Preferably the ArraySubscriptExpr using candidateVD (highlights the\
+  \ actual indexing).\n    - Optionally add a note on the loop condition containing\
+  \ max_links.\n\nStep E: Utility functions used\n- Use ExprHasName to detect key\
+  \ names inside expressions:\n  - \"max_links\", \"dc->caps\", \"secure_display_ctxs\"\
+  , \"crtcs\", \"mode_info\", \"AMDGPU_MAX_CRTCS\", \"num_crtc\", \"adev\".\n- Use\
+  \ findSpecificTypeInChildren only if needed to quickly obtain one child node, but\
+  \ a direct recursive traversal over children is recommended to find all ArraySubscriptExpr\
+  \ occurrences.\n\nStep F: Heuristics and false positive control\n- Only warn when\
+  \ both:\n  - The loop condition contains \u201Cmax_links\u201D (preferably with\
+  \ \u201Cdc->caps\u201D).\n  - There is at least one array subscript in the body\
+  \ that:\n    - Uses the same induction variable, and\n    - Indexes a known per-CRTC\
+  \ array (crtcs/secure_display_ctxs) or a local pointer previously recognized as\
+  \ per-CRTC-sized via kcalloc/kmalloc_array with num_crtc/AMDGPU_MAX_CRTCS.\n- Optionally\
+  \ require the presence of \u201Cadev\u201D in both the condition and the base expression\
+  \ to ensure object relation.\n- Do not attempt path-sensitive reasoning or symbolic\
+  \ bounds; keep the rule syntactic to stay simple and precise for this bug pattern."
+refined_plan: null
+repaired_checker_code: "#include <memory>\n#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/AST/ASTContext.h\"\n\
+  #include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\
+  \n#include \"clang/AST/StmtVisitor.h\"\n#include \"clang/Lex/Lexer.h\"\n#include\
+  \ \"llvm/ADT/DenseMap.h\"\n#include \"llvm/ADT/SmallPtrSet.h\"\n#include \"llvm/ADT/SmallVector.h\"\
+  \n#include \"llvm/ADT/ArrayRef.h\"\n#include \"clang/Analysis/AnalysisDeclContext.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\n\n// No custom program state\
+  \ is needed. This checker is a mostly-syntactic matcher.\n\nnamespace {\n/* The\
+  \ checker callbacks are to be decided. */\nclass SAGenTestChecker : public Checker<check::ASTCodeBody>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Per-CRTC array indexed by max_links\", \"Memory Error\"\
+  )) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const;\n\n   private:\n\n      // (no ProgramState helpers needed)\n};\n\n\
+  // ---- Helper functions and visitor implementation ----\n\nstatic bool ExprHasNameAST(const\
+  \ Expr *E, StringRef Name, ASTContext &AC) {\n  if (!E)\n    return false;\n  const\
+  \ SourceManager &SM = AC.getSourceManager();\n  const LangOptions &LangOpts = AC.getLangOpts();\n\
+  \  CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, LangOpts);\n  return Text.contains(Name);\n\
+  }\n\nstatic StringRef getCalleeName(const CallExpr *CE) {\n  if (!CE)\n    return\
+  \ StringRef();\n  if (const FunctionDecl *FD = CE->getDirectCallee()) {\n    if\
+  \ (const IdentifierInfo *II = FD->getIdentifier())\n      return II->getName();\n\
+  \  }\n  return StringRef();\n}\n\nstatic bool isAllocCallOfInterest(const Expr *InitE,\
+  \ const CallExpr *&OutCE, const Expr *&OutCountArg, ASTContext &AC) {\n  OutCE =\
+  \ nullptr;\n  OutCountArg = nullptr;\n  if (!InitE)\n    return false;\n\n  const\
+  \ Expr *E = InitE->IgnoreParenImpCasts();\n  const CallExpr *CE = dyn_cast<CallExpr>(E);\n\
+  \  if (!CE)\n    return false;\n\n  StringRef Name = getCalleeName(CE);\n  if (Name.empty())\
+  \ {\n    // Fallback: try textual match if we couldn't get a direct callee (rare)\n\
+  \    if (!ExprHasNameAST(CE, \"kcalloc\", AC) && !ExprHasNameAST(CE, \"kmalloc_array\"\
+  , AC))\n      return false;\n  } else {\n    if (!(Name == \"kcalloc\" || Name ==\
+  \ \"kmalloc_array\"))\n      return false;\n  }\n\n  if (CE->getNumArgs() < 1)\n\
+  \    return false;\n\n  OutCE = CE;\n  OutCountArg = CE->getArg(0);\n  return true;\n\
+  }\n\nclass MaxLinksLoopVisitor : public RecursiveASTVisitor<MaxLinksLoopVisitor>\
+  \ {\npublic:\n  MaxLinksLoopVisitor(ASTContext &AC, BugReporter &BR, BugType &BT,\n\
+  \                      AnalysisDeclContext *ADC)\n      : AC(AC), BR(BR), BT(BT),\
+  \ ADC(ADC) {}\n\n  bool VisitDeclStmt(const DeclStmt *DS) {\n    // Look for: Type\
+  \ *p = kcalloc(num_crtc or AMDGPU_MAX_CRTCS, ...);\n    for (const Decl *D : DS->decls())\
+  \ {\n      const VarDecl *VD = dyn_cast<VarDecl>(D);\n      if (!VD)\n        continue;\n\
+  \      const Expr *Init = VD->getInit();\n      const CallExpr *CE = nullptr;\n\
+  \      const Expr *CountArg = nullptr;\n      if (isAllocCallOfInterest(Init, CE,\
+  \ CountArg, AC)) {\n        if (CountArg &&\n            (ExprHasNameAST(CountArg,\
+  \ \"num_crtc\", AC) ||\n             ExprHasNameAST(CountArg, \"AMDGPU_MAX_CRTCS\"\
+  , AC))) {\n          PerCrtcSizedLocals[VD] = true;\n        }\n      }\n    }\n\
+  \    return true;\n  }\n\n  bool VisitBinaryOperator(const BinaryOperator *BO) {\n\
+  \    if (!BO || !BO->isAssignmentOp())\n      return true;\n\n    const Expr *RHS\
+  \ = BO->getRHS();\n    const CallExpr *CE = nullptr;\n    const Expr *CountArg =\
+  \ nullptr;\n    if (!isAllocCallOfInterest(RHS, CE, CountArg, AC))\n      return\
+  \ true;\n\n    const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n    const DeclRefExpr\
+  \ *DRE = dyn_cast<DeclRefExpr>(LHS);\n    if (!DRE)\n      return true;\n    const\
+  \ VarDecl *VD = dyn_cast<VarDecl>(DRE->getDecl());\n    if (!VD)\n      return true;\n\
+  \n    if (CountArg &&\n        (ExprHasNameAST(CountArg, \"num_crtc\", AC) ||\n\
+  \         ExprHasNameAST(CountArg, \"AMDGPU_MAX_CRTCS\", AC))) {\n      PerCrtcSizedLocals[VD]\
+  \ = true;\n    }\n\n    return true;\n  }\n\n  bool VisitForStmt(const ForStmt *FS)\
+  \ {\n    if (!FS)\n      return true;\n    processLoop(FS->getCond(), FS->getBody());\n\
+  \    return true;\n  }\n\n  bool VisitWhileStmt(const WhileStmt *WS) {\n    if (!WS)\n\
+  \      return true;\n    processLoop(WS->getCond(), WS->getBody());\n    return\
+  \ true;\n  }\n\nprivate:\n  ASTContext &AC;\n  BugReporter &BR;\n  BugType &BT;\n\
+  \  AnalysisDeclContext *ADC;\n\n  llvm::DenseMap<const VarDecl *, bool> PerCrtcSizedLocals;\n\
+  \  llvm::SmallPtrSet<const Stmt *, 16> Reported;\n\n  void collectVarsInExpr(const\
+  \ Expr *E, llvm::SmallVectorImpl<const VarDecl *> &Out) {\n    if (!E)\n      return;\n\
+  \    class VarCollector : public RecursiveASTVisitor<VarCollector> {\n    public:\n\
+  \      VarCollector(llvm::SmallVectorImpl<const VarDecl *> &Out) : Out(Out) {}\n\
+  \      bool VisitDeclRefExpr(const DeclRefExpr *DRE) {\n        if (const VarDecl\
+  \ *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n          if (VD->getType().getTypePtrOrNull()\
+  \ &&\n              VD->getType()->isIntegerType())\n            Out.push_back(VD);\n\
+  \        }\n        return true;\n      }\n    private:\n      llvm::SmallVectorImpl<const\
+  \ VarDecl *> &Out;\n    } VC(Out);\n    VC.TraverseStmt(const_cast<Expr *>(E));\n\
+  \  }\n\n  bool baseIsPerCrtc(const Expr *Base) {\n    if (!Base)\n      return false;\n\
+  \    Base = Base->IgnoreParenImpCasts();\n\n    // If base is a known local allocated\
+  \ by num_crtc/AMDGPU_MAX_CRTCS\n    if (const auto *DRE = dyn_cast<DeclRefExpr>(Base))\
+  \ {\n      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {\n        auto\
+  \ It = PerCrtcSizedLocals.find(VD);\n        if (It != PerCrtcSizedLocals.end()\
+  \ && It->second)\n          return true;\n      }\n    }\n\n    // Heuristic name\
+  \ matches for known per-CRTC arrays\n    if (ExprHasNameAST(Base, \"secure_display_ctxs\"\
+  , AC))\n      return true;\n\n    if (ExprHasNameAST(Base, \"crtcs\", AC) && ExprHasNameAST(Base,\
+  \ \"mode_info\", AC))\n      return true;\n\n    return false;\n  }\n\n  void processLoop(const\
+  \ Expr *Cond, const Stmt *Body) {\n    if (!Cond || !Body)\n      return;\n\n  \
+  \  // We only care about loops whose condition involves max_links.\n    if (!ExprHasNameAST(Cond,\
+  \ \"max_links\", AC))\n      return;\n\n    llvm::SmallVector<const VarDecl *, 8>\
+  \ CandidateIdxVars;\n    collectVarsInExpr(Cond, CandidateIdxVars);\n    if (CandidateIdxVars.empty())\n\
+  \      return;\n\n    // Scan loop body for array subscripts using those variables\
+  \ as indices.\n    class BodyScanner : public RecursiveASTVisitor<BodyScanner> {\n\
+  \    public:\n      BodyScanner(MaxLinksLoopVisitor &Parent,\n                 \
+  \ ArrayRef<const VarDecl *> IdxVars,\n                  const Expr *Cond)\n    \
+  \      : P(Parent), Cond(Cond) {\n        for (const VarDecl *VD : IdxVars)\n  \
+  \        IdxSet.insert(VD);\n      }\n\n      bool VisitArraySubscriptExpr(const\
+  \ ArraySubscriptExpr *ASE) {\n        if (!ASE)\n          return true;\n      \
+  \  const Expr *Idx = ASE->getIdx()->IgnoreParenImpCasts();\n        const DeclRefExpr\
+  \ *IdxDRE = dyn_cast<DeclRefExpr>(Idx);\n        if (!IdxDRE)\n          return\
+  \ true;\n        const VarDecl *VD = dyn_cast<VarDecl>(IdxDRE->getDecl());\n   \
+  \     if (!VD || !IdxSet.count(VD))\n          return true;\n\n        const Expr\
+  \ *Base = ASE->getBase()->IgnoreParenImpCasts();\n        if (!Base)\n         \
+  \ return true;\n\n        if (P.baseIsPerCrtc(Base)) {\n          // Report once\
+  \ per subscript site.\n          if (!P.Reported.count(ASE)) {\n            P.Reported.insert(ASE);\n\
+  \n            PathDiagnosticLocation Loc =\n                PathDiagnosticLocation::createBegin(ASE,\
+  \ P.BR.getSourceManager(), P.ADC);\n            auto R = std::make_unique<BasicBugReport>(\n\
+  \                P.BT,\n                \"Possible out-of-bounds: loop bound uses\
+  \ dc->caps.max_links but \"\n                \"indexes a per-CRTC array; use adev->mode_info.num_crtc.\"\
+  ,\n                Loc);\n            R->addRange(ASE->getSourceRange());\n    \
+  \        if (Cond)\n              R->addRange(Cond->getSourceRange());\n       \
+  \     P.BR.emitReport(std::move(R));\n          }\n        }\n\n        return true;\n\
+  \      }\n\n    private:\n      MaxLinksLoopVisitor &P;\n      const Expr *Cond;\n\
+  \      llvm::SmallPtrSet<const VarDecl *, 8> IdxSet;\n    } Scanner(*this, CandidateIdxVars,\
+  \ Cond);\n\n    Scanner.TraverseStmt(const_cast<Stmt *>(Body));\n  }\n};\n\nvoid\
+  \ SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD || !FD->doesThisDeclarationHaveABody())\n\
+  \    return;\n\n  Stmt *Body = FD->getBody();\n  if (!Body)\n    return;\n\n  MaxLinksLoopVisitor\
+  \ V(Mgr.getASTContext(), BR, *BT, Mgr.getAnalysisDeclContext(D));\n  V.TraverseStmt(Body);\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects loops bounded by dc->caps.max_links that index per-CRTC arrays\
+  \ (possible OOB); use num_crtc\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 2
+tp_score: 2

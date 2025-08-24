@@ -1,0 +1,186 @@
+--- attempt_2_original.cpp+++ attempt_2.cpp@@ -54,8 +54,11 @@       bool isLockAcquire(const CallEvent &Call, CheckerContext &C) const;
+       bool isLockRelease(const CallEvent &Call, CheckerContext &C) const;
+
++      // Old helper kept for reference; superseded by analyzeNullCheckForInvalidBranch
+       const MemRegion* extractNullCheckedPointer(const Expr *Cond, CheckerContext &C) const;
++
+       bool thenHasEarlyExit(const Stmt *Then, CheckerContext &C) const;
++      bool hasEarlyExit(const Stmt *S, CheckerContext &C) const;
+
+       const MemRegion* getBaseRegionFromExpr(const Expr *E, CheckerContext &C) const;
+
+@@ -68,6 +71,14 @@       // New helpers to reduce false positives
+       bool containsLoggingCall(const Stmt *S, CheckerContext &C) const;
+       static bool isLoggingName(StringRef Name);
++
++      // New: analyze which branch corresponds to "invalid" (null) case.
++      enum class InvalidOnBranch { Then, Else, Unknown };
++      struct NullCheckInfo {
++        const MemRegion *PtrRegion = nullptr;
++        InvalidOnBranch InvalidBranch = InvalidOnBranch::Unknown;
++      };
++      NullCheckInfo analyzeNullCheckForInvalidBranch(const Expr *Cond, CheckerContext &C) const;
+ };
+
+
+@@ -97,6 +108,7 @@   return MR->getBaseRegion();
+ }
+
++// Deprecated in logic; left to keep signature compatibility (not used by final logic).
+ const MemRegion* SAGenTestChecker::extractNullCheckedPointer(const Expr *Cond, CheckerContext &C) const {
+   if (!Cond) return nullptr;
+   const Expr *E = Cond->IgnoreParenImpCasts();
+@@ -146,15 +158,20 @@   return nullptr;
+ }
+
++// Determine if S contains any abrupt exit (return/goto/break/continue).
++bool SAGenTestChecker::hasEarlyExit(const Stmt *S, CheckerContext &C) const {
++  if (!S) return false;
++
++  if (findSpecificTypeInChildren<ReturnStmt>(S)) return true;
++  if (findSpecificTypeInChildren<GotoStmt>(S)) return true;
++  if (findSpecificTypeInChildren<BreakStmt>(S)) return true;
++  if (findSpecificTypeInChildren<ContinueStmt>(S)) return true;
++
++  return false;
++}
++
+ bool SAGenTestChecker::thenHasEarlyExit(const Stmt *Then, CheckerContext &C) const {
+-  if (!Then) return false;
+-
+-  if (findSpecificTypeInChildren<ReturnStmt>(Then)) return true;
+-  if (findSpecificTypeInChildren<GotoStmt>(Then)) return true;
+-  if (findSpecificTypeInChildren<BreakStmt>(Then)) return true;
+-  if (findSpecificTypeInChildren<ContinueStmt>(Then)) return true;
+-
+-  return false;
++  return hasEarlyExit(Then, C);
+ }
+
+ static bool stmtContainsCallWithName(const Stmt *S, StringRef Name, CheckerContext &C) {
+@@ -363,6 +380,70 @@   C.emitReport(std::move(Report));
+ }
+
++// Analyze the condition to find a null-check and determine which branch is "invalid".
++SAGenTestChecker::NullCheckInfo
++SAGenTestChecker::analyzeNullCheckForInvalidBranch(const Expr *Cond, CheckerContext &C) const {
++  NullCheckInfo Info;
++  if (!Cond) return Info;
++
++  const Expr *E = Cond->IgnoreParenImpCasts();
++
++  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
++    BinaryOperator::Opcode Op = BO->getOpcode();
++    if (Op == BO_LOr || Op == BO_LAnd) {
++      // Prefer a negative (invalid-on-then) check if present in either side
++      NullCheckInfo L = analyzeNullCheckForInvalidBranch(BO->getLHS(), C);
++      if (L.PtrRegion && L.InvalidBranch == InvalidOnBranch::Then)
++        return L;
++      NullCheckInfo R = analyzeNullCheckForInvalidBranch(BO->getRHS(), C);
++      if (R.PtrRegion && R.InvalidBranch == InvalidOnBranch::Then)
++        return R;
++      // Otherwise, return any found info (most likely valid-on-then -> invalid-on-else)
++      if (L.PtrRegion) return L;
++      if (R.PtrRegion) return R;
++      return Info;
++    }
++
++    if (Op == BO_EQ || Op == BO_NE) {
++      const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
++      const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
++      bool LHSNull = isNullLikeExpr(LHS, C);
++      bool RHSNull = isNullLikeExpr(RHS, C);
++
++      // (ptr == NULL) => invalid on THEN; (ptr != NULL) => invalid on ELSE
++      if (LHSNull && !RHSNull && RHS->getType()->isAnyPointerType() && isa<DeclRefExpr>(RHS)) {
++        Info.PtrRegion = getBaseRegionFromExpr(RHS, C);
++        Info.InvalidBranch = (Op == BO_EQ) ? InvalidOnBranch::Then : InvalidOnBranch::Else;
++        return Info;
++      }
++      if (RHSNull && !LHSNull && LHS->getType()->isAnyPointerType() && isa<DeclRefExpr>(LHS)) {
++        Info.PtrRegion = getBaseRegionFromExpr(LHS, C);
++        Info.InvalidBranch = (Op == BO_EQ) ? InvalidOnBranch::Then : InvalidOnBranch::Else;
++        return Info;
++      }
++      return Info;
++    }
++  } else if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
++    if (UO->getOpcode() == UO_LNot) {
++      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
++      if (Sub->getType()->isAnyPointerType() && isa<DeclRefExpr>(Sub)) {
++        Info.PtrRegion = getBaseRegionFromExpr(Sub, C);
++        Info.InvalidBranch = InvalidOnBranch::Then; // if (!ptr) => invalid on THEN
++        return Info;
++      }
++      return Info;
++    }
++  } else if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
++    if (DRE->getType()->isAnyPointerType()) {
++      // if (ptr) => invalid on ELSE
++      Info.PtrRegion = getBaseRegionFromExpr(DRE, C);
++      Info.InvalidBranch = InvalidOnBranch::Else;
++      return Info;
++    }
++  }
++
++  return Info;
++}
+
+ // ---------------- Checker Callbacks ----------------
+
+@@ -376,35 +457,41 @@   if (!Cond)
+     return;
+
+-  const Stmt *Then = IS->getThen();
+-  // Identify the pointer that is being null-checked in the condition
+-  const MemRegion *R = extractNullCheckedPointer(Cond, C);
+-  if (!R)
+-    return;
++  // Analyze which branch represents the "invalid" case.
++  NullCheckInfo NCI = analyzeNullCheckForInvalidBranch(Cond, C);
++  if (!NCI.PtrRegion || NCI.InvalidBranch == InvalidOnBranch::Unknown)
++    return;
++
++  // Compute the invalid branch statement node
++  const Stmt *InvalidBranchStmt = (NCI.InvalidBranch == InvalidOnBranch::Then)
++                                  ? IS->getThen()
++                                  : IS->getElse();
++  if (!InvalidBranchStmt)
++    return; // No invalid branch to inspect (e.g., if (ptr) without else) => not our pattern.
+
+   ProgramStateRef State = C.getState();
+   int Depth = State->get<LockDepth>();
+
+   // If inside the lock and we see re-validation with early-exit, clear suspicion.
+   if (Depth > 0) {
+-    if (thenHasEarlyExit(Then, C)) {
+-      State = State->remove<SuspiciousAfterLockSet>(R);
++    if (hasEarlyExit(InvalidBranchStmt, C)) {
++      State = State->remove<SuspiciousAfterLockSet>(NCI.PtrRegion);
+       C.addTransition(State);
+     }
+     return;
+   }
+
+-  // We only care about the "log-and-continue" pattern outside the lock:
+-  // - Then branch must not have early exit
+-  // - Then branch must contain a logging call (dbg/warn/err/printk/...)
+-  if (thenHasEarlyExit(Then, C))
+-    return;
+-
+-  if (!containsLoggingCall(Then, C))
+-    return; // Avoid FPs where the check is not "log-only".
++  // Target pattern outside the lock:
++  // - Invalid branch must contain a logging call
++  // - Invalid branch must NOT have an early exit (no return/goto/break/continue)
++  if (!containsLoggingCall(InvalidBranchStmt, C))
++    return;
++
++  if (hasEarlyExit(InvalidBranchStmt, C))
++    return;
+
+   // Mark this pointer as suspicious: invalid-checked, no abort, and not under lock.
+-  State = State->add<SuspiciousNoLockSet>(R);
++  State = State->add<SuspiciousNoLockSet>(NCI.PtrRegion);
+   C.addTransition(State);
+ }

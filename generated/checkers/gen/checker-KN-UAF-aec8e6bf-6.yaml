@@ -1,0 +1,473 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: aec8e6bf839101784f3ef037dcdb9432c3f32343
+commit_type: UAF
+index: 6
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/ExprCXX.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/Type.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n#include \"llvm/ADT/StringRef.h\"\n#include\
+  \ \"llvm/ADT/ImmutableMap.h\"\n\nusing namespace clang;\nusing namespace ento;\n\
+  using namespace taint;\n\n// Program state: Track released pointer \"owners\" (base\
+  \ regions) and where they were released.\nREGISTER_MAP_WITH_PROGRAMSTATE(ReleasedPtrMap,\
+  \ const MemRegion *, SourceLocation)\n// Program state: Simple aliasing between\
+  \ pointer lvalues (both directions stored).\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n\nnamespace {\n\nstatic bool CalleeIs(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C) {\n  const Expr *Origin =\
+  \ Call.getOriginExpr();\n  if (!Origin)\n    return false;\n  return ExprHasName(Origin,\
+  \ Name, C);\n}\n\n// Known release/put/free functions and which parameters they\
+  \ release\nstatic bool isKnownReleaseFunction(const CallEvent &Call,\n         \
+  \                          CheckerContext &C,\n                                \
+  \   llvm::SmallVectorImpl<unsigned> &Params) {\n  // Use callee expression textual\
+  \ name match for robustness\n  struct Entry { const char *Name; unsigned ParamIndex;\
+  \ };\n  static const Entry Table[] = {\n      {\"fput\", 0}, {\"kfree\", 0}, {\"\
+  kvfree\", 0}, {\"vfree\", 0},\n      {\"blkdev_put\", 0}, {\"filp_close\", 0}, {\"\
+  put_device\", 0},\n      {\"sock_release\", 0}, {\"bio_put\", 0}, {\"kobject_put\"\
+  , 0},\n  };\n\n  bool Found = false;\n  for (const auto &E : Table) {\n    if (CalleeIs(Call,\
+  \ E.Name, C)) {\n      Params.push_back(E.ParamIndex);\n      Found = true;\n  \
+  \  }\n  }\n  return Found;\n}\n\n// Owner-based wrapper summary: btrfs_close_bdev(device)\
+  \ releases device->bdev_file\nstatic bool getOwnerReleasedFields(const CallEvent\
+  \ &Call,\n                                   CheckerContext &C,\n              \
+  \                     llvm::SmallVectorImpl<std::pair<unsigned, StringRef>> &OwnerParamFieldNames)\
+  \ {\n  if (CalleeIs(Call, \"btrfs_close_bdev\", C)) {\n    OwnerParamFieldNames.push_back({0u,\
+  \ StringRef(\"bdev_file\")});\n    return true;\n  }\n  return false;\n}\n\nstatic\
+  \ const FieldDecl *findFieldDeclByName(QualType OwnerPtrTy, StringRef FieldName)\
+  \ {\n  QualType Pointee = OwnerPtrTy->getPointeeType();\n  if (Pointee.isNull())\n\
+  \    return nullptr;\n  const RecordType *RT = Pointee->getAs<RecordType>();\n \
+  \ if (!RT)\n    return nullptr;\n  const RecordDecl *RD = RT->getDecl();\n  if (!RD)\n\
+  \    return nullptr;\n  for (const FieldDecl *FD : RD->fields()) {\n    if (FD &&\
+  \ FD->getName().equals(FieldName))\n      return FD;\n  }\n  return nullptr;\n}\n\
+  \n// Remove region and its aliases from ReleasedPtrMap and clear alias links.\n\
+  static ProgramStateRef clearReleasedAndAliases(ProgramStateRef State,\n        \
+  \                                       const MemRegion *Reg) {\n  if (!Reg)\n \
+  \   return State;\n  Reg = Reg->getBaseRegion();\n  State = State->remove<ReleasedPtrMap>(Reg);\n\
+  \n  if (const MemRegion *Alias = State->get<PtrAliasMap>(Reg)) {\n    Alias = Alias->getBaseRegion();\n\
+  \    State = State->remove<ReleasedPtrMap>(Alias);\n    State = State->remove<PtrAliasMap>(Alias);\n\
+  \  }\n  State = State->remove<PtrAliasMap>(Reg);\n  return State;\n}\n\nclass SAGenTestChecker\n\
+  \  : public Checker<\n        check::PostCall,\n        check::PreCall,\n      \
+  \  check::Bind,\n        check::BranchCondition,\n        check::EndFunction> {\n\
+  \   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Released pointer not nullified\", \"Memory Error\"))\
+  \ {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \      void checkPreCall(const CallEvent &Call, CheckerContext &C) const;\n    \
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \      void checkBranchCondition(const Stmt *Condition, CheckerContext &C) const;\n\
+  \      void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;\n\n\
+  \   private:\n      void report(CheckerContext &C, StringRef Msg, SourceRange R\
+  \ = SourceRange()) const;\n};\n\nvoid SAGenTestChecker::report(CheckerContext &C,\
+  \ StringRef Msg, SourceRange R) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto Rep = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (R.isValid())\n    Rep->addRange(R);\n  C.emitReport(std::move(Rep));\n\
+  }\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Case 1: Direct release\
+  \ functions, track argument lvalues that are fields (preferably)\n  llvm::SmallVector<unsigned,\
+  \ 4> ReleaseParams;\n  if (isKnownReleaseFunction(Call, C, ReleaseParams)) {\n \
+  \   for (unsigned Idx : ReleaseParams) {\n      if (Idx >= Call.getNumArgs())\n\
+  \        continue;\n      const Expr *ArgE = Call.getArgExpr(Idx);\n      if (!ArgE)\n\
+  \        continue;\n\n      const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n\
+  \      if (!MR)\n        continue;\n\n      // Always use base region per guideline\n\
+  \      MR = MR->getBaseRegion();\n      if (!MR)\n        continue;\n\n      //\
+  \ Track only non-local/meaningful regions; but in general base region is fine.\n\
+  \      State = State->set<ReleasedPtrMap>(MR, ArgE->getExprLoc());\n    }\n  }\n\
+  \n  // Case 2: Owner-based wrapper releases\n  llvm::SmallVector<std::pair<unsigned,\
+  \ StringRef>, 4> OwnerFields;\n  if (getOwnerReleasedFields(Call, C, OwnerFields))\
+  \ {\n    for (const auto &P : OwnerFields) {\n      unsigned OwnerIdx = P.first;\n\
+  \      StringRef FieldName = P.second;\n      if (OwnerIdx >= Call.getNumArgs())\n\
+  \        continue;\n\n      const Expr *OwnerArgE = Call.getArgExpr(OwnerIdx);\n\
+  \      if (!OwnerArgE)\n        continue;\n\n      // Get the base location (pointer\
+  \ to owner object)\n      ProgramStateRef CurState = C.getState();\n      SVal OwnerSV\
+  \ = CurState->getSVal(OwnerArgE, C.getLocationContext());\n      Optional<Loc> OwnerLocOpt\
+  \ = OwnerSV.getAs<Loc>();\n      if (!OwnerLocOpt)\n        continue;\n\n      //\
+  \ Find the field declaration by name from the owner type\n      const FieldDecl\
+  \ *FD = findFieldDeclByName(OwnerArgE->getType(), FieldName);\n      // Build an\
+  \ lvalue for the field region using the owner pointer loc.\n      const MemRegion\
+  \ *FieldMR = nullptr;\n      if (FD) {\n        SVal FieldLV = C.getSValBuilder().getLValue(FD,\
+  \ *OwnerLocOpt);\n        FieldMR = FieldLV.getAsRegion();\n      }\n\n      //\
+  \ Fallback: if we couldn't form the field region, use the owner region base\n  \
+  \    const MemRegion *BaseMR = nullptr;\n      if (FieldMR) {\n        BaseMR =\
+  \ FieldMR->getBaseRegion();\n      } else {\n        const MemRegion *OwnerMR =\
+  \ getMemRegionFromExpr(OwnerArgE, C);\n        if (OwnerMR)\n          BaseMR =\
+  \ OwnerMR->getBaseRegion();\n      }\n\n      if (BaseMR)\n        State = State->set<ReleasedPtrMap>(BaseMR,\
+  \ Call.getSourceRange().getBegin());\n    }\n  }\n\n  if (State != C.getState())\n\
+  \    C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\n\
+  \  llvm::SmallVector<unsigned, 4> DerefParams;\n  bool IsKnownDeref = functionKnownToDeref(Call,\
+  \ DerefParams);\n\n  llvm::SmallVector<unsigned, 4> ReleaseParams;\n  bool IsKnownRelease\
+  \ = isKnownReleaseFunction(Call, C, ReleaseParams);\n\n  for (unsigned i = 0; i\
+  \ < Call.getNumArgs(); ++i) {\n    const Expr *ArgE = Call.getArgExpr(i);\n    if\
+  \ (!ArgE)\n      continue;\n\n    const MemRegion *MR = getMemRegionFromExpr(ArgE,\
+  \ C);\n    if (!MR)\n      continue;\n    MR = MR->getBaseRegion();\n    if (!MR)\n\
+  \      continue;\n\n    const SourceLocation *RelLoc = State->get<ReleasedPtrMap>(MR);\n\
+  \    if (!RelLoc)\n      continue;\n\n    // Determine report kind: double release\
+  \ or use-after-release\n    bool IsDoubleRelease = false;\n    if (IsKnownRelease)\
+  \ {\n      for (unsigned RIdx : ReleaseParams) {\n        if (RIdx == i) {\n   \
+  \       IsDoubleRelease = true;\n          break;\n        }\n      }\n    }\n\n\
+  \    if (IsDoubleRelease) {\n      report(C, \"Double release: pointer already released\"\
+  , Call.getSourceRange());\n      return;\n    }\n\n    bool IsDerefUse = false;\n\
+  \    if (IsKnownDeref) {\n      for (unsigned DIdx : DerefParams) {\n        if\
+  \ (DIdx == i) {\n          IsDerefUse = true;\n          break;\n        }\n   \
+  \   }\n    }\n\n    if (IsDerefUse) {\n      report(C, \"Use-after-release: function\
+  \ dereferences a released pointer\", Call.getSourceRange());\n      return;\n  \
+  \  }\n\n    // Generic use of released pointer\n    report(C, \"Use of a previously\
+  \ released pointer\", Call.getSourceRange());\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  // Track aliasing\
+  \ if both sides are pointer lvalues (regions)\n  if (const BinaryOperator *BO =\
+  \ dyn_cast_or_null<BinaryOperator>(S)) {\n    if (BO->isAssignmentOp()) {\n    \
+  \  const Expr *RHS = BO->getRHS();\n      if (RHS) {\n        const MemRegion *RHSReg\
+  \ = getMemRegionFromExpr(RHS, C);\n        if (RHSReg) {\n          RHSReg = RHSReg->getBaseRegion();\n\
+  \          if (RHSReg) {\n            // Record alias both directions\n        \
+  \    State = State->set<PtrAliasMap>(LHSReg, RHSReg);\n            State = State->set<PtrAliasMap>(RHSReg,\
+  \ LHSReg);\n          }\n        }\n      }\n    }\n  }\n\n  // If the LHS is a\
+  \ tracked released region and we store NULL or any non-unknown pointer, clear it.\n\
+  \  bool ShouldClear = false;\n\n  if (Val.isZeroConstant()) {\n    ShouldClear =\
+  \ true; // explicit NULL store\n  } else {\n    // Re-initialization with some pointer\
+  \ value (region)\n    if (Val.getAsRegion())\n      ShouldClear = true;\n  }\n\n\
+  \  if (ShouldClear) {\n    // Clear for the region and its alias, if any.\n    State\
+  \ = clearReleasedAndAliases(State, LHSReg);\n  }\n\n  if (State != C.getState())\n\
+  \    C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n  if (!CondE) {\n   \
+  \ C.addTransition(State);\n    return;\n  }\n\n  // Try to find a member expression\
+  \ in the condition (e.g., if (device->bdev_file))\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(CondE);\n\
+  \  const Expr *TargetE = nullptr;\n\n  if (ME) {\n    TargetE = ME;\n  } else {\n\
+  \    // Fallback: maybe the whole condition is a single expr referencing the field\n\
+  \    TargetE = CondE;\n  }\n\n  if (TargetE) {\n    const MemRegion *MR = getMemRegionFromExpr(TargetE,\
+  \ C);\n    if (MR) {\n      MR = MR->getBaseRegion();\n      if (MR) {\n       \
+  \ if (State->get<ReleasedPtrMap>(MR)) {\n          report(C, \"Released pointer\
+  \ used as validity flag; set it to NULL after release.\",\n                 Condition->getSourceRange());\n\
+  \          return;\n        }\n      }\n    }\n  }\n\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // If any region is\
+  \ still marked as released at function end, it wasn't nullified.\n  auto Map = State->get<ReleasedPtrMap>();\n\
+  \  if (!Map.isEmpty()) {\n    report(C, \"Pointer released but not set to NULL before\
+  \ function returns\");\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void\
+  \ clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects using released pointer as validity\
+  \ flag and not nullifying after release\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbtrfs: fix use-after-free of block device file in\
+  \ __btrfs_free_extra_devids()\n\nMounting btrfs from two images (which have the\
+  \ same one fsid and two\ndifferent dev_uuids) in certain executing order may trigger\
+  \ an UAF for\nvariable 'device->bdev_file' in __btrfs_free_extra_devids(). And\n\
+  following are the details:\n\n1. Attach image_1 to loop0, attach image_2 to loop1,\
+  \ and scan btrfs\n   devices by ioctl(BTRFS_IOC_SCAN_DEV):\n\n             /  btrfs_device_1\
+  \ \u2192 loop0\n   fs_device\n             \\  btrfs_device_2 \u2192 loop1\n2. mount\
+  \ /dev/loop0 /mnt\n   btrfs_open_devices\n    btrfs_device_1->bdev_file = btrfs_get_bdev_and_sb(loop0)\n\
+  \    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n   btrfs_fill_super\n\
+  \    open_ctree\n     fail: btrfs_close_devices // -ENOMEM\n\t    btrfs_close_bdev(btrfs_device_1)\n\
+  \             fput(btrfs_device_1->bdev_file)\n\t      // btrfs_device_1->bdev_file\
+  \ is freed\n\t    btrfs_close_bdev(btrfs_device_2)\n             fput(btrfs_device_2->bdev_file)\n\
+  \n3. mount /dev/loop1 /mnt\n   btrfs_open_devices\n    btrfs_get_bdev_and_sb(&bdev_file)\n\
+  \     // EIO, btrfs_device_1->bdev_file is not assigned,\n     // which points to\
+  \ a freed memory area\n    btrfs_device_2->bdev_file = btrfs_get_bdev_and_sb(loop1)\n\
+  \   btrfs_fill_super\n    open_ctree\n     btrfs_free_extra_devids\n      if (btrfs_device_1->bdev_file)\n\
+  \       fput(btrfs_device_1->bdev_file) // UAF !\n\nFix it by setting 'device->bdev_file'\
+  \ as 'NULL' after closing the\nbtrfs_device in btrfs_close_one_device().\n\nFixes:\
+  \ 142388194191 (\"btrfs: do not background blkdev_put()\")\nCC: stable@vger.kernel.org\
+  \ # 4.19+\nLink: https://bugzilla.kernel.org/show_bug.cgi?id=219408\nSigned-off-by:\
+  \ Zhihao Cheng <chengzhihao1@huawei.com>\nReviewed-by: David Sterba <dsterba@suse.com>\n\
+  Signed-off-by: David Sterba <dsterba@suse.com>\n\n## Buggy Code\n\n```c\n// Function:\
+  \ btrfs_close_one_device in fs/btrfs/volumes.c\nstatic void btrfs_close_one_device(struct\
+  \ btrfs_device *device)\n{\n\tstruct btrfs_fs_devices *fs_devices = device->fs_devices;\n\
+  \n\tif (test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) &&\n\t    device->devid\
+  \ != BTRFS_DEV_REPLACE_DEVID) {\n\t\tlist_del_init(&device->dev_alloc_list);\n\t\
+  \tfs_devices->rw_devices--;\n\t}\n\n\tif (device->devid == BTRFS_DEV_REPLACE_DEVID)\n\
+  \t\tclear_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state);\n\n\tif (test_bit(BTRFS_DEV_STATE_MISSING,\
+  \ &device->dev_state)) {\n\t\tclear_bit(BTRFS_DEV_STATE_MISSING, &device->dev_state);\n\
+  \t\tfs_devices->missing_devices--;\n\t}\n\n\tbtrfs_close_bdev(device);\n\tif (device->bdev)\
+  \ {\n\t\tfs_devices->open_devices--;\n\t\tdevice->bdev = NULL;\n\t}\n\tclear_bit(BTRFS_DEV_STATE_WRITEABLE,\
+  \ &device->dev_state);\n\tbtrfs_destroy_dev_zone_info(device);\n\n\tdevice->fs_info\
+  \ = NULL;\n\tatomic_set(&device->dev_stats_ccnt, 0);\n\textent_io_tree_release(&device->alloc_state);\n\
+  \n\t/*\n\t * Reset the flush error record. We might have a transient flush error\n\
+  \t * in this mount, and if so we aborted the current transaction and set\n\t * the\
+  \ fs to an error state, guaranteeing no super blocks can be further\n\t * committed.\
+  \ However that error might be transient and if we unmount the\n\t * filesystem and\
+  \ mount it again, we should allow the mount to succeed\n\t * (btrfs_check_rw_degradable()\
+  \ should not fail) - if after mounting the\n\t * filesystem again we still get flush\
+  \ errors, then we will again abort\n\t * any transaction and set the error state,\
+  \ guaranteeing no commits of\n\t * unsafe super blocks.\n\t */\n\tdevice->last_flush_error\
+  \ = 0;\n\n\t/* Verify the device is back in a pristine state  */\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_FLUSH_SENT,\
+  \ &device->dev_state));\n\tWARN_ON(test_bit(BTRFS_DEV_STATE_REPLACE_TGT, &device->dev_state));\n\
+  \tWARN_ON(!list_empty(&device->dev_alloc_list));\n\tWARN_ON(!list_empty(&device->post_commit_list));\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c\n\
+  index 8f340ad1d938..eb51b609190f 100644\n--- a/fs/btrfs/volumes.c\n+++ b/fs/btrfs/volumes.c\n\
+  @@ -1105,6 +1105,7 @@ static void btrfs_close_one_device(struct btrfs_device *device)\n\
+  \ \tif (device->bdev) {\n \t\tfs_devices->open_devices--;\n \t\tdevice->bdev = NULL;\n\
+  +\t\tdevice->bdev_file = NULL;\n \t}\n \tclear_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state);\n\
+  \ \tbtrfs_destroy_dev_zone_info(device);\n```\n"
+pattern: "## Bug Pattern\n\nUsing a stored pointer as a validity/ownership flag without\
+  \ clearing it after release: a file pointer (device->bdev_file) is fput()\u2019\
+  d/closed, but the struct field is not set to NULL. Later code relies on a non-NULL\
+  \ check (if (device->bdev_file)) to decide whether to use or fput() it again, leading\
+  \ to use-after-free."
+plan: "1) Program state\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(ReleasedPtrMap, const\
+  \ MemRegion *, SourceLocation)\n  - Tracks pointer lvalue locations (typically struct\
+  \ fields) that have been released but not cleared to NULL. The SourceLocation is\
+  \ where the release happened for better diagnostics.\n\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n  - Tracks simple pointer aliasing (B aliases\
+  \ A). If one alias is cleared or reinitialized, remove both from ReleasedPtrMap.\n\
+  \n\n2) Helpers and known summaries\n\n- Known \u201Crelease\u201D functions (direct\
+  \ pointer releases)\n  - Maintain a small, explicit table of function names whose\
+  \ arguments release a pointer: fput (param 0), kfree (param 0), kvfree (param 0),\
+  \ vfree (param 0), blkdev_put (param 0), filp_close (param 0), put_device (param\
+  \ 0), sock_release (param 0), bio_put (param 0), kobject_put (param 0).\n  - Implement\
+  \ a helper isKnownReleaseFunction(const CallEvent &Call, SmallVectorImpl<unsigned>\
+  \ &ReleaseParams).\n    - This is different from functionKnownToDeref: we only add\
+  \ those that definitely release/put/free their pointer argument.\n\n- Owner-based\
+  \ \u201Cwrapper\u201D releases (callee frees a specific field of an owner struct)\n\
+  \  - Create a minimal summary for target pattern:\n    - Function btrfs_close_bdev\
+  \ (param 0) releases owner->bdev_file.\n  - Implement a helper getOwnerReleasedFields(const\
+  \ CallEvent &Call, SmallVectorImpl<std::pair<unsigned, StringRef>> &OwnerParamFieldNames).\n\
+  \    - For \u201Cbtrfs_close_bdev\u201D, push_back {0, \"bdev_file\"}.\n  - Given\
+  \ an owner argument region and a field name, compute the field region:\n    - From\
+  \ the owner argument Expr, get its MemRegion (getMemRegionFromExpr).\n    - From\
+  \ the owner\u2019s QualType (Call.getArgExpr(OwnerIdx)->getType()), obtain the RecordDecl\
+  \ and find a FieldDecl whose name matches the field string.\n    - Get the field\u2019\
+  s lvalue MemRegion using the state\u2019s getLValue(FieldDecl, loc::MemRegionVal(OwnerRegion)).\n\
+  \  - Only track fields (FieldRegion). This keeps the checker specific and reduces\
+  \ noise.\n\n- Common utilities\n  - getMemRegionFromExpr(E, C): to get the lvalue\
+  \ region of arguments or fields.\n  - functionKnownToDeref(Call, DerefParams): to\
+  \ upgrade a use-site to \u201Cdefinitely dereferences\u201D when reporting use-after-release.\n\
+  \  - ExprHasName(E, \"name\", C): can be used as a fallback when resolving field\
+  \ names for owner-based summaries if type info is incomplete.\n\n\n3) Callback selection\
+  \ and implementation details\n\n- checkPostCall (mark \u201Creleased but not nullified\u201D\
+  )\n  - Direct release:\n    - If isKnownReleaseFunction(Call, ReleaseParams) is\
+  \ true:\n      - For each index in ReleaseParams:\n        - Let E = Call.getArgExpr(idx).\n\
+  \        - If E is a MemberExpr (struct field) or a DeclRefExpr to a global/static\
+  \ field container, get its MemRegion via getMemRegionFromExpr(E, C).\n        -\
+  \ Only proceed if the region is a field-like region (prefer MemberExpr); ignore\
+  \ plain local pointer variables to avoid noise.\n        - Insert into ReleasedPtrMap(Region)\
+  \ = E->getExprLoc().\n  - Owner-based release (wrapper):\n    - If getOwnerReleasedFields(Call,\
+  \ OwnerFieldPairs) yields entries (e.g., btrfs_close_bdev):\n      - For each (OwnerIdx,\
+  \ FieldName):\n        - Resolve owner argument region (getMemRegionFromExpr(Call.getArgExpr(OwnerIdx),\
+  \ C)).\n        - Find FieldDecl by name and then its field MemRegion (as described\
+  \ above).\n        - Insert ReleasedPtrMap(FieldRegion) = Call.getSourceRange().getBegin().\n\
+  \  - Also, if the call returns a new pointer and we immediately bind it to a tracked\
+  \ field (rare here), the clean-up will happen in checkBind; no action needed in\
+  \ checkPostCall.\n\n- checkBind (clear state on NULLing or reinitialization; track\
+  \ aliases)\n  - If Loc corresponds to a pointer lvalue region (get the MemRegion\
+  \ from Loc if available), and Val is:\n    - Explicit NULL:\n      - If the region\
+  \ is present in ReleasedPtrMap, remove it.\n      - Also remove entries for all\
+  \ aliases of this region (look up in PtrAliasMap both directions).\n    - A non-NULL\
+  \ pointer (symbolic or concrete):\n      - Treat as reinitialization: remove it\
+  \ from ReleasedPtrMap and also clear its aliases.\n  - Track pointer aliases:\n\
+  \    - If S represents an assignment LHS = RHS where both LHS and RHS are pointer\
+  \ lvalues:\n      - Get MemRegion for both sides with getMemRegionFromExpr on the\
+  \ corresponding sub-exprs (use the Stmt S to disambiguate).\n      - Record alias\
+  \ PtrAliasMap[LHS] = RHS. Do not propagate ReleasedPtrMap here; we only use alias\
+  \ map to mirror clears/reinits.\n\n- checkBranchCondition (flag using released pointer\
+  \ as a validity flag)\n  - Pre-visit the condition:\n    - Extract any MemberExpr/DeclRefExpr\
+  \ within Condition that denotes a pointer lvalue region:\n      - Use a small visitor\
+  \ or findSpecificTypeInChildren to find MemberExpr/DeclRefExpr nodes.\n      - For\
+  \ each such expr, get its MemRegion with getMemRegionFromExpr.\n      - If any region\
+  \ is in ReleasedPtrMap, emit a warning:\n        - Message: \u201CReleased pointer\
+  \ used as validity flag; set it to NULL after release.\u201D\n      - This catches\
+  \ patterns like if (device->bdev_file), if (ptr != NULL), if (!ptr), etc. No need\
+  \ to evaluate; just the reference is enough.\n  - Create the report at the condition\u2019\
+  s SourceLocation.\n\n- checkPreCall (flag actual use or double release)\n  - For\
+  \ each argument of the call:\n    - Get its region via getMemRegionFromExpr.\n \
+  \   - If the region is in ReleasedPtrMap:\n      - If the callee is a known release\
+  \ function taking that argument index:\n        - Report \u201CDouble release: pointer\
+  \ already released and not nullified.\u201D\n      - Else if functionKnownToDeref(Call,\
+  \ DerefParams) returns true and includes this argument index:\n        - Report\
+  \ \u201CUse-after-release: function dereferences a previously released pointer.\u201D\
+  \n      - Else:\n        - As a fallback, still report \u201CUse of a previously\
+  \ released pointer.\u201D (lower confidence).\n  - Point the report to Call.getSourceRange().getBegin()\
+  \ and reference the release location stored in ReleasedPtrMap for extra context.\n\
+  \n- checkEndFunction (enforce \u201Cnull after release\u201D rule)\n  - For any\
+  \ region remaining in ReleasedPtrMap at function end:\n    - Report: \u201CPointer\
+  \ released but not set to NULL before function returns.\u201D\n    - This is the\
+  \ minimal, robust rule that matches the btrfs fix: after calling the closer, ensure\
+  \ device->bdev_file = NULL within the same function.\n  - Use the stored SourceLocation\
+  \ for a note (\u201Creleased here\u201D).\n\n- No need for checkLocation or evalAssume\
+  \ for this pattern. No need for checkASTDecl/CodeBody.\n\n\n4) Reporting\n\n- Create\
+  \ a BugType, e.g., \u201CReleased-pointer-not-nullified\u201D (category: Memory\
+  \ error).\n- Use generateNonFatalErrorNode() and PathSensitiveBugReport with short\
+  \ messages:\n  - On branch condition: \u201CReleased pointer used as validity flag;\
+  \ set it to NULL after release.\u201D\n  - On pre-call deref/double-release: \u201C\
+  Use-after-release of pointer\u201D or \u201CDouble release of pointer.\u201D\n \
+  \ - On end of function: \u201CPointer released but not set to NULL before function\
+  \ returns.\u201D\n- Add notes:\n  - Where it was released (SourceLocation from ReleasedPtrMap).\n\
+  \  - Optionally, where it is used (Condition or Call site).\n\n5) Heuristics to\
+  \ reduce false positives\n\n- Only track MemberExpr (struct/union fields) and optionally\
+  \ globals; skip local auto pointer variables.\n- Clear state on any store to the\
+  \ field (NULL or non-NULL).\n- Use owner-based summaries only when confident (currently\
+  \ only btrfs_close_bdev -> bdev_file), implemented via field-name match; use ExprHasName\
+  \ as a fallback if the FieldDecl resolution is not straightforward.\n- When multiple\
+  \ aliases exist, clearing any alias clears the tracked state for all.\n\n\n6) How\
+  \ this catches the target bug\n\n- In btrfs_close_one_device:\n  - The call to btrfs_close_bdev(device)\
+  \ matches the owner-based summary, so ReleasedPtrMap marks device->bdev_file as\
+  \ released.\n  - Before returning, if there is no assignment device->bdev_file =\
+  \ NULL, checkEndFunction reports \u201CPointer released but not set to NULL before\
+  \ function returns.\u201D\n- Alternatively, if later code checks if (device->bdev_file)\
+  \ or calls fput(device->bdev_file), checkBranchCondition/checkPreCall will report\
+  \ use-after-release/double release."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/ExprCXX.h\"\n#include \"clang/AST/Decl.h\"\n#include \"clang/AST/Type.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n#include \"llvm/ADT/StringRef.h\"\n#include\
+  \ \"llvm/ADT/ImmutableMap.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\
+  \n#include <optional>\n\nusing namespace clang;\nusing namespace ento;\nusing namespace\
+  \ taint;\n\n// Program state: Track released pointer \"owners\" (base regions) and\
+  \ where they were released.\nREGISTER_MAP_WITH_PROGRAMSTATE(ReleasedPtrMap, const\
+  \ MemRegion *, SourceLocation)\n// Program state: Simple aliasing between pointer\
+  \ lvalues (both directions stored).\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion*, const MemRegion*)\n\nnamespace {\n\nstatic bool CalleeIs(const\
+  \ CallEvent &Call, StringRef Name, CheckerContext &C) {\n  const Expr *Origin =\
+  \ Call.getOriginExpr();\n  if (!Origin)\n    return false;\n  return ExprHasName(Origin,\
+  \ Name, C);\n}\n\n// Known release/put/free functions and which parameters they\
+  \ release\nstatic bool isKnownReleaseFunction(const CallEvent &Call,\n         \
+  \                          CheckerContext &C,\n                                \
+  \   llvm::SmallVectorImpl<unsigned> &Params) {\n  // Use callee expression textual\
+  \ name match for robustness\n  struct Entry { const char *Name; unsigned ParamIndex;\
+  \ };\n  static const Entry Table[] = {\n      {\"fput\", 0}, {\"kfree\", 0}, {\"\
+  kvfree\", 0}, {\"vfree\", 0},\n      {\"blkdev_put\", 0}, {\"filp_close\", 0}, {\"\
+  put_device\", 0},\n      {\"sock_release\", 0}, {\"bio_put\", 0}, {\"kobject_put\"\
+  , 0},\n  };\n\n  bool Found = false;\n  for (const auto &E : Table) {\n    if (CalleeIs(Call,\
+  \ E.Name, C)) {\n      Params.push_back(E.ParamIndex);\n      Found = true;\n  \
+  \  }\n  }\n  return Found;\n}\n\n// Owner-based wrapper summary: btrfs_close_bdev(device)\
+  \ releases device->bdev_file\nstatic bool getOwnerReleasedFields(const CallEvent\
+  \ &Call,\n                                   CheckerContext &C,\n              \
+  \                     llvm::SmallVectorImpl<std::pair<unsigned, StringRef>> &OwnerParamFieldNames)\
+  \ {\n  if (CalleeIs(Call, \"btrfs_close_bdev\", C)) {\n    OwnerParamFieldNames.push_back({0u,\
+  \ StringRef(\"bdev_file\")});\n    return true;\n  }\n  return false;\n}\n\nstatic\
+  \ const FieldDecl *findFieldDeclByName(QualType OwnerPtrTy, StringRef FieldName)\
+  \ {\n  QualType Pointee = OwnerPtrTy->getPointeeType();\n  if (Pointee.isNull())\n\
+  \    return nullptr;\n  const RecordType *RT = Pointee->getAs<RecordType>();\n \
+  \ if (!RT)\n    return nullptr;\n  const RecordDecl *RD = RT->getDecl();\n  if (!RD)\n\
+  \    return nullptr;\n  for (const FieldDecl *FD : RD->fields()) {\n    if (FD &&\
+  \ FD->getName().equals(FieldName))\n      return FD;\n  }\n  return nullptr;\n}\n\
+  \n// Remove region and its aliases from ReleasedPtrMap and clear alias links.\n\
+  static ProgramStateRef clearReleasedAndAliases(ProgramStateRef State,\n        \
+  \                                       const MemRegion *Reg) {\n  if (!Reg)\n \
+  \   return State;\n  Reg = Reg->getBaseRegion();\n  State = State->remove<ReleasedPtrMap>(Reg);\n\
+  \n  if (const MemRegion *const *AliasPtr = State->get<PtrAliasMap>(Reg)) {\n   \
+  \ const MemRegion *Alias = (*AliasPtr)->getBaseRegion();\n    State = State->remove<ReleasedPtrMap>(Alias);\n\
+  \    State = State->remove<PtrAliasMap>(Alias);\n  }\n  State = State->remove<PtrAliasMap>(Reg);\n\
+  \  return State;\n}\n\nclass SAGenTestChecker\n  : public Checker<\n        check::PostCall,\n\
+  \        check::PreCall,\n        check::Bind,\n        check::BranchCondition,\n\
+  \        check::EndFunction> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Released pointer not nullified\"\
+  , \"Memory Error\")) {}\n\n      void checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n      void checkPreCall(const CallEvent &Call, CheckerContext &C)\
+  \ const;\n      void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const;\n      void checkBranchCondition(const Stmt *Condition, CheckerContext\
+  \ &C) const;\n      void checkEndFunction(const ReturnStmt *RS, CheckerContext &C)\
+  \ const;\n\n   private:\n      void report(CheckerContext &C, StringRef Msg, SourceRange\
+  \ R = SourceRange()) const;\n};\n\nvoid SAGenTestChecker::report(CheckerContext\
+  \ &C, StringRef Msg, SourceRange R) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n  auto Rep = std::make_unique<PathSensitiveBugReport>(*BT,\
+  \ Msg, N);\n  if (R.isValid())\n    Rep->addRange(R);\n  C.emitReport(std::move(Rep));\n\
+  }\n\nvoid SAGenTestChecker::checkPostCall(const CallEvent &Call, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // Case 1: Direct release\
+  \ functions, track argument lvalues that are fields (preferably)\n  llvm::SmallVector<unsigned,\
+  \ 4> ReleaseParams;\n  if (isKnownReleaseFunction(Call, C, ReleaseParams)) {\n \
+  \   for (unsigned Idx : ReleaseParams) {\n      if (Idx >= Call.getNumArgs())\n\
+  \        continue;\n      const Expr *ArgE = Call.getArgExpr(Idx);\n      if (!ArgE)\n\
+  \        continue;\n\n      const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n\
+  \      if (!MR)\n        continue;\n\n      // Always use base region per guideline\n\
+  \      MR = MR->getBaseRegion();\n      if (!MR)\n        continue;\n\n      //\
+  \ Track only non-local/meaningful regions; but in general base region is fine.\n\
+  \      State = State->set<ReleasedPtrMap>(MR, ArgE->getExprLoc());\n    }\n  }\n\
+  \n  // Case 2: Owner-based wrapper releases\n  llvm::SmallVector<std::pair<unsigned,\
+  \ StringRef>, 4> OwnerFields;\n  if (getOwnerReleasedFields(Call, C, OwnerFields))\
+  \ {\n    for (const auto &P : OwnerFields) {\n      unsigned OwnerIdx = P.first;\n\
+  \      StringRef FieldName = P.second;\n      if (OwnerIdx >= Call.getNumArgs())\n\
+  \        continue;\n\n      const Expr *OwnerArgE = Call.getArgExpr(OwnerIdx);\n\
+  \      if (!OwnerArgE)\n        continue;\n\n      // Get the SVal and region of\
+  \ the owner argument.\n      ProgramStateRef CurState = C.getState();\n      SVal\
+  \ OwnerSV = CurState->getSVal(OwnerArgE, C.getLocationContext());\n      const MemRegion\
+  \ *OwnerReg = OwnerSV.getAsRegion();\n      if (!OwnerReg)\n        continue;\n\n\
+  \      // Find the field declaration by name from the owner type\n      const FieldDecl\
+  \ *FD = findFieldDeclByName(OwnerArgE->getType(), FieldName);\n      // Build a\
+  \ field region if possible when owner is a record region (non-pointer)\n      const\
+  \ MemRegion *FieldMR = nullptr;\n      if (FD) {\n        const MemRegion *BaseOwner\
+  \ = OwnerReg->getBaseRegion();\n        if (const auto *TR = dyn_cast<TypedValueRegion>(BaseOwner))\
+  \ {\n          if (TR->getValueType()->isRecordType()) {\n            FieldMR =\
+  \ C.getSValBuilder().getRegionManager().getFieldRegion(FD, TR);\n          }\n \
+  \       }\n      }\n\n      // Fallback: if we couldn't form the field region, use\
+  \ the owner region base\n      const MemRegion *BaseMR = nullptr;\n      if (FieldMR)\
+  \ {\n        BaseMR = FieldMR->getBaseRegion();\n      } else {\n        const MemRegion\
+  \ *OwnerMR = getMemRegionFromExpr(OwnerArgE, C);\n        if (OwnerMR)\n       \
+  \   BaseMR = OwnerMR->getBaseRegion();\n      }\n\n      if (BaseMR)\n        State\
+  \ = State->set<ReleasedPtrMap>(BaseMR, Call.getSourceRange().getBegin());\n    }\n\
+  \  }\n\n  if (State != C.getState())\n    C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  llvm::SmallVector<unsigned, 4> DerefParams;\n  bool IsKnownDeref = functionKnownToDeref(Call,\
+  \ DerefParams);\n\n  llvm::SmallVector<unsigned, 4> ReleaseParams;\n  bool IsKnownRelease\
+  \ = isKnownReleaseFunction(Call, C, ReleaseParams);\n\n  for (unsigned i = 0; i\
+  \ < Call.getNumArgs(); ++i) {\n    const Expr *ArgE = Call.getArgExpr(i);\n    if\
+  \ (!ArgE)\n      continue;\n\n    const MemRegion *MR = getMemRegionFromExpr(ArgE,\
+  \ C);\n    if (!MR)\n      continue;\n    MR = MR->getBaseRegion();\n    if (!MR)\n\
+  \      continue;\n\n    const SourceLocation *RelLoc = State->get<ReleasedPtrMap>(MR);\n\
+  \    if (!RelLoc)\n      continue;\n\n    // Determine report kind: double release\
+  \ or use-after-release\n    bool IsDoubleRelease = false;\n    if (IsKnownRelease)\
+  \ {\n      for (unsigned RIdx : ReleaseParams) {\n        if (RIdx == i) {\n   \
+  \       IsDoubleRelease = true;\n          break;\n        }\n      }\n    }\n\n\
+  \    if (IsDoubleRelease) {\n      report(C, \"Double release: pointer already released\"\
+  , Call.getSourceRange());\n      return;\n    }\n\n    bool IsDerefUse = false;\n\
+  \    if (IsKnownDeref) {\n      for (unsigned DIdx : DerefParams) {\n        if\
+  \ (DIdx == i) {\n          IsDerefUse = true;\n          break;\n        }\n   \
+  \   }\n    }\n\n    if (IsDerefUse) {\n      report(C, \"Use-after-release: function\
+  \ dereferences a released pointer\", Call.getSourceRange());\n      return;\n  \
+  \  }\n\n    // Generic use of released pointer\n    report(C, \"Use of a previously\
+  \ released pointer\", Call.getSourceRange());\n    return;\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n\n  const MemRegion *LHSReg = Loc.getAsRegion();\n  if (!LHSReg)\
+  \ {\n    C.addTransition(State);\n    return;\n  }\n  LHSReg = LHSReg->getBaseRegion();\n\
+  \  if (!LHSReg) {\n    C.addTransition(State);\n    return;\n  }\n\n  // Track aliasing\
+  \ if both sides are pointer lvalues (regions)\n  if (const BinaryOperator *BO =\
+  \ dyn_cast_or_null<BinaryOperator>(S)) {\n    if (BO->isAssignmentOp()) {\n    \
+  \  const Expr *RHS = BO->getRHS();\n      if (RHS) {\n        const MemRegion *RHSReg\
+  \ = getMemRegionFromExpr(RHS, C);\n        if (RHSReg) {\n          RHSReg = RHSReg->getBaseRegion();\n\
+  \          if (RHSReg) {\n            // Record alias both directions\n        \
+  \    State = State->set<PtrAliasMap>(LHSReg, RHSReg);\n            State = State->set<PtrAliasMap>(RHSReg,\
+  \ LHSReg);\n          }\n        }\n      }\n    }\n  }\n\n  // If the LHS is a\
+  \ tracked released region and we store NULL or any non-unknown pointer, clear it.\n\
+  \  bool ShouldClear = false;\n\n  if (Val.isZeroConstant()) {\n    ShouldClear =\
+  \ true; // explicit NULL store\n  } else {\n    // Re-initialization with some pointer\
+  \ value (region)\n    if (Val.getAsRegion())\n      ShouldClear = true;\n  }\n\n\
+  \  if (ShouldClear) {\n    // Clear for the region and its alias, if any.\n    State\
+  \ = clearReleasedAndAliases(State, LHSReg);\n  }\n\n  if (State != C.getState())\n\
+  \    C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n  if (!CondE) {\n   \
+  \ C.addTransition(State);\n    return;\n  }\n\n  // Try to find a member expression\
+  \ in the condition (e.g., if (device->bdev_file))\n  const MemberExpr *ME = findSpecificTypeInChildren<MemberExpr>(CondE);\n\
+  \  const Expr *TargetE = nullptr;\n\n  if (ME) {\n    TargetE = ME;\n  } else {\n\
+  \    // Fallback: maybe the whole condition is a single expr referencing the field\n\
+  \    TargetE = CondE;\n  }\n\n  if (TargetE) {\n    const MemRegion *MR = getMemRegionFromExpr(TargetE,\
+  \ C);\n    if (MR) {\n      MR = MR->getBaseRegion();\n      if (MR) {\n       \
+  \ if (State->get<ReleasedPtrMap>(MR)) {\n          report(C, \"Released pointer\
+  \ used as validity flag; set it to NULL after release.\",\n                 Condition->getSourceRange());\n\
+  \          return;\n        }\n      }\n    }\n  }\n\n  C.addTransition(State);\n\
+  }\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // If any region is\
+  \ still marked as released at function end, it wasn't nullified.\n  auto Map = State->get<ReleasedPtrMap>();\n\
+  \  if (!Map.isEmpty()) {\n    report(C, \"Pointer released but not set to NULL before\
+  \ function returns\");\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void\
+  \ clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects using released pointer as validity\
+  \ flag and not nullifying after release\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

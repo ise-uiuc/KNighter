@@ -1,0 +1,376 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -17,6 +17,8 @@ #include "clang/AST/Stmt.h"
+ #include "clang/Lex/Lexer.h"
+ #include <string>
++#include <optional>
++#include <memory>
+
+ using namespace clang;
+ using namespace ento;
+@@ -62,9 +64,11 @@
+       const MemRegion* getBaseRegionFromExpr(const Expr *E, CheckerContext &C) const;
+
++      // Extended: also return base expr for constraint/guard checks.
+       bool stmtDerefsTrackedPtr(const Stmt *S, CheckerContext &C,
+                                 const ProgramStateRef &State,
+-                                const MemRegion *&TrackedPtrOut) const;
++                                const MemRegion *&TrackedPtrOut,
++                                const Expr *&BaseExprOut) const;
+
+       void reportDerefBug(const Stmt *S, const MemRegion *R, CheckerContext &C) const;
+
+@@ -72,13 +76,18 @@       bool containsLoggingCall(const Stmt *S, CheckerContext &C) const;
+       static bool isLoggingName(StringRef Name);
+
+-      // New: analyze which branch corresponds to "invalid" (null) case.
++      // Analyze branch to find which side is "invalid" (null) for a pointer.
+       enum class InvalidOnBranch { Then, Else, Unknown };
+       struct NullCheckInfo {
+         const MemRegion *PtrRegion = nullptr;
+         InvalidOnBranch InvalidBranch = InvalidOnBranch::Unknown;
+       };
+       NullCheckInfo analyzeNullCheckForInvalidBranch(const Expr *Cond, CheckerContext &C) const;
++
++      // New: Guard checks to suppress false positives.
++      bool isGuardedByNonNullCheck(const Stmt *UseSite, const MemRegion *PtrR, CheckerContext &C) const;
++      bool stmtIsInSubtree(const Stmt *Root, const Stmt *S) const;
++      bool isKnownNonNullExpr(const Expr *E, CheckerContext &C) const;
+ };
+
+
+@@ -88,11 +97,9 @@ static bool isNullLikeExpr(const Expr *E, CheckerContext &C) {
+   if (!E) return false;
+   E = E->IgnoreParenImpCasts();
+-  // Check for null pointer constant per AST utilities
+   if (E->isNullPointerConstant(C.getASTContext(), Expr::NPC_ValueDependentIsNull))
+     return true;
+
+-  // Also try constant-evaluated integer 0
+   llvm::APSInt Val;
+   if (EvaluateExprToInt(Val, E, C)) {
+     if (Val == 0)
+@@ -116,7 +123,6 @@   if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+     BinaryOperator::Opcode Op = BO->getOpcode();
+     if (Op == BO_LOr || Op == BO_LAnd) {
+-      // Recurse into both sides, prefer LHS first
+       if (const MemRegion *R = extractNullCheckedPointer(BO->getLHS(), C))
+         return R;
+       return extractNullCheckedPointer(BO->getRHS(), C);
+@@ -129,7 +135,6 @@       bool LHSNull = isNullLikeExpr(LHS, C);
+       bool RHSNull = isNullLikeExpr(RHS, C);
+
+-      // Look for (ptr == NULL) or (ptr != NULL)
+       if (LHSNull && !RHSNull) {
+         if (RHS->getType()->isAnyPointerType()) {
+           if (isa<DeclRefExpr>(RHS))
+@@ -150,7 +155,6 @@       }
+     }
+   } else if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+-    // In conditions like "if (ptr)" treat it as a null-check too.
+     if (DRE->getType()->isAnyPointerType())
+       return getBaseRegionFromExpr(DRE, C);
+   }
+@@ -177,14 +181,12 @@ static bool stmtContainsCallWithName(const Stmt *S, StringRef Name, CheckerContext &C) {
+   if (!S) return false;
+   if (const auto *CE = dyn_cast<CallExpr>(S)) {
+-    // Try callee identifier first
+     if (const FunctionDecl *FD = CE->getDirectCallee()) {
+       if (FD->getIdentifier()) {
+         if (FD->getName().equals(Name))
+           return true;
+       }
+     }
+-    // Fallback to source text name matching (macro-expanded cases)
+     if (ExprHasName(CE->getCallee(), Name, C))
+       return true;
+   }
+@@ -196,7 +198,6 @@ }
+
+ bool SAGenTestChecker::isLoggingName(StringRef Name) {
+-  // Normalize to lowercase for case-insensitive matching.
+   std::string LowerStr = Name.lower();
+   StringRef L(LowerStr);
+   return L.contains("dbg") ||
+@@ -219,7 +220,6 @@           return true;
+       }
+     }
+-    // Fallback to textual sniffing on callee/source if no identifier
+     const Expr *CalleeE = CE->getCallee();
+     if (CalleeE) {
+       const SourceManager &SM = C.getSourceManager();
+@@ -238,14 +238,11 @@ }
+
+ bool SAGenTestChecker::isLockAcquire(const CallEvent &Call, CheckerContext &C) const {
+-  // Prefer callee identifier when available
+   if (const IdentifierInfo *ID = Call.getCalleeIdentifier()) {
+     StringRef FnName = ID->getName();
+-    // Common Linux locking APIs
+     static const char *LockNames[] = {
+       "spin_lock", "spin_lock_irq", "spin_lock_irqsave", "spin_lock_bh",
+       "mutex_lock", "rt_mutex_lock", "raw_spin_lock",
+-      // XA/RCU-like helpers used as locks in some subsystems
+       "xa_lock", "xa_lock_irq", "xa_lock_irqsave", "xa_lock_bh",
+       "read_lock", "write_lock", "down_read", "down_write", "down"
+     };
+@@ -257,7 +254,6 @@   const Expr *OE = Call.getOriginExpr();
+   if (!OE) return false;
+
+-  // Fallback textual match when identifier is not available or macro-expanded
+   static const char *LockTextNames[] = {
+     "spin_lock", "spin_lock_irq", "spin_lock_irqsave", "spin_lock_bh",
+     "mutex_lock", "rt_mutex_lock", "raw_spin_lock",
+@@ -305,21 +301,24 @@
+ bool SAGenTestChecker::stmtDerefsTrackedPtr(const Stmt *S, CheckerContext &C,
+                                             const ProgramStateRef &State,
+-                                            const MemRegion *&TrackedPtrOut) const {
++                                            const MemRegion *&TrackedPtrOut,
++                                            const Expr *&BaseExprOut) const {
+   TrackedPtrOut = nullptr;
++  BaseExprOut = nullptr;
+   if (!S) return false;
+
+   // Look for "ptr->field"
+   if (const auto *ME = findSpecificTypeInChildren<MemberExpr>(S)) {
+     if (ME->isArrow()) {
+-      const Expr *Base = ME->getBase();
+-      if (const auto *DRE = dyn_cast<DeclRefExpr>(Base->IgnoreParenImpCasts())) {
++      const Expr *Base = ME->getBase()->IgnoreParenImpCasts();
++      if (const auto *DRE = dyn_cast<DeclRefExpr>(Base)) {
+         const MemRegion *MR = getBaseRegionFromExpr(DRE, C);
+         if (MR) {
+           auto Set = State->get<SuspiciousAfterLockSet>();
+           for (auto I = Set.begin(), E = Set.end(); I != E; ++I) {
+             if (*I == MR) {
+               TrackedPtrOut = MR;
++              BaseExprOut = DRE;
+               return true;
+             }
+           }
+@@ -339,6 +338,7 @@           for (auto I = Set.begin(), E = Set.end(); I != E; ++I) {
+             if (*I == MR) {
+               TrackedPtrOut = MR;
++              BaseExprOut = DRE;
+               return true;
+             }
+           }
+@@ -357,6 +357,7 @@         for (auto I = Set.begin(), E = Set.end(); I != E; ++I) {
+           if (*I == MR) {
+             TrackedPtrOut = MR;
++            BaseExprOut = DRE;
+             return true;
+           }
+         }
+@@ -391,14 +392,12 @@   if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+     BinaryOperator::Opcode Op = BO->getOpcode();
+     if (Op == BO_LOr || Op == BO_LAnd) {
+-      // Prefer a negative (invalid-on-then) check if present in either side
+       NullCheckInfo L = analyzeNullCheckForInvalidBranch(BO->getLHS(), C);
+       if (L.PtrRegion && L.InvalidBranch == InvalidOnBranch::Then)
+         return L;
+       NullCheckInfo R = analyzeNullCheckForInvalidBranch(BO->getRHS(), C);
+       if (R.PtrRegion && R.InvalidBranch == InvalidOnBranch::Then)
+         return R;
+-      // Otherwise, return any found info (most likely valid-on-then -> invalid-on-else)
+       if (L.PtrRegion) return L;
+       if (R.PtrRegion) return R;
+       return Info;
+@@ -410,7 +409,6 @@       bool LHSNull = isNullLikeExpr(LHS, C);
+       bool RHSNull = isNullLikeExpr(RHS, C);
+
+-      // (ptr == NULL) => invalid on THEN; (ptr != NULL) => invalid on ELSE
+       if (LHSNull && !RHSNull && RHS->getType()->isAnyPointerType() && isa<DeclRefExpr>(RHS)) {
+         Info.PtrRegion = getBaseRegionFromExpr(RHS, C);
+         Info.InvalidBranch = (Op == BO_EQ) ? InvalidOnBranch::Then : InvalidOnBranch::Else;
+@@ -445,10 +443,91 @@   return Info;
+ }
+
++// Utility: check whether S is under the subtree Root.
++bool SAGenTestChecker::stmtIsInSubtree(const Stmt *Root, const Stmt *S) const {
++  if (!Root || !S) return false;
++  if (Root == S) return true;
++  for (const Stmt *Child : Root->children()) {
++    if (stmtIsInSubtree(Child, S))
++      return true;
++  }
++  return false;
++}
++
++// Suppress reports if the deref site is in a branch that guarantees PtrR != NULL.
++bool SAGenTestChecker::isGuardedByNonNullCheck(const Stmt *UseSite, const MemRegion *PtrR, CheckerContext &C) const {
++  if (!UseSite || !PtrR) return false;
++
++  const IfStmt *IS = findSpecificTypeInParents<IfStmt>(UseSite, C);
++  if (!IS) return false;
++
++  // Determine which branch contains UseSite.
++  const Stmt *Then = IS->getThen();
++  const Stmt *Else = IS->getElse();
++
++  bool InThen = Then && stmtIsInSubtree(Then, UseSite);
++  bool InElse = Else && stmtIsInSubtree(Else, UseSite);
++  if (!InThen && !InElse)
++    return false;
++
++  NullCheckInfo NCI = analyzeNullCheckForInvalidBranch(IS->getCond(), C);
++  if (!NCI.PtrRegion || NCI.InvalidBranch == InvalidOnBranch::Unknown)
++    return false;
++
++  if (NCI.PtrRegion != PtrR)
++    return false;
++
++  // If invalid is ELSE, then "if (ptr)" => non-null in THEN.
++  if (NCI.InvalidBranch == InvalidOnBranch::Else && InThen)
++    return true;
++
++  // If invalid is THEN, then "if (!ptr)" => non-null in ELSE.
++  if (NCI.InvalidBranch == InvalidOnBranch::Then && InElse)
++    return true;
++
++  return false;
++}
++
++// Path-sensitive: if state proves E != NULL, suppress.
++bool SAGenTestChecker::isKnownNonNullExpr(const Expr *E, CheckerContext &C) const {
++  if (!E) return false;
++  ProgramStateRef State = C.getState();
++  SVal SV = State->getSVal(E, C.getLocationContext());
++  SValBuilder &SB = C.getSValBuilder();
++
++  SVal ZeroSV = SB.makeZeroVal(E->getType());
++
++  std::optional<DefinedOrUnknownSVal> Cond;
++  if (SV.getAs<Loc>()) {
++    Loc LHS = SV.castAs<Loc>();
++    if (!ZeroSV.getAs<Loc>())
++      return false;
++    Cond = SB.evalEQ(State, LHS, ZeroSV.castAs<Loc>());
++  } else if (SV.getAs<NonLoc>()) {
++    NonLoc LHS = SV.castAs<NonLoc>();
++    if (!ZeroSV.getAs<NonLoc>())
++      return false;
++    Cond = SB.evalEQ(State, LHS, ZeroSV.castAs<NonLoc>());
++  } else {
++    return false;
++  }
++
++  if (!Cond)
++    return false;
++
++  auto Assumption = State->assume(*Cond);
++  ProgramStateRef StEqNull = Assumption.first;
++  ProgramStateRef StNeNull = Assumption.second;
++
++  // If "SV == NULL" is infeasible and "SV != NULL" feasible -> known non-null.
++  if (!StEqNull && StNeNull)
++    return true;
++  return false;
++}
++
+ // ---------------- Checker Callbacks ----------------
+
+ void SAGenTestChecker::checkBranchCondition(const Stmt *Condition, CheckerContext &C) const {
+-  // Find the containing IfStmt
+   const IfStmt *IS = findSpecificTypeInParents<IfStmt>(Condition, C);
+   if (!IS)
+     return;
+@@ -457,17 +536,15 @@   if (!Cond)
+     return;
+
+-  // Analyze which branch represents the "invalid" case.
+   NullCheckInfo NCI = analyzeNullCheckForInvalidBranch(Cond, C);
+   if (!NCI.PtrRegion || NCI.InvalidBranch == InvalidOnBranch::Unknown)
+     return;
+
+-  // Compute the invalid branch statement node
+   const Stmt *InvalidBranchStmt = (NCI.InvalidBranch == InvalidOnBranch::Then)
+                                   ? IS->getThen()
+                                   : IS->getElse();
+   if (!InvalidBranchStmt)
+-    return; // No invalid branch to inspect (e.g., if (ptr) without else) => not our pattern.
++    return; // No invalid branch to inspect (e.g., if (ptr) without else).
+
+   ProgramStateRef State = C.getState();
+   int Depth = State->get<LockDepth>();
+@@ -481,9 +558,7 @@     return;
+   }
+
+-  // Target pattern outside the lock:
+-  // - Invalid branch must contain a logging call
+-  // - Invalid branch must NOT have an early exit (no return/goto/break/continue)
++  // Target pattern outside the lock: invalid branch must only log and not abort.
+   if (!containsLoggingCall(InvalidBranchStmt, C))
+     return;
+
+@@ -524,7 +599,6 @@     else
+       State = State->set<LockDepth>(0);
+
+-    // When fully unlocked, clear AfterLockSet to avoid stale carry-over.
+     int NewDepth = State->get<LockDepth>();
+     if (NewDepth <= 0) {
+       auto After = State->get<SuspiciousAfterLockSet>();
+@@ -540,14 +614,11 @@ }
+
+ void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
+-  // Only report deref if we're currently under a lock.
+   ProgramStateRef State = C.getState();
+   int Depth = State->get<LockDepth>();
+   if (Depth <= 0)
+     return;
+
+-  // For calls that are known to dereference pointer arguments, check if any of those
+-  // arguments correspond to our suspicious pointer after the lock.
+   llvm::SmallVector<unsigned, 4> DerefParams;
+   if (!functionKnownToDeref(Call, DerefParams))
+     return;
+@@ -573,14 +644,21 @@     for (auto I = After.begin(), E = After.end(); I != E; ++I) {
+       if (*I == MR) { Found = true; break; }
+     }
+-
+-    if (Found) {
+-      reportDerefBug(Call.getOriginExpr(), MR, C);
+-      // Remove to avoid duplicate reports.
++    if (!Found)
++      continue;
++
++    // Suppress if guarded by a non-null check or already known non-null.
++    const Stmt *UseSite = Call.getOriginExpr();
++    if (isGuardedByNonNullCheck(UseSite, MR, C) || isKnownNonNullExpr(ArgE, C)) {
++      // Do not report, also clear to avoid future noisy reports.
+       State = State->remove<SuspiciousAfterLockSet>(MR);
+       C.addTransition(State);
+-      // do not return early; check other params as well
+-    }
++      continue;
++    }
++
++    reportDerefBug(Call.getOriginExpr(), MR, C);
++    State = State->remove<SuspiciousAfterLockSet>(MR);
++    C.addTransition(State);
+   }
+ }
+
+@@ -590,10 +668,16 @@   if (Depth <= 0)
+     return;
+
+-  // Heuristic: for members like ir->intr_num or deref *ir or arr like ir[idx],
+-  // extract the base DeclRefExpr and see if it matches our tracked pointer.
+   const MemRegion *TrackedR = nullptr;
+-  if (stmtDerefsTrackedPtr(S, C, State, TrackedR) && TrackedR) {
++  const Expr *BaseExpr = nullptr;
++  if (stmtDerefsTrackedPtr(S, C, State, TrackedR, BaseExpr) && TrackedR) {
++    // Suppress if enclosed by a non-null guard or known non-null via constraints.
++    if (isGuardedByNonNullCheck(S, TrackedR, C) || isKnownNonNullExpr(BaseExpr, C)) {
++      State = State->remove<SuspiciousAfterLockSet>(TrackedR);
++      C.addTransition(State);
++      return;
++    }
++
+     reportDerefBug(S, TrackedR, C);
+     State = State->remove<SuspiciousAfterLockSet>(TrackedR);
+     C.addTransition(State);
+@@ -601,7 +685,6 @@ }
+
+ void SAGenTestChecker::checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const {
+-  // Best-effort cleanup of lock depth; sets will be discarded with state anyway.
+   ProgramStateRef State = C.getState();
+   State = State->set<LockDepth>(0);
+   C.addTransition(State);

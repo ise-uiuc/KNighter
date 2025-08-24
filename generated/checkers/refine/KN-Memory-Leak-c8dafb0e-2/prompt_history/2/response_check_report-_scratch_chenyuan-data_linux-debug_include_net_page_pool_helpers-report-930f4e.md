@@ -1,0 +1,2 @@
+- Decision: NotABug
+- Reason: The reported location (include/net/page_pool/helpers.h, around line 316) is within the generic page pool helpers (page_pool_put_page and related functions) and contains no calls to hwrm_req_init(), hwrm_req_replace(), or hwrm_req_drop(). The target bug pattern specifically concerns missing hwrm_req_drop() after a successful hwrm_req_init() in BNXT HWRM request handling. Since the flagged code path is unrelated to HWRM requests and contains no such allocation/cleanup sequence, it does not match the target bug pattern and thus is a false positive.

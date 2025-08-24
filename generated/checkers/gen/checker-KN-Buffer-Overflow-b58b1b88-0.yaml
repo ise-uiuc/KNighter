@@ -1,0 +1,525 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: b58b1b883b9b702e25204dbe2b221eecc8ecd159
+commit_type: Buffer-Overflow
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"llvm/ADT/SmallVector.h\"\n#include \"llvm/ADT/APInt.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state: track suspicious values and guards\nREGISTER_SET_WITH_PROGRAMSTATE(SuspiciousVars,\
+  \ const MemRegion *)\nREGISTER_SET_WITH_PROGRAMSTATE(GuardedVars, const MemRegion\
+  \ *)\n\nnamespace {\n\nclass SAGenTestChecker\n  : public Checker<\n      check::PostStmt<DeclStmt>,\n\
+  \      check::Bind,\n      check::BranchCondition\n    > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Possible\
+  \ size_t underflow\", \"Integer errors\")) {}\n\n      void checkPostStmt(const\
+  \ DeclStmt *DS, CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n      void checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const;\n\n   private:\n      // Helpers\n\
+  \      static bool isUnsignedType(QualType T);\n      static bool isZeroExpr(const\
+  \ Expr *E, CheckerContext &C);\n      static const MemRegion *getRegionIfVarOrField(const\
+  \ Expr *E, CheckerContext &C);\n      static bool isRoundUpLike(const Expr *E, CheckerContext\
+  \ &C);\n      static bool isSuspiciousMinus(const Expr *E, CheckerContext &C);\n\
+  \      static QualType getRegionValueType(const MemRegion *MR);\n      static bool\
+  \ isSubAssignOnUnsigned(const BinaryOperator *BO, const MemRegion *LReg);\n    \
+  \  static bool isAssignWithMinusOnUnsigned(const BinaryOperator *BO, const MemRegion\
+  \ *LReg, CheckerContext &C);\n      static bool guardConditionMentionsVarGEorGT(const\
+  \ Expr *Cond, const MemRegion *VarR, CheckerContext &C);\n      static bool branchSetsVarZero(const\
+  \ Stmt *S, const MemRegion *VarR, CheckerContext &C);\n      static bool immediateIfGuardSetsVarZero(const\
+  \ Stmt *S, const MemRegion *VarR, CheckerContext &C);\n\n      void markSuspicious(const\
+  \ MemRegion *R, CheckerContext &C) const;\n      void clearSuspicious(const MemRegion\
+  \ *R, CheckerContext &C) const;\n      void clearGuard(const MemRegion *R, CheckerContext\
+  \ &C) const;\n      void reportUnderflow(const Stmt *S, CheckerContext &C) const;\n\
+  };\n\n// ---------------- Helper Implementations ----------------\n\nbool SAGenTestChecker::isUnsignedType(QualType\
+  \ T) {\n  if (T.isNull()) return false;\n  return T->isUnsignedIntegerType();\n\
+  }\n\nbool SAGenTestChecker::isZeroExpr(const Expr *E, CheckerContext &C) {\n  if\
+  \ (!E) return false;\n  E = E->IgnoreParenCasts();\n  if (const auto *IL = dyn_cast<IntegerLiteral>(E))\
+  \ {\n    return IL->getValue() == 0;\n  }\n  llvm::APSInt Res;\n  if (EvaluateExprToInt(Res,\
+  \ E, C)) {\n    return Res == 0;\n  }\n  return false;\n}\n\nconst MemRegion *SAGenTestChecker::getRegionIfVarOrField(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return nullptr;\n  const MemRegion *MR\
+  \ = getMemRegionFromExpr(E, C);\n  if (!MR) return nullptr;\n  MR = MR->getBaseRegion();\n\
+  \  return MR;\n}\n\nbool SAGenTestChecker::isRoundUpLike(const Expr *E, CheckerContext\
+  \ &C) {\n  if (!E) return false;\n  // Name-based detection; handles function-like\
+  \ macros or functions.\n  if (ExprHasName(E, \"round_up\", C)) return true;\n  if\
+  \ (ExprHasName(E, \"roundup\", C)) return true;\n  if (ExprHasName(E, \"ALIGN_UP\"\
+  , C)) return true;\n  if (ExprHasName(E, \"ALIGN\", C)) return true; // common Linux\
+  \ macro\n  return false;\n}\n\nbool SAGenTestChecker::isSuspiciousMinus(const Expr\
+  \ *E, CheckerContext &C) {\n  if (!E) return false;\n  E = E->IgnoreParenCasts();\n\
+  \  const auto *BO = dyn_cast<BinaryOperator>(E);\n  if (!BO) return false;\n  if\
+  \ (BO->getOpcode() != BO_Sub) return false;\n\n  const Expr *RHS = BO->getRHS();\n\
+  \  if (!RHS) return false;\n  if (isRoundUpLike(RHS, C))\n    return true;\n\n \
+  \ // Also consider nested patterns like (A - ALIGN(B, C)) appearing under casts.\n\
+  \  return false;\n}\n\nQualType SAGenTestChecker::getRegionValueType(const MemRegion\
+  \ *MR) {\n  if (!MR) return QualType();\n  MR = MR->getBaseRegion();\n  if (const\
+  \ auto *VR = dyn_cast<VarRegion>(MR))\n    return VR->getDecl()->getType();\n  if\
+  \ (const auto *FR = dyn_cast<FieldRegion>(MR))\n    return FR->getDecl()->getType();\n\
+  \  return QualType();\n}\n\nbool SAGenTestChecker::isSubAssignOnUnsigned(const BinaryOperator\
+  \ *BO, const MemRegion *LReg) {\n  if (!BO || !LReg) return false;\n  if (BO->getOpcode()\
+  \ != BO_SubAssign) return false;\n  return isUnsignedType(getRegionValueType(LReg));\n\
+  }\n\nbool SAGenTestChecker::isAssignWithMinusOnUnsigned(const BinaryOperator *BO,\
+  \ const MemRegion *LReg, CheckerContext &C) {\n  if (!BO || !LReg) return false;\n\
+  \  if (BO->getOpcode() != BO_Assign) return false;\n  if (!isUnsignedType(getRegionValueType(LReg)))\
+  \ return false;\n  const Expr *RHS = BO->getRHS();\n  if (!RHS) return false;\n\
+  \  RHS = RHS->IgnoreParenCasts();\n  const auto *RBO = dyn_cast<BinaryOperator>(RHS);\n\
+  \  if (!RBO) return false;\n  if (RBO->getOpcode() != BO_Sub) return false;\n  return\
+  \ true;\n}\n\nbool SAGenTestChecker::guardConditionMentionsVarGEorGT(const Expr\
+  \ *Cond, const MemRegion *VarR, CheckerContext &C) {\n  if (!Cond || !VarR) return\
+  \ false;\n\n  // DFS through the condition's AST\n  SmallVector<const Stmt *, 8>\
+  \ Worklist;\n  Worklist.push_back(Cond);\n  while (!Worklist.empty()) {\n    const\
+  \ Stmt *Cur = Worklist.pop_back_val();\n    if (const auto *BE = dyn_cast<BinaryOperator>(Cur))\
+  \ {\n      BinaryOperator::Opcode Op = BE->getOpcode();\n      if (Op == BO_GE ||\
+  \ Op == BO_GT) {\n        const MemRegion *L = getRegionIfVarOrField(BE->getLHS(),\
+  \ C);\n        const MemRegion *R = getRegionIfVarOrField(BE->getRHS(), C);\n  \
+  \      if ((L && L->getBaseRegion() == VarR->getBaseRegion()) ||\n            (R\
+  \ && R->getBaseRegion() == VarR->getBaseRegion())) {\n              return true;\n\
+  \        }\n      }\n    }\n    for (const Stmt *Child : Cur->children()) {\n  \
+  \    if (Child) Worklist.push_back(Child);\n    }\n  }\n  return false;\n}\n\nbool\
+  \ SAGenTestChecker::branchSetsVarZero(const Stmt *S, const MemRegion *VarR, CheckerContext\
+  \ &C) {\n  if (!S || !VarR) return false;\n  SmallVector<const Stmt *, 16> Worklist;\n\
+  \  Worklist.push_back(S);\n  while (!Worklist.empty()) {\n    const Stmt *Cur =\
+  \ Worklist.pop_back_val();\n    if (const auto *BO = dyn_cast<BinaryOperator>(Cur))\
+  \ {\n      if (BO->getOpcode() == BO_Assign) {\n        const MemRegion *LReg =\
+  \ getRegionIfVarOrField(BO->getLHS(), C);\n        if (LReg && LReg->getBaseRegion()\
+  \ == VarR->getBaseRegion()) {\n          if (const Expr *RHS = BO->getRHS()) {\n\
+  \            if (isZeroExpr(RHS, C))\n              return true;\n          }\n\
+  \        }\n      }\n    }\n    for (const Stmt *Child : Cur->children()) {\n  \
+  \    if (Child) Worklist.push_back(Child);\n    }\n  }\n  return false;\n}\n\nbool\
+  \ SAGenTestChecker::immediateIfGuardSetsVarZero(const Stmt *S, const MemRegion *VarR,\
+  \ CheckerContext &C) {\n  if (!S || !VarR) return false;\n  const CompoundStmt *CS\
+  \ = findSpecificTypeInParents<CompoundStmt>(S, C);\n  if (!CS) return false;\n\n\
+  \  // Find S in CS body and inspect the immediate previous statement if any\n  const\
+  \ Stmt *Prev = nullptr;\n  for (const Stmt *Child : CS->body()) {\n    if (Child\
+  \ == S) break;\n    Prev = Child;\n  }\n  if (!Prev) return false;\n\n  if (const\
+  \ auto *IfS = dyn_cast<IfStmt>(Prev)) {\n    const Expr *Cond = IfS->getCond();\n\
+  \    if (guardConditionMentionsVarGEorGT(Cond, VarR, C)) {\n      const Stmt *Then\
+  \ = IfS->getThen();\n      if (Then && branchSetsVarZero(Then, VarR, C))\n     \
+  \   return true;\n    }\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::markSuspicious(const\
+  \ MemRegion *R, CheckerContext &C) const {\n  if (!R) return;\n  ProgramStateRef\
+  \ State = C.getState();\n  if (!State->contains<SuspiciousVars>(R))\n    State =\
+  \ State->add<SuspiciousVars>(R);\n  // Recompute guard; new value invalidates guard\
+  \ assumptions\n  if (State->contains<GuardedVars>(R))\n    State = State->remove<GuardedVars>(R);\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::clearSuspicious(const MemRegion\
+  \ *R, CheckerContext &C) const {\n  if (!R) return;\n  ProgramStateRef State = C.getState();\n\
+  \  if (State->contains<SuspiciousVars>(R))\n    State = State->remove<SuspiciousVars>(R);\n\
+  \  if (State->contains<GuardedVars>(R))\n    State = State->remove<GuardedVars>(R);\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::clearGuard(const MemRegion\
+  \ *R, CheckerContext &C) const {\n  if (!R) return;\n  ProgramStateRef State = C.getState();\n\
+  \  if (State->contains<GuardedVars>(R))\n    State = State->remove<GuardedVars>(R);\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::reportUnderflow(const Stmt\
+  \ *S, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n  auto R = std::make_unique<PathSensitiveBugReport>(\n     \
+  \ *BT,\n      \"Subtracting (avail - round_up(...)) from length without bound check\
+  \ may underflow\",\n      N);\n  if (S)\n    R->addRange(S->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\n// ---------------- Checker Callbacks ----------------\n\
+  \nvoid SAGenTestChecker::checkPostStmt(const DeclStmt *DS, CheckerContext &C) const\
+  \ {\n  if (!DS) return;\n  for (const Decl *D : DS->decls()) {\n    const auto *VD\
+  \ = dyn_cast<VarDecl>(D);\n    if (!VD) continue;\n    if (!VD->hasInit()) continue;\n\
+  \n    QualType T = VD->getType();\n    if (!isUnsignedType(T)) continue;\n\n   \
+  \ const Expr *Init = VD->getInit();\n    if (!Init) continue;\n\n    if (isSuspiciousMinus(Init,\
+  \ C)) {\n      // Get the region for this variable\n      SVal LVal = C.getSValBuilder().getLValue(VD,\
+  \ C.getLocationContext());\n      const MemRegion *R = LVal.getAsRegion();\n   \
+  \   if (!R) continue;\n      R = R->getBaseRegion();\n      markSuspicious(R, C);\n\
+  \    }\n  }\n}\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt\
+  \ *S, CheckerContext &C) const {\n  const MemRegion *LReg = Loc.getAsRegion();\n\
+  \  if (LReg) LReg = LReg->getBaseRegion();\n\n  const auto *BO = dyn_cast_or_null<BinaryOperator>(S);\n\
+  \n  // Case A: Detect suspicious assignment/initialization into a variable/field\n\
+  \  if (LReg) {\n    // If S is an assignment: X = (A - round_up(...))\n    if (BO\
+  \ && BO->getOpcode() == BO_Assign) {\n      const Expr *RHS = BO->getRHS();\n  \
+  \    if (RHS && isUnsignedType(getRegionValueType(LReg))) {\n        if (isSuspiciousMinus(RHS,\
+  \ C)) {\n          markSuspicious(LReg, C);\n        } else if (isZeroExpr(RHS,\
+  \ C)) {\n          // Reset if assigned zero\n          clearSuspicious(LReg, C);\n\
+  \        } else {\n          // Reassignment to something else drops the guard but\
+  \ may keep suspiciousness if unchanged.\n          // Since we can't know, be conservative:\
+  \ drop guard only.\n          clearGuard(LReg, C);\n        }\n      }\n    } else\
+  \ {\n      // Initialization via binding with RHS expression directly (not a BinaryOperator\
+  \ assign)\n      if (const auto *RE = dyn_cast_or_null<Expr>(S)) {\n        if (isUnsignedType(getRegionValueType(LReg))\
+  \ && isSuspiciousMinus(RE, C)) {\n          markSuspicious(LReg, C);\n        }\n\
+  \      }\n    }\n  }\n\n  // Case B: Detect dangerous subtract: Y -= X\n  if (BO\
+  \ && isSubAssignOnUnsigned(BO, LReg)) {\n    const Expr *RHS = BO->getRHS();\n \
+  \   // B1: RHS is a suspicious variable\n    if (const MemRegion *RHSReg = getRegionIfVarOrField(RHS,\
+  \ C)) {\n      ProgramStateRef State = C.getState();\n      if (State->contains<SuspiciousVars>(RHSReg))\
+  \ {\n        bool Guarded = State->contains<GuardedVars>(RHSReg);\n        bool\
+  \ LocalGuard = immediateIfGuardSetsVarZero(S, RHSReg, C);\n        if (!Guarded\
+  \ && !LocalGuard) {\n          reportUnderflow(S, C);\n        }\n      }\n    }\
+  \ else {\n      // B2: RHS is directly (A - round_up(...))\n      if (isSuspiciousMinus(RHS,\
+  \ C)) {\n        // Optional heuristic: look for immediate guard setting to zero;\
+  \ we can't map to a var here\n        if (!immediateIfGuardSetsVarZero(S, nullptr,\
+  \ C))\n          reportUnderflow(S, C);\n      }\n    }\n  }\n\n  // Case C: Detect\
+  \ dangerous subtract: Y = Y - X\n  if (BO && isAssignWithMinusOnUnsigned(BO, LReg,\
+  \ C)) {\n    const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n    const auto\
+  \ *RBO = dyn_cast<BinaryOperator>(RHS);\n    if (RBO && RBO->getOpcode() == BO_Sub)\
+  \ {\n      const Expr *SubRHS = RBO->getRHS();\n      if (const MemRegion *RHSReg\
+  \ = getRegionIfVarOrField(SubRHS, C)) {\n        ProgramStateRef State = C.getState();\n\
+  \        if (State->contains<SuspiciousVars>(RHSReg)) {\n          bool Guarded\
+  \ = State->contains<GuardedVars>(RHSReg);\n          bool LocalGuard = immediateIfGuardSetsVarZero(S,\
+  \ RHSReg, C);\n          if (!Guarded && !LocalGuard) {\n            reportUnderflow(S,\
+  \ C);\n          }\n        }\n      } else if (isSuspiciousMinus(SubRHS, C)) {\n\
+  \        if (!immediateIfGuardSetsVarZero(S, nullptr, C))\n          reportUnderflow(S,\
+  \ C);\n      }\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE) return;\n\n  ProgramStateRef State = C.getState();\n\n  // Scan condition\
+  \ for GE/GT comparisons involving suspicious vars and mark as guarded.\n  SmallVector<const\
+  \ Stmt *, 8> Worklist;\n  Worklist.push_back(CondE);\n  while (!Worklist.empty())\
+  \ {\n    const Stmt *Cur = Worklist.pop_back_val();\n    if (const auto *BE = dyn_cast<BinaryOperator>(Cur))\
+  \ {\n      BinaryOperator::Opcode Op = BE->getOpcode();\n      if (Op == BO_GE ||\
+  \ Op == BO_GT) {\n        const MemRegion *L = getRegionIfVarOrField(BE->getLHS(),\
+  \ C);\n        const MemRegion *R = getRegionIfVarOrField(BE->getRHS(), C);\n  \
+  \      if (L && State->contains<SuspiciousVars>(L))\n          State = State->add<GuardedVars>(L);\n\
+  \        if (R && State->contains<SuspiciousVars>(R))\n          State = State->add<GuardedVars>(R);\n\
+  \      }\n    }\n    for (const Stmt *Child : Cur->children()) {\n      if (Child)\
+  \ Worklist.push_back(Child);\n    }\n  }\n\n  C.addTransition(State);\n}\n\n} //\
+  \ end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects subtracting (avail - round_up(...)) from an unsigned length without\
+  \ guard, which may underflow\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nbcachefs: fix iov_iter count underflow on sub-block\
+  \ dio read\n\nbch2_direct_IO_read() checks the request offset and size for sector\n\
+  alignment and then falls through to a couple calculations to shrink\nthe size of\
+  \ the request based on the inode size. The problem is that\nthese checks round up\
+  \ to the fs block size, which runs the risk of\nunderflowing iter->count if the\
+  \ block size happens to be large\nenough. This is triggered by fstest generic/361\
+  \ with a 4k block\nsize, which subsequently leads to a crash. To avoid this crash,\n\
+  check that the shorten length doesn't exceed the overall length of\nthe iter.\n\n\
+  Fixes:\nSigned-off-by: Brian Foster <bfoster@redhat.com>\nReviewed-by: Su Yue <glass.su@suse.com>\n\
+  Signed-off-by: Kent Overstreet <kent.overstreet@linux.dev>\n\n## Buggy Code\n\n\
+  ```c\n// Function: bch2_direct_IO_read in fs/bcachefs/fs-io-direct.c\nstatic int\
+  \ bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)\n{\n\tstruct file\
+  \ *file = req->ki_filp;\n\tstruct bch_inode_info *inode = file_bch_inode(file);\n\
+  \tstruct bch_fs *c = inode->v.i_sb->s_fs_info;\n\tstruct bch_io_opts opts;\n\tstruct\
+  \ dio_read *dio;\n\tstruct bio *bio;\n\tloff_t offset = req->ki_pos;\n\tbool sync\
+  \ = is_sync_kiocb(req);\n\tsize_t shorten;\n\tssize_t ret;\n\n\tbch2_inode_opts_get(&opts,\
+  \ c, &inode->ei_inode);\n\n\t/* bios must be 512 byte aligned: */\n\tif ((offset|iter->count)\
+  \ & (SECTOR_SIZE - 1))\n\t\treturn -EINVAL;\n\n\tret = min_t(loff_t, iter->count,\n\
+  \t\t    max_t(loff_t, 0, i_size_read(&inode->v) - offset));\n\n\tif (!ret)\n\t\t\
+  return ret;\n\n\tshorten = iov_iter_count(iter) - round_up(ret, block_bytes(c));\n\
+  \titer->count -= shorten;\n\n\tbio = bio_alloc_bioset(NULL,\n\t\t\t       bio_iov_vecs_to_alloc(iter,\
+  \ BIO_MAX_VECS),\n\t\t\t       REQ_OP_READ,\n\t\t\t       GFP_KERNEL,\n\t\t\t  \
+  \     &c->dio_read_bioset);\n\n\tbio->bi_end_io = bch2_direct_IO_read_endio;\n\n\
+  \tdio = container_of(bio, struct dio_read, rbio.bio);\n\tclosure_init(&dio->cl,\
+  \ NULL);\n\n\t/*\n\t * this is a _really_ horrible hack just to avoid an atomic\
+  \ sub at the\n\t * end:\n\t */\n\tif (!sync) {\n\t\tset_closure_fn(&dio->cl, bch2_dio_read_complete,\
+  \ NULL);\n\t\tatomic_set(&dio->cl.remaining,\n\t\t\t   CLOSURE_REMAINING_INITIALIZER\
+  \ -\n\t\t\t   CLOSURE_RUNNING +\n\t\t\t   CLOSURE_DESTRUCTOR);\n\t} else {\n\t\t\
+  atomic_set(&dio->cl.remaining,\n\t\t\t   CLOSURE_REMAINING_INITIALIZER + 1);\n\t\
+  \tdio->cl.closure_get_happened = true;\n\t}\n\n\tdio->req\t= req;\n\tdio->ret\t\
+  = ret;\n\t/*\n\t * This is one of the sketchier things I've encountered: we have\
+  \ to skip\n\t * the dirtying of requests that are internal from the kernel (i.e.\
+  \ from\n\t * loopback), because we'll deadlock on page_lock.\n\t */\n\tdio->should_dirty\
+  \ = iter_is_iovec(iter);\n\n\tgoto start;\n\twhile (iter->count) {\n\t\tbio = bio_alloc_bioset(NULL,\n\
+  \t\t\t\t       bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS),\n\t\t\t\t       REQ_OP_READ,\n\
+  \t\t\t\t       GFP_KERNEL,\n\t\t\t\t       &c->bio_read);\n\t\tbio->bi_end_io\t\t\
+  = bch2_direct_IO_read_split_endio;\nstart:\n\t\tbio->bi_opf\t\t= REQ_OP_READ|REQ_SYNC;\n\
+  \t\tbio->bi_iter.bi_sector\t= offset >> 9;\n\t\tbio->bi_private\t\t= dio;\n\n\t\t\
+  ret = bio_iov_iter_get_pages(bio, iter);\n\t\tif (ret < 0) {\n\t\t\t/* XXX: fault\
+  \ inject this path */\n\t\t\tbio->bi_status = BLK_STS_RESOURCE;\n\t\t\tbio_endio(bio);\n\
+  \t\t\tbreak;\n\t\t}\n\n\t\toffset += bio->bi_iter.bi_size;\n\n\t\tif (dio->should_dirty)\n\
+  \t\t\tbio_set_pages_dirty(bio);\n\n\t\tif (iter->count)\n\t\t\tclosure_get(&dio->cl);\n\
+  \n\t\tbch2_read(c, rbio_init(bio, opts), inode_inum(inode));\n\t}\n\n\titer->count\
+  \ += shorten;\n\n\tif (sync) {\n\t\tclosure_sync(&dio->cl);\n\t\tclosure_debug_destroy(&dio->cl);\n\
+  \t\tret = dio->ret;\n\t\tbio_check_or_release(&dio->rbio.bio, dio->should_dirty);\n\
+  \t\treturn ret;\n\t} else {\n\t\treturn -EIOCBQUEUED;\n\t}\n}\n```\n\n## Bug Fix\
+  \ Patch\n\n```diff\ndiff --git a/fs/bcachefs/fs-io-direct.c b/fs/bcachefs/fs-io-direct.c\n\
+  index e3b219e19e10..33cb6da3a5ad 100644\n--- a/fs/bcachefs/fs-io-direct.c\n+++ b/fs/bcachefs/fs-io-direct.c\n\
+  @@ -88,6 +88,8 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter\
+  \ *iter)\n \t\treturn ret;\n \n \tshorten = iov_iter_count(iter) - round_up(ret,\
+  \ block_bytes(c));\n+\tif (shorten >= iter->count)\n+\t\tshorten = 0;\n \titer->count\
+  \ -= shorten;\n \n \tbio = bio_alloc_bioset(NULL,\n```\n"
+pattern: "## Bug Pattern\n\nComputing a decrement as (available_len - round_up(request_len,\
+  \ align)) using unsigned sizes and then subtracting it from a length without verifying\
+  \ that round_up(request_len, align) <= available_len. If the rounded-up length exceeds\
+  \ the available length, the unsigned subtraction underflows, and the subsequent\
+  \ \u201Clen -= shorten;\u201D wraps the length to a huge value.\n\nExample:\n- size_t\
+  \ shorten = iov_iter_count(iter) - round_up(ret, block_bytes);\n- iter->count -=\
+  \ shorten;  // underflows if round_up(ret, block_bytes) > iov_iter_count(iter)\n\
+  \nRoot cause: Missing bound check before subtracting an alignment-inflated length\
+  \ from an unsigned length, leading to size_t underflow."
+plan: "Plan\n\n1. Program state\n- REGISTER_SET_WITH_PROGRAMSTATE(SuspiciousVars,\
+  \ const MemRegion*)\n  - Tracks variables that were computed as (available_len -\
+  \ round_up(...)) in an unsigned type, i.e., they may have wrapped due to underflow.\n\
+  - REGISTER_SET_WITH_PROGRAMSTATE(GuardedVars, const MemRegion*)\n  - Tracks suspicious\
+  \ variables that have an explicit guard seen in a branch condition (e.g., if (shorten\
+  \ >= len) \u2026), so subtracting them is likely safe.\n- No other custom traits/maps\
+  \ are necessary.\n\n2. Helper predicates/utilities (local static functions in the\
+  \ checker)\n- bool isUnsignedType(QualType T)\n  - Return T->isUnsignedIntegerType().\n\
+  - bool isRoundUpLike(const Expr *E, CheckerContext &C)\n  - Return true if the source\
+  \ text of E contains any of: \"round_up\", \"roundup\", \"ALIGN\", \"ALIGN_UP\"\
+  . Use ExprHasName(E, ..., C).\n  - Additionally: if E is a CallExpr, and callee\
+  \ name is one of the above, return true.\n- bool isSuspiciousMinus(const Expr *E,\
+  \ CheckerContext &C)\n  - Return true if E is a BinaryOperator with opcode BO_Sub,\
+  \ LHS is any expr, RHS satisfies isRoundUpLike(RHS, C).\n- const MemRegion *getRegionIfVarOrField(const\
+  \ Expr *E, CheckerContext &C)\n  - Use getMemRegionFromExpr(E, C) and return the\
+  \ base region when E is a DeclRefExpr or a field/member that maps to a region.\n\
+  - bool isZeroExpr(const Expr *E)\n  - Check if E is an integer literal equal to\
+  \ 0 (ignoring implicit casts), or EvaluateExprToInt succeeds and equals 0.\n- bool\
+  \ isSubAssignOnUnsigned(const BinaryOperator *BO)\n  - BO->getOpcode() == BO_SubAssign\
+  \ and LHS type is unsigned integer.\n- bool isAssignWithMinusOnUnsigned(const BinaryOperator\
+  \ *BO)\n  - BO->isAssignmentOp() and BO->getOpcode() == BO_Assign, RHS is BO_Sub,\
+  \ and LHS type is unsigned integer.\n- bool guardConditionMentionsVarGEorGT(const\
+  \ Expr *Cond, const MemRegion *VarR, CheckerContext &C)\n  - If Cond is a BinaryOperator\
+  \ with opcode BO_GE or BO_GT:\n    - If either side\u2019s expression region equals\
+  \ VarR (via getRegionIfVarOrField), return true.\n  - Else recursively check children\
+  \ (or use findSpecificTypeInChildren<BinaryOperator>()) and test all BinaryOperators\
+  \ in the condition.\n- bool immediateIfGuardSetsVarZero(const Stmt *S, const MemRegion\
+  \ *VarR, CheckerContext &C)\n  - If the parent of S (findSpecificTypeInParents<CompoundStmt>())\
+  \ is a CompoundStmt, scan the preceding sibling statement:\n    - If it is an IfStmt:\n\
+  \      - If the condition guardConditionMentionsVarGEorGT on VarR is true, and inside\
+  \ the Then branch, there exists a BinaryOperator assignment setting VarR to zero\
+  \ (use findSpecificTypeInChildren<BinaryOperator>() on then body and check isZeroExpr\
+  \ on RHS and LHS region equals VarR), return true.\n  - This is an optional local-guard\
+  \ heuristic to reduce false positives for direct \u201CY -= (A - round_up(...))\u201D\
+  \ patterns.\n\n3. checkPostStmt(const DeclStmt *DS, CheckerContext &C)\n- Goal:\
+  \ detect initialization like size_t shorten = avail - round_up(...);\n- For each\
+  \ VarDecl in DS with an initializer:\n  - If the declared type is unsigned integer,\
+  \ and the initializer isSuspiciousMinus(Init, C):\n    - Get the MemRegion of the\
+  \ declared variable via getMemRegionFromExpr(DeclRefExpr(...), C) or from State\
+  \ binding of the VarDecl; insert into SuspiciousVars.\n- No bug report here; only\
+  \ record suspicious origin.\n\n4. checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C)\n- Handle assignments and compound assignments in one place.\n\nA) Mark suspicious\
+  \ variable when assigned a suspicious-minus expression\n- If S is a BinaryOperator\
+  \ BO with opcode BO_Assign:\n  - Let LHS be the assigned-to expr; if LHS type is\
+  \ unsigned integer:\n    - If RHS isSuspiciousMinus(RHS, C), then:\n      - Get\
+  \ region of LHS via getRegionIfVarOrField(LHS, C).\n      - Add region to SuspiciousVars.\n\
+  \      - Remove region from GuardedVars (fresh computation invalidates prior guards).\n\
+  \    - Else if RHS isZeroExpr(RHS) and LHS region is in SuspiciousVars:\n      -\
+  \ Remove LHS region from SuspiciousVars (explicit zeroing makes further subtracts\
+  \ safe).\n      - Also remove from GuardedVars.\n\nB) Detect dangerous subtract:\
+  \ Y -= X\n- If S is a BinaryOperator BO with opcode BO_SubAssign and LHS is unsigned:\n\
+  \  - Case B1: RHS is a DeclRefExpr (or region-backed expr):\n    - Get RHS region\
+  \ R via getRegionIfVarOrField(RHS, C).\n    - If R is in SuspiciousVars:\n     \
+  \ - If R is in GuardedVars, do nothing (assume guarded in this path).\n      - Else\
+  \ if immediateIfGuardSetsVarZero(S, R, C) is true, do nothing.\n      - Else: report\
+  \ bug at this statement.\n  - Case B2: RHS is not a simple var: If RHS isSuspiciousMinus(RHS,\
+  \ C), then:\n    - If immediateIfGuardSetsVarZero(S, /*VarR*/nullptr, C) is false\
+  \ (cannot tie to a var), report bug at this statement.\n\nC) Detect dangerous subtract:\
+  \ Y = Y - X\n- If S is a BinaryOperator BO with opcode BO_Assign and LHS is unsigned:\n\
+  \  - If RHS is a BinaryOperator with opcode BO_Sub:\n    - Let RHS_R be RHS->getRHS():\n\
+  \      - If RHS_R is a DeclRefExpr with region R in SuspiciousVars:\n        - If\
+  \ R in GuardedVars -> skip; else if immediateIfGuardSetsVarZero(S, R, C) -> skip;\
+  \ else report.\n      - Else if RHS_R isSuspiciousMinus(RHS_R, C):\n        - If\
+  \ immediateIfGuardSetsVarZero(S, nullptr, C) is false -> report.\n\nD) Reset guards\
+  \ on reassignment\n- If BO is an assignment to a variable region R that is in SuspiciousVars\
+  \ but RHS is neither zero nor suspicious-minus, remove R from GuardedVars (any new\
+  \ value invalidates the old guard).\n\n5. checkBranchCondition(const Stmt *Condition,\
+  \ CheckerContext &C)\n- Purpose: recognize guards like if (shorten >= len) ... in\
+  \ the current path.\n- For each region R in SuspiciousVars (iterate via ProgramState\u2019\
+  s set):\n  - If guardConditionMentionsVarGEorGT(cast<Expr>(Condition), R, C) is\
+  \ true:\n    - Add R to GuardedVars in the returned ProgramState.\n- This marks\
+  \ the path as having seen a relevant guard. It will be consumed implicitly by the\
+  \ later subtract detection.\n- Note: If the suspicious variable is reassigned later\
+  \ (checkBind), we remove it from GuardedVars.\n\n6. Bug reporting\n- When reporting\
+  \ in step 4B/4C, create a PathSensitiveBugReport:\n  - BugType: \"Possible size_t\
+  \ underflow\"\n  - Message: \"Subtracting (avail - round_up(...)) from length without\
+  \ bound check may underflow\"\n  - Use generateNonFatalErrorNode() to get a node;\
+  \ if null, return.\n  - Add the range of the subtraction statement (the BO) to the\
+  \ report.\n- Do not report more than once on the same statement. You can keep a\
+  \ small in-checker hash set of reported statements if needed (not part of ProgramState).\n\
+  \n7. Notes and simplifications\n- This checker focuses on the round-up family: round_up,\
+  \ roundup, ALIGN, ALIGN_UP; add more names if needed by extending isRoundUpLike.\n\
+  - The core risk is unsigned underflow in computing X = A - round_up(...), which\
+  \ then propagates via Y -= X. The checker either:\n  - sees Y -= (A - round_up(...))\
+  \ directly, or\n  - tracks a variable X computed in that form and later subtracted.\n\
+  - Guards:\n  - Path guard (checkBranchCondition): marks a variable as guarded upon\
+  \ seeing if (X >= Y) ... (>= or >).\n  - Local heuristic guard (immediateIfGuardSetsVarZero):\
+  \ detects the common pattern \"if (X >= Y) X = 0;\" immediately before the subtraction.\n\
+  - The checker intentionally does not try to prove round_up(...) <= avail via symbolic\
+  \ reasoning; it uses pattern-based recognition as in the target patch.\n\n8. Chosen\
+  \ callbacks summary\n- checkPostStmt(const DeclStmt *):\n  - Record suspicious variable\
+  \ at initialization.\n- checkBind(SVal, SVal, const Stmt *):\n  - Record suspicious\
+  \ variable at assignment.\n  - Detect subtract patterns (Y -= X and Y = Y - X) and\
+  \ emit reports if unguarded.\n  - Maintain GuardedVars on reassignment/zeroing.\n\
+  - checkBranchCondition(const Stmt *):\n  - Mark suspicious variables as guarded\
+  \ when branch conditions compare them (>= or >) to another value.\n\nThis plan is\
+  \ minimal, path-sensitive where it matters, leverages name-based round-up detection\
+  \ to match kernel macros, and mirrors the fix pattern (if (shorten >= len) shorten\
+  \ = 0) to suppress false positives."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h\"\
+  \n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\n#include \"clang/AST/RecursiveASTVisitor.h\"\
+  \n#include \"clang/AST/StmtVisitor.h\"\n#include \"llvm/Support/raw_ostream.h\"\n\
+  #include \"clang/StaticAnalyzer/Checkers/utility.h\"\n#include \"clang/AST/ASTContext.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"llvm/ADT/SmallVector.h\"\
+  \n#include \"llvm/ADT/APInt.h\"\n#include <memory>\n\nusing namespace clang;\nusing\
+  \ namespace ento;\nusing namespace taint;\n\n// Program state: track suspicious\
+  \ values and guards\nREGISTER_SET_WITH_PROGRAMSTATE(SuspiciousVars, const MemRegion\
+  \ *)\nREGISTER_SET_WITH_PROGRAMSTATE(GuardedVars, const MemRegion *)\n\nnamespace\
+  \ {\n\nclass SAGenTestChecker\n  : public Checker<\n      check::PostStmt<DeclStmt>,\n\
+  \      check::Bind,\n      check::BranchCondition\n    > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"Possible\
+  \ size_t underflow\", \"Integer errors\")) {}\n\n      void checkPostStmt(const\
+  \ DeclStmt *DS, CheckerContext &C) const;\n      void checkBind(SVal Loc, SVal Val,\
+  \ const Stmt *S, CheckerContext &C) const;\n      void checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const;\n\n   private:\n      // Helpers\n\
+  \      static bool isUnsignedType(QualType T);\n      static bool isZeroExpr(const\
+  \ Expr *E, CheckerContext &C);\n      static const MemRegion *getRegionIfVarOrField(const\
+  \ Expr *E, CheckerContext &C);\n      static bool isRoundUpLike(const Expr *E, CheckerContext\
+  \ &C);\n      static bool isSuspiciousMinus(const Expr *E, CheckerContext &C);\n\
+  \      static QualType getRegionValueType(const MemRegion *MR);\n      static bool\
+  \ isSubAssignOnUnsigned(const BinaryOperator *BO, const MemRegion *LReg);\n    \
+  \  static bool isAssignWithMinusOnUnsigned(const BinaryOperator *BO, const MemRegion\
+  \ *LReg, CheckerContext &C);\n      static bool guardConditionMentionsVarGEorGT(const\
+  \ Expr *Cond, const MemRegion *VarR, CheckerContext &C);\n      static bool branchSetsVarZero(const\
+  \ Stmt *S, const MemRegion *VarR, CheckerContext &C);\n      static bool immediateIfGuardSetsVarZero(const\
+  \ Stmt *S, const MemRegion *VarR, CheckerContext &C);\n\n      void markSuspicious(const\
+  \ MemRegion *R, CheckerContext &C) const;\n      void clearSuspicious(const MemRegion\
+  \ *R, CheckerContext &C) const;\n      void clearGuard(const MemRegion *R, CheckerContext\
+  \ &C) const;\n      void reportUnderflow(const Stmt *S, CheckerContext &C) const;\n\
+  };\n\n// ---------------- Helper Implementations ----------------\n\nbool SAGenTestChecker::isUnsignedType(QualType\
+  \ T) {\n  if (T.isNull()) return false;\n  return T->isUnsignedIntegerType();\n\
+  }\n\nbool SAGenTestChecker::isZeroExpr(const Expr *E, CheckerContext &C) {\n  if\
+  \ (!E) return false;\n  E = E->IgnoreParenCasts();\n  if (const auto *IL = dyn_cast<IntegerLiteral>(E))\
+  \ {\n    return IL->getValue() == 0;\n  }\n  llvm::APSInt Res;\n  if (EvaluateExprToInt(Res,\
+  \ E, C)) {\n    return Res == 0;\n  }\n  return false;\n}\n\nconst MemRegion *SAGenTestChecker::getRegionIfVarOrField(const\
+  \ Expr *E, CheckerContext &C) {\n  if (!E) return nullptr;\n  const MemRegion *MR\
+  \ = getMemRegionFromExpr(E, C);\n  if (!MR) return nullptr;\n  MR = MR->getBaseRegion();\n\
+  \  return MR;\n}\n\nbool SAGenTestChecker::isRoundUpLike(const Expr *E, CheckerContext\
+  \ &C) {\n  if (!E) return false;\n  // Name-based detection; handles function-like\
+  \ macros or functions.\n  if (ExprHasName(E, \"round_up\", C)) return true;\n  if\
+  \ (ExprHasName(E, \"roundup\", C)) return true;\n  if (ExprHasName(E, \"ALIGN_UP\"\
+  , C)) return true;\n  if (ExprHasName(E, \"ALIGN\", C)) return true; // common Linux\
+  \ macro\n  return false;\n}\n\nbool SAGenTestChecker::isSuspiciousMinus(const Expr\
+  \ *E, CheckerContext &C) {\n  if (!E) return false;\n  E = E->IgnoreParenCasts();\n\
+  \  const auto *BO = dyn_cast<BinaryOperator>(E);\n  if (!BO) return false;\n  if\
+  \ (BO->getOpcode() != BO_Sub) return false;\n\n  const Expr *RHS = BO->getRHS();\n\
+  \  if (!RHS) return false;\n  if (isRoundUpLike(RHS, C))\n    return true;\n\n \
+  \ // Also consider nested patterns like (A - ALIGN(B, C)) appearing under casts.\n\
+  \  return false;\n}\n\nQualType SAGenTestChecker::getRegionValueType(const MemRegion\
+  \ *MR) {\n  if (!MR) return QualType();\n  MR = MR->getBaseRegion();\n  if (const\
+  \ auto *VR = dyn_cast<VarRegion>(MR))\n    return VR->getDecl()->getType();\n  if\
+  \ (const auto *FR = dyn_cast<FieldRegion>(MR))\n    return FR->getDecl()->getType();\n\
+  \  return QualType();\n}\n\nbool SAGenTestChecker::isSubAssignOnUnsigned(const BinaryOperator\
+  \ *BO, const MemRegion *LReg) {\n  if (!BO || !LReg) return false;\n  if (BO->getOpcode()\
+  \ != BO_SubAssign) return false;\n  return isUnsignedType(getRegionValueType(LReg));\n\
+  }\n\nbool SAGenTestChecker::isAssignWithMinusOnUnsigned(const BinaryOperator *BO,\
+  \ const MemRegion *LReg, CheckerContext &C) {\n  if (!BO || !LReg) return false;\n\
+  \  if (BO->getOpcode() != BO_Assign) return false;\n  if (!isUnsignedType(getRegionValueType(LReg)))\
+  \ return false;\n  const Expr *RHS = BO->getRHS();\n  if (!RHS) return false;\n\
+  \  RHS = RHS->IgnoreParenCasts();\n  const auto *RBO = dyn_cast<BinaryOperator>(RHS);\n\
+  \  if (!RBO) return false;\n  if (RBO->getOpcode() != BO_Sub) return false;\n  return\
+  \ true;\n}\n\nbool SAGenTestChecker::guardConditionMentionsVarGEorGT(const Expr\
+  \ *Cond, const MemRegion *VarR, CheckerContext &C) {\n  if (!Cond || !VarR) return\
+  \ false;\n\n  // DFS through the condition's AST\n  SmallVector<const Stmt *, 8>\
+  \ Worklist;\n  Worklist.push_back(Cond);\n  while (!Worklist.empty()) {\n    const\
+  \ Stmt *Cur = Worklist.pop_back_val();\n    if (const auto *BE = dyn_cast<BinaryOperator>(Cur))\
+  \ {\n      BinaryOperator::Opcode Op = BE->getOpcode();\n      if (Op == BO_GE ||\
+  \ Op == BO_GT) {\n        const MemRegion *L = getRegionIfVarOrField(BE->getLHS(),\
+  \ C);\n        const MemRegion *R = getRegionIfVarOrField(BE->getRHS(), C);\n  \
+  \      if ((L && L->getBaseRegion() == VarR->getBaseRegion()) ||\n            (R\
+  \ && R->getBaseRegion() == VarR->getBaseRegion())) {\n              return true;\n\
+  \        }\n      }\n    }\n    for (const Stmt *Child : Cur->children()) {\n  \
+  \    if (Child) Worklist.push_back(Child);\n    }\n  }\n  return false;\n}\n\nbool\
+  \ SAGenTestChecker::branchSetsVarZero(const Stmt *S, const MemRegion *VarR, CheckerContext\
+  \ &C) {\n  if (!S || !VarR) return false;\n  SmallVector<const Stmt *, 16> Worklist;\n\
+  \  Worklist.push_back(S);\n  while (!Worklist.empty()) {\n    const Stmt *Cur =\
+  \ Worklist.pop_back_val();\n    if (const auto *BO = dyn_cast<BinaryOperator>(Cur))\
+  \ {\n      if (BO->getOpcode() == BO_Assign) {\n        const MemRegion *LReg =\
+  \ getRegionIfVarOrField(BO->getLHS(), C);\n        if (LReg && LReg->getBaseRegion()\
+  \ == VarR->getBaseRegion()) {\n          if (const Expr *RHS = BO->getRHS()) {\n\
+  \            if (isZeroExpr(RHS, C))\n              return true;\n          }\n\
+  \        }\n      }\n    }\n    for (const Stmt *Child : Cur->children()) {\n  \
+  \    if (Child) Worklist.push_back(Child);\n    }\n  }\n  return false;\n}\n\nbool\
+  \ SAGenTestChecker::immediateIfGuardSetsVarZero(const Stmt *S, const MemRegion *VarR,\
+  \ CheckerContext &C) {\n  if (!S || !VarR) return false;\n  const CompoundStmt *CS\
+  \ = findSpecificTypeInParents<CompoundStmt>(S, C);\n  if (!CS) return false;\n\n\
+  \  // Find S in CS body and inspect the immediate previous statement if any\n  const\
+  \ Stmt *Prev = nullptr;\n  for (const Stmt *Child : CS->body()) {\n    if (Child\
+  \ == S) break;\n    Prev = Child;\n  }\n  if (!Prev) return false;\n\n  if (const\
+  \ auto *IfS = dyn_cast<IfStmt>(Prev)) {\n    const Expr *Cond = IfS->getCond();\n\
+  \    if (guardConditionMentionsVarGEorGT(Cond, VarR, C)) {\n      const Stmt *Then\
+  \ = IfS->getThen();\n      if (Then && branchSetsVarZero(Then, VarR, C))\n     \
+  \   return true;\n    }\n  }\n  return false;\n}\n\nvoid SAGenTestChecker::markSuspicious(const\
+  \ MemRegion *R, CheckerContext &C) const {\n  if (!R) return;\n  ProgramStateRef\
+  \ State = C.getState();\n  if (!State->contains<SuspiciousVars>(R))\n    State =\
+  \ State->add<SuspiciousVars>(R);\n  // Recompute guard; new value invalidates guard\
+  \ assumptions\n  if (State->contains<GuardedVars>(R))\n    State = State->remove<GuardedVars>(R);\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::clearSuspicious(const MemRegion\
+  \ *R, CheckerContext &C) const {\n  if (!R) return;\n  ProgramStateRef State = C.getState();\n\
+  \  if (State->contains<SuspiciousVars>(R))\n    State = State->remove<SuspiciousVars>(R);\n\
+  \  if (State->contains<GuardedVars>(R))\n    State = State->remove<GuardedVars>(R);\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::clearGuard(const MemRegion\
+  \ *R, CheckerContext &C) const {\n  if (!R) return;\n  ProgramStateRef State = C.getState();\n\
+  \  if (State->contains<GuardedVars>(R))\n    State = State->remove<GuardedVars>(R);\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::reportUnderflow(const Stmt\
+  \ *S, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N) return;\n  auto R = std::make_unique<PathSensitiveBugReport>(\n     \
+  \ *BT,\n      \"Subtracting (avail - round_up(...)) from length without bound check\
+  \ may underflow\",\n      N);\n  if (S)\n    R->addRange(S->getSourceRange());\n\
+  \  C.emitReport(std::move(R));\n}\n\n// ---------------- Checker Callbacks ----------------\n\
+  \nvoid SAGenTestChecker::checkPostStmt(const DeclStmt *DS, CheckerContext &C) const\
+  \ {\n  if (!DS) return;\n  for (const Decl *D : DS->decls()) {\n    const auto *VD\
+  \ = dyn_cast<VarDecl>(D);\n    if (!VD) continue;\n    if (!VD->hasInit()) continue;\n\
+  \n    QualType T = VD->getType();\n    if (!isUnsignedType(T)) continue;\n\n   \
+  \ const Expr *Init = VD->getInit();\n    if (!Init) continue;\n\n    if (isSuspiciousMinus(Init,\
+  \ C)) {\n      // Get the region for this variable\n      MemRegionManager &MRMgr\
+  \ = C.getState()->getStateManager().getRegionManager();\n      const MemRegion *R\
+  \ = MRMgr.getVarRegion(VD, C.getLocationContext());\n      if (!R) continue;\n \
+  \     R = R->getBaseRegion();\n      markSuspicious(R, C);\n    }\n  }\n}\n\nvoid\
+  \ SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext\
+  \ &C) const {\n  const MemRegion *LReg = Loc.getAsRegion();\n  if (LReg) LReg =\
+  \ LReg->getBaseRegion();\n\n  const auto *BO = dyn_cast_or_null<BinaryOperator>(S);\n\
+  \n  // Case A: Detect suspicious assignment/initialization into a variable/field\n\
+  \  if (LReg) {\n    // If S is an assignment: X = (A - round_up(...))\n    if (BO\
+  \ && BO->getOpcode() == BO_Assign) {\n      const Expr *RHS = BO->getRHS();\n  \
+  \    if (RHS && isUnsignedType(getRegionValueType(LReg))) {\n        if (isSuspiciousMinus(RHS,\
+  \ C)) {\n          markSuspicious(LReg, C);\n        } else if (isZeroExpr(RHS,\
+  \ C)) {\n          // Reset if assigned zero\n          clearSuspicious(LReg, C);\n\
+  \        } else {\n          // Reassignment to something else drops the guard but\
+  \ may keep suspiciousness if unchanged.\n          // Since we can't know, be conservative:\
+  \ drop guard only.\n          clearGuard(LReg, C);\n        }\n      }\n    } else\
+  \ {\n      // Initialization via binding with RHS expression directly (not a BinaryOperator\
+  \ assign)\n      if (const auto *RE = dyn_cast_or_null<Expr>(S)) {\n        if (isUnsignedType(getRegionValueType(LReg))\
+  \ && isSuspiciousMinus(RE, C)) {\n          markSuspicious(LReg, C);\n        }\n\
+  \      }\n    }\n  }\n\n  // Case B: Detect dangerous subtract: Y -= X\n  if (BO\
+  \ && isSubAssignOnUnsigned(BO, LReg)) {\n    const Expr *RHS = BO->getRHS();\n \
+  \   // B1: RHS is a suspicious variable\n    if (const MemRegion *RHSReg = getRegionIfVarOrField(RHS,\
+  \ C)) {\n      ProgramStateRef State = C.getState();\n      if (State->contains<SuspiciousVars>(RHSReg))\
+  \ {\n        bool Guarded = State->contains<GuardedVars>(RHSReg);\n        bool\
+  \ LocalGuard = immediateIfGuardSetsVarZero(S, RHSReg, C);\n        if (!Guarded\
+  \ && !LocalGuard) {\n          reportUnderflow(S, C);\n        }\n      }\n    }\
+  \ else {\n      // B2: RHS is directly (A - round_up(...))\n      if (isSuspiciousMinus(RHS,\
+  \ C)) {\n        // Optional heuristic: look for immediate guard setting to zero;\
+  \ we can't map to a var here\n        if (!immediateIfGuardSetsVarZero(S, nullptr,\
+  \ C))\n          reportUnderflow(S, C);\n      }\n    }\n  }\n\n  // Case C: Detect\
+  \ dangerous subtract: Y = Y - X\n  if (BO && isAssignWithMinusOnUnsigned(BO, LReg,\
+  \ C)) {\n    const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n    const auto\
+  \ *RBO = dyn_cast<BinaryOperator>(RHS);\n    if (RBO && RBO->getOpcode() == BO_Sub)\
+  \ {\n      const Expr *SubRHS = RBO->getRHS();\n      if (const MemRegion *RHSReg\
+  \ = getRegionIfVarOrField(SubRHS, C)) {\n        ProgramStateRef State = C.getState();\n\
+  \        if (State->contains<SuspiciousVars>(RHSReg)) {\n          bool Guarded\
+  \ = State->contains<GuardedVars>(RHSReg);\n          bool LocalGuard = immediateIfGuardSetsVarZero(S,\
+  \ RHSReg, C);\n          if (!Guarded && !LocalGuard) {\n            reportUnderflow(S,\
+  \ C);\n          }\n        }\n      } else if (isSuspiciousMinus(SubRHS, C)) {\n\
+  \        if (!immediateIfGuardSetsVarZero(S, nullptr, C))\n          reportUnderflow(S,\
+  \ C);\n      }\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkBranchCondition(const\
+  \ Stmt *Condition, CheckerContext &C) const {\n  const Expr *CondE = dyn_cast_or_null<Expr>(Condition);\n\
+  \  if (!CondE) return;\n\n  ProgramStateRef State = C.getState();\n\n  // Scan condition\
+  \ for GE/GT comparisons involving suspicious vars and mark as guarded.\n  SmallVector<const\
+  \ Stmt *, 8> Worklist;\n  Worklist.push_back(CondE);\n  while (!Worklist.empty())\
+  \ {\n    const Stmt *Cur = Worklist.pop_back_val();\n    if (const auto *BE = dyn_cast<BinaryOperator>(Cur))\
+  \ {\n      BinaryOperator::Opcode Op = BE->getOpcode();\n      if (Op == BO_GE ||\
+  \ Op == BO_GT) {\n        const MemRegion *L = getRegionIfVarOrField(BE->getLHS(),\
+  \ C);\n        const MemRegion *R = getRegionIfVarOrField(BE->getRHS(), C);\n  \
+  \      if (L && State->contains<SuspiciousVars>(L))\n          State = State->add<GuardedVars>(L);\n\
+  \        if (R && State->contains<SuspiciousVars>(R))\n          State = State->add<GuardedVars>(R);\n\
+  \      }\n    }\n    for (const Stmt *Child : Cur->children()) {\n      if (Child)\
+  \ Worklist.push_back(Child);\n    }\n  }\n\n  C.addTransition(State);\n}\n\n} //\
+  \ end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects subtracting (avail - round_up(...)) from an unsigned length without\
+  \ guard, which may underflow\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

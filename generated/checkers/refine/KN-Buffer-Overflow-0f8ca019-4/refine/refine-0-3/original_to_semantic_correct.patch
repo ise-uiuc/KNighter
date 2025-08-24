@@ -1,0 +1,94 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -53,8 +53,6 @@ }
+
+ // A single place to decide whether this ASE is a known false positive.
+-// Currently filters macro-originated subscripts, which covers the reported case
+-// (e.g., IF_ISSET-style bitset helpers).
+ static bool isFalsePositive(const ArraySubscriptExpr *ASE) {
+   if (!ASE) return false;
+   // If either the subscript expression itself, its base, or its index come from
+@@ -76,10 +74,12 @@
+ private:
+   // Extract loop index variable and bounds from a ForStmt.
+-  // Returns true on success and sets IVar, LB, UBExclusive.
++  // Returns true on success and sets IVar, LB, UBExclusive, CondOp, RHSValue.
+   static bool getLoopIndexAndBounds(const ForStmt *FS, const ASTContext &Ctx,
+                                     const VarDecl *&IVar, llvm::APSInt &LB,
+-                                    llvm::APSInt &UBExclusive);
++                                    llvm::APSInt &UBExclusive,
++                                    BinaryOperator::Opcode &CondOpOut,
++                                    llvm::APSInt &RHSValueOut);
+
+   // Process a single ForStmt: find array subscripts using IVar and check against Cap.
+   void processForStmt(const ForStmt *FS, const ASTContext &Ctx, BugReporter &BR) const;
+@@ -340,8 +340,11 @@
+ bool SAGenTestChecker::getLoopIndexAndBounds(const ForStmt *FS, const ASTContext &Ctx,
+                                              const VarDecl *&IVar, llvm::APSInt &LB,
+-                                             llvm::APSInt &UBExclusive) {
++                                             llvm::APSInt &UBExclusive,
++                                             BinaryOperator::Opcode &CondOpOut,
++                                             llvm::APSInt &RHSValueOut) {
+   IVar = nullptr;
++  CondOpOut = BO_Comma; // sentinel
+
+   // Parse init: either "int i = 0" or "i = 0"
+   const Stmt *Init = FS->getInit();
+@@ -398,6 +401,8 @@
+   LB = InitVal;
+   IVar = IdxVar;
++  CondOpOut = Op;
++  RHSValueOut = RHSVal;
+   return true;
+ }
+
+@@ -420,24 +425,28 @@
+ void SAGenTestChecker::processForStmt(const ForStmt *FS, const ASTContext &Ctx, BugReporter &BR) const {
+   const VarDecl *IVar = nullptr;
+-  llvm::APSInt LB, UBEx;
+-  if (!getLoopIndexAndBounds(FS, Ctx, IVar, LB, UBEx))
++  llvm::APSInt LB, UBEx, RHSVal;
++  BinaryOperator::Opcode CondOp;
++  if (!getLoopIndexAndBounds(FS, Ctx, IVar, LB, UBEx, CondOp, RHSVal))
+     return;
+
+   // Only consider LB == 0 (already filtered)
+   uint64_t UBExclusive = UBEx.getLimitedValue();
++  uint64_t RHSNumeric = RHSVal.getLimitedValue();
+
+   // Traverse the loop body to find array subscripts using IVar.
+   struct ASEVisitor : public RecursiveASTVisitor<ASEVisitor> {
+     const ASTContext &Ctx;
+     const VarDecl *IVar;
+     uint64_t UBExclusive;
++    uint64_t RHSNumeric;
++    BinaryOperator::Opcode CondOp;
+     BugReporter &BR;
+     const SAGenTestChecker *Checker;
+
+-    ASEVisitor(const ASTContext &C, const VarDecl *V, uint64_t UB, BugReporter &B,
+-               const SAGenTestChecker *Ch)
+-      : Ctx(C), IVar(V), UBExclusive(UB), BR(B), Checker(Ch) {}
++    ASEVisitor(const ASTContext &C, const VarDecl *V, uint64_t UB, uint64_t RHSN,
++               BinaryOperator::Opcode Op, BugReporter &B, const SAGenTestChecker *Ch)
++      : Ctx(C), IVar(V), UBExclusive(UB), RHSNumeric(RHSN), CondOp(Op), BR(B), Checker(Ch) {}
+
+     bool VisitArraySubscriptExpr(ArraySubscriptExpr *ASE) {
+       const Expr *Idx = ASE->getIdx();
+@@ -459,6 +468,11 @@       if (isGuardedBeforeUse(Ctx, ASE, IVar, Cap))
+         return true;
+
++      // Suppress off-by-one "<=" cases where RHS equals the array's capacity.
++      // This is not the targeted "mismatched macro sizes" pattern.
++      if (CondOp == BO_LE && RHSNumeric == Cap)
++        return true;
++
+       if (UBExclusive > Cap) {
+         Checker->reportIssue(ASE, IVar, UBExclusive, Cap, BR, Ctx);
+       }
+@@ -468,7 +482,7 @@   };
+
+   if (const Stmt *Body = FS->getBody()) {
+-    ASEVisitor V(Ctx, IVar, UBExclusive, BR, this);
++    ASEVisitor V(Ctx, IVar, UBExclusive, RHSNumeric, CondOp, BR, this);
+     V.TraverseStmt(const_cast<Stmt*>(Body));
+   }
+ }

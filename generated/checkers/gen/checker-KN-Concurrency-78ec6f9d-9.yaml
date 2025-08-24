@@ -1,0 +1,562 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 78ec6f9df6642418411c534683da6133e0962ec7
+commit_type: Concurrency
+index: 9
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/ParentMapContext.h\"\n#include \"clang/Lex/Lexer.h\"\n#include <set>\n\
+  #include <vector>\n#include <string>\n#include <map>\n#include <utility>\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// No custom\
+  \ program states are required.\n\nnamespace {\n\nclass SAGenTestChecker : public\
+  \ Checker< check::ASTCodeBody, check::EndAnalysis > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   // A key identifying a specific field in a pointed-to record type.\n\
+  \   struct FieldKey {\n     std::string RecName;\n     std::string FieldName;\n\
+  \     bool operator<(const FieldKey &Other) const {\n       if (RecName != Other.RecName)\
+  \ return RecName < Other.RecName;\n       return FieldName < Other.FieldName;\n\
+  \     }\n   };\n\n   // Hazards collected at this_cpu_ptr sites: non-atomic RMW\
+  \ on a per-cpu field.\n   struct HazardRec {\n     FieldKey Key;\n     const MemberExpr\
+  \ *ME; // for report location\n     std::string Msg;\n   };\n\n   // Accumulated\
+  \ across the TU:\n   // Set of fields that were accessed via per_cpu_ptr(..., cpu)\
+  \ without READ/WRITE_ONCE.\n   std::set<FieldKey> RemotePlainFieldSet;\n   // Collected\
+  \ local hazards for all functions; reported at EndAnalysis when RemotePlainFieldSet\
+  \ intersects.\n   std::vector<HazardRec> LocalRMWHazards;\n\npublic:\n   SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Per-CPU data race\", \"Concurrency\")) {}\n\n   void\
+  \ checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR) const;\n\
+  \   void checkEndAnalysis(ExplodedGraph &G, BugReporter &BR, ExprEngine &Eng) const;\n\
+  \nprivate:\n   // Helper: get source text of an expression\n   static StringRef\
+  \ getExprText(const Expr *E, ASTContext &Ctx) {\n     if (!E) return StringRef();\n\
+  \     const SourceManager &SM = Ctx.getSourceManager();\n     const LangOptions\
+  \ &LangOpts = Ctx.getLangOpts();\n     CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \     return Lexer::getSourceText(Range, SM, LangOpts);\n   }\n\n   // Helper: check\
+  \ if expression text contains a given name (macro/function)\n   static bool ExprHasNameAST(const\
+  \ Expr *E, StringRef Name, ASTContext &Ctx) {\n     StringRef Text = getExprText(E,\
+  \ Ctx);\n     return Text.contains(Name);\n   }\n\n   // Helper: is a call expression\
+  \ named per_cpu_ptr? Return CE and NumArgs if yes.\n   static bool isPerCpuPtrCall(const\
+  \ Expr *E, unsigned &NumArgs, ASTContext &Ctx, const CallExpr *&OutCE) {\n     const\
+  \ Expr *EI = E;\n     if (!EI) return false;\n     EI = EI->IgnoreParenImpCasts();\n\
+  \     const CallExpr *CE = dyn_cast<CallExpr>(EI);\n     if (!CE) return false;\n\
+  \     if (!ExprHasNameAST(CE->getCallee(), \"per_cpu_ptr\", Ctx) &&\n         !ExprHasNameAST(CE,\
+  \ \"per_cpu_ptr\", Ctx))\n       return false;\n     NumArgs = CE->getNumArgs();\n\
+  \     OutCE = CE;\n     return true;\n   }\n\n   // Helper: is a call expression\
+  \ named this_cpu_ptr?\n   static bool isThisCpuPtrCall(const Expr *E, ASTContext\
+  \ &Ctx, const CallExpr *&OutCE) {\n     const Expr *EI = E;\n     if (!EI) return\
+  \ false;\n     EI = EI->IgnoreParenImpCasts();\n     const CallExpr *CE = dyn_cast<CallExpr>(EI);\n\
+  \     if (!CE) return false;\n     if (!ExprHasNameAST(CE->getCallee(), \"this_cpu_ptr\"\
+  , Ctx) &&\n         !ExprHasNameAST(CE, \"this_cpu_ptr\", Ctx))\n       return false;\n\
+  \     OutCE = CE;\n     return true;\n   }\n\n   // Helper: climb parents to find\
+  \ enclosing CallExpr; check if it's READ_ONCE/WRITE_ONCE context\n   static bool\
+  \ isReadOrWriteOnceContext(const Expr *E, ASTContext &Ctx) {\n     if (!E) return\
+  \ false;\n     DynTypedNode N = DynTypedNode::create(*E);\n     // Walk parents\
+  \ up until we find a CallExpr or leave statement tree.\n     while (true) {\n  \
+  \     auto Parents = Ctx.getParents(N);\n       if (Parents.empty())\n         break;\n\
+  \n       bool Moved = false;\n       for (const auto &P : Parents) {\n         if\
+  \ (const CallExpr *CE = P.get<CallExpr>()) {\n           // Examine callee and call\
+  \ text for macros READ_ONCE/WRITE_ONCE\n           if (ExprHasNameAST(CE, \"READ_ONCE\"\
+  , Ctx) || ExprHasNameAST(CE, \"WRITE_ONCE\", Ctx))\n             return true;\n\
+  \           // Not a protect context; but stop climbing at the call boundary.\n\
+  \           return false;\n         }\n       }\n\n       // If not found, continue\
+  \ climbing via a Stmt parent if available.\n       for (const auto &P : Parents)\
+  \ {\n         if (const Stmt *PS = P.get<Stmt>()) {\n           N = DynTypedNode::create(*PS);\n\
+  \           Moved = true;\n           break;\n         }\n       }\n       if (!Moved)\n\
+  \         break;\n     }\n     return false;\n   }\n\n   // Helper: obtain the VarDecl\
+  \ serving as base of a MemberExpr, if it is a DeclRefExpr\n   static const VarDecl*\
+  \ getBaseVar(const Expr *Base) {\n     if (!Base) return nullptr;\n     const Expr\
+  \ *B = Base->IgnoreParenImpCasts();\n     if (const auto *DRE = dyn_cast<DeclRefExpr>(B))\
+  \ {\n       return dyn_cast<VarDecl>(DRE->getDecl());\n     }\n     // Also handle\
+  \ (*var).field pattern, though uncommon in our target\n     if (const auto *UO =\
+  \ dyn_cast<UnaryOperator>(B)) {\n       if (UO->getOpcode() == UO_Deref) {\n   \
+  \      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();\n         if (const\
+  \ auto *DRE2 = dyn_cast<DeclRefExpr>(Sub))\n           return dyn_cast<VarDecl>(DRE2->getDecl());\n\
+  \       }\n     }\n     return nullptr;\n   }\n\n   // Helper: get pointee record\
+  \ type name from a QualType (expecting T* to a record)\n   static std::string getRecordTypeName(QualType\
+  \ QT) {\n     if (QT.isNull()) return std::string();\n     QualType Pointee = QT->getPointeeType();\n\
+  \     if (Pointee.isNull()) return std::string();\n     if (const RecordType *RT\
+  \ = Pointee->getAs<RecordType>()) {\n       const RecordDecl *RD = RT->getDecl();\n\
+  \       if (const auto *CRD = dyn_cast<CXXRecordDecl>(RD)) {\n         std::string\
+  \ N = CRD->getNameAsString();\n         if (!N.empty()) return N;\n         return\
+  \ CRD->getQualifiedNameAsString();\n       } else if (RD) {\n         std::string\
+  \ N = RD->getNameAsString();\n         if (!N.empty()) return N;\n         return\
+  \ RD->getQualifiedNameAsString();\n       }\n     }\n     return std::string();\n\
+  \   }\n\n   // Helper: build FieldKey from a pointer-typed expression and member\n\
+  \   static bool makeFieldKeyFromBaseExpr(const Expr *Base, const MemberExpr *ME,\
+  \ FieldKey &OutKey) {\n     if (!Base || !ME) return false;\n     std::string Rec\
+  \ = getRecordTypeName(Base->getType());\n     if (Rec.empty()) return false;\n \
+  \    const ValueDecl *MD = ME->getMemberDecl();\n     if (!MD) return false;\n \
+  \    std::string Field = MD->getNameAsString();\n     if (Field.empty()) return\
+  \ false;\n     OutKey = FieldKey{Rec, Field};\n     return true;\n   }\n\n   //\
+  \ Helper: compare two expr pointers after stripping parens/casts\n   static bool\
+  \ isSameExpr(const Expr *A, const Expr *B) {\n     if (!A || !B) return false;\n\
+  \     A = A->IgnoreParenCasts();\n     B = B->IgnoreParenCasts();\n     return A\
+  \ == B;\n   }\n\n   // Helper: check if the MemberExpr is used in a RMW context\
+  \ (+=, -=, ++, --)\n   static bool isRMWOnMember(const MemberExpr *ME, ASTContext\
+  \ &Ctx) {\n     if (!ME) return false;\n     // Look for CompoundAssignOperator\
+  \ ancestor\n     DynTypedNode N = DynTypedNode::create(*ME);\n     while (true)\
+  \ {\n       auto Parents = Ctx.getParents(N);\n       if (Parents.empty())\n   \
+  \      break;\n       bool Moved = false;\n       for (const auto &P : Parents)\
+  \ {\n         if (const auto *CAO = P.get<CompoundAssignOperator>()) {\n       \
+  \    const Expr *LHS = CAO->getLHS();\n           if (isSameExpr(LHS, ME))\n   \
+  \          return true;\n           // Even if not same, stop here because the operator\
+  \ boundary reached.\n           return false;\n         }\n         if (const auto\
+  \ *UO = P.get<UnaryOperator>()) {\n           UnaryOperatorKind Op = UO->getOpcode();\n\
+  \           if (Op == UO_PostInc || Op == UO_PostDec || Op == UO_PreInc || Op ==\
+  \ UO_PreDec) {\n             const Expr *Sub = UO->getSubExpr();\n             if\
+  \ (isSameExpr(Sub, ME))\n               return true;\n             return false;\n\
+  \           }\n         }\n       }\n       // Continue climbing through stmt parents\n\
+  \       for (const auto &P : Parents) {\n         if (const Stmt *PS = P.get<Stmt>())\
+  \ {\n           N = DynTypedNode::create(*PS);\n           Moved = true;\n     \
+  \      break;\n         }\n       }\n       if (!Moved)\n         break;\n     }\n\
+  \     return false;\n   }\n\n   // Per-function visitor\n   class FuncVisitor :\
+  \ public RecursiveASTVisitor<FuncVisitor> {\n     ASTContext &Ctx;\n     const SAGenTestChecker\
+  \ *Chk;\n     // Map variables initialized or assigned from per_cpu_ptr/this_cpu_ptr\n\
+  \     enum VarKind { VK_Unknown = 0, VK_Remote, VK_ThisCPU };\n     llvm::DenseMap<const\
+  \ VarDecl*, VarKind> VarKinds;\n\n   public:\n     FuncVisitor(ASTContext &C, const\
+  \ SAGenTestChecker *Checker) : Ctx(C), Chk(Checker) {}\n\n     // Access to checker\
+  \ accumulators\n     std::set<FieldKey> &RemotePlainFieldSet() const {\n       return\
+  \ const_cast<SAGenTestChecker*>(Chk)->RemotePlainFieldSet;\n     }\n     std::vector<HazardRec>\
+  \ &LocalRMWHazards() const {\n       return const_cast<SAGenTestChecker*>(Chk)->LocalRMWHazards;\n\
+  \     }\n\n     bool VisitVarDecl(VarDecl *VD) {\n       if (!VD || !VD->hasInit())\n\
+  \         return true;\n       const Expr *Init = VD->getInit();\n       unsigned\
+  \ NumArgs = 0;\n       const CallExpr *CE = nullptr;\n       if (isPerCpuPtrCall(Init,\
+  \ NumArgs, Ctx, CE) && NumArgs >= 2) {\n         VarKinds[VD] = VK_Remote;\n   \
+  \    } else if (isThisCpuPtrCall(Init, Ctx, CE)) {\n         VarKinds[VD] = VK_ThisCPU;\n\
+  \       }\n       return true;\n     }\n\n     bool VisitBinaryOperator(BinaryOperator\
+  \ *BO) {\n       if (!BO || !BO->isAssignmentOp())\n         return true;\n\n  \
+  \     const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n       const auto *LHS_DRE\
+  \ = dyn_cast<DeclRefExpr>(LHS);\n       if (!LHS_DRE) return true;\n       const\
+  \ auto *VD = dyn_cast<VarDecl>(LHS_DRE->getDecl());\n       if (!VD) return true;\n\
+  \n       const Expr *RHS = BO->getRHS();\n       unsigned NumArgs = 0;\n       const\
+  \ CallExpr *CE = nullptr;\n       if (isPerCpuPtrCall(RHS, NumArgs, Ctx, CE) &&\
+  \ NumArgs >= 2) {\n         VarKinds[VD] = VK_Remote;\n       } else if (isThisCpuPtrCall(RHS,\
+  \ Ctx, CE)) {\n         VarKinds[VD] = VK_ThisCPU;\n       }\n       return true;\n\
+  \     }\n\n     bool VisitMemberExpr(MemberExpr *ME) {\n       if (!ME) return true;\n\
+  \n       // Check if protected by READ_ONCE/WRITE_ONCE\n       if (isReadOrWriteOnceContext(ME,\
+  \ Ctx))\n         return true;\n\n       // Determine base kind: Remote via per_cpu_ptr(...,\
+  \ cpu) or local via this_cpu_ptr(...)\n       VarKind BaseK = VK_Unknown;\n    \
+  \   const Expr *Base = ME->getBase();\n       const VarDecl *BaseVD = getBaseVar(Base);\n\
+  \n       if (BaseVD) {\n         auto It = VarKinds.find(BaseVD);\n         if (It\
+  \ != VarKinds.end())\n           BaseK = It->second;\n       } else {\n        \
+  \ // Handle direct call bases like per_cpu_ptr(...)->field\n         unsigned NumArgs\
+  \ = 0;\n         const CallExpr *CE = nullptr;\n         if (isPerCpuPtrCall(Base,\
+  \ NumArgs, Ctx, CE) && NumArgs >= 2) {\n           BaseK = VK_Remote;\n        \
+  \ } else if (isThisCpuPtrCall(Base, Ctx, CE)) {\n           BaseK = VK_ThisCPU;\n\
+  \         }\n       }\n\n       if (BaseK == VK_Unknown)\n         return true;\n\
+  \n       FieldKey Key;\n       if (!makeFieldKeyFromBaseExpr(Base, ME, Key))\n \
+  \        return true;\n\n       if (BaseK == VK_Remote) {\n         // Cross-CPU\
+  \ plain access (not READ/WRITE_ONCE) -> remember this field\n         RemotePlainFieldSet().insert(Key);\n\
+  \       } else if (BaseK == VK_ThisCPU) {\n         // Only interested in non-atomic\
+  \ RMW on local per-CPU field\n         if (isRMWOnMember(ME, Ctx)) {\n         \
+  \  HazardRec H { Key, ME, \"Non-atomic RMW on per-CPU field also accessed cross-CPU\"\
+  \ };\n           LocalRMWHazards().push_back(H);\n         }\n       }\n\n     \
+  \  return true;\n     }\n   };\n\n}; // end of checker class\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  if (!D) return;\n \
+  \ const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD) return;\n  if\
+  \ (!FD->hasBody()) return;\n\n  ASTContext &Ctx = Mgr.getASTContext();\n  Stmt *Body\
+  \ = FD->getBody();\n  if (!Body) return;\n\n  FuncVisitor V(Ctx, this);\n  V.TraverseStmt(Body);\n\
+  }\n\nvoid SAGenTestChecker::checkEndAnalysis(ExplodedGraph &G, BugReporter &BR,\
+  \ ExprEngine &Eng) const {\n  if (LocalRMWHazards.empty() || RemotePlainFieldSet.empty())\n\
+  \    return;\n\n  for (const auto &H : LocalRMWHazards) {\n    if (RemotePlainFieldSet.find(H.Key)\
+  \ != RemotePlainFieldSet.end()) {\n      // Report\n      const MemberExpr *ME =\
+  \ H.ME;\n      if (!ME) continue;\n\n      std::string Msg = \"Racy per-CPU field:\
+  \ non-atomic RMW and cross-CPU plain access.\";\n      PathDiagnosticLocation Loc\
+  \ = PathDiagnosticLocation::createBegin(ME, BR.getSourceManager(), nullptr);\n \
+  \     auto Report = std::make_unique<BasicBugReport>(*BT, Msg, Loc);\n      Report->addRange(ME->getSourceRange());\n\
+  \      BR.emitReport(std::move(Report));\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects racy per-CPU fields: non-atomic\
+  \ this_cpu_ptr RMW combined with plain cross-CPU per_cpu_ptr access without READ/WRITE_ONCE\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nmemcg: fix data-race KCSAN bug in rstats\n\nA data-race\
+  \ issue in memcg rstat occurs when two distinct code paths\naccess the same 4-byte\
+  \ region concurrently.  KCSAN detection triggers the\nfollowing BUG as a result.\n\
+  \n\tBUG: KCSAN: data-race in __count_memcg_events / mem_cgroup_css_rstat_flush\n\
+  \n\twrite to 0xffffe8ffff98e300 of 4 bytes by task 5274 on cpu 17:\n\tmem_cgroup_css_rstat_flush\
+  \ (mm/memcontrol.c:5850)\n\tcgroup_rstat_flush_locked (kernel/cgroup/rstat.c:243\
+  \ (discriminator 7))\n\tcgroup_rstat_flush (./include/linux/spinlock.h:401 kernel/cgroup/rstat.c:278)\n\
+  \tmem_cgroup_flush_stats.part.0 (mm/memcontrol.c:767)\n\tmemory_numa_stat_show (mm/memcontrol.c:6911)\n\
+  <snip>\n\n\tread to 0xffffe8ffff98e300 of 4 bytes by task 410848 on cpu 27:\n\t\
+  __count_memcg_events (mm/memcontrol.c:725 mm/memcontrol.c:962)\n\tcount_memcg_event_mm.part.0\
+  \ (./include/linux/memcontrol.h:1097 ./include/linux/memcontrol.h:1120)\n\thandle_mm_fault\
+  \ (mm/memory.c:5483 mm/memory.c:5622)\n<snip>\n\n\tvalue changed: 0x00000029 ->\
+  \ 0x00000000\n\nThe race occurs because two code paths access the same \"stats_updates\"\
+  \nlocation.  Although \"stats_updates\" is a per-CPU variable, it is remotely\n\
+  accessed by another CPU at\ncgroup_rstat_flush_locked()->mem_cgroup_css_rstat_flush(),\
+  \ leading to the\ndata race mentioned.\n\nConsidering that memcg_rstat_updated()\
+  \ is in the hot code path, adding a\nlock to protect it may not be desirable, especially\
+  \ since this variable\npertains solely to statistics.\n\nTherefore, annotating accesses\
+  \ to stats_updates with READ/WRITE_ONCE() can\nprevent KCSAN splats and potential\
+  \ partial reads/writes.\n\nLink: https://lkml.kernel.org/r/20240424125940.2410718-1-leitao@debian.org\n\
+  Fixes: 9cee7e8ef3e3 (\"mm: memcg: optimize parent iteration in memcg_rstat_updated()\"\
+  )\nSigned-off-by: Breno Leitao <leitao@debian.org>\nSuggested-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Acked-by: Johannes Weiner <hannes@cmpxchg.org>\nAcked-by: Shakeel Butt <shakeel.butt@linux.dev>\n\
+  Reviewed-by: Yosry Ahmed <yosryahmed@google.com>\nCc: Michal Hocko <mhocko@suse.com>\n\
+  Cc: Roman Gushchin <roman.gushchin@linux.dev>\nCc: Muchun Song <songmuchun@bytedance.com>\n\
+  Signed-off-by: Andrew Morton <akpm@linux-foundation.org>\n\n## Buggy Code\n\n```c\n\
+  // Function: memcg_rstat_updated in mm/memcontrol.c\nstatic inline void memcg_rstat_updated(struct\
+  \ mem_cgroup *memcg, int val)\n{\n\tstruct memcg_vmstats_percpu *statc;\n\tint cpu\
+  \ = smp_processor_id();\n\n\tif (!val)\n\t\treturn;\n\n\tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n\tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n\tfor (; statc; statc =\
+  \ statc->parent) {\n\t\tstatc->stats_updates += abs(val);\n\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n\t\t\tcontinue;\n\n\t\t/*\n\t\t * If @memcg is already\
+  \ flush-able, increasing stats_updates is\n\t\t * redundant. Avoid the overhead\
+  \ of the atomic update.\n\t\t */\n\t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  \t\t\tatomic64_add(statc->stats_updates,\n\t\t\t\t     &statc->vmstats->stats_updates);\n\
+  \t\tstatc->stats_updates = 0;\n\t}\n}\n```\n\n```c\n// Function: mem_cgroup_css_rstat_flush\
+  \ in mm/memcontrol.c\nstatic void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state\
+  \ *css, int cpu)\n{\n\tstruct mem_cgroup *memcg = mem_cgroup_from_css(css);\n\t\
+  struct mem_cgroup *parent = parent_mem_cgroup(memcg);\n\tstruct memcg_vmstats_percpu\
+  \ *statc;\n\tlong delta, delta_cpu, v;\n\tint i, nid;\n\n\tstatc = per_cpu_ptr(memcg->vmstats_percpu,\
+  \ cpu);\n\n\tfor (i = 0; i < MEMCG_NR_STAT; i++) {\n\t\t/*\n\t\t * Collect the aggregated\
+  \ propagation counts of groups\n\t\t * below us. We're in a per-cpu loop here and\
+  \ this is\n\t\t * a global counter, so the first cycle will get them.\n\t\t */\n\
+  \t\tdelta = memcg->vmstats->state_pending[i];\n\t\tif (delta)\n\t\t\tmemcg->vmstats->state_pending[i]\
+  \ = 0;\n\n\t\t/* Add CPU changes on this level since the last flush */\n\t\tdelta_cpu\
+  \ = 0;\n\t\tv = READ_ONCE(statc->state[i]);\n\t\tif (v != statc->state_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->state_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\t\
+  \tstatc->state_prev[i] = v;\n\t\t}\n\n\t\t/* Aggregate counts on this level and\
+  \ propagate upwards */\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->state_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->state[i] += delta;\n\t\
+  \t\tif (parent)\n\t\t\t\tparent->vmstats->state_pending[i] += delta;\n\t\t}\n\t\
+  }\n\n\tfor (i = 0; i < NR_MEMCG_EVENTS; i++) {\n\t\tdelta = memcg->vmstats->events_pending[i];\n\
+  \t\tif (delta)\n\t\t\tmemcg->vmstats->events_pending[i] = 0;\n\n\t\tdelta_cpu =\
+  \ 0;\n\t\tv = READ_ONCE(statc->events[i]);\n\t\tif (v != statc->events_prev[i])\
+  \ {\n\t\t\tdelta_cpu = v - statc->events_prev[i];\n\t\t\tdelta += delta_cpu;\n\t\
+  \t\tstatc->events_prev[i] = v;\n\t\t}\n\n\t\tif (delta_cpu)\n\t\t\tmemcg->vmstats->events_local[i]\
+  \ += delta_cpu;\n\n\t\tif (delta) {\n\t\t\tmemcg->vmstats->events[i] += delta;\n\
+  \t\t\tif (parent)\n\t\t\t\tparent->vmstats->events_pending[i] += delta;\n\t\t}\n\
+  \t}\n\n\tfor_each_node_state(nid, N_MEMORY) {\n\t\tstruct mem_cgroup_per_node *pn\
+  \ = memcg->nodeinfo[nid];\n\t\tstruct mem_cgroup_per_node *ppn = NULL;\n\t\tstruct\
+  \ lruvec_stats_percpu *lstatc;\n\n\t\tif (parent)\n\t\t\tppn = parent->nodeinfo[nid];\n\
+  \n\t\tlstatc = per_cpu_ptr(pn->lruvec_stats_percpu, cpu);\n\n\t\tfor (i = 0; i <\
+  \ NR_VM_NODE_STAT_ITEMS; i++) {\n\t\t\tdelta = pn->lruvec_stats.state_pending[i];\n\
+  \t\t\tif (delta)\n\t\t\t\tpn->lruvec_stats.state_pending[i] = 0;\n\n\t\t\tdelta_cpu\
+  \ = 0;\n\t\t\tv = READ_ONCE(lstatc->state[i]);\n\t\t\tif (v != lstatc->state_prev[i])\
+  \ {\n\t\t\t\tdelta_cpu = v - lstatc->state_prev[i];\n\t\t\t\tdelta += delta_cpu;\n\
+  \t\t\t\tlstatc->state_prev[i] = v;\n\t\t\t}\n\n\t\t\tif (delta_cpu)\n\t\t\t\tpn->lruvec_stats.state_local[i]\
+  \ += delta_cpu;\n\n\t\t\tif (delta) {\n\t\t\t\tpn->lruvec_stats.state[i] += delta;\n\
+  \t\t\t\tif (ppn)\n\t\t\t\t\tppn->lruvec_stats.state_pending[i] += delta;\n\t\t\t\
+  }\n\t\t}\n\t}\n\tstatc->stats_updates = 0;\n\t/* We are in a per-cpu loop here,\
+  \ only do the atomic write once */\n\tif (atomic64_read(&memcg->vmstats->stats_updates))\n\
+  \t\tatomic64_set(&memcg->vmstats->stats_updates, 0);\n}\n```\n\n## Bug Fix Patch\n\
+  \n```diff\ndiff --git a/mm/memcontrol.c b/mm/memcontrol.c\nindex 9095ab05d47a..a111e0d981ba\
+  \ 100644\n--- a/mm/memcontrol.c\n+++ b/mm/memcontrol.c\n@@ -715,6 +715,7 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n {\n \tstruct\
+  \ memcg_vmstats_percpu *statc;\n \tint cpu = smp_processor_id();\n+\tunsigned int\
+  \ stats_updates;\n \n \tif (!val)\n \t\treturn;\n@@ -722,8 +723,9 @@ static inline\
+  \ void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \tcgroup_rstat_updated(memcg->css.cgroup,\
+  \ cpu);\n \tstatc = this_cpu_ptr(memcg->vmstats_percpu);\n \tfor (; statc; statc\
+  \ = statc->parent) {\n-\t\tstatc->stats_updates += abs(val);\n-\t\tif (statc->stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n+\t\tstats_updates = READ_ONCE(statc->stats_updates) +\
+  \ abs(val);\n+\t\tWRITE_ONCE(statc->stats_updates, stats_updates);\n+\t\tif (stats_updates\
+  \ < MEMCG_CHARGE_BATCH)\n \t\t\tcontinue;\n \n \t\t/*\n@@ -731,9 +733,9 @@ static\
+  \ inline void memcg_rstat_updated(struct mem_cgroup *memcg, int val)\n \t\t * redundant.\
+  \ Avoid the overhead of the atomic update.\n \t\t */\n \t\tif (!memcg_vmstats_needs_flush(statc->vmstats))\n\
+  -\t\t\tatomic64_add(statc->stats_updates,\n+\t\t\tatomic64_add(stats_updates,\n\
+  \ \t\t\t\t     &statc->vmstats->stats_updates);\n-\t\tstatc->stats_updates = 0;\n\
+  +\t\tWRITE_ONCE(statc->stats_updates, 0);\n \t}\n }\n \n@@ -5887,7 +5889,7 @@ static\
+  \ void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)\n \t\
+  \t\t}\n \t\t}\n \t}\n-\tstatc->stats_updates = 0;\n+\tWRITE_ONCE(statc->stats_updates,\
+  \ 0);\n \t/* We are in a per-cpu loop here, only do the atomic write once */\n \t\
+  if (atomic64_read(&memcg->vmstats->stats_updates))\n \t\tatomic64_set(&memcg->vmstats->stats_updates,\
+  \ 0);\n```\n"
+pattern: '## Bug Pattern
+
+
+  Unprotected read/modify/write of a per-CPU field that is accessed from multiple
+  CPUs:
+
+  - One path does non-atomic increments on this_cpu_ptr(per-cpu) data (e.g., statc->stats_updates
+  += ...).
+
+  - Another path remotely reads/clears the same per-cpu field via per_cpu_ptr(...,
+  cpu) (e.g., statc->stats_updates = 0).
+
+  - Because the per-cpu variable is accessed cross-CPU without locks or atomic/READ_ONCE/WRITE_ONCE
+  annotations, concurrent accesses can race and cause torn or lost updates.
+
+
+  In short: plain loads/stores and RMW on a per-CPU counter that is also accessed
+  from other CPUs (remote per-cpu access) -> data race.'
+plan: "Plan\n\n1) Program state\n- No custom program state is required. This checker\
+  \ is an AST-level, cross-function pattern detector. We only need checker-internal\
+  \ containers to accumulate evidence across all functions in the TU and then report\
+  \ once we know both sides of the pattern exist.\n\n2) Data kept in the checker (member\
+  \ fields)\n- RemotePlainFieldSet: set of field keys that are accessed through per_cpu_ptr(...,\
+  \ cpu) without READ_ONCE/WRITE_ONCE.\n  - Each key is a pair: (PointeeRecordTypeName,\
+  \ FieldName).\n- LocalRMWHazards: vector of hazard records collected at this_cpu_ptr\
+  \ sites:\n  - Each hazard record stores:\n    - FieldKey (PointeeRecordTypeName,\
+  \ FieldName)\n    - const MemberExpr* ME (for location/range)\n    - A short message\
+  \ string for the report\n- A BugType instance: \u201CPer-CPU data race\u201D.\n\n\
+  3) Helper utilities to implement inside the checker\n- getRecordTypeName(QualType\
+  \ QT): return qualified name of the pointee record type; if QT is T*, get record\
+  \ name of T (use QT->getPointeeType()->getAsRecordDecl()).\n- makeFieldKey(const\
+  \ VarDecl *BaseVar, const MemberExpr *ME):\n  - Get pointee record type name from\
+  \ BaseVar->getType().\n  - Get field name from ME->getMemberDecl()->getNameAsString().\n\
+  - isCallNamed(const Expr *E, StringRef Name, CheckerContext &C):\n  - Use ExprHasName(E,\
+  \ Name, C) to check source text contains the macro/function name.\n- isPerCpuPtrCall(const\
+  \ Expr *E, unsigned &NumArgs, CheckerContext &C):\n  - If E->IgnoreImplicit() is\
+  \ CallExpr and ExprHasName(E, \"per_cpu_ptr\", C) is true, set NumArgs = CE->getNumArgs(),\
+  \ return true.\n- isThisCpuPtrCall(const Expr *E, CheckerContext &C):\n  - If E->IgnoreImplicit()\
+  \ is CallExpr and ExprHasName(E, \"this_cpu_ptr\", C) is true, return true.\n- isReadOrWriteOnceContext(const\
+  \ Expr *E, CheckerContext &C):\n  - Walk up parents from E using findSpecificTypeInParents<CallExpr>.\
+  \ If found, and callee text contains \"READ_ONCE\" or \"WRITE_ONCE\" via ExprHasName,\
+  \ return true. Else false.\n- getBaseVar(const Expr *Base):\n  - If Base->IgnoreParenImpCasts()\
+  \ is DeclRefExpr, return its VarDecl*. If it\u2019s a UnaryOperator (deref) of DeclRefExpr,\
+  \ unwrap and return the VarDecl*. If it\u2019s an implicit temporary, return nullptr.\n\
+  - isRMWOnMember(const MemberExpr *ME, CheckerContext &C):\n  - Check parents:\n\
+  \    - If parent is CompoundAssignOperator (+=, -=, |=, &=, ^=, <<=, >>=), and its\
+  \ LHS contains ME (compare pointer after IgnoreParenImpCasts), return true.\n  \
+  \  - If parent is UnaryOperator (pre/post ++/--), return true.\n  - Otherwise false.\n\
+  \n4) Per-function local analysis (inside checkASTCodeBody)\nWe will scan each function\
+  \ body once, building a local map of variables that originate from per_cpu_ptr or\
+  \ this_cpu_ptr. Then we will inspect all member accesses through those variables\
+  \ to classify accesses and collect hazards. Note: no path-sensitivity is needed.\n\
+  \nData (function-scoped):\n- VarKindMap: map<const VarDecl*, enum { Unknown, RemoteCPU,\
+  \ ThisCPU }>\n\nSteps:\n- Build VarKindMap by scanning:\n  - Variable definitions\
+  \ with initializers: for each DeclStmt:\n    - For each VarDecl with an initializer\
+  \ RHS:\n      - If RHS is a CallExpr and isPerCpuPtrCall(RHS, NumArgs, C) is true\
+  \ and NumArgs >= 2, set VarKindMap[VD] = RemoteCPU.\n      - Else if RHS is a CallExpr\
+  \ and isThisCpuPtrCall(RHS, C), set VarKindMap[VD] = ThisCPU.\n  - Simple assignments:\
+  \ scan BinaryOperator \u201C=\u201D:\n    - If LHS is a DeclRefExpr to VarDecl*\
+  \ V, and RHS is a CallExpr:\n      - If per_cpu_ptr(...) with 2 args => VarKindMap[V]\
+  \ = RemoteCPU.\n      - If this_cpu_ptr(...) => VarKindMap[V] = ThisCPU.\n- Also\
+  \ handle direct use without a temp:\n  - When we later visit a MemberExpr, if its\
+  \ base is directly a CallExpr to per_cpu_ptr or this_cpu_ptr, we treat it as RemoteCPU\
+  \ or ThisCPU respectively even if no VarDecl was recorded.\n- MemberExpr inspection:\n\
+  \  - For every MemberExpr in the function body:\n    - Determine the base \u201C\
+  source\u201D:\n      - First, try to retrieve a VarDecl via getBaseVar(ME->getBase()).\n\
+  \      - If no VarDecl, check if base is a CallExpr:\n        - If per_cpu_ptr(...,\
+  \ 2 args) => treat as RemoteCPU.\n        - If this_cpu_ptr(...) => treat as ThisCPU.\n\
+  \      - Otherwise skip.\n    - Determine whether the access is within READ_ONCE/WRITE_ONCE\
+  \ using isReadOrWriteOnceContext(ME, C). If true, skip (safe).\n    - Build FieldKey\
+  \ via makeFieldKey(BaseVarOrSynthetic, ME). For the synthetic case (base is a CallExpr),\
+  \ use the pointee type of the CallExpr\u2019s type.\n    - Classify the access:\n\
+  \      - RemoteCPU member access (not READ/WRITE_ONCE): record RemotePlainFieldSet.insert(FieldKey).\n\
+  \      - ThisCPU member access: if isRMWOnMember(ME, C) is true (and not READ/WRITE_ONCE),\
+  \ record hazard: LocalRMWHazards.emplace_back(ME, FieldKey, \"Non-atomic RMW on\
+  \ per-CPU field also accessed cross-CPU\").\n    - Ignore ThisCPU plain read/write\
+  \ that are not RMW, to keep the checker focused on the target pattern and reduce\
+  \ false positives.\n- Note: We do not attempt alias analysis across variables; a\
+  \ variable becomes RemoteCPU or ThisCPU only when directly assigned from a matching\
+  \ call. This is sufficient to detect the target pattern in the provided patch and\
+  \ typical kernel code.\n\n5) Final reporting after full TU is analyzed (checkEndAnalysis)\n\
+  - Iterate over LocalRMWHazards:\n  - If the hazard\u2019s FieldKey exists in RemotePlainFieldSet,\
+  \ emit a report.\n    - Use BasicBugReport with the checker\u2019s BugType.\n  \
+  \  - Message: \u201CRacy per-CPU field: non-atomic RMW and cross-CPU plain access.\u201D\
+  \n    - Location/Range: ME->getSourceRange().\n- Rationale: Warning only when both\
+  \ sides are present in the same translation unit minimizes noise:\n  - this_cpu_ptr\
+  \ RMW is flagged only if there is also a plain remote per_cpu_ptr access to the\
+  \ same field elsewhere.\n  - We require that the remote access is not guarded by\
+  \ READ_ONCE/WRITE_ONCE, matching the fix.\n\n6) Callback selection and how to implement\
+  \ them\n- checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR)\
+  \ const\n  - If D has a body, traverse it:\n    - Implement a small recursive walker\
+  \ (e.g., RecursiveASTVisitor inside the checker) to visit DeclStmt, BinaryOperator\
+  \ (=), CallExpr, MemberExpr, UnaryOperator, CompoundAssignOperator.\n    - Fill\
+  \ VarKindMap by looking at initializers and assignment RHS as described.\n    -\
+  \ For each MemberExpr, classify as RemoteCPU or ThisCPU (including direct call bases),\
+  \ check for READ_ONCE/WRITE_ONCE with isReadOrWriteOnceContext, and record into\
+  \ RemotePlainFieldSet or LocalRMWHazards accordingly.\n  - Do not emit any reports\
+  \ here.\n- checkEndAnalysis(ExplodedGraph &G, BugReporter &BR, ExprEngine &Eng)\
+  \ const\n  - For each hazard in LocalRMWHazards, if its FieldKey is in RemotePlainFieldSet,\
+  \ create and emit a BasicBugReport tied to the MemberExpr\u2019s location.\n  -\
+  \ Keep the message short.\n\n7) Heuristics and filters to reduce false positives\n\
+  - Only treat per_cpu_ptr as \u201Cremote\u201D when it has 2 or more arguments (per_cpu_ptr(ptr,\
+  \ cpu)).\n- Treat this_cpu_ptr as \u201Clocal\u201D on the current CPU (one argument).\n\
+  - Exempt member accesses wrapped in READ_ONCE/WRITE_ONCE. Use ExprHasName on the\
+  \ parent CallExpr to detect these macros reliably in macro-expanded code.\n- Only\
+  \ flag this_cpu_ptr operations when they are RMW (CompoundAssignOperator or ++/--)\
+  \ to closely align with the bug pattern.\n- FieldKey requires both pointee record\
+  \ type name and field name to match (e.g., \u201Cmemcg_vmstats_percpu::stats_updates\u201D\
+  ), ensuring we report only when the exact field matches on both sides.\n\n8) Where\
+  \ to use provided Utility Functions\n- ExprHasName: to detect macro/function names\
+  \ in source for per_cpu_ptr, this_cpu_ptr, READ_ONCE, WRITE_ONCE.\n- findSpecificTypeInParents:\
+  \ to find the enclosing CallExpr for detecting READ_ONCE/WRITE_ONCE, and to find\
+  \ enclosing CompoundAssignOperator or UnaryOperator during RMW detection.\n- findSpecificTypeInChildren:\
+  \ not necessary for this checker.\n- The other utilities (EvaluateExprToInt, getMemRegionFromExpr,\
+  \ etc.) are not needed for this pattern.\n\n9) Report message\n- Keep it short and\
+  \ clear:\n  - Title: \u201CPer-CPU data race\u201D\n  - Message: \u201CRacy per-CPU\
+  \ field: non-atomic RMW and cross-CPU plain access.\u201D\n  - Point to the this_cpu_ptr\
+  \ RMW MemberExpr location."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/ParentMapContext.h\"\n#include \"clang/Lex/Lexer.h\"\n#include <set>\n\
+  #include <vector>\n#include <string>\n#include <map>\n#include <utility>\n\nusing\
+  \ namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// No custom\
+  \ program states are required.\n\nnamespace {\n\nclass SAGenTestChecker : public\
+  \ Checker< check::ASTCodeBody, check::EndAnalysis > {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   // A key identifying a specific field in a pointed-to record type.\n\
+  \   struct FieldKey {\n     std::string RecName;\n     std::string FieldName;\n\
+  \     bool operator<(const FieldKey &Other) const {\n       if (RecName != Other.RecName)\
+  \ return RecName < Other.RecName;\n       return FieldName < Other.FieldName;\n\
+  \     }\n   };\n\n   // Hazards collected at this_cpu_ptr sites: non-atomic RMW\
+  \ on a per-cpu field.\n   struct HazardRec {\n     FieldKey Key;\n     const MemberExpr\
+  \ *ME; // for report location\n     std::string Msg;\n   };\n\n   // Accumulated\
+  \ across the TU:\n   // Set of fields that were accessed via per_cpu_ptr(..., cpu)\
+  \ without READ/WRITE_ONCE.\n   std::set<FieldKey> RemotePlainFieldSet;\n   // Collected\
+  \ local hazards for all functions; reported at EndAnalysis when RemotePlainFieldSet\
+  \ intersects.\n   std::vector<HazardRec> LocalRMWHazards;\n\npublic:\n   SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Per-CPU data race\", \"Concurrency\")) {}\n\n   void\
+  \ checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR) const;\n\
+  \   void checkEndAnalysis(ExplodedGraph &G, BugReporter &BR, ExprEngine &Eng) const;\n\
+  \nprivate:\n   // Helper: get source text of an expression\n   static StringRef\
+  \ getExprText(const Expr *E, ASTContext &Ctx) {\n     if (!E) return StringRef();\n\
+  \     const SourceManager &SM = Ctx.getSourceManager();\n     const LangOptions\
+  \ &LangOpts = Ctx.getLangOpts();\n     CharSourceRange Range = CharSourceRange::getTokenRange(E->getSourceRange());\n\
+  \     return Lexer::getSourceText(Range, SM, LangOpts);\n   }\n\n   // Helper: check\
+  \ if expression text contains a given name (macro/function)\n   static bool ExprHasNameAST(const\
+  \ Expr *E, StringRef Name, ASTContext &Ctx) {\n     StringRef Text = getExprText(E,\
+  \ Ctx);\n     return Text.contains(Name);\n   }\n\n   // Helper: is a call expression\
+  \ named per_cpu_ptr? Return CE and NumArgs if yes.\n   static bool isPerCpuPtrCall(const\
+  \ Expr *E, unsigned &NumArgs, ASTContext &Ctx, const CallExpr *&OutCE) {\n     const\
+  \ Expr *EI = E;\n     if (!EI) return false;\n     EI = EI->IgnoreParenImpCasts();\n\
+  \     const CallExpr *CE = dyn_cast<CallExpr>(EI);\n     if (!CE) return false;\n\
+  \     if (!ExprHasNameAST(CE->getCallee(), \"per_cpu_ptr\", Ctx) &&\n         !ExprHasNameAST(CE,\
+  \ \"per_cpu_ptr\", Ctx))\n       return false;\n     NumArgs = CE->getNumArgs();\n\
+  \     OutCE = CE;\n     return true;\n   }\n\n   // Helper: is a call expression\
+  \ named this_cpu_ptr?\n   static bool isThisCpuPtrCall(const Expr *E, ASTContext\
+  \ &Ctx, const CallExpr *&OutCE) {\n     const Expr *EI = E;\n     if (!EI) return\
+  \ false;\n     EI = EI->IgnoreParenImpCasts();\n     const CallExpr *CE = dyn_cast<CallExpr>(EI);\n\
+  \     if (!CE) return false;\n     if (!ExprHasNameAST(CE->getCallee(), \"this_cpu_ptr\"\
+  , Ctx) &&\n         !ExprHasNameAST(CE, \"this_cpu_ptr\", Ctx))\n       return false;\n\
+  \     OutCE = CE;\n     return true;\n   }\n\n   // Helper: climb parents to find\
+  \ enclosing CallExpr; check if it's READ_ONCE/WRITE_ONCE context\n   static bool\
+  \ isReadOrWriteOnceContext(const Expr *E, ASTContext &Ctx) {\n     if (!E) return\
+  \ false;\n     DynTypedNode N = DynTypedNode::create(*E);\n     // Walk parents\
+  \ up until we find a CallExpr or leave statement tree.\n     while (true) {\n  \
+  \     auto Parents = Ctx.getParents(N);\n       if (Parents.empty())\n         break;\n\
+  \n       bool Moved = false;\n       for (const auto &P : Parents) {\n         if\
+  \ (const CallExpr *CE = P.get<CallExpr>()) {\n           // Examine callee and call\
+  \ text for macros READ_ONCE/WRITE_ONCE\n           if (ExprHasNameAST(CE, \"READ_ONCE\"\
+  , Ctx) || ExprHasNameAST(CE, \"WRITE_ONCE\", Ctx))\n             return true;\n\
+  \           // Not a protect context; but stop climbing at the call boundary.\n\
+  \           return false;\n         }\n       }\n\n       // If not found, continue\
+  \ climbing via a Stmt parent if available.\n       for (const auto &P : Parents)\
+  \ {\n         if (const Stmt *PS = P.get<Stmt>()) {\n           N = DynTypedNode::create(*PS);\n\
+  \           Moved = true;\n           break;\n         }\n       }\n       if (!Moved)\n\
+  \         break;\n     }\n     return false;\n   }\n\n   // Helper: obtain the VarDecl\
+  \ serving as base of a MemberExpr, if it is a DeclRefExpr\n   static const VarDecl*\
+  \ getBaseVar(const Expr *Base) {\n     if (!Base) return nullptr;\n     const Expr\
+  \ *B = Base->IgnoreParenImpCasts();\n     if (const auto *DRE = dyn_cast<DeclRefExpr>(B))\
+  \ {\n       return dyn_cast<VarDecl>(DRE->getDecl());\n     }\n     // Also handle\
+  \ (*var).field pattern, though uncommon in our target\n     if (const auto *UO =\
+  \ dyn_cast<UnaryOperator>(B)) {\n       if (UO->getOpcode() == UO_Deref) {\n   \
+  \      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();\n         if (const\
+  \ auto *DRE2 = dyn_cast<DeclRefExpr>(Sub))\n           return dyn_cast<VarDecl>(DRE2->getDecl());\n\
+  \       }\n     }\n     return nullptr;\n   }\n\n   // Helper: get pointee record\
+  \ type name from a QualType (expecting T* to a record)\n   static std::string getRecordTypeName(QualType\
+  \ QT) {\n     if (QT.isNull()) return std::string();\n     QualType Pointee = QT->getPointeeType();\n\
+  \     if (Pointee.isNull()) return std::string();\n     if (const RecordType *RT\
+  \ = Pointee->getAs<RecordType>()) {\n       const RecordDecl *RD = RT->getDecl();\n\
+  \       if (const auto *CRD = dyn_cast<CXXRecordDecl>(RD)) {\n         std::string\
+  \ N = CRD->getNameAsString();\n         if (!N.empty()) return N;\n         return\
+  \ CRD->getQualifiedNameAsString();\n       } else if (RD) {\n         std::string\
+  \ N = RD->getNameAsString();\n         if (!N.empty()) return N;\n         return\
+  \ RD->getQualifiedNameAsString();\n       }\n     }\n     return std::string();\n\
+  \   }\n\n   // Helper: build FieldKey from a pointer-typed expression and member\n\
+  \   static bool makeFieldKeyFromBaseExpr(const Expr *Base, const MemberExpr *ME,\
+  \ FieldKey &OutKey) {\n     if (!Base || !ME) return false;\n     std::string Rec\
+  \ = getRecordTypeName(Base->getType());\n     if (Rec.empty()) return false;\n \
+  \    const ValueDecl *MD = ME->getMemberDecl();\n     if (!MD) return false;\n \
+  \    std::string Field = MD->getNameAsString();\n     if (Field.empty()) return\
+  \ false;\n     OutKey = FieldKey{Rec, Field};\n     return true;\n   }\n\n   //\
+  \ Helper: compare two expr pointers after stripping parens/casts\n   static bool\
+  \ isSameExpr(const Expr *A, const Expr *B) {\n     if (!A || !B) return false;\n\
+  \     A = A->IgnoreParenCasts();\n     B = B->IgnoreParenCasts();\n     return A\
+  \ == B;\n   }\n\n   // Helper: check if the MemberExpr is used in a RMW context\
+  \ (+=, -=, ++, --)\n   static bool isRMWOnMember(const MemberExpr *ME, ASTContext\
+  \ &Ctx) {\n     if (!ME) return false;\n     // Look for CompoundAssignOperator\
+  \ ancestor\n     DynTypedNode N = DynTypedNode::create(*ME);\n     while (true)\
+  \ {\n       auto Parents = Ctx.getParents(N);\n       if (Parents.empty())\n   \
+  \      break;\n       bool Moved = false;\n       for (const auto &P : Parents)\
+  \ {\n         if (const auto *CAO = P.get<CompoundAssignOperator>()) {\n       \
+  \    const Expr *LHS = CAO->getLHS();\n           if (isSameExpr(LHS, ME))\n   \
+  \          return true;\n           // Even if not same, stop here because the operator\
+  \ boundary reached.\n           return false;\n         }\n         if (const auto\
+  \ *UO = P.get<UnaryOperator>()) {\n           UnaryOperatorKind Op = UO->getOpcode();\n\
+  \           if (Op == UO_PostInc || Op == UO_PostDec || Op == UO_PreInc || Op ==\
+  \ UO_PreDec) {\n             const Expr *Sub = UO->getSubExpr();\n             if\
+  \ (isSameExpr(Sub, ME))\n               return true;\n             return false;\n\
+  \           }\n         }\n       }\n       // Continue climbing through stmt parents\n\
+  \       for (const auto &P : Parents) {\n         if (const Stmt *PS = P.get<Stmt>())\
+  \ {\n           N = DynTypedNode::create(*PS);\n           Moved = true;\n     \
+  \      break;\n         }\n       }\n       if (!Moved)\n         break;\n     }\n\
+  \     return false;\n   }\n\n   // Per-function visitor\n   class FuncVisitor :\
+  \ public RecursiveASTVisitor<FuncVisitor> {\n     ASTContext &Ctx;\n     const SAGenTestChecker\
+  \ *Chk;\n     // Map variables initialized or assigned from per_cpu_ptr/this_cpu_ptr\n\
+  \     enum VarKind { VK_Unknown = 0, VK_Remote, VK_ThisCPU };\n     llvm::DenseMap<const\
+  \ VarDecl*, VarKind> VarKinds;\n\n   public:\n     FuncVisitor(ASTContext &C, const\
+  \ SAGenTestChecker *Checker) : Ctx(C), Chk(Checker) {}\n\n     // Access to checker\
+  \ accumulators\n     std::set<FieldKey> &RemotePlainFieldSet() const {\n       return\
+  \ const_cast<SAGenTestChecker*>(Chk)->RemotePlainFieldSet;\n     }\n     std::vector<HazardRec>\
+  \ &LocalRMWHazards() const {\n       return const_cast<SAGenTestChecker*>(Chk)->LocalRMWHazards;\n\
+  \     }\n\n     bool VisitVarDecl(VarDecl *VD) {\n       if (!VD || !VD->hasInit())\n\
+  \         return true;\n       const Expr *Init = VD->getInit();\n       unsigned\
+  \ NumArgs = 0;\n       const CallExpr *CE = nullptr;\n       if (isPerCpuPtrCall(Init,\
+  \ NumArgs, Ctx, CE) && NumArgs >= 2) {\n         VarKinds[VD] = VK_Remote;\n   \
+  \    } else if (isThisCpuPtrCall(Init, Ctx, CE)) {\n         VarKinds[VD] = VK_ThisCPU;\n\
+  \       }\n       return true;\n     }\n\n     bool VisitBinaryOperator(BinaryOperator\
+  \ *BO) {\n       if (!BO || !BO->isAssignmentOp())\n         return true;\n\n  \
+  \     const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n       const auto *LHS_DRE\
+  \ = dyn_cast<DeclRefExpr>(LHS);\n       if (!LHS_DRE) return true;\n       const\
+  \ auto *VD = dyn_cast<VarDecl>(LHS_DRE->getDecl());\n       if (!VD) return true;\n\
+  \n       const Expr *RHS = BO->getRHS();\n       unsigned NumArgs = 0;\n       const\
+  \ CallExpr *CE = nullptr;\n       if (isPerCpuPtrCall(RHS, NumArgs, Ctx, CE) &&\
+  \ NumArgs >= 2) {\n         VarKinds[VD] = VK_Remote;\n       } else if (isThisCpuPtrCall(RHS,\
+  \ Ctx, CE)) {\n         VarKinds[VD] = VK_ThisCPU;\n       }\n       return true;\n\
+  \     }\n\n     bool VisitMemberExpr(MemberExpr *ME) {\n       if (!ME) return true;\n\
+  \n       // Check if protected by READ_ONCE/WRITE_ONCE\n       if (isReadOrWriteOnceContext(ME,\
+  \ Ctx))\n         return true;\n\n       // Determine base kind: Remote via per_cpu_ptr(...,\
+  \ cpu) or local via this_cpu_ptr(...)\n       VarKind BaseK = VK_Unknown;\n    \
+  \   const Expr *Base = ME->getBase();\n       const VarDecl *BaseVD = getBaseVar(Base);\n\
+  \n       if (BaseVD) {\n         auto It = VarKinds.find(BaseVD);\n         if (It\
+  \ != VarKinds.end())\n           BaseK = It->second;\n       } else {\n        \
+  \ // Handle direct call bases like per_cpu_ptr(...)->field\n         unsigned NumArgs\
+  \ = 0;\n         const CallExpr *CE = nullptr;\n         if (isPerCpuPtrCall(Base,\
+  \ NumArgs, Ctx, CE) && NumArgs >= 2) {\n           BaseK = VK_Remote;\n        \
+  \ } else if (isThisCpuPtrCall(Base, Ctx, CE)) {\n           BaseK = VK_ThisCPU;\n\
+  \         }\n       }\n\n       if (BaseK == VK_Unknown)\n         return true;\n\
+  \n       FieldKey Key;\n       if (!makeFieldKeyFromBaseExpr(Base, ME, Key))\n \
+  \        return true;\n\n       if (BaseK == VK_Remote) {\n         // Cross-CPU\
+  \ plain access (not READ/WRITE_ONCE) -> remember this field\n         RemotePlainFieldSet().insert(Key);\n\
+  \       } else if (BaseK == VK_ThisCPU) {\n         // Only interested in non-atomic\
+  \ RMW on local per-CPU field\n         if (isRMWOnMember(ME, Ctx)) {\n         \
+  \  HazardRec H { Key, ME, \"Non-atomic RMW on per-CPU field also accessed cross-CPU\"\
+  \ };\n           LocalRMWHazards().push_back(H);\n         }\n       }\n\n     \
+  \  return true;\n     }\n   };\n\n}; // end of checker class\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  if (!D) return;\n \
+  \ const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);\n  if (!FD) return;\n  if\
+  \ (!FD->hasBody()) return;\n\n  ASTContext &Ctx = Mgr.getASTContext();\n  Stmt *Body\
+  \ = FD->getBody();\n  if (!Body) return;\n\n  FuncVisitor V(Ctx, this);\n  V.TraverseStmt(Body);\n\
+  }\n\nvoid SAGenTestChecker::checkEndAnalysis(ExplodedGraph &G, BugReporter &BR,\
+  \ ExprEngine &Eng) const {\n  if (LocalRMWHazards.empty() || RemotePlainFieldSet.empty())\n\
+  \    return;\n\n  for (const auto &H : LocalRMWHazards) {\n    if (RemotePlainFieldSet.find(H.Key)\
+  \ != RemotePlainFieldSet.end()) {\n      // Report\n      const MemberExpr *ME =\
+  \ H.ME;\n      if (!ME) continue;\n\n      std::string Msg = \"Racy per-CPU field:\
+  \ non-atomic RMW and cross-CPU plain access.\";\n      PathDiagnosticLocation Loc\
+  \ = PathDiagnosticLocation::createBegin(ME, BR.getSourceManager(), nullptr);\n \
+  \     auto Report = std::make_unique<BasicBugReport>(*BT, Msg, Loc);\n      Report->addRange(ME->getSourceRange());\n\
+  \      BR.emitReport(std::move(Report));\n    }\n  }\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects racy per-CPU fields: non-atomic\
+  \ this_cpu_ptr RMW combined with plain cross-CPU per_cpu_ptr access without READ/WRITE_ONCE\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

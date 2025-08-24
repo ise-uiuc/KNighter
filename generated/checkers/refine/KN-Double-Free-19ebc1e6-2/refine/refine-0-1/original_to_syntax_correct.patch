@@ -1,0 +1,197 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -12,7 +12,6 @@ #include "clang/AST/RecursiveASTVisitor.h"
+ #include "clang/AST/StmtVisitor.h"
+ #include "llvm/Support/raw_ostream.h"
+-#include "clang/StaticAnalyzer/Checkers/utility.h"
+ #include "clang/AST/ASTContext.h"
+ #include "clang/AST/Expr.h"
+ #include "clang/AST/Stmt.h"
+@@ -24,6 +23,12 @@ #include <utility>
+ #include <memory>
+
++// Added includes for CFG-based reachability (Clang-18 compatible).
++#include "clang/Analysis/CFG.h"
++#include "clang/Analysis/AnalysisDeclContext.h"
++#include "llvm/ADT/BitVector.h"
++#include "llvm/ADT/DenseMap.h"
++
+ using namespace clang;
+ using namespace ento;
+ using namespace taint;
+@@ -220,6 +225,16 @@   }
+ };
+
++// CFG statement index for reachability and within-block ordering.
++struct CFGPos {
++  const CFGBlock *Block = nullptr;
++  unsigned Index = 0; // index of CFGElement within the block
++};
++
++struct CFGStmtIndex {
++  llvm::DenseMap<const Stmt *, llvm::SmallVector<CFGPos, 2>> Map;
++};
++
+ class SAGenTestChecker : public Checker<check::ASTCodeBody> {
+    mutable std::unique_ptr<BugType> BT;
+
+@@ -249,9 +264,78 @@
+       static bool isSelfCleanupJump(const GotoInfo &GR, const FreeSite &FS) {
+         // A restart candidate must not be a goto back to the same cleanup label.
+-        // Such a jump cannot form a retry loop and can cause false positives,
+-        // e.g. "bail: ... goto out;" which is unrelated to retrying.
+         return GR.Target && FS.CleanupLabel && (GR.Target == FS.CleanupLabel);
++      }
++
++      static void buildCFGStmtIndex(const CFG *Cfg, CFGStmtIndex &Index) {
++        if (!Cfg) return;
++        for (const CFGBlock *B : *Cfg) {
++          unsigned I = 0;
++          for (auto EI = B->begin(); EI != B->end(); ++EI, ++I) {
++            if (auto CS = EI->getAs<CFGStmt>()) {
++              const Stmt *S = CS->getStmt();
++              Index.Map[S].push_back({B, I});
++            }
++          }
++        }
++      }
++
++      // Returns true if there's a CFG path from any occurrence of 'From' to any occurrence of 'To'.
++      static bool cfgReachable(const CFG *Cfg, const CFGStmtIndex &Index,
++                               const Stmt *From, const Stmt *To) {
++        if (!Cfg || !From || !To)
++          return false;
++
++        auto FI = Index.Map.find(From);
++        auto TI = Index.Map.find(To);
++        if (FI == Index.Map.end() || TI == Index.Map.end())
++          return false;
++
++        for (const CFGPos &FPos : FI->second) {
++          for (const CFGPos &TPos : TI->second) {
++            if (FPos.Block == TPos.Block) {
++              if (FPos.Index <= TPos.Index)
++                return true;
++              // Otherwise, same block but To occurs before From; not reachable in-order.
++              continue;
++            }
++
++            // BFS over blocks from FPos.Block to TPos.Block
++            llvm::BitVector Visited(Cfg->getNumBlockIDs());
++            llvm::SmallVector<const CFGBlock *, 16> WL;
++            WL.push_back(FPos.Block);
++            Visited.set(FPos.Block->getBlockID());
++            while (!WL.empty()) {
++              const CFGBlock *B = WL.back();
++              WL.pop_back();
++              for (auto SI = B->succ_begin(); SI != B->succ_end(); ++SI) {
++                const CFGBlock *Succ = *SI;
++                if (!Succ)
++                  continue;
++                if (Visited.test(Succ->getBlockID()))
++                  continue;
++                Visited.set(Succ->getBlockID());
++                if (Succ == TPos.Block)
++                  return true;
++                WL.push_back(Succ);
++              }
++            }
++          }
++        }
++
++        return false;
++      }
++
++      static const Stmt *getFirstStmtAfterLabel(const std::vector<LabelInfo> &Labels,
++                                                const LabelDecl *LD) {
++        for (const auto &LI : Labels) {
++          if (LI.LDecl == LD) {
++            if (const LabelStmt *LS = LI.LStmt) {
++              return LS->getSubStmt();
++            }
++          }
++        }
++        return nullptr;
+       }
+
+       void detectAndReport(const FunctionDecl *FD,
+@@ -259,6 +343,7 @@                            const std::vector<GotoInfo> &Gotos,
+                            const std::vector<FreeSite> &Frees,
+                            const std::vector<AssignInfo> &Assigns,
++                           const CFG *Cfg, const CFGStmtIndex &CfgIndex,
+                            BugReporter &BR, ASTContext &AC) const;
+ };
+
+@@ -279,7 +364,13 @@   BodyScanner Scanner(Ctx, Labels, Gotos, Frees, Assigns);
+   Scanner.TraverseStmt(const_cast<Stmt *>(Body));
+
+-  detectAndReport(FD, Labels, Gotos, Frees, Assigns, BR, Ctx);
++  // Build CFG and index for reachability analysis.
++  AnalysisDeclContext *ADC = Mgr.getAnalysisDeclContext(FD);
++  const CFG *Cfg = ADC ? ADC->getCFG() : nullptr;
++  CFGStmtIndex CfgIndex;
++  buildCFGStmtIndex(Cfg, CfgIndex);
++
++  detectAndReport(FD, Labels, Gotos, Frees, Assigns, Cfg, CfgIndex, BR, Ctx);
+ }
+
+ void SAGenTestChecker::detectAndReport(const FunctionDecl *FD,
+@@ -287,6 +378,7 @@                                        const std::vector<GotoInfo> &Gotos,
+                                        const std::vector<FreeSite> &Frees,
+                                        const std::vector<AssignInfo> &Assigns,
++                                       const CFG *Cfg, const CFGStmtIndex &CfgIndex,
+                                        BugReporter &BR, ASTContext &AC) const {
+   const SourceManager &SM = AC.getSourceManager();
+
+@@ -312,7 +404,6 @@       if (!GR.Target)
+         continue;
+
+-      // Important: don't treat a goto to the same cleanup label as a restart.
+       if (isSelfCleanupJump(GR, FS))
+         continue;
+
+@@ -323,6 +414,10 @@
+       // Must be: free ... goto restart_label; where restart_label is before free.
+       if (!(before(SM, FreeLoc, GoLoc) && before(SM, TargetLoc, FreeLoc)))
++        continue;
++
++      // New: Require that the backward goto is actually reachable from the cleanup free.
++      if (!cfgReachable(Cfg, CfgIndex, FS.FreeCall, GR.G))
+         continue;
+
+       // Safety check 1: reset to NULL between free and retry goto
+@@ -338,7 +433,7 @@       if (ResetBetween)
+         continue; // safe for this retry goto
+
+-      // Safety check 2: earliest assignment after restart label
++      // The earliest assignment to P after the restart label (if any).
+       const AssignInfo *Earliest = nullptr;
+       for (const auto &AI : Assigns) {
+         if (AI.P != FS.P)
+@@ -349,8 +444,10 @@         }
+       }
+
+-      // Look for an early goto to the cleanup label between restart label and earliest assignment.
++      // Safety check 2: Look for an early goto to the cleanup label between restart label and earliest assignment.
+       bool EarlyGotoToCleanup = false;
++      const Stmt *RestartEntryStmt = getFirstStmtAfterLabel(Labels, GR.Target);
++
+       for (const auto &GE : Gotos) {
+         if (GE.Target != FS.CleanupLabel)
+           continue;
+@@ -359,13 +456,11 @@         if (!before(SM, TargetLoc, ELoc))
+           continue;
+
+-        if (Earliest) {
+-          if (before(SM, ELoc, Earliest->Loc)) {
+-            EarlyGotoToCleanup = true;
+-            break;
+-          }
+-        } else {
+-          // No assignment after restart; any early goto to cleanup after restart is problematic.
++        if (Earliest && !before(SM, ELoc, Earliest->Loc))
++          continue;
++
++        // Require reachability from the restart label entry to this early goto.
++        if (RestartEntryStmt && cfgReachable(Cfg, CfgIndex, RestartEntryStmt, GE.G)) {
+           EarlyGotoToCleanup = true;
+           break;
+         }

@@ -1,0 +1,152 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -16,6 +16,8 @@ #include "clang/AST/Stmt.h"
+ #include "clang/AST/Type.h"
+ #include "clang/Lex/Lexer.h"
++#include <memory>
++#include <string>
+
+ using namespace clang;
+ using namespace ento;
+@@ -58,6 +60,13 @@
+   void reportUnbounded(const CallEvent &Call, const Expr *Dst,
+                        const Expr *Len, CheckerContext &C) const;
++
++  // Fallback: obtain VarRegion directly from AST DeclRefExpr of an array.
++  const MemRegion *getVarRegionFromArrayDRE(const Expr *E, CheckerContext &C) const;
++
++  // Remove mappings for any arrays that currently associate to LenReg.
++  ProgramStateRef removeLenMappingsForRegion(ProgramStateRef State,
++                                             const MemRegion *LenReg) const;
+ };
+
+ bool SAGenTestChecker::isCopyFromUser(const CallEvent &Call, CheckerContext &C) const {
+@@ -103,6 +112,28 @@   return true;
+ }
+
++const MemRegion *SAGenTestChecker::getVarRegionFromArrayDRE(const Expr *E,
++                                                            CheckerContext &C) const {
++  const Expr *EE = E ? E->IgnoreParenImpCasts() : nullptr;
++  if (!EE)
++    return nullptr;
++  const auto *DRE = dyn_cast<DeclRefExpr>(EE);
++  if (!DRE)
++    return nullptr;
++  const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
++  if (!VD)
++    return nullptr;
++
++  // Ensure it's a constant-sized array variable.
++  QualType QT = VD->getType();
++  if (!isa<ConstantArrayType>(QT.getTypePtr()))
++    return nullptr;
++
++  auto &RM = C.getSValBuilder().getRegionManager();
++  const VarRegion *VR = RM.getVarRegion(VD, C.getLocationContext());
++  return VR ? VR->getBaseRegion() : nullptr;
++}
++
+ bool SAGenTestChecker::exprContainsSizeofOfArray(const Expr *E, const MemRegion *ArrReg,
+                                                  StringRef ArrName, CheckerContext &C) const {
+   if (!E || !ArrReg)
+@@ -112,7 +143,12 @@   if (const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(E)) {
+     if (UE->getKind() == UETT_SizeOf) {
+       if (const Expr *Arg = UE->getArgumentExpr()) {
++        // Try to resolve to the same array region.
+         const MemRegion *SizeofMR = getMemRegionFromExpr(Arg, C);
++        if (!SizeofMR) {
++          // Fallback for unevaluated sizeof argument: build VarRegion from AST.
++          SizeofMR = getVarRegionFromArrayDRE(Arg, C);
++        }
+         if (SizeofMR) {
+           SizeofMR = SizeofMR->getBaseRegion();
+           if (SizeofMR == ArrReg)
+@@ -134,9 +170,7 @@   LenReg = nullptr;
+   LenSym = nullptr;
+
+-  ProgramStateRef State = C.getState();
+-
+-  // Try to get region
++  // Try to get region from state
+   const MemRegion *MR = getMemRegionFromExpr(LenArg, C);
+   if (MR) {
+     MR = MR->getBaseRegion();
+@@ -144,7 +178,7 @@   }
+
+   // Try to get symbol
+-  SVal SV = State->getSVal(LenArg, C.getLocationContext());
++  SVal SV = C.getSVal(LenArg);
+   LenSym = SV.getAsSymbol();
+ }
+
+@@ -166,6 +200,23 @@   C.emitReport(std::move(R));
+ }
+
++ProgramStateRef SAGenTestChecker::removeLenMappingsForRegion(ProgramStateRef State,
++                                                             const MemRegion *LenReg) const {
++  if (!LenReg)
++    return State;
++  auto Map = State->get<ArraySafeLenMap>();
++  SmallVector<const MemRegion*, 4> ToRemove;
++  for (auto It = Map.begin(), End = Map.end(); It != End; ++It) {
++    const MemRegion *ArrMR = It->first;
++    const MemRegion *LReg = It->second;
++    if (LReg == LenReg)
++      ToRemove.push_back(ArrMR);
++  }
++  for (const MemRegion *ArrMR : ToRemove)
++    State = State->remove<ArraySafeLenMap>(ArrMR);
++  return State;
++}
++
+ void SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
+   if (!S)
+     return;
+@@ -186,30 +237,43 @@   const Expr *RHS = BO->getRHS();
+   if (!RHS)
+     return;
++
++  bool Recorded = false;
+
+   // Look for sizeof(array) in RHS; if found, associate the array with this LHS length variable
+   if (const auto *UE = findSpecificTypeInChildren<UnaryExprOrTypeTraitExpr>(RHS)) {
+     if (UE->getKind() == UETT_SizeOf) {
+       if (const Expr *Arg = UE->getArgumentExpr()) {
+-        // Confirm it's an array decl ref
++        // Confirm it's a constant array.
+         llvm::APInt DummySize;
+         if (getArraySizeFromExpr(DummySize, Arg)) {
++          // Try state-based region first, then AST-based fallback due to unevaluated context.
+           const MemRegion *ArrMR = getMemRegionFromExpr(Arg, C);
++          if (!ArrMR)
++            ArrMR = getVarRegionFromArrayDRE(Arg, C);
+           if (ArrMR) {
+             ArrMR = ArrMR->getBaseRegion();
+             if (ArrMR) {
+               State = State->set<ArraySafeLenMap>(ArrMR, LHSReg);
++              Recorded = true;
+             }
+           }
+         }
+       }
+     }
+-  } else {
+-    // Weak heuristic: if RHS contains both min and sizeof, consider LHS symbol bounded
+-    if (ExprHasName(RHS, "min", C) && ExprHasName(RHS, "sizeof", C)) {
+-      if (SymbolRef Sym = Val.getAsSymbol())
+-        State = State->add<BoundedLenSyms>(Sym);
+-    }
++  }
++
++  // Weak heuristic: if RHS contains both min and sizeof, consider LHS symbol bounded
++  if (!Recorded && ExprHasName(RHS, "min", C) && ExprHasName(RHS, "sizeof", C)) {
++    if (SymbolRef Sym = Val.getAsSymbol())
++      State = State->add<BoundedLenSyms>(Sym);
++  }
++
++  // If RHS didn't contain any sizeof(...) at all, and this LHSReg was previously
++  // considered a "safe length" for any array, drop those associations to avoid
++  // suppressing real bugs after reassignment.
++  if (!ExprHasName(RHS, "sizeof", C)) {
++    State = removeLenMappingsForRegion(State, LHSReg);
+   }
+
+   C.addTransition(State);

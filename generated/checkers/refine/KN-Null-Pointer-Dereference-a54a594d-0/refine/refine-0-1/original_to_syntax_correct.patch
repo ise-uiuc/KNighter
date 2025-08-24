@@ -1,0 +1,232 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -26,9 +26,12 @@ REGISTER_SET_WITH_PROGRAMSTATE(SuspiciousAfterLockSet, const MemRegion*)
+ REGISTER_TRAIT_WITH_PROGRAMSTATE(LockDepth, int)
+
++// Map suspicious pointer -> the Then body Stmt of the originating IfStmt.
++// Used to suppress reports when the deref happens inside the same Then branch.
++REGISTER_MAP_WITH_PROGRAMSTATE(PtrToThenMap, const MemRegion*, const Stmt*)
++
+ namespace {
+
+-/* The checker callbacks are to be decided. */
+ class SAGenTestChecker
+   : public Checker<
+       check::BranchCondition,
+@@ -48,7 +51,6 @@       void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;
+
+    private:
+-
+       // Helpers
+       bool isLockAcquire(const CallEvent &Call, CheckerContext &C) const;
+       bool isLockRelease(const CallEvent &Call, CheckerContext &C) const;
+@@ -63,8 +65,15 @@                                 const MemRegion *&TrackedPtrOut) const;
+
+       void reportDerefBug(const Stmt *S, const MemRegion *R, CheckerContext &C) const;
++
++      // New helpers to reduce false positives
++      bool isLoggingCallName(StringRef Name) const;
++      bool isLoggingCall(const CallExpr *CE, CheckerContext &C) const;
++      bool containsLoggingCall(const Stmt *S, CheckerContext &C) const;
++      bool isDescendantOf(const Stmt *Inner, const Stmt *Ancestor, CheckerContext &C) const;
++
++      bool isFalsePositive(const MemRegion *R, const Stmt *UseSite, CheckerContext &C) const;
+ };
+-
+
+
+ // ---------------- Helper Implementations ----------------
+@@ -114,7 +123,6 @@
+       // Look for (ptr == NULL) or (ptr != NULL)
+       if (LHSNull && !RHSNull) {
+-        // RHS should be pointer DeclRefExpr
+         if (RHS->getType()->isAnyPointerType()) {
+           if (isa<DeclRefExpr>(RHS))
+             return getBaseRegionFromExpr(RHS, C);
+@@ -263,6 +271,109 @@   C.emitReport(std::move(Report));
+ }
+
++// --- New helpers for logging detection and ancestry checks ---
++
++bool SAGenTestChecker::isLoggingCallName(StringRef Name) const {
++  if (Name.empty())
++    return false;
++
++  // Canonical Linux kernel logging patterns
++  if (Name.equals("printk") || Name.equals("trace_printk"))
++    return true;
++  if (Name.startswith("pr_")) // pr_err, pr_warn, pr_info, pr_debug, etc.
++    return true;
++  if (Name.startswith("dev_")) // dev_err, dev_warn, dev_dbg, ...
++    return true;
++  if (Name.startswith("netdev_")) // netdev_err, netdev_warn, ...
++    return true;
++  if (Name.equals("WARN") || Name.equals("WARN_ON") || Name.equals("WARN_ONCE"))
++    return true;
++  // Subsystem specific, used in the target buggy code
++  if (Name.equals("xhci_dbg") || Name.equals("xhci_err") || Name.equals("xhci_warn"))
++    return true;
++
++  return false;
++}
++
++bool SAGenTestChecker::isLoggingCall(const CallExpr *CE, CheckerContext &C) const {
++  if (!CE) return false;
++  if (const FunctionDecl *FD = CE->getDirectCallee()) {
++    if (isLoggingCallName(FD->getName()))
++      return true;
++  }
++
++  // Fallback to textual match on callee expr if direct callee is not available
++  const Expr *Callee = CE->getCallee();
++  if (!Callee) return false;
++  if (ExprHasName(Callee, "printk", C)) return true;
++  if (ExprHasName(Callee, "pr_", C)) return true;
++  if (ExprHasName(Callee, "dev_", C)) return true;
++  if (ExprHasName(Callee, "netdev_", C)) return true;
++  if (ExprHasName(Callee, "xhci_dbg", C) ||
++      ExprHasName(Callee, "xhci_err", C) ||
++      ExprHasName(Callee, "xhci_warn", C)) return true;
++  if (ExprHasName(Callee, "WARN", C) ||
++      ExprHasName(Callee, "WARN_ON", C) ||
++      ExprHasName(Callee, "WARN_ONCE", C)) return true;
++
++  return false;
++}
++
++bool SAGenTestChecker::containsLoggingCall(const Stmt *S, CheckerContext &C) const {
++  if (!S) return false;
++
++  // Simple DFS over the AST looking for any logging call
++  llvm::SmallVector<const Stmt *, 16> Worklist;
++  Worklist.push_back(S);
++
++  while (!Worklist.empty()) {
++    const Stmt *Cur = Worklist.pop_back_val();
++    if (!Cur) continue;
++
++    if (const auto *CE = dyn_cast<CallExpr>(Cur)) {
++      if (isLoggingCall(CE, C))
++        return true;
++    }
++
++    for (const Stmt *Child : Cur->children()) {
++      if (Child)
++        Worklist.push_back(Child);
++    }
++  }
++
++  return false;
++}
++
++bool SAGenTestChecker::isDescendantOf(const Stmt *Inner, const Stmt *Ancestor, CheckerContext &C) const {
++  if (!Inner || !Ancestor)
++    return false;
++
++  const Stmt *Node = Inner;
++  // Walk upwards through parents until we find Ancestor or hit the top.
++  while (Node) {
++    if (Node == Ancestor)
++      return true;
++    Node = findSpecificTypeInParents<Stmt>(Node, C);
++  }
++  return false;
++}
++
++bool SAGenTestChecker::isFalsePositive(const MemRegion *R, const Stmt *UseSite, CheckerContext &C) const {
++  if (!R || !UseSite)
++    return false;
++
++  ProgramStateRef State = C.getState();
++  const Stmt *const *ThenPtr = State->get<PtrToThenMap>(R);
++  if (ThenPtr) {
++    const Stmt *Then = *ThenPtr;
++    // If the dereference occurs within the same Then-branch that did the
++    // invalid check (and possibly did proper locking), suppress the report.
++    if (isDescendantOf(UseSite, Then, C))
++      return true;
++  }
++
++  return false;
++}
+
+ // ---------------- Checker Callbacks ----------------
+
+@@ -286,14 +397,21 @@   if (thenHasEarlyExit(Then, C))
+     return;
+
++  // New: Require the then-branch to have a logging call; otherwise, this is not
++  // the "log-and-continue" pattern we are after.
++  if (!containsLoggingCall(Then, C))
++    return;
++
+   ProgramStateRef State = C.getState();
+   int Depth = State->get<LockDepth>();
+   // We only care if the validation is happening outside the lock
+   if (Depth > 0)
+     return;
+
+-  // Mark this pointer as suspicious: invalid-checked, no abort, and not under lock.
++  // Mark this pointer as suspicious: invalid-checked, logged, no abort, and not under lock.
+   State = State->add<SuspiciousNoLockSet>(R);
++  // Track the Then branch for this pointer to suppress derefs inside it.
++  State = State->set<PtrToThenMap>(R, Then);
+   C.addTransition(State);
+ }
+
+@@ -338,6 +456,12 @@     return;
+
+   ProgramStateRef State = C.getState();
++
++  // Ensure we are actually under a lock
++  int Depth = State->get<LockDepth>();
++  if (Depth <= 0)
++    return;
++
+   for (unsigned Idx : DerefParams) {
+     if (Idx >= Call.getNumArgs())
+       continue;
+@@ -361,9 +485,15 @@     }
+
+     if (Found) {
+-      reportDerefBug(Call.getOriginExpr(), MR, C);
+-      // Remove to avoid duplicate reports.
++      const Expr *Origin = Call.getOriginExpr();
++      const Stmt *UseSite = Origin ? cast<Stmt>(Origin) : nullptr;
++      // Suppress if deref happens inside the original Then-branch
++      if (!isFalsePositive(MR, UseSite, C)) {
++        reportDerefBug(UseSite, MR, C);
++      }
++      // Remove to avoid duplicate reports and clean tracking
+       State = State->remove<SuspiciousAfterLockSet>(MR);
++      State = State->remove<PtrToThenMap>(MR);
+       C.addTransition(State);
+       // do not return early; check other params as well
+     }
+@@ -372,13 +502,21 @@
+ void SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext &C) const {
+   ProgramStateRef State = C.getState();
++
++  // Ensure we are actually under a lock
++  int Depth = State->get<LockDepth>();
++  if (Depth <= 0)
++    return;
+
+   // Heuristic: for members like ir->intr_num or deref *ir or arr like ir[idx],
+   // extract the base DeclRefExpr and see if it matches our tracked pointer.
+   const MemRegion *TrackedR = nullptr;
+   if (stmtDerefsTrackedPtr(S, C, State, TrackedR) && TrackedR) {
+-    reportDerefBug(S, TrackedR, C);
++    if (!isFalsePositive(TrackedR, S, C)) {
++      reportDerefBug(S, TrackedR, C);
++    }
+     State = State->remove<SuspiciousAfterLockSet>(TrackedR);
++    State = State->remove<PtrToThenMap>(TrackedR);
+     C.addTransition(State);
+   }
+ }
+@@ -387,8 +525,6 @@   // Best-effort cleanup of lock depth; sets will be discarded with state anyway.
+   ProgramStateRef State = C.getState();
+   State = State->set<LockDepth>(0);
+-
+-  // We don't strictly need to clear the sets; analysis state ends at function end.
+   C.addTransition(State);
+ }

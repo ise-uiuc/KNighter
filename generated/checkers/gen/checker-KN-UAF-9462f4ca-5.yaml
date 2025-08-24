@@ -1,0 +1,297 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 9462f4ca56e7d2430fdb6dcc8498244acbfc4489
+commit_type: UAF
+index: 5
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Expr.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state: set of currently-held locks (by their MemRegion).\nREGISTER_SET_WITH_PROGRAMSTATE(HeldLocks,\
+  \ const MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PreCall>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \      : BT(new BugType(this, \"Iterating/freeing tx list without holding tx_lock\"\
+  ,\n                       \"Concurrency\")) {}\n\n  void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  static bool isOneOfNames(const\
+  \ Expr *E, CheckerContext &C,\n                           std::initializer_list<StringRef>\
+  \ Names);\n  static bool isSpinLockAcquire(const CallEvent &Call, CheckerContext\
+  \ &C);\n  static bool isSpinLockRelease(const CallEvent &Call, CheckerContext &C);\n\
+  \  static bool isFreeLike(const CallEvent &Call, CheckerContext &C);\n\n  static\
+  \ const MemRegion *getLockRegionFromFirstArg(const CallEvent &Call,\n          \
+  \                                          CheckerContext &C);\n\n  static bool\
+  \ lockSetHasFieldName(ProgramStateRef State, StringRef FieldName);\n\n  static bool\
+  \ insideTxListIteration(const Stmt *S, CheckerContext &C);\n\n  void reportMissingTxLock(const\
+  \ Stmt *Anchor, CheckerContext &C) const;\n};\n\n// ------------ Helper Implementations\
+  \ ------------\n\nbool SAGenTestChecker::isOneOfNames(const Expr *E, CheckerContext\
+  \ &C,\n                                    std::initializer_list<StringRef> Names)\
+  \ {\n  if (!E)\n    return false;\n  for (auto N : Names) {\n    if (ExprHasName(E,\
+  \ N, C))\n      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isSpinLockAcquire(const\
+  \ CallEvent &Call,\n                                         CheckerContext &C)\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  return isOneOfNames(E, C, {\"spin_lock\"\
+  ,\n                             \"spin_lock_irqsave\",\n                       \
+  \      \"spin_lock_bh\",\n                             \"raw_spin_lock\",\n    \
+  \                         \"raw_spin_lock_irqsave\",\n                         \
+  \    \"raw_spin_lock_bh\"});\n}\n\nbool SAGenTestChecker::isSpinLockRelease(const\
+  \ CallEvent &Call,\n                                         CheckerContext &C)\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  return isOneOfNames(E, C, {\"spin_unlock\"\
+  ,\n                             \"spin_unlock_irqrestore\",\n                  \
+  \           \"spin_unlock_bh\",\n                             \"raw_spin_unlock\"\
+  ,\n                             \"raw_spin_unlock_irqrestore\",\n              \
+  \               \"raw_spin_unlock_bh\"});\n}\n\nbool SAGenTestChecker::isFreeLike(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  return isOneOfNames(E, C, {\"kfree\", \"kvfree\"});\n}\n\nconst MemRegion *SAGenTestChecker::getLockRegionFromFirstArg(\n\
+  \    const CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() == 0)\n\
+  \    return nullptr;\n  const Expr *Arg0 = Call.getArgExpr(0);\n  if (!Arg0)\n \
+  \   return nullptr;\n\n  // Do not strip implicit casts before getting region as\
+  \ per suggestions.\n  const MemRegion *MR = getMemRegionFromExpr(Arg0, C);\n  if\
+  \ (!MR)\n    return nullptr;\n\n  // Keep the precise region (likely FieldRegion\
+  \ for &gsm->tx_lock).\n  return MR;\n}\n\nbool SAGenTestChecker::lockSetHasFieldName(ProgramStateRef\
+  \ State,\n                                           StringRef FieldName) {\n  auto\
+  \ Locks = State->get<HeldLocks>();\n  for (const MemRegion *R : Locks) {\n    if\
+  \ (!R)\n      continue;\n\n    // Try to climb to a FieldRegion if needed.\n   \
+  \ const MemRegion *Cur = R;\n    while (Cur) {\n      if (const auto *FR = dyn_cast<FieldRegion>(Cur))\
+  \ {\n        if (FR->getDecl() && FR->getDecl()->getName().equals(FieldName))\n\
+  \          return true;\n        break;\n      }\n      const auto *SR = dyn_cast<SubRegion>(Cur);\n\
+  \      if (!SR)\n        break;\n      Cur = SR->getSuperRegion();\n    }\n  }\n\
+  \  return false;\n}\n\nbool SAGenTestChecker::insideTxListIteration(const Stmt *S,\
+  \ CheckerContext &C) {\n  if (!S)\n    return false;\n\n  const ForStmt *FS = findSpecificTypeInParents<ForStmt>(S,\
+  \ C);\n  if (!FS)\n    return false;\n\n  const SourceManager &SM = C.getSourceManager();\n\
+  \  const LangOptions &LangOpts = C.getLangOpts();\n\n  CharSourceRange Range = CharSourceRange::getTokenRange(FS->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, LangOpts);\n\n  if (!Text.contains(\"\
+  list_for_each_entry\"))\n    return false;\n\n  if (Text.contains(\"tx_ctrl_list\"\
+  ) || Text.contains(\"tx_data_list\"))\n    return true;\n\n  return false;\n}\n\n\
+  void SAGenTestChecker::reportMissingTxLock(const Stmt *Anchor,\n               \
+  \                            CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Iterating/freeing tx list without holding tx_lock\", N);\n  if (Anchor)\n\
+  \    R->addRange(Anchor->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n\
+  // ------------ Main Callback ------------\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call,\n                                    CheckerContext &C) const\
+  \ {\n  ProgramStateRef State = C.getState();\n\n  // Track spinlock acquisitions.\n\
+  \  if (isSpinLockAcquire(Call, C)) {\n    if (const MemRegion *R = getLockRegionFromFirstArg(Call,\
+  \ C)) {\n      // Add the concrete lock region.\n      State = State->add<HeldLocks>(R);\n\
+  \      // Also add the base region to be robust (won't hurt).\n      const MemRegion\
+  \ *Base = R->getBaseRegion();\n      if (Base)\n        State = State->add<HeldLocks>(Base);\n\
+  \      C.addTransition(State);\n    }\n    return;\n  }\n\n  // Track spinlock releases.\n\
+  \  if (isSpinLockRelease(Call, C)) {\n    if (const MemRegion *R = getLockRegionFromFirstArg(Call,\
+  \ C)) {\n      State = State->remove<HeldLocks>(R);\n      const MemRegion *Base\
+  \ = R->getBaseRegion();\n      if (Base)\n        State = State->remove<HeldLocks>(Base);\n\
+  \      C.addTransition(State);\n    }\n    return;\n  }\n\n  // Detect free-like\
+  \ operations inside list_for_each_entry* loops over tx lists.\n  if (isFreeLike(Call,\
+  \ C)) {\n    const Expr *Origin = Call.getOriginExpr();\n    const Stmt *Anchor\
+  \ = Origin ? static_cast<const Stmt *>(Origin) : Call.getStmt();\n    if (insideTxListIteration(Anchor,\
+  \ C)) {\n      // If tx_lock is not currently held, report.\n      if (!lockSetHasFieldName(State,\
+  \ \"tx_lock\")) {\n        reportMissingTxLock(Anchor, C);\n      }\n    }\n   \
+  \ return;\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing and iterating over GSM tx lists without holding tx_lock\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ntty: n_gsm: Fix use-after-free in gsm_cleanup_mux\n\
+  \nBUG: KASAN: slab-use-after-free in gsm_cleanup_mux+0x77b/0x7b0\ndrivers/tty/n_gsm.c:3160\
+  \ [n_gsm]\nRead of size 8 at addr ffff88815fe99c00 by task poc/3379\nCPU: 0 UID:\
+  \ 0 PID: 3379 Comm: poc Not tainted 6.11.0+ #56\nHardware name: VMware, Inc. VMware\
+  \ Virtual Platform/440BX\nDesktop Reference Platform, BIOS 6.00 11/12/2020\nCall\
+  \ Trace:\n <TASK>\n gsm_cleanup_mux+0x77b/0x7b0 drivers/tty/n_gsm.c:3160 [n_gsm]\n\
+  \ __pfx_gsm_cleanup_mux+0x10/0x10 drivers/tty/n_gsm.c:3124 [n_gsm]\n __pfx_sched_clock_cpu+0x10/0x10\
+  \ kernel/sched/clock.c:389\n update_load_avg+0x1c1/0x27b0 kernel/sched/fair.c:4500\n\
+  \ __pfx_min_vruntime_cb_rotate+0x10/0x10 kernel/sched/fair.c:846\n __rb_insert_augmented+0x492/0xbf0\
+  \ lib/rbtree.c:161\n gsmld_ioctl+0x395/0x1450 drivers/tty/n_gsm.c:3408 [n_gsm]\n\
+  \ _raw_spin_lock_irqsave+0x92/0xf0 arch/x86/include/asm/atomic.h:107\n __pfx_gsmld_ioctl+0x10/0x10\
+  \ drivers/tty/n_gsm.c:3822 [n_gsm]\n ktime_get+0x5e/0x140 kernel/time/timekeeping.c:195\n\
+  \ ldsem_down_read+0x94/0x4e0 arch/x86/include/asm/atomic64_64.h:79\n __pfx_ldsem_down_read+0x10/0x10\
+  \ drivers/tty/tty_ldsem.c:338\n __pfx_do_vfs_ioctl+0x10/0x10 fs/ioctl.c:805\n tty_ioctl+0x643/0x1100\
+  \ drivers/tty/tty_io.c:2818\n\nAllocated by task 65:\n gsm_data_alloc.constprop.0+0x27/0x190\
+  \ drivers/tty/n_gsm.c:926 [n_gsm]\n gsm_send+0x2c/0x580 drivers/tty/n_gsm.c:819\
+  \ [n_gsm]\n gsm1_receive+0x547/0xad0 drivers/tty/n_gsm.c:3038 [n_gsm]\n gsmld_receive_buf+0x176/0x280\
+  \ drivers/tty/n_gsm.c:3609 [n_gsm]\n tty_ldisc_receive_buf+0x101/0x1e0 drivers/tty/tty_buffer.c:391\n\
+  \ tty_port_default_receive_buf+0x61/0xa0 drivers/tty/tty_port.c:39\n flush_to_ldisc+0x1b0/0x750\
+  \ drivers/tty/tty_buffer.c:445\n process_scheduled_works+0x2b0/0x10d0 kernel/workqueue.c:3229\n\
+  \ worker_thread+0x3dc/0x950 kernel/workqueue.c:3391\n kthread+0x2a3/0x370 kernel/kthread.c:389\n\
+  \ ret_from_fork+0x2d/0x70 arch/x86/kernel/process.c:147\n ret_from_fork_asm+0x1a/0x30\
+  \ arch/x86/entry/entry_64.S:257\n\nFreed by task 3367:\n kfree+0x126/0x420 mm/slub.c:4580\n\
+  \ gsm_cleanup_mux+0x36c/0x7b0 drivers/tty/n_gsm.c:3160 [n_gsm]\n gsmld_ioctl+0x395/0x1450\
+  \ drivers/tty/n_gsm.c:3408 [n_gsm]\n tty_ioctl+0x643/0x1100 drivers/tty/tty_io.c:2818\n\
+  \n[Analysis]\ngsm_msg on the tx_ctrl_list or tx_data_list of gsm_mux\ncan be freed\
+  \ by multi threads through ioctl,which leads\nto the occurrence of uaf. Protect\
+  \ it by gsm tx lock.\n\nSigned-off-by: Longlong Xia <xialonglong@kylinos.cn>\nCc:\
+  \ stable <stable@kernel.org>\nSuggested-by: Jiri Slaby <jirislaby@kernel.org>\n\
+  Link: https://lore.kernel.org/r/20240926130213.531959-1-xialonglong@kylinos.cn\n\
+  Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>\n\n## Buggy Code\n\
+  \n```c\n// Function: gsm_cleanup_mux in drivers/tty/n_gsm.c\nstatic void gsm_cleanup_mux(struct\
+  \ gsm_mux *gsm, bool disc)\n{\n\tint i;\n\tstruct gsm_dlci *dlci;\n\tstruct gsm_msg\
+  \ *txq, *ntxq;\n\n\tgsm->dead = true;\n\tmutex_lock(&gsm->mutex);\n\n\tdlci = gsm->dlci[0];\n\
+  \tif (dlci) {\n\t\tif (disc && dlci->state != DLCI_CLOSED) {\n\t\t\tgsm_dlci_begin_close(dlci);\n\
+  \t\t\twait_event(gsm->event, dlci->state == DLCI_CLOSED);\n\t\t}\n\t\tdlci->dead\
+  \ = true;\n\t}\n\n\t/* Finish outstanding timers, making sure they are done */\n\
+  \tdel_timer_sync(&gsm->kick_timer);\n\tdel_timer_sync(&gsm->t2_timer);\n\tdel_timer_sync(&gsm->ka_timer);\n\
+  \n\t/* Finish writing to ldisc */\n\tflush_work(&gsm->tx_work);\n\n\t/* Free up\
+  \ any link layer users and finally the control channel */\n\tif (gsm->has_devices)\
+  \ {\n\t\tgsm_unregister_devices(gsm_tty_driver, gsm->num);\n\t\tgsm->has_devices\
+  \ = false;\n\t}\n\tfor (i = NUM_DLCI - 1; i >= 0; i--)\n\t\tif (gsm->dlci[i])\n\t\
+  \t\tgsm_dlci_release(gsm->dlci[i]);\n\tmutex_unlock(&gsm->mutex);\n\t/* Now wipe\
+  \ the queues */\n\ttty_ldisc_flush(gsm->tty);\n\tlist_for_each_entry_safe(txq, ntxq,\
+  \ &gsm->tx_ctrl_list, list)\n\t\tkfree(txq);\n\tINIT_LIST_HEAD(&gsm->tx_ctrl_list);\n\
+  \tlist_for_each_entry_safe(txq, ntxq, &gsm->tx_data_list, list)\n\t\tkfree(txq);\n\
+  \tINIT_LIST_HEAD(&gsm->tx_data_list);\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff\
+  \ --git a/drivers/tty/n_gsm.c b/drivers/tty/n_gsm.c\nindex 5d37a0984916..252849910588\
+  \ 100644\n--- a/drivers/tty/n_gsm.c\n+++ b/drivers/tty/n_gsm.c\n@@ -3157,6 +3157,8\
+  \ @@ static void gsm_cleanup_mux(struct gsm_mux *gsm, bool disc)\n \tmutex_unlock(&gsm->mutex);\n\
+  \ \t/* Now wipe the queues */\n \ttty_ldisc_flush(gsm->tty);\n+\n+\tguard(spinlock_irqsave)(&gsm->tx_lock);\n\
+  \ \tlist_for_each_entry_safe(txq, ntxq, &gsm->tx_ctrl_list, list)\n \t\tkfree(txq);\n\
+  \ \tINIT_LIST_HEAD(&gsm->tx_ctrl_list);\n```\n"
+pattern: "## Bug Pattern\n\nFreeing and iterating over a shared list without holding\
+  \ the lock that protects that list. Specifically, tearing down tx_ctrl_list/tx_data_list\
+  \ with list_for_each_entry_safe() and kfree() outside the list\u2019s spinlock (gsm->tx_lock),\
+  \ while other threads (e.g., ioctl paths) can concurrently access/remove/free the\
+  \ same entries, leading to use-after-free."
+plan: "1) Program state\n\n- REGISTER_SET_WITH_PROGRAMSTATE(HeldLocks, const MemRegion*)\n\
+  \  - Purpose: track the set of currently-held locks (by their addressable MemRegion)\
+  \ on the current path.\n\nNo other custom state is needed.\n\n2) Helper utilities\n\
+  \n- isSpinLockAcquire(const CallEvent&):\n  - Return true if callee name is one\
+  \ of: \"spin_lock\", \"spin_lock_irqsave\", \"spin_lock_bh\", \"raw_spin_lock\"\
+  , \"raw_spin_lock_irqsave\", \"raw_spin_lock_bh\".\n- isSpinLockRelease(const CallEvent&):\n\
+  \  - Return true if callee name is one of: \"spin_unlock\", \"spin_unlock_irqrestore\"\
+  , \"spin_unlock_bh\", \"raw_spin_unlock\", \"raw_spin_unlock_irqrestore\", \"raw_spin_unlock_bh\"\
+  .\n- isFreeLike(const CallEvent&):\n  - Return true if callee name is one of: \"\
+  kfree\", \"kvfree\".\n- getLockRegionFromFirstArg(const CallEvent&, CheckerContext&):\n\
+  \  - Return getMemRegionFromExpr(Call.getArgExpr(0), C).\n- lockSetHasFieldName(ProgramStateRef,\
+  \ StringRef FieldName):\n  - Iterate over State->get<HeldLocks>(). For each MemRegion\
+  \ R:\n    - If const FieldRegion* FR = dyn_cast<FieldRegion>(R), return true if\
+  \ FR->getDecl()->getName().equals(FieldName).\n  - Return false otherwise.\n- insideTxListIteration(const\
+  \ Stmt* S, CheckerContext& C):\n  - Ascend to the nearest parent ForStmt using findSpecificTypeInParents<ForStmt>(S,\
+  \ C).\n  - If none found, return false.\n  - Get source text of that ForStmt using\
+  \ SourceManager and LangOptions:\n    - CharSourceRange Range = CharSourceRange::getTokenRange(FS->getSourceRange());\n\
+  \    - StringRef Text = Lexer::getSourceText(Range, SM, LangOpts).\n  - Return true\
+  \ if:\n    - Text.contains(\"list_for_each_entry\") and\n    - (Text.contains(\"\
+  tx_ctrl_list\") || Text.contains(\"tx_data_list\")).\n  - Otherwise return false.\n\
+  - reportMissingTxLock(const Stmt* Anchor, CheckerContext& C, StringRef WhichList):\n\
+  \  - auto N = C.generateNonFatalErrorNode();\n  - If N is non-null, create a PathSensitiveBugReport\
+  \ with short message:\n    - \"Iterating/freeing tx list without holding tx_lock\"\
+  \n  - Add range of Anchor (e.g., CallExpr to kfree) and emit the report.\n\n3) Callback:\
+  \ checkPreCall\n\n- Track spinlock acquisitions:\n  - If isSpinLockAcquire(Call):\n\
+  \    - const MemRegion* R = getLockRegionFromFirstArg(Call, C).\n    - If R is non-null:\n\
+  \      - State = C.getState()->add<HeldLocks>(R).\n      - C.addTransition(State).\n\
+  - Track spinlock releases:\n  - If isSpinLockRelease(Call):\n    - const MemRegion*\
+  \ R = getLockRegionFromFirstArg(Call, C).\n    - If R is non-null:\n      - State\
+  \ = C.getState()->remove<HeldLocks>(R).\n      - C.addTransition(State).\n- Detect\
+  \ missing lock around tx list teardown:\n  - If isFreeLike(Call):\n    - If insideTxListIteration(Call.getOriginExpr()\
+  \ or Call.getStmt(), C) is true:\n      - If NOT lockSetHasFieldName(C.getState(),\
+  \ \"tx_lock\"):\n        - reportMissingTxLock(Call.getStmt(), C, /*WhichList not\
+  \ needed in message*/ \"\");\n\nNotes:\n- The guard(spinlock_irqsave) macro in the\
+  \ fix typically expands to a call to spin_lock_irqsave(...), so the acquisition\
+  \ is observed here.\n- We purposefully look for frees (kfree/kvfree) inside list_for_each_entry*\
+  \ loops over tx_ctrl_list/tx_data_list; if no tx_lock is currently held on the path,\
+  \ we report.\n\n4) Other callbacks\n\n- None required. We do not need checkBind,\
+  \ checkLocation, etc., because we do not perform aliasing or dereference reasoning\
+  \ here. The spinlock lockset is fully tracked by checkPreCall acquisitions/releases.\n\
+  \n5) Detection scope and rationale\n\n- The checker focuses narrowly on the intended\
+  \ kernel pattern:\n  - Iterating over tx_ctrl_list/tx_data_list via list_for_each_entry*\
+  \ and freeing elements.\n  - Requires an enclosing tx_lock to be held.\n- By keying\
+  \ off the loop\u2019s source text (macro use) and the list names, we sidestep macro-expansion\
+  \ AST complications.\n- We minimize false positives by requiring:\n  - A free-like\
+  \ call inside that specific loop, and\n  - Absence of any currently-held FieldRegion\
+  \ named \"tx_lock\" in the lockset.\n\n6) Reporting\n\n- One short diagnostic per\
+  \ free detected without tx_lock in the loop:\n  - Title: \"Iterating/freeing tx\
+  \ list without holding tx_lock\"\n  - Anchor: the kfree/kvfree call site.\n- Use\
+  \ PathSensitiveBugReport via generateNonFatalErrorNode."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"clang/AST/Expr.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n//\
+  \ Program state: set of currently-held locks (by their MemRegion).\nREGISTER_SET_WITH_PROGRAMSTATE(HeldLocks,\
+  \ const MemRegion*)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<check::PreCall>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\npublic:\n  SAGenTestChecker()\n\
+  \      : BT(new BugType(this, \"Iterating/freeing tx list without holding tx_lock\"\
+  ,\n                       \"Concurrency\")) {}\n\n  void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n\nprivate:\n  // Helpers\n  static bool isOneOfNames(const\
+  \ Expr *E, CheckerContext &C,\n                           std::initializer_list<StringRef>\
+  \ Names);\n  static bool isSpinLockAcquire(const CallEvent &Call, CheckerContext\
+  \ &C);\n  static bool isSpinLockRelease(const CallEvent &Call, CheckerContext &C);\n\
+  \  static bool isFreeLike(const CallEvent &Call, CheckerContext &C);\n\n  static\
+  \ const MemRegion *getLockRegionFromFirstArg(const CallEvent &Call,\n          \
+  \                                          CheckerContext &C);\n\n  static bool\
+  \ lockSetHasFieldName(ProgramStateRef State, StringRef FieldName);\n\n  static bool\
+  \ insideTxListIteration(const Stmt *S, CheckerContext &C);\n\n  void reportMissingTxLock(const\
+  \ Stmt *Anchor, CheckerContext &C) const;\n};\n\n// ------------ Helper Implementations\
+  \ ------------\n\nbool SAGenTestChecker::isOneOfNames(const Expr *E, CheckerContext\
+  \ &C,\n                                    std::initializer_list<StringRef> Names)\
+  \ {\n  if (!E)\n    return false;\n  for (auto N : Names) {\n    if (ExprHasName(E,\
+  \ N, C))\n      return true;\n  }\n  return false;\n}\n\nbool SAGenTestChecker::isSpinLockAcquire(const\
+  \ CallEvent &Call,\n                                         CheckerContext &C)\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  return isOneOfNames(E, C, {\"spin_lock\"\
+  ,\n                             \"spin_lock_irqsave\",\n                       \
+  \      \"spin_lock_bh\",\n                             \"raw_spin_lock\",\n    \
+  \                         \"raw_spin_lock_irqsave\",\n                         \
+  \    \"raw_spin_lock_bh\"});\n}\n\nbool SAGenTestChecker::isSpinLockRelease(const\
+  \ CallEvent &Call,\n                                         CheckerContext &C)\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  return isOneOfNames(E, C, {\"spin_unlock\"\
+  ,\n                             \"spin_unlock_irqrestore\",\n                  \
+  \           \"spin_unlock_bh\",\n                             \"raw_spin_unlock\"\
+  ,\n                             \"raw_spin_unlock_irqrestore\",\n              \
+  \               \"raw_spin_unlock_bh\"});\n}\n\nbool SAGenTestChecker::isFreeLike(const\
+  \ CallEvent &Call, CheckerContext &C) {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  return isOneOfNames(E, C, {\"kfree\", \"kvfree\"});\n}\n\nconst MemRegion *SAGenTestChecker::getLockRegionFromFirstArg(\n\
+  \    const CallEvent &Call, CheckerContext &C) {\n  if (Call.getNumArgs() == 0)\n\
+  \    return nullptr;\n  const Expr *Arg0 = Call.getArgExpr(0);\n  if (!Arg0)\n \
+  \   return nullptr;\n\n  // Do not strip implicit casts before getting region as\
+  \ per suggestions.\n  const MemRegion *MR = getMemRegionFromExpr(Arg0, C);\n  if\
+  \ (!MR)\n    return nullptr;\n\n  // Keep the precise region (likely FieldRegion\
+  \ for &gsm->tx_lock).\n  return MR;\n}\n\nbool SAGenTestChecker::lockSetHasFieldName(ProgramStateRef\
+  \ State,\n                                           StringRef FieldName) {\n  auto\
+  \ Locks = State->get<HeldLocks>();\n  for (const MemRegion *R : Locks) {\n    if\
+  \ (!R)\n      continue;\n\n    // Try to climb to a FieldRegion if needed.\n   \
+  \ const MemRegion *Cur = R;\n    while (Cur) {\n      if (const auto *FR = dyn_cast<FieldRegion>(Cur))\
+  \ {\n        if (FR->getDecl() && FR->getDecl()->getName().equals(FieldName))\n\
+  \          return true;\n        break;\n      }\n      const auto *SR = dyn_cast<SubRegion>(Cur);\n\
+  \      if (!SR)\n        break;\n      Cur = SR->getSuperRegion();\n    }\n  }\n\
+  \  return false;\n}\n\nbool SAGenTestChecker::insideTxListIteration(const Stmt *S,\
+  \ CheckerContext &C) {\n  if (!S)\n    return false;\n\n  const ForStmt *FS = findSpecificTypeInParents<ForStmt>(S,\
+  \ C);\n  if (!FS)\n    return false;\n\n  const SourceManager &SM = C.getSourceManager();\n\
+  \  const LangOptions &LangOpts = C.getLangOpts();\n\n  CharSourceRange Range = CharSourceRange::getTokenRange(FS->getSourceRange());\n\
+  \  StringRef Text = Lexer::getSourceText(Range, SM, LangOpts);\n\n  if (!Text.contains(\"\
+  list_for_each_entry\"))\n    return false;\n\n  if (Text.contains(\"tx_ctrl_list\"\
+  ) || Text.contains(\"tx_data_list\"))\n    return true;\n\n  return false;\n}\n\n\
+  void SAGenTestChecker::reportMissingTxLock(const Stmt *Anchor,\n               \
+  \                            CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Iterating/freeing tx list without holding tx_lock\", N);\n  if (Anchor)\n\
+  \    R->addRange(Anchor->getSourceRange());\n  C.emitReport(std::move(R));\n}\n\n\
+  // ------------ Main Callback ------------\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call,\n                                    CheckerContext &C) const\
+  \ {\n  ProgramStateRef State = C.getState();\n\n  // Track spinlock acquisitions.\n\
+  \  if (isSpinLockAcquire(Call, C)) {\n    if (const MemRegion *R = getLockRegionFromFirstArg(Call,\
+  \ C)) {\n      // Add the concrete lock region.\n      State = State->add<HeldLocks>(R);\n\
+  \      // Also add the base region to be robust (won't hurt).\n      const MemRegion\
+  \ *Base = R->getBaseRegion();\n      if (Base)\n        State = State->add<HeldLocks>(Base);\n\
+  \      C.addTransition(State);\n    }\n    return;\n  }\n\n  // Track spinlock releases.\n\
+  \  if (isSpinLockRelease(Call, C)) {\n    if (const MemRegion *R = getLockRegionFromFirstArg(Call,\
+  \ C)) {\n      State = State->remove<HeldLocks>(R);\n      const MemRegion *Base\
+  \ = R->getBaseRegion();\n      if (Base)\n        State = State->remove<HeldLocks>(Base);\n\
+  \      C.addTransition(State);\n    }\n    return;\n  }\n\n  // Detect free-like\
+  \ operations inside list_for_each_entry* loops over tx lists.\n  if (isFreeLike(Call,\
+  \ C)) {\n    const Expr *Origin = Call.getOriginExpr();\n    const Stmt *Anchor\
+  \ = Origin ? static_cast<const Stmt *>(Origin) : nullptr;\n    if (insideTxListIteration(Anchor,\
+  \ C)) {\n      // If tx_lock is not currently held, report.\n      if (!lockSetHasFieldName(State,\
+  \ \"tx_lock\")) {\n        reportMissingTxLock(Anchor, C);\n      }\n    }\n   \
+  \ return;\n  }\n}\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects freeing and iterating over GSM tx lists without holding tx_lock\"\
+  ,\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[] =\n\
+  \    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 0
+tp_score: 1

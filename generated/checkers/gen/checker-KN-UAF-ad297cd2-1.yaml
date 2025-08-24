@@ -1,0 +1,322 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ad297cd2db8953e2202970e9504cab247b6c7cb4
+commit_type: UAF
+index: 1
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program states\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrToNetdev,\
+  \ const MemRegion*, const MemRegion*)\nREGISTER_MAP_WITH_PROGRAMSTATE(NetdevFreedMap,\
+  \ const MemRegion*, char)\n\nnamespace {\n\nclass SAGenTestChecker : public Checker<\n\
+  \    check::Bind,\n    check::PreCall,\n    check::Location> {\n   mutable std::unique_ptr<BugType>\
+  \ BT;\n\n   public:\n      SAGenTestChecker() : BT(new BugType(this, \"use-after-free\
+  \ of net_device private data\", \"Memory Management\")) {}\n\n      void checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n      void checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const;\n      void checkLocation(SVal Loc,\
+  \ bool IsLoad, const Stmt *S, CheckerContext &C) const;\n\n   private:\n\n     \
+  \ // Helpers\n      static bool isCallTo(const CallEvent &Call, StringRef Name,\
+  \ CheckerContext &C);\n      static StringRef getCalleeName(const CallEvent &Call);\n\
+  \      static const MemRegion *getArgRegion(const CallEvent &Call, unsigned Idx,\
+  \ CheckerContext &C);\n\n      static const MemRegion *getLHSRegionFromBind(SVal\
+  \ Loc);\n      static const MemRegion *getRHSRegionFromBind(SVal Val);\n\n     \
+  \ static const Expr *getRootBaseExprOfMemberChain(const Expr *E);\n      static\
+  \ const MemRegion *getMemberBasePtrRegion(const Stmt *S, CheckerContext &C);\n \
+  \     static const MemRegion *argContainsMemberBasePtrRegion(const Expr *Arg, CheckerContext\
+  \ &C);\n\n      static const MemRegion *getOwnerNetdevForPtr(ProgramStateRef State,\
+  \ const MemRegion *PtrReg);\n      static bool isNetdevFreed(ProgramStateRef State,\
+  \ const MemRegion *NetdevReg);\n\n      void reportUAF(const Stmt *Trigger, const\
+  \ MemRegion *NetdevReg, CheckerContext &C) const;\n};\n\n// Implementation\n\nbool\
+  \ SAGenTestChecker::isCallTo(const CallEvent &Call, StringRef Name, CheckerContext\
+  \ &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, Name, C);\n}\n\nStringRef SAGenTestChecker::getCalleeName(const\
+  \ CallEvent &Call) {\n  if (const IdentifierInfo *ID = Call.getCalleeIdentifier())\n\
+  \    return ID->getName();\n  return StringRef();\n}\n\nconst MemRegion *SAGenTestChecker::getArgRegion(const\
+  \ CallEvent &Call, unsigned Idx, CheckerContext &C) {\n  if (Idx >= Call.getNumArgs())\n\
+  \    return nullptr;\n  const Expr *ArgE = Call.getArgExpr(Idx);\n  if (!ArgE)\n\
+  \    return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n \
+  \ if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion\
+  \ *SAGenTestChecker::getLHSRegionFromBind(SVal Loc) {\n  const MemRegion *MR = Loc.getAsRegion();\n\
+  \  if (!MR) return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion\
+  \ *SAGenTestChecker::getRHSRegionFromBind(SVal Val) {\n  const MemRegion *MR = Val.getAsRegion();\n\
+  \  if (!MR) return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst Expr *SAGenTestChecker::getRootBaseExprOfMemberChain(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  const Expr *Base = E;\n  // Walk down\
+  \ through member chains to find the root base expression (e.g., 'adpt' from 'adpt->phy.base')\n\
+  \  while (true) {\n    const Expr *Cur = Base->IgnoreParenImpCasts();\n    if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(Cur)) {\n      Base = ME->getBase();\n      continue;\n\
+  \    }\n    break;\n  }\n  return Base;\n}\n\nconst MemRegion *SAGenTestChecker::getMemberBasePtrRegion(const\
+  \ Stmt *S, CheckerContext &C) {\n  if (!S) return nullptr;\n  const MemberExpr *ME\
+  \ = findSpecificTypeInParents<MemberExpr>(S, C);\n  if (!ME) return nullptr;\n\n\
+  \  const Expr *RootBase = getRootBaseExprOfMemberChain(ME);\n  if (!RootBase) return\
+  \ nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(RootBase, C);\n  if (!MR)\
+  \ return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion *SAGenTestChecker::argContainsMemberBasePtrRegion(const\
+  \ Expr *Arg, CheckerContext &C) {\n  if (!Arg) return nullptr;\n  const MemberExpr\
+  \ *ME = findSpecificTypeInChildren<MemberExpr>(Arg);\n  if (!ME) return nullptr;\n\
+  \n  const Expr *RootBase = getRootBaseExprOfMemberChain(ME);\n  if (!RootBase) return\
+  \ nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(RootBase, C);\n  if (!MR)\
+  \ return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion *SAGenTestChecker::getOwnerNetdevForPtr(ProgramStateRef\
+  \ State, const MemRegion *PtrReg) {\n  if (!State || !PtrReg) return nullptr;\n\
+  \  return State->get<PtrToNetdev>(PtrReg);\n}\n\nbool SAGenTestChecker::isNetdevFreed(ProgramStateRef\
+  \ State, const MemRegion *NetdevReg) {\n  if (!State || !NetdevReg) return false;\n\
+  \  const char *Val = State->get<NetdevFreedMap>(NetdevReg);\n  return Val && *Val\
+  \ == 1;\n}\n\nvoid SAGenTestChecker::reportUAF(const Stmt *Trigger, const MemRegion\
+  \ *NetdevReg, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"use-after-free: net_device private data used after free_netdev()\"\
+  , N);\n  if (Trigger)\n    R->addRange(Trigger->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// Build map from private-data pointer to its owning net_device\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n\n  const MemRegion *LHSReg = getLHSRegionFromBind(Loc);\n  if\
+  \ (!LHSReg) {\n    return;\n  }\n\n  // Case A: LHS is assigned from netdev_priv(netdev)\n\
+  \  if (S) {\n    const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S);\n\
+  \    if (CE && ExprHasName(CE, \"netdev_priv\", C)) {\n      if (CE->getNumArgs()\
+  \ >= 1) {\n        const Expr *Arg0 = CE->getArg(0);\n        const MemRegion *NetdevReg\
+  \ = getMemRegionFromExpr(Arg0, C);\n        if (NetdevReg) {\n          NetdevReg\
+  \ = NetdevReg->getBaseRegion();\n          State = State->set<PtrToNetdev>(LHSReg,\
+  \ NetdevReg);\n          C.addTransition(State);\n          return;\n        }\n\
+  \      }\n    }\n  }\n\n  // Case B: Propagate aliasing: LHS = RHS and RHS already\
+  \ mapped to a net_device\n  const MemRegion *RHSReg = getRHSRegionFromBind(Val);\n\
+  \  if (RHSReg) {\n    const MemRegion *OwnerNetdev = State->get<PtrToNetdev>(RHSReg);\n\
+  \    if (OwnerNetdev) {\n      State = State->set<PtrToNetdev>(LHSReg, OwnerNetdev);\n\
+  \      C.addTransition(State);\n      return;\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkPreCall(const\
+  \ CallEvent &Call, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // Mark free_netdev argument net_device as freed\n  if (isCallTo(Call, \"free_netdev\"\
+  , C)) {\n    const MemRegion *NetdevReg = getArgRegion(Call, 0, C);\n    if (NetdevReg)\
+  \ {\n      State = State->set<NetdevFreedMap>(NetdevReg, 1);\n      C.addTransition(State);\n\
+  \    }\n    return;\n  }\n\n  // For all other calls, scan arguments for uses of\
+  \ private data (adpt->...)\n  for (unsigned i = 0; i < Call.getNumArgs(); ++i) {\n\
+  \    const Expr *ArgE = Call.getArgExpr(i);\n    const MemRegion *BasePtrReg = argContainsMemberBasePtrRegion(ArgE,\
+  \ C);\n    if (!BasePtrReg)\n      continue;\n\n    const MemRegion *OwnerNetdev\
+  \ = getOwnerNetdevForPtr(State, BasePtrReg);\n    if (!OwnerNetdev)\n      continue;\n\
+  \n    if (isNetdevFreed(State, OwnerNetdev)) {\n      reportUAF(ArgE, OwnerNetdev,\
+  \ C);\n    }\n  }\n}\n\nvoid SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad,\
+  \ const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State = C.getState();\n\
+  \n  // We are interested in member accesses like adpt->... after free_netdev(netdev)\n\
+  \  const MemRegion *BasePtrReg = getMemberBasePtrRegion(S, C);\n  if (!BasePtrReg)\n\
+  \    return;\n\n  const MemRegion *OwnerNetdev = getOwnerNetdevForPtr(State, BasePtrReg);\n\
+  \  if (!OwnerNetdev)\n    return;\n\n  if (isNetdevFreed(State, OwnerNetdev)) {\n\
+  \    reportUAF(S, OwnerNetdev, C);\n  }\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects use-after-free of net_device\
+  \ private data after free_netdev()\",\n      \"\");\n}\n\nextern \"C\" const char\
+  \ clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nnet: qcom/emac: fix UAF in emac_remove\n\nadpt is\
+  \ netdev private data and it cannot be\nused after free_netdev() call. Using adpt\
+  \ after free_netdev()\ncan cause UAF bug. Fix it by moving free_netdev() at the\
+  \ end of the\nfunction.\n\nFixes: 54e19bc74f33 (\"net: qcom/emac: do not use devm\
+  \ on internal phy pdev\")\nSigned-off-by: Pavel Skripkin <paskripkin@gmail.com>\n\
+  Signed-off-by: David S. Miller <davem@davemloft.net>\n\n## Buggy Code\n\n```c\n\
+  // Function: emac_remove in drivers/net/ethernet/qualcomm/emac/emac.c\nstatic int\
+  \ emac_remove(struct platform_device *pdev)\n{\n\tstruct net_device *netdev = dev_get_drvdata(&pdev->dev);\n\
+  \tstruct emac_adapter *adpt = netdev_priv(netdev);\n\n\tunregister_netdev(netdev);\n\
+  \tnetif_napi_del(&adpt->rx_q.napi);\n\n\temac_clks_teardown(adpt);\n\n\tput_device(&adpt->phydev->mdio.dev);\n\
+  \tmdiobus_unregister(adpt->mii_bus);\n\tfree_netdev(netdev);\n\n\tif (adpt->phy.digital)\n\
+  \t\tiounmap(adpt->phy.digital);\n\tiounmap(adpt->phy.base);\n\n\treturn 0;\n}\n\
+  ```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/net/ethernet/qualcomm/emac/emac.c\
+  \ b/drivers/net/ethernet/qualcomm/emac/emac.c\nindex 8543bf3c3484..ad655f0a4965\
+  \ 100644\n--- a/drivers/net/ethernet/qualcomm/emac/emac.c\n+++ b/drivers/net/ethernet/qualcomm/emac/emac.c\n\
+  @@ -735,12 +735,13 @@ static int emac_remove(struct platform_device *pdev)\n \n\
+  \ \tput_device(&adpt->phydev->mdio.dev);\n \tmdiobus_unregister(adpt->mii_bus);\n\
+  -\tfree_netdev(netdev);\n \n \tif (adpt->phy.digital)\n \t\tiounmap(adpt->phy.digital);\n\
+  \ \tiounmap(adpt->phy.base);\n \n+\tfree_netdev(netdev);\n+\n \treturn 0;\n }\n\
+  \ \n```\n"
+pattern: '## Bug Pattern
+
+
+  Use-after-free due to freeing the net_device before the last use of its private
+  data:
+
+  - Obtain adapter pointer from netdev_priv(netdev).
+
+  - Call free_netdev(netdev) (which frees the private data).
+
+  - Continue to dereference the adapter (e.g., adpt->... for iounmap/MDIO/etc.).
+
+
+  In short: dereferencing netdev_priv(netdev) after calling free_netdev(netdev) because
+  of incorrect teardown order.'
+plan: "1) Program state\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrToNetdev, const MemRegion*,\
+  \ const MemRegion*)\n  - Maps a pointer variable/region (e.g., adpt) to the owning\
+  \ net_device\u2019s region.\n- REGISTER_MAP_WITH_PROGRAMSTATE(NetdevFreedMap, const\
+  \ MemRegion*, char)\n  - Marks a net_device region as freed (value = 1). Absence\
+  \ means not freed.\n\nNo extra traits/sets are necessary. Alias tracking will be\
+  \ handled by propagating PtrToNetdev in checkBind.\n\n2) Helper utilities (internal\
+  \ to the checker)\n- isCallTo(const CallEvent &Call, StringRef Name)\n  - Compare\
+  \ callee identifier with Name.\n- getCalleeName(const CallEvent &Call)\n  - Returns\
+  \ a StringRef of the callee name for debugging and branching.\n- getArgRegion(const\
+  \ CallEvent &Call, unsigned Idx, CheckerContext &C)\n  - Return MemRegion of Call.getArgExpr(Idx)\
+  \ using getMemRegionFromExpr.\n- getLHSRegionFromBind(SVal Loc)\n  - From checkBind\u2019\
+  s Loc, return the MemRegion for LHS variable.\n- getRHSRegionFromBind(SVal Val)\n\
+  \  - From checkBind\u2019s Val, return the MemRegion for RHS (if it is a region).\n\
+  - getMemberBasePtrRegion(const Stmt *S, CheckerContext &C)\n  - If S corresponds\
+  \ to a memory access on a MemberExpr (adpt->...), find the parent MemberExpr using\
+  \ findSpecificTypeInParents<MemberExpr>(S, C), then return MemRegion of the MemberExpr\
+  \ base expression via getMemRegionFromExpr.\n- argContainsMemberBasePtrRegion(const\
+  \ Expr *Arg, CheckerContext &C)\n  - Find a MemberExpr inside Arg using findSpecificTypeInChildren<MemberExpr>(Arg);\
+  \ if found, return MemRegion of its base expression via getMemRegionFromExpr. If\
+  \ none, return nullptr.\n\n3) Reporting\n- reportUAF(const Stmt *Trigger, const\
+  \ MemRegion *NetdevReg, CheckerContext &C)\n  - If no error node exists, create\
+  \ one with generateNonFatalErrorNode.\n  - Emit a PathSensitiveBugReport with a\
+  \ short message:\n    - \"use-after-free: net_device private data used after free_netdev()\"\
+  \n\n4) Callback: checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C)\
+  \ const\n- Purpose: Build the PtrToNetdev map both on netdev_priv() assignment and\
+  \ on pointer aliasing.\n\nImplementation specifics:\n- Get LHSReg = getLHSRegionFromBind(Loc);\
+  \ if null, return.\n- Case A: Binding LHS from netdev_priv(...)\n  - If S contains\
+  \ a CallExpr on the RHS (use findSpecificTypeInChildren<CallExpr>(S)):\n    - If\
+  \ callee name is \"netdev_priv\":\n      - Get netdevReg = getMemRegionFromExpr(CallExpr->getArg(0),\
+  \ C).\n      - If both LHSReg and netdevReg are non-null, set PtrToNetdev[LHSReg]\
+  \ = netdevReg.\n- Case B: Pointer alias propagation\n  - Get RHSReg = getRHSRegionFromBind(Val).\n\
+  \  - If RHSReg exists and PtrToNetdev has RHSReg -> netdevReg mapping:\n    - Set\
+  \ PtrToNetdev[LHSReg] = netdevReg.\n- Do not remove mappings on reassignments; latest\
+  \ binding will overwrite.\n\n5) Callback: checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const\n- Purpose: Mark free_netdev() and proactively catch uses of freed netdev_priv\
+  \ data when passed as function arguments (including address-of scenarios that may\
+  \ not cause a load).\n\nImplementation specifics:\n- If isCallTo(Call, \"free_netdev\"\
+  ):\n  - netdevReg = getArgRegion(Call, 0, C).\n  - If netdevReg, set NetdevFreedMap[netdevReg]\
+  \ = 1.\n  - return.\n- For every argument i in Call:\n  - ArgExpr = Call.getArgExpr(i).\n\
+  \  - basePtrReg = argContainsMemberBasePtrRegion(ArgExpr, C).\n    - If basePtrReg:\n\
+  \      - Look up ownerNetdevReg = PtrToNetdev[basePtrReg].\n      - If ownerNetdevReg\
+  \ exists and NetdevFreedMap[ownerNetdevReg] == 1:\n        - reportUAF(ArgExpr,\
+  \ ownerNetdevReg, C).\n\n6) Callback: checkLocation(SVal Loc, bool IsLoad, const\
+  \ Stmt *S, CheckerContext &C) const\n- Purpose: Catch dereferences of private data\
+  \ after free_netdev via member access (adpt->...).\n\nImplementation specifics:\n\
+  - If !IsLoad and !IsStore, return.\n- basePtrReg = getMemberBasePtrRegion(S, C).\n\
+  \  - If null, return.\n- ownerNetdevReg = PtrToNetdev[basePtrReg].\n  - If none,\
+  \ return.\n- If NetdevFreedMap[ownerNetdevReg] == 1:\n  - reportUAF(S, ownerNetdevReg,\
+  \ C).\n\nNotes:\n- This catches typical adpt->field reads/writes after free_netdev().\
+  \ The S provided by the engine for loads/stores will have a MemberExpr parent for\
+  \ \"->\" access, which we extract using findSpecificTypeInParents.\n- Even if the\
+  \ access is address-of a field (&adpt->field), checkPreCall\u2019s argument scanning\
+  \ will catch it when the expression is passed to a function. If such an expression\
+  \ appears in a bind (e.g., p = &adpt->field), you can optionally extend checkBind\
+  \ similarly by detecting a MemberExpr on the RHS and checking NetdevFreedMap for\
+  \ the base.\n\n7) Optional refinement (keep simple; not required)\n- To avoid duplicate\
+  \ reports, keep a small bug location set in the node, or rely on CSA\u2019s deduplication.\n\
+  - You may conservatively clear PtrToNetdev entries for a given netdev when it is\
+  \ freed to reduce future noise, but it\u2019s not necessary for correctness.\n\n\
+  8) Summary of detection flow\n- Build map: adpt_region -> netdev_region when assigning\
+  \ netdev_priv(netdev) to adpt.\n- Mark: free_netdev(netdev) sets netdev_region as\
+  \ freed.\n- Detect:\n  - Any subsequent member access off adpt (loads/stores) =>\
+  \ UAF if its owner netdev is freed.\n  - Any function argument that contains a member\
+  \ expression based on adpt (including address-of cases) => UAF if its owner netdev\
+  \ is freed.\n\n9) Messages\n- Use a concise message:\n  - Title: \"use-after-free\
+  \ of net_device private data\"\n  - Description: \"use-after-free: net_device private\
+  \ data used after free_netdev()\"\n\nThis plan uses minimal state (two maps), leverages\
+  \ checkBind for precise origin tracking from netdev_priv, marks free_netdev in checkPreCall,\
+  \ and reports at memory accesses (checkLocation) and argument uses (checkPreCall),\
+  \ which suffices to capture the teardown order bug illustrated by the patch."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include <memory>\n\
+  \nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\n// Program\
+  \ states\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrToNetdev, const MemRegion*, const MemRegion*)\n\
+  REGISTER_MAP_WITH_PROGRAMSTATE(NetdevFreedMap, const MemRegion*, char)\n\nnamespace\
+  \ {\n\nclass SAGenTestChecker : public Checker<\n    check::Bind,\n    check::PreCall,\n\
+  \    check::Location> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"use-after-free of net_device\
+  \ private data\", \"Memory Management\")) {}\n\n      void checkBind(SVal Loc, SVal\
+  \ Val, const Stmt *S, CheckerContext &C) const;\n      void checkPreCall(const CallEvent\
+  \ &Call, CheckerContext &C) const;\n      void checkLocation(SVal Loc, bool IsLoad,\
+  \ const Stmt *S, CheckerContext &C) const;\n\n   private:\n\n      // Helpers\n\
+  \      static bool isCallTo(const CallEvent &Call, StringRef Name, CheckerContext\
+  \ &C);\n      static StringRef getCalleeName(const CallEvent &Call);\n      static\
+  \ const MemRegion *getArgRegion(const CallEvent &Call, unsigned Idx, CheckerContext\
+  \ &C);\n\n      static const MemRegion *getLHSRegionFromBind(SVal Loc);\n      static\
+  \ const MemRegion *getRHSRegionFromBind(SVal Val);\n\n      static const Expr *getRootBaseExprOfMemberChain(const\
+  \ Expr *E);\n      static const MemRegion *getMemberBasePtrRegion(const Stmt *S,\
+  \ CheckerContext &C);\n      static const MemRegion *argContainsMemberBasePtrRegion(const\
+  \ Expr *Arg, CheckerContext &C);\n\n      static const MemRegion *getOwnerNetdevForPtr(ProgramStateRef\
+  \ State, const MemRegion *PtrReg);\n      static bool isNetdevFreed(ProgramStateRef\
+  \ State, const MemRegion *NetdevReg);\n\n      void reportUAF(const Stmt *Trigger,\
+  \ const MemRegion *NetdevReg, CheckerContext &C) const;\n};\n\n// Implementation\n\
+  \nbool SAGenTestChecker::isCallTo(const CallEvent &Call, StringRef Name, CheckerContext\
+  \ &C) {\n  const Expr *E = Call.getOriginExpr();\n  if (!E) return false;\n  return\
+  \ ExprHasName(E, Name, C);\n}\n\nStringRef SAGenTestChecker::getCalleeName(const\
+  \ CallEvent &Call) {\n  if (const IdentifierInfo *ID = Call.getCalleeIdentifier())\n\
+  \    return ID->getName();\n  return StringRef();\n}\n\nconst MemRegion *SAGenTestChecker::getArgRegion(const\
+  \ CallEvent &Call, unsigned Idx, CheckerContext &C) {\n  if (Idx >= Call.getNumArgs())\n\
+  \    return nullptr;\n  const Expr *ArgE = Call.getArgExpr(Idx);\n  if (!ArgE)\n\
+  \    return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(ArgE, C);\n \
+  \ if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion\
+  \ *SAGenTestChecker::getLHSRegionFromBind(SVal Loc) {\n  const MemRegion *MR = Loc.getAsRegion();\n\
+  \  if (!MR) return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion\
+  \ *SAGenTestChecker::getRHSRegionFromBind(SVal Val) {\n  const MemRegion *MR = Val.getAsRegion();\n\
+  \  if (!MR) return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst Expr *SAGenTestChecker::getRootBaseExprOfMemberChain(const\
+  \ Expr *E) {\n  if (!E) return nullptr;\n  const Expr *Base = E;\n  // Walk down\
+  \ through member chains to find the root base expression (e.g., 'adpt' from 'adpt->phy.base')\n\
+  \  while (true) {\n    const Expr *Cur = Base->IgnoreParenImpCasts();\n    if (const\
+  \ auto *ME = dyn_cast<MemberExpr>(Cur)) {\n      Base = ME->getBase();\n      continue;\n\
+  \    }\n    break;\n  }\n  return Base;\n}\n\nconst MemRegion *SAGenTestChecker::getMemberBasePtrRegion(const\
+  \ Stmt *S, CheckerContext &C) {\n  if (!S) return nullptr;\n  const MemberExpr *ME\
+  \ = findSpecificTypeInParents<MemberExpr>(S, C);\n  if (!ME) return nullptr;\n\n\
+  \  const Expr *RootBase = getRootBaseExprOfMemberChain(ME);\n  if (!RootBase) return\
+  \ nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(RootBase, C);\n  if (!MR)\
+  \ return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion *SAGenTestChecker::argContainsMemberBasePtrRegion(const\
+  \ Expr *Arg, CheckerContext &C) {\n  if (!Arg) return nullptr;\n  const MemberExpr\
+  \ *ME = findSpecificTypeInChildren<MemberExpr>(Arg);\n  if (!ME) return nullptr;\n\
+  \n  const Expr *RootBase = getRootBaseExprOfMemberChain(ME);\n  if (!RootBase) return\
+  \ nullptr;\n\n  const MemRegion *MR = getMemRegionFromExpr(RootBase, C);\n  if (!MR)\
+  \ return nullptr;\n  return MR->getBaseRegion();\n}\n\nconst MemRegion *SAGenTestChecker::getOwnerNetdevForPtr(ProgramStateRef\
+  \ State, const MemRegion *PtrReg) {\n  if (!State || !PtrReg) return nullptr;\n\
+  \  if (const MemRegion *const *V = State->get<PtrToNetdev>(PtrReg))\n    return\
+  \ *V;\n  return nullptr;\n}\n\nbool SAGenTestChecker::isNetdevFreed(ProgramStateRef\
+  \ State, const MemRegion *NetdevReg) {\n  if (!State || !NetdevReg) return false;\n\
+  \  const char *Val = State->get<NetdevFreedMap>(NetdevReg);\n  return Val && *Val\
+  \ == 1;\n}\n\nvoid SAGenTestChecker::reportUAF(const Stmt *Trigger, const MemRegion\
+  \ *NetdevReg, CheckerContext &C) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"use-after-free: net_device private data used after free_netdev()\"\
+  , N);\n  if (Trigger)\n    R->addRange(Trigger->getSourceRange());\n  C.emitReport(std::move(R));\n\
+  }\n\n// Build map from private-data pointer to its owning net_device\nvoid SAGenTestChecker::checkBind(SVal\
+  \ Loc, SVal Val, const Stmt *S, CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n\n  const MemRegion *LHSReg = getLHSRegionFromBind(Loc);\n  if\
+  \ (!LHSReg) {\n    return;\n  }\n\n  // Case A: LHS is assigned from netdev_priv(netdev)\n\
+  \  if (S) {\n    const CallExpr *CE = findSpecificTypeInChildren<CallExpr>(S);\n\
+  \    if (CE && ExprHasName(CE, \"netdev_priv\", C)) {\n      if (CE->getNumArgs()\
+  \ >= 1) {\n        const Expr *Arg0 = CE->getArg(0);\n        const MemRegion *NetdevReg\
+  \ = getMemRegionFromExpr(Arg0, C);\n        if (NetdevReg) {\n          NetdevReg\
+  \ = NetdevReg->getBaseRegion();\n          State = State->set<PtrToNetdev>(LHSReg,\
+  \ NetdevReg);\n          C.addTransition(State);\n          return;\n        }\n\
+  \      }\n    }\n  }\n\n  // Case B: Propagate aliasing: LHS = RHS and RHS already\
+  \ mapped to a net_device\n  const MemRegion *RHSReg = getRHSRegionFromBind(Val);\n\
+  \  if (RHSReg) {\n    if (const MemRegion *const *OwnerNetdevPtr = State->get<PtrToNetdev>(RHSReg))\
+  \ {\n      const MemRegion *OwnerNetdev = *OwnerNetdevPtr;\n      State = State->set<PtrToNetdev>(LHSReg,\
+  \ OwnerNetdev);\n      C.addTransition(State);\n      return;\n    }\n  }\n}\n\n\
+  void SAGenTestChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const\
+  \ {\n  ProgramStateRef State = C.getState();\n\n  // Mark free_netdev argument net_device\
+  \ as freed\n  if (isCallTo(Call, \"free_netdev\", C)) {\n    const MemRegion *NetdevReg\
+  \ = getArgRegion(Call, 0, C);\n    if (NetdevReg) {\n      State = State->set<NetdevFreedMap>(NetdevReg,\
+  \ 1);\n      C.addTransition(State);\n    }\n    return;\n  }\n\n  // For all other\
+  \ calls, scan arguments for uses of private data (adpt->...)\n  for (unsigned i\
+  \ = 0; i < Call.getNumArgs(); ++i) {\n    const Expr *ArgE = Call.getArgExpr(i);\n\
+  \    const MemRegion *BasePtrReg = argContainsMemberBasePtrRegion(ArgE, C);\n  \
+  \  if (!BasePtrReg)\n      continue;\n\n    const MemRegion *OwnerNetdev = getOwnerNetdevForPtr(State,\
+  \ BasePtrReg);\n    if (!OwnerNetdev)\n      continue;\n\n    if (isNetdevFreed(State,\
+  \ OwnerNetdev)) {\n      reportUAF(ArgE, OwnerNetdev, C);\n    }\n  }\n}\n\nvoid\
+  \ SAGenTestChecker::checkLocation(SVal Loc, bool IsLoad, const Stmt *S, CheckerContext\
+  \ &C) const {\n  ProgramStateRef State = C.getState();\n\n  // We are interested\
+  \ in member accesses like adpt->... after free_netdev(netdev)\n  const MemRegion\
+  \ *BasePtrReg = getMemberBasePtrRegion(S, C);\n  if (!BasePtrReg)\n    return;\n\
+  \n  const MemRegion *OwnerNetdev = getOwnerNetdevForPtr(State, BasePtrReg);\n  if\
+  \ (!OwnerNetdev)\n    return;\n\n  if (isNetdevFreed(State, OwnerNetdev)) {\n  \
+  \  reportUAF(S, OwnerNetdev, C);\n  }\n}\n\n} // end anonymous namespace\n\nextern\
+  \ \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects use-after-free of net_device\
+  \ private data after free_netdev()\",\n      \"\");\n}\n\nextern \"C\" const char\
+  \ clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

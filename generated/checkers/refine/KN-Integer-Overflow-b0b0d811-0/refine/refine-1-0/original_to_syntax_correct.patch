@@ -1,0 +1,261 @@
+--- original_code.cpp+++ syntax_correct_refine_code.cpp@@ -66,6 +66,13 @@   static bool isWideTargetType(QualType QT, CheckerContext &C);
+   static bool isConstantFolded(const Expr *E, CheckerContext &C);
+
++  // Range reasoning helpers to suppress FPs when product fits in the mul's type.
++  static bool getMaxForExpr(const Expr *E, CheckerContext &C,
++                            llvm::APSInt &Max, bool &IsNonNegative, bool &Known);
++  static llvm::APSInt getMaxForType(QualType QT, CheckerContext &C);
++  static bool productDefinitelyFitsInType(const Expr *L, const Expr *R,
++                                          QualType MulType, CheckerContext &C);
++
+   // Finds a suspicious '*' on the value-producing path of Root.
+   static bool findFirstSuspiciousMulOnValuePath(const Expr *Root,
+                                                 unsigned TargetBits,
+@@ -134,6 +141,114 @@   return EvaluateExprToInt(EvalRes, E, C);
+ }
+
++// Compute max value representable by a type (signed or unsigned).
++llvm::APSInt SAGenTestChecker::getMaxForType(QualType QT, CheckerContext &C) {
++  unsigned Bits = getTypeBitWidth(QT, C);
++  bool IsUnsigned = QT->isUnsignedIntegerType();
++  llvm::APInt MaxAP = IsUnsigned ? llvm::APInt::getMaxValue(Bits)
++                                 : llvm::APInt::getSignedMaxValue(Bits);
++  return llvm::APSInt(MaxAP, IsUnsigned);
++}
++
++// Obtain a conservative maximum for an expression and whether it is non-negative.
++// Known is true if we could establish a bound; false if unknown.
++bool SAGenTestChecker::getMaxForExpr(const Expr *E, CheckerContext &C,
++                                     llvm::APSInt &Max, bool &IsNonNegative, bool &Known) {
++  if (!E) {
++    Known = false;
++    IsNonNegative = false;
++    return false;
++  }
++
++  E = E->IgnoreParenImpCasts();
++
++  // 1) Integer literal or compile-time constant.
++  if (const auto *IL = dyn_cast<IntegerLiteral>(E)) {
++    Max = llvm::APSInt(IL->getValue(), /*IsUnsigned=*/false);
++    IsNonNegative = !Max.isSigned() || Max.isNonNegative();
++    Known = true;
++    return true;
++  }
++
++  // Attempt constant-fold.
++  llvm::APSInt EvalRes;
++  if (EvaluateExprToInt(EvalRes, E, C)) {
++    Max = EvalRes;
++    IsNonNegative = !Max.isSigned() || Max.isNonNegative();
++    Known = true;
++    return true;
++  }
++
++  // 2) Concrete SVal from the engine.
++  ProgramStateRef State = C.getState();
++  SVal SV = State->getSVal(E, C.getLocationContext());
++
++  if (auto CI = SV.getAs<nonloc::ConcreteInt>()) {
++    Max = CI->getValue();
++    IsNonNegative = !Max.isSigned() || Max.isNonNegative();
++    Known = true;
++    return true;
++  }
++
++  // 3) Symbolic upper bound from constraints.
++  if (SymbolRef Sym = SV.getAsSymbol()) {
++    if (const llvm::APSInt *MaxVal = inferSymbolMaxVal(Sym, C)) {
++      Max = *MaxVal;
++      IsNonNegative = !Max.isSigned() || Max.isNonNegative();
++      Known = true;
++      return true;
++    }
++  }
++
++  // 4) Fallback: type-based bound.
++  QualType QT = E->getType();
++  if (isIntegerLike(QT)) {
++    Max = getMaxForType(QT, C);
++    // For unsigned integer types, we know it's non-negative.
++    IsNonNegative = QT->isUnsignedIntegerType();
++    Known = true;
++    return true;
++  }
++
++  Known = false;
++  IsNonNegative = false;
++  return false;
++}
++
++// If both operands are known non-negative and we can bound their maxima,
++// check if the product of these maxima definitely fits in MulType.
++// Return true only if we can prove it fits (hence no overflow possible).
++bool SAGenTestChecker::productDefinitelyFitsInType(const Expr *L, const Expr *R,
++                                                   QualType MulType, CheckerContext &C) {
++  llvm::APSInt MaxL, MaxR;
++  bool NN_L = false, NN_R = false, KnownL = false, KnownR = false;
++
++  getMaxForExpr(L, C, MaxL, NN_L, KnownL);
++  getMaxForExpr(R, C, MaxR, NN_R, KnownR);
++
++  if (!(KnownL && KnownR && NN_L && NN_R))
++    return false; // Cannot prove safety.
++
++  // Compute product in a sufficiently wide unsigned APInt domain.
++  const unsigned WideBits = 128;
++  llvm::APInt LExt = MaxL.isSigned() ? MaxL.sext(WideBits) : MaxL.zext(WideBits);
++  llvm::APInt RExt = MaxR.isSigned() ? MaxR.sext(WideBits) : MaxR.zext(WideBits);
++  llvm::APInt Prod = LExt * RExt;
++
++  // Compare against maximum representable in the mul's (promoted) result type.
++  unsigned MulBits = getTypeBitWidth(MulType, C);
++  bool MulUnsigned = MulType->isUnsignedIntegerType();
++  llvm::APInt MulMax = MulUnsigned ? llvm::APInt::getMaxValue(MulBits)
++                                   : llvm::APInt::getSignedMaxValue(MulBits);
++  llvm::APInt MulMaxExt = MulMax.zextOrTrunc(WideBits);
++
++  // Since product is non-negative, unsigned compare suffices.
++  if (Prod.ule(MulMaxExt))
++    return true; // Definitely fits -> no overflow in narrower mul type.
++
++  return false;
++}
++
+ // Restrict traversal to the value-producing path of Root.
+ bool SAGenTestChecker::findFirstSuspiciousMulOnValuePath(const Expr *Root,
+                                                          unsigned TargetBits,
+@@ -153,11 +268,15 @@       if (isIntegerLike(ResT)) {
+         unsigned MulBits = getTypeBitWidth(ResT, C);
+         if (MulBits < TargetBits) {
+-          OutMul = BO;
+-          return true;
++          // New guard: if we can prove the product cannot overflow in ResT,
++          // then it is safe and should not be considered suspicious.
++          if (!productDefinitelyFitsInType(BO->getLHS(), BO->getRHS(), ResT, C)) {
++            OutMul = BO;
++            return true;
++          }
+         }
+       }
+-      // Even if not suspicious, do not stop searching; sub-operands might contain another mul.
++      // Even if not suspicious, continue searching sub-expressions.
+       if (findFirstSuspiciousMulOnValuePath(BO->getLHS(), TargetBits, OutMul, C))
+         return true;
+       if (findFirstSuspiciousMulOnValuePath(BO->getRHS(), TargetBits, OutMul, C))
+@@ -262,7 +381,6 @@   std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
+
+   // Heuristic keywords that map to memory/byte/size/address semantics.
+-  // This keeps detection focused on the intended bug pattern.
+   return nameContains(Lower,
+                       {"addr", "address", "dma_addr",
+                        "size", "len", "length", "bytes", "nbytes",
+@@ -290,7 +408,7 @@   }
+
+   // Source expression text heuristic.
+-  if (ExprHasName(Root, "intspec", C) || ExprHasName(Root, "irq", C) ||
++  if (ExprHasName(Root, "jiffies", C) || ExprHasName(Root, "irq", C) ||
+       ExprHasName(Root, "hwirq", C))
+     return true;
+
+@@ -304,14 +422,11 @@                                               CheckerContext &C) {
+   (void)MulBO;
+
+-  // 1) If the RHS/root expression text contains "jiffies", treat this as
+-  //    time arithmetic; suppress the report.
++  // 1) Time arithmetic.
+   if (ExprHasName(Root, "jiffies", C))
+     return true;
+
+-  // 2) If the parent assignment/compound-assignment LHS name implies timeout-like field,
+-  //    suppress as well.
+-  //    Common patterns: expires, expiry, timeout, deadline, jiffies.
++  // 2) Timeout-like LHS names.
+   const CompoundAssignOperator *CAO =
+       findSpecificTypeInParents<CompoundAssignOperator>(Root, C);
+   const BinaryOperator *AssignBO =
+@@ -335,7 +450,7 @@     }
+   }
+
+-  // 3) IRQ-like contexts (e.g., hwirq math) commonly wide-typed but safe.
++  // 3) IRQ-like contexts.
+   if (LHS && isIrqLikeContext(Root, LHS, C))
+     return true;
+
+@@ -347,7 +462,7 @@ bool SAGenTestChecker::isMulUnderCallArg(const BinaryOperator *MulBO,
+                                          const Expr *Root,
+                                          CheckerContext &C) {
+-  (void)Root; // Root can be used for stricter checks if needed.
++  (void)Root;
+   const CallExpr *CE = findSpecificTypeInParents<CallExpr>(MulBO, C);
+   return CE != nullptr;
+ }
+@@ -367,20 +482,17 @@   if (!MulBO)
+     return true;
+
+-  // Suppress when:
+-  // - The LHS is not address/size-like (we only target addr/size/len/offset/pitch/stride).
++  // Suppress when LHS is not address/size-like (we target addr/size/len/offset/pitch/stride).
+   if (!isAddressOrSizeLikeLHS(LHSExpr))
+     return true;
+
+-  // - The context is time/jiffies-like or irq-domain-like.
++  // Suppress known benign contexts.
+   if (isFalsePositiveContext(Root, MulBO, LHSExpr, C))
+     return true;
+
+-  // - The multiplication is under a CallExpr (argument), e.g., MSR index macros.
++  // Suppress when '*' is under a call arg or an array index.
+   if (isMulUnderCallArg(MulBO, Root, C))
+     return true;
+-
+-  // - The multiplication is under an ArraySubscriptExpr (index computation).
+   if (isMulUnderArrayIndex(MulBO, C))
+     return true;
+
+@@ -424,6 +536,11 @@       const BinaryOperator *MulBO = nullptr;
+       const Expr *RHS = CAO->getRHS();
+       if (findFirstSuspiciousMulOnValuePath(RHS, getTypeBitWidth(LT, C), MulBO, C)) {
++        // Extra safety: if multiplication definitely fits in its own type, skip.
++        if (MulBO && productDefinitelyFitsInType(MulBO->getLHS(), MulBO->getRHS(),
++                                                 MulBO->getType(), C)) {
++          return;
++        }
+         if (MulBO && !isConstantFolded(MulBO, C) &&
+             !isFalsePositive(RHS, MulBO, LHS, C)) {
+           emitReport(MulBO, LT, C);
+@@ -448,6 +565,10 @@     const Expr *RHS = BO->getRHS();
+     const BinaryOperator *MulBO = nullptr;
+     if (findFirstSuspiciousMulOnValuePath(RHS, getTypeBitWidth(LT, C), MulBO, C)) {
++      if (MulBO && productDefinitelyFitsInType(MulBO->getLHS(), MulBO->getRHS(),
++                                               MulBO->getType(), C)) {
++        return;
++      }
+       if (MulBO && !isConstantFolded(MulBO, C) &&
+           !isFalsePositive(RHS, MulBO, LHS, C)) {
+         emitReport(MulBO, LT, C);
+@@ -475,13 +596,7 @@     const Expr *Init = VD->getInit();
+     const BinaryOperator *MulBO = nullptr;
+     if (findFirstSuspiciousMulOnValuePath(Init, getTypeBitWidth(T, C), MulBO, C)) {
+-      // For initialization, synthesize a pseudo-LHS using the VarDecl's name.
+-      // We'll build a simple DeclRefExpr-like name via VD.
+-      // Here we create a very small shim: we pass nullptr for LHSExpr, but handle
+-      // it in isFalsePositiveContext by scanning jiffies/irq in Root and using
+-      // the VarDecl's name as a proxy for LHS semantics.
+-      // Simpler: construct a fake DeclRefExpr is heavy; instead check name here.
+-      // If VD name isn't address/size-like, suppress.
++      // For initialization, ensure the variable name is address/size-like.
+       std::string Name = VD->getNameAsString();
+       std::string Lower = Name;
+       std::transform(Lower.begin(), Lower.end(), Lower.begin(), ::tolower);
+@@ -493,6 +608,11 @@       if (!IsAddrSizeLike)
+         continue;
+
++      if (MulBO && productDefinitelyFitsInType(MulBO->getLHS(), MulBO->getRHS(),
++                                               MulBO->getType(), C)) {
++        continue;
++      }
++
+       if (MulBO && !isConstantFolded(MulBO, C) &&
+           !isFalsePositive(Init, MulBO, nullptr, C)) {
+         emitReport(MulBO, T, C);

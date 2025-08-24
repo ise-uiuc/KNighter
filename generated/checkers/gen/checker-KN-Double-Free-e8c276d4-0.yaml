@@ -1,0 +1,408 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: e8c276d4dc0e19ee48385f74426aebc855b49aaf
+commit_type: Double-Free
+index: 0
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"llvm/ADT/SmallSet.h\"\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\nREGISTER_MAP_WITH_PROGRAMSTATE(ResourceStateMap,\
+  \ const MemRegion *, unsigned)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const\
+  \ MemRegion *, const MemRegion *)\n\n// Resource states\nenum ResourceState : unsigned\
+  \ {\n  RS_Unknown = 0,\n  RS_Allocated = 1,\n  RS_MaybeFreed = 2,\n  RS_Freed =\
+  \ 3\n};\n\nnamespace {\nclass SAGenTestChecker\n    : public Checker<\n        \
+  \  check::PreCall,\n          check::PostCall,\n          check::Bind,\n       \
+  \   check::EndFunction> {\n  mutable std::unique_ptr<BugType> BT;\n\npublic:\n \
+  \ SAGenTestChecker()\n      : BT(new BugType(this, \"Double free of resource\",\
+  \ \"Memory Management\")) {}\n\n  void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \  void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;\n\nprivate:\n\
+  \  // Helpers for function identification\n  bool isAllocCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n  bool isFreeCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  bool isMaybeFreeCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n  // Alias helpers\n  const MemRegion *getRootAlias(ProgramStateRef State, const\
+  \ MemRegion *R) const;\n  ProgramStateRef setAlias(ProgramStateRef State, const\
+  \ MemRegion *Dst,\n                           const MemRegion *SrcRoot) const;\n\
+  \n  // Resource state helpers\n  unsigned getResState(ProgramStateRef State, const\
+  \ MemRegion *R) const;\n  ProgramStateRef setResState(ProgramStateRef State, const\
+  \ MemRegion *R,\n                              unsigned NewState) const;\n\n  //\
+  \ Utility to extract and canonicalize region from a call argument\n  const MemRegion\
+  \ *getArgBaseRegion(const CallEvent &Call, unsigned Idx,\n                     \
+  \               CheckerContext &C) const;\n\n  void reportDoubleFree(const CallEvent\
+  \ &Call, CheckerContext &C,\n                        const MemRegion *Root) const;\n\
+  };\n\n// ================== Helper Implementations ==================\n\nbool SAGenTestChecker::isAllocCall(const\
+  \ CallEvent &Call,\n                                   CheckerContext &C) const\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  if (!E)\n    return false;\n  return\
+  \ ExprHasName(E, \"fastrpc_buf_alloc\", C) ||\n         ExprHasName(E, \"fastrpc_remote_heap_alloc\"\
+  , C);\n}\n\nbool SAGenTestChecker::isFreeCall(const CallEvent &Call,\n         \
+  \                         CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E)\n    return false;\n  return ExprHasName(E, \"fastrpc_buf_free\", C);\n\
+  }\n\nbool SAGenTestChecker::isMaybeFreeCall(const CallEvent &Call,\n           \
+  \                            CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E)\n    return false;\n  return ExprHasName(E, \"fastrpc_req_munmap_impl\"\
+  , C);\n}\n\nconst MemRegion *SAGenTestChecker::getRootAlias(ProgramStateRef State,\n\
+  \                                                const MemRegion *R) const {\n \
+  \ if (!R)\n    return nullptr;\n  const MemRegion *Cur = R->getBaseRegion();\n \
+  \ llvm::SmallSet<const MemRegion *, 8> Visited;\n  while (Cur) {\n    if (!Visited.insert(Cur).second)\
+  \ // loop detected\n      break;\n    const MemRegion *Next = State->get<PtrAliasMap>(Cur);\n\
+  \    if (!Next)\n      break;\n    Cur = Next->getBaseRegion();\n  }\n  return Cur\
+  \ ? Cur->getBaseRegion() : nullptr;\n}\n\nProgramStateRef SAGenTestChecker::setAlias(ProgramStateRef\
+  \ State,\n                                           const MemRegion *Dst,\n   \
+  \                                        const MemRegion *SrcRoot) const {\n  if\
+  \ (!Dst || !SrcRoot)\n    return State;\n  const MemRegion *DstRoot = Dst->getBaseRegion();\n\
+  \  const MemRegion *SrcCanon = getRootAlias(State, SrcRoot);\n  if (!DstRoot ||\
+  \ !SrcCanon)\n    return State;\n  // Map destination root to source canonical root\n\
+  \  State = State->set<PtrAliasMap>(DstRoot, SrcCanon);\n  return State;\n}\n\nunsigned\
+  \ SAGenTestChecker::getResState(ProgramStateRef State,\n                       \
+  \                const MemRegion *R) const {\n  if (!R)\n    return RS_Unknown;\n\
+  \  const MemRegion *Root = getRootAlias(State, R);\n  if (!Root)\n    return RS_Unknown;\n\
+  \  const unsigned *St = State->get<ResourceStateMap>(Root);\n  return St ? *St :\
+  \ RS_Unknown;\n}\n\nProgramStateRef SAGenTestChecker::setResState(ProgramStateRef\
+  \ State,\n                                              const MemRegion *R,\n  \
+  \                                            unsigned NewState) const {\n  if (!R)\n\
+  \    return State;\n  const MemRegion *Root = getRootAlias(State, R);\n  if (!Root)\n\
+  \    Root = R->getBaseRegion();\n  if (!Root)\n    return State;\n  return State->set<ResourceStateMap>(Root,\
+  \ NewState);\n}\n\nconst MemRegion *SAGenTestChecker::getArgBaseRegion(const CallEvent\
+  \ &Call,\n                                                    unsigned Idx,\n  \
+  \                                                  CheckerContext &C) const {\n\
+  \  if (Idx >= Call.getNumArgs())\n    return nullptr;\n  const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \  if (!ArgE)\n    return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(ArgE,\
+  \ C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n}\n\nvoid\
+  \ SAGenTestChecker::reportDoubleFree(const CallEvent &Call,\n                  \
+  \                      CheckerContext &C,\n                                    \
+  \    const MemRegion *Root) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Double free: resource may have been released earlier in error path\"\
+  ,\n      N);\n  R->addRange(Call.getSourceRange());\n  if (Root)\n    R->markInteresting(Root);\n\
+  \  C.emitReport(std::move(R));\n}\n\n// ================== Checker Callbacks ==================\n\
+  \nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call,\n                 \
+  \                   CheckerContext &C) const {\n  // Warn before a second free happens.\n\
+  \  if (!isFreeCall(Call, C))\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  const MemRegion *MR = getArgBaseRegion(Call, 0, C);\n  if (!MR)\n    return;\n\
+  \n  const MemRegion *Root = getRootAlias(State, MR);\n  if (!Root)\n    Root = MR->getBaseRegion();\n\
+  \n  unsigned St = getResState(State, Root);\n  if (St == RS_MaybeFreed || St ==\
+  \ RS_Freed) {\n    reportDoubleFree(Call, C, Root);\n  }\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call,\n                                     CheckerContext &C) const\
+  \ {\n  ProgramStateRef State = C.getState();\n\n  // Model allocation: out-param\
+  \ at index 3 -> Allocated\n  if (isAllocCall(Call, C)) {\n    const MemRegion *OutMR\
+  \ = getArgBaseRegion(Call, 3, C);\n    if (OutMR) {\n      const MemRegion *Root\
+  \ = getRootAlias(State, OutMR);\n      if (!Root)\n        Root = OutMR->getBaseRegion();\n\
+  \      if (Root) {\n        State = State->set<ResourceStateMap>(Root, RS_Allocated);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  // Model\
+  \ maybe-free helper: arg1 -> MaybeFreed\n  if (isMaybeFreeCall(Call, C)) {\n   \
+  \ const MemRegion *ArgMR = getArgBaseRegion(Call, 1, C);\n    if (ArgMR) {\n   \
+  \   const MemRegion *Root = getRootAlias(State, ArgMR);\n      if (!Root)\n    \
+  \    Root = ArgMR->getBaseRegion();\n      if (Root) {\n        // Transition to\
+  \ MaybeFreed regardless of previous state to reflect\n        // that the helper\
+  \ might have released the resource.\n        State = State->set<ResourceStateMap>(Root,\
+  \ RS_MaybeFreed);\n        C.addTransition(State);\n      }\n    }\n    return;\n\
+  \  }\n\n  // Model direct free: arg0 -> Freed\n  if (isFreeCall(Call, C)) {\n  \
+  \  const MemRegion *ArgMR = getArgBaseRegion(Call, 0, C);\n    if (ArgMR) {\n  \
+  \    const MemRegion *Root = getRootAlias(State, ArgMR);\n      if (!Root)\n   \
+  \     Root = ArgMR->getBaseRegion();\n      if (Root) {\n        State = State->set<ResourceStateMap>(Root,\
+  \ RS_Freed);\n        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,\n     \
+  \                            CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n  const MemRegion *Dst = Loc.getAsRegion();\n  if (!Dst) {\n\
+  \    C.addTransition(State);\n    return;\n  }\n  Dst = Dst->getBaseRegion();\n\
+  \  if (!Dst) {\n    C.addTransition(State);\n    return;\n  }\n\n  if (const MemRegion\
+  \ *Src = Val.getAsRegion()) {\n    Src = Src->getBaseRegion();\n    if (Src) {\n\
+  \      State = setAlias(State, Dst, Src);\n      C.addTransition(State);\n     \
+  \ return;\n    }\n  }\n\n  // No aliasing to record for other kinds of values.\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt\
+  \ *RS,\n                                        CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  State = State->remove<ResourceStateMap>();\n  State =\
+  \ State->remove<PtrAliasMap>();\n  C.addTransition(State);\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects double free when a helper may free and then a shared cleanup\
+  \ frees again\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nmisc: fastrpc: Fix double free of 'buf' in error path\n\
+  \nsmatch warning:\ndrivers/misc/fastrpc.c:1926 fastrpc_req_mmap() error: double\
+  \ free of 'buf'\n\nIn fastrpc_req_mmap() error path, the fastrpc buffer is freed\
+  \ in\nfastrpc_req_munmap_impl() if unmap is successful.\n\nBut in the end, there\
+  \ is an unconditional call to fastrpc_buf_free().\nSo the above case triggers the\
+  \ double free of fastrpc buf.\n\nFixes: 72fa6f7820c4 (\"misc: fastrpc: Rework fastrpc_req_munmap\"\
+  )\nReviewed-by: Shuah Khan <skhan@linuxfoundation.org>\nReviewed-by: Dan Carpenter\
+  \ <dan.carpenter@linaro.org>\nReviewed-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>\n\
+  Signed-off-by: Sukrut Bellary <sukrut.bellary@linux.com>\nSigned-off-by: Srinivas\
+  \ Kandagatla <srinivas.kandagatla@linaro.org>\nCc: stable <stable@kernel.org>\n\
+  Link: https://lore.kernel.org/r/20240902141409.70371-2-srinivas.kandagatla@linaro.org\n\
+  Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>\n\n## Buggy Code\n\
+  \n```c\n// Function: fastrpc_req_mmap in drivers/misc/fastrpc.c\nstatic int fastrpc_req_mmap(struct\
+  \ fastrpc_user *fl, char __user *argp)\n{\n\tstruct fastrpc_invoke_args args[3]\
+  \ = { [0 ... 2] = { 0 } };\n\tstruct fastrpc_buf *buf = NULL;\n\tstruct fastrpc_mmap_req_msg\
+  \ req_msg;\n\tstruct fastrpc_mmap_rsp_msg rsp_msg;\n\tstruct fastrpc_phy_page pages;\n\
+  \tstruct fastrpc_req_mmap req;\n\tstruct device *dev = fl->sctx->dev;\n\tint err;\n\
+  \tu32 sc;\n\n\tif (copy_from_user(&req, argp, sizeof(req)))\n\t\treturn -EFAULT;\n\
+  \n\tif (req.flags != ADSP_MMAP_ADD_PAGES && req.flags != ADSP_MMAP_REMOTE_HEAP_ADDR)\
+  \ {\n\t\tdev_err(dev, \"flag not supported 0x%x\\n\", req.flags);\n\n\t\treturn\
+  \ -EINVAL;\n\t}\n\n\tif (req.vaddrin) {\n\t\tdev_err(dev, \"adding user allocated\
+  \ pages is not supported\\n\");\n\t\treturn -EINVAL;\n\t}\n\n\tif (req.flags ==\
+  \ ADSP_MMAP_REMOTE_HEAP_ADDR)\n\t\terr = fastrpc_remote_heap_alloc(fl, dev, req.size,\
+  \ &buf);\n\telse\n\t\terr = fastrpc_buf_alloc(fl, dev, req.size, &buf);\n\n\tif\
+  \ (err) {\n\t\tdev_err(dev, \"failed to allocate buffer\\n\");\n\t\treturn err;\n\
+  \t}\n\n\treq_msg.pgid = fl->tgid;\n\treq_msg.flags = req.flags;\n\treq_msg.vaddr\
+  \ = req.vaddrin;\n\treq_msg.num = sizeof(pages);\n\n\targs[0].ptr = (u64) (uintptr_t)\
+  \ &req_msg;\n\targs[0].length = sizeof(req_msg);\n\n\tpages.addr = buf->phys;\n\t\
+  pages.size = buf->size;\n\n\targs[1].ptr = (u64) (uintptr_t) &pages;\n\targs[1].length\
+  \ = sizeof(pages);\n\n\targs[2].ptr = (u64) (uintptr_t) &rsp_msg;\n\targs[2].length\
+  \ = sizeof(rsp_msg);\n\n\tsc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_MMAP, 2, 1);\n\t\
+  err = fastrpc_internal_invoke(fl, true, FASTRPC_INIT_HANDLE, sc,\n\t\t\t\t     \
+  \ &args[0]);\n\tif (err) {\n\t\tdev_err(dev, \"mmap error (len 0x%08llx)\\n\", buf->size);\n\
+  \t\tgoto err_invoke;\n\t}\n\n\t/* update the buffer to be able to deallocate the\
+  \ memory on the DSP */\n\tbuf->raddr = (uintptr_t) rsp_msg.vaddr;\n\n\t/* let the\
+  \ client know the address to use */\n\treq.vaddrout = rsp_msg.vaddr;\n\n\t/* Add\
+  \ memory to static PD pool, protection thru hypervisor */\n\tif (req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR\
+  \ && fl->cctx->vmcount) {\n\t\tu64 src_perms = BIT(QCOM_SCM_VMID_HLOS);\n\n\t\t\
+  err = qcom_scm_assign_mem(buf->phys, (u64)buf->size,\n\t\t\t&src_perms, fl->cctx->vmperms,\
+  \ fl->cctx->vmcount);\n\t\tif (err) {\n\t\t\tdev_err(fl->sctx->dev, \"Failed to\
+  \ assign memory phys 0x%llx size 0x%llx err %d\",\n\t\t\t\t\tbuf->phys, buf->size,\
+  \ err);\n\t\t\tgoto err_assign;\n\t\t}\n\t}\n\n\tspin_lock(&fl->lock);\n\tlist_add_tail(&buf->node,\
+  \ &fl->mmaps);\n\tspin_unlock(&fl->lock);\n\n\tif (copy_to_user((void __user *)argp,\
+  \ &req, sizeof(req))) {\n\t\terr = -EFAULT;\n\t\tgoto err_assign;\n\t}\n\n\tdev_dbg(dev,\
+  \ \"mmap\\t\\tpt 0x%09lx OK [len 0x%08llx]\\n\",\n\t\tbuf->raddr, buf->size);\n\n\
+  \treturn 0;\n\nerr_assign:\n\tfastrpc_req_munmap_impl(fl, buf);\nerr_invoke:\n\t\
+  fastrpc_buf_free(buf);\n\n\treturn err;\n}\n```\n\n## Bug Fix Patch\n\n```diff\n\
+  diff --git a/drivers/misc/fastrpc.c b/drivers/misc/fastrpc.c\nindex 339d126414d4..da87abe93daf\
+  \ 100644\n--- a/drivers/misc/fastrpc.c\n+++ b/drivers/misc/fastrpc.c\n@@ -1910,7\
+  \ +1910,8 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)\n\
+  \ \t\t\t\t      &args[0]);\n \tif (err) {\n \t\tdev_err(dev, \"mmap error (len 0x%08llx)\\\
+  n\", buf->size);\n-\t\tgoto err_invoke;\n+\t\tfastrpc_buf_free(buf);\n+\t\treturn\
+  \ err;\n \t}\n \n \t/* update the buffer to be able to deallocate the memory on\
+  \ the DSP */\n@@ -1948,8 +1949,6 @@ static int fastrpc_req_mmap(struct fastrpc_user\
+  \ *fl, char __user *argp)\n \n err_assign:\n \tfastrpc_req_munmap_impl(fl, buf);\n\
+  -err_invoke:\n-\tfastrpc_buf_free(buf);\n \n \treturn err;\n }\n```\n"
+pattern: '## Bug Pattern
+
+
+  Unconditional common-error cleanup frees a resource that may have already been freed
+  by an earlier error handler. Specifically:
+
+  - A buffer (buf) is allocated.
+
+  - In one error path, a helper (fastrpc_req_munmap_impl(fl, buf)) is called which
+  can free buf.
+
+  - Control then jumps/falls through to a shared error label that unconditionally
+  calls fastrpc_buf_free(buf).
+
+  - This goto-based stacked cleanup without ownership tracking/NULLing causes a double
+  free when the helper already released buf.'
+plan: "Plan\n\n1) Program state customizations\n- REGISTER_MAP_WITH_PROGRAMSTATE(ResourceStateMap,\
+  \ const MemRegion *, unsigned)\n  - States:\n    - 0 = Unknown/not tracked\n   \
+  \ - 1 = Allocated (owns a live resource)\n    - 2 = MaybeFreed (a helper that may\
+  \ free was called)\n    - 3 = Freed (definitely freed)\n- REGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap,\
+  \ const MemRegion *, const MemRegion *)\n  - Tracks simple pointer-to-pointer aliases\
+  \ (dst -> canonical root region).\n- Helpers:\n  - const MemRegion *getRootAlias(ProgramStateRef\
+  \ S, const MemRegion *R): chase PtrAliasMap until fixpoint to get canonical root.\n\
+  \  - ProgramStateRef setAlias(ProgramStateRef S, const MemRegion *Dst, const MemRegion\
+  \ *SrcRoot).\n  - Optional: ProgramStateRef clearAlias(ProgramStateRef S, const\
+  \ MemRegion *Dst).\n  - unsigned getResState(ProgramStateRef S, const MemRegion\
+  \ *R): read state from ResourceStateMap for root region, default 0.\n  - ProgramStateRef\
+  \ setResState(ProgramStateRef S, const MemRegion *R, unsigned NewState): write state\
+  \ for root region.\n  - Small helpers to identify callee by name:\n    - bool isAllocCall(const\
+  \ CallEvent &Call): callee is \"fastrpc_buf_alloc\" or \"fastrpc_remote_heap_alloc\"\
+  .\n    - bool isFreeCall(const CallEvent &Call): callee is \"fastrpc_buf_free\"\
+  .\n    - bool isMaybeFreeCall(const CallEvent &Call): callee is \"fastrpc_req_munmap_impl\"\
+  .\n  - Extract target pointer variable\u2019s MemRegion from a call argument:\n\
+  \    - Use getMemRegionFromExpr(Call.getArgExpr(Idx), C) and then canonicalize via\
+  \ getRootAlias.\n\n2) Callbacks to use and how to implement\n\nA) checkPostCall\
+  \ (model allocations and state transitions after calls)\n- Purpose:\n  - Mark the\
+  \ out-parameter as Allocated after alloc calls.\n  - Mark the target pointer as\
+  \ MaybeFreed after maybe-free helper calls.\n  - Mark the target pointer as Freed\
+  \ after direct free calls.\n- Steps:\n  1) If isAllocCall(Call):\n     - Determine\
+  \ the index of the out-parameter (for both fastrpc_buf_alloc and fastrpc_remote_heap_alloc\
+  \ it is the 4th parameter: index 3).\n     - Get MR = getMemRegionFromExpr(Call.getArgExpr(3),\
+  \ C). If null, bail.\n     - Root = getRootAlias(State, MR).\n     - State = setResState(State,\
+  \ Root, 1 /*Allocated*/).\n     - C.addTransition(State).\n  2) If isMaybeFreeCall(Call):\n\
+  \     - The buffer is the 2nd parameter: index 1 (fastrpc_req_munmap_impl(fl, buf)).\n\
+  \     - Get MR from arg1, Root, then:\n       - If getResState(State, Root) == 1\
+  \ (Allocated), set to 2 (MaybeFreed).\n       - Else, if Unknown, still set to MaybeFreed\
+  \ to be conservative (helps detect the \u201Cmay free then free again\u201D pattern).\n\
+  \     - C.addTransition(State).\n  3) If isFreeCall(Call):\n     - The buffer is\
+  \ the first parameter: index 0 (fastrpc_buf_free(buf)).\n     - Get MR from arg0,\
+  \ Root.\n     - After the call returns, if no report was emitted (see checkPreCall),\
+  \ mark Freed:\n       - State = setResState(State, Root, 3 /*Freed*/).\n     - C.addTransition(State).\n\
+  \nB) checkPreCall (detect double free before executing the second free)\n- Purpose:\
+  \ Warn when calling fastrpc_buf_free on a pointer that has already been freed or\
+  \ may have been freed by a helper.\n- Steps:\n  1) If !isFreeCall(Call), return.\n\
+  \  2) MR = getMemRegionFromExpr(Call.getArgExpr(0), C); if null, return.\n  3) Root\
+  \ = getRootAlias(State, MR).\n  4) St = getResState(State, Root).\n  5) If St ==\
+  \ 2 /*MaybeFreed*/ or St == 3 /*Freed*/:\n     - Generate a non-fatal error node\
+  \ and emit a PathSensitiveBugReport with a short message:\n       - \u201CDouble\
+  \ free: resource may have been released earlier in error path\u201D\n     - Optionally,\
+  \ add a note range on the earlier call site (if you recorded it); otherwise, keep\
+  \ the report minimal.\n  6) Do not change state here; state change to Freed will\
+  \ be done in checkPostCall.\n\nC) checkBind (track pointer aliasing)\n- Purpose:\
+  \ If code does p2 = p1; treat p2 as an alias of p1, so frees via either name are\
+  \ correlated.\n- Steps:\n  1) If Loc is a MemRegion of a pointer variable (cast\
+  \ to MemRegion) and Val is an SVal referring to another pointer variable\u2019s\
+  \ MemRegion:\n     - SrcMR = Val.getAsRegion(); DstMR = Loc.getAsRegion(); if either\
+  \ null, return.\n     - RootSrc = getRootAlias(State, SrcMR).\n     - State = setAlias(State,\
+  \ DstMR, RootSrc).\n  2) If Val is a concrete 0 (null):\n     - Optionally, clear\
+  \ alias for DstMR (clearAlias) to avoid propagating freed/alloc state spuriously\
+  \ through nullification. This is optional; simplest is to do nothing.\n\nD) checkEndFunction\n\
+  - Purpose: Clean up to avoid leaking state across functions.\n- Steps:\n  - Drop\
+  \ all entries from ResourceStateMap and PtrAliasMap by returning State->remove<ResourceStateMap>().remove<PtrAliasMap>().\n\
+  \n3) Heuristics and constraints to reduce false positives\n- Only transition to\
+  \ MaybeFreed on isMaybeFreeCall when the argument region is known (has a region)\
+  \ and has been previously Allocated or is Unknown. This better matches the pattern\
+  \ where a helper may release a previously allocated buffer.\n- Report only when\
+  \ the later free call targets a tracked region (appeared in ResourceStateMap). If\
+  \ the region was never tracked (i.e., not observed via alloc), do not report.\n\
+  - Keep the checker narrowly scoped by function names:\n  - Allocators: \"fastrpc_buf_alloc\"\
+  , \"fastrpc_remote_heap_alloc\"\n  - Maybe-free helper: \"fastrpc_req_munmap_impl\"\
+  \n  - Free: \"fastrpc_buf_free\"\n- If needed, allow easy extension via small arrays\
+  \ of names so users can add more alloc/free pairs.\n\n4) Where to use provided utility\
+  \ functions\n- getMemRegionFromExpr: to obtain MemRegion of both &buf (out-param\
+  \ for alloc) and buf (argument of free/maybe-free).\n- ExprHasName: not strictly\
+  \ needed here.\n- findSpecificTypeInParents/Children: not needed.\n- EvaluateExprToInt/inferSymbolMaxVal:\
+  \ not needed in the simplest version.\n\n5) Bug reporting\n- Use generateNonFatalErrorNode\
+  \ to create a node.\n- Create a PathSensitiveBugReport with a concise message:\n\
+  \  - Title: \u201CDouble free of resource\u201D\n  - Description: \u201CSecond free\
+  \ after earlier helper may have already released \u2018buf\u2019\u201D\n- Attach\
+  \ the current call expression as the location. If practical, track and note the\
+  \ earlier maybe-free call site by storing a ProgramPoint or SourceRange in the state\
+  \ when setting MaybeFreed; otherwise, keep the report minimal as required.\n\n6)\
+  \ Summary of the detection for the target patch\n- After alloc call \u2192 ResourceStateMap[buf]\
+  \ = Allocated.\n- On error path, call fastrpc_req_munmap_impl(fl, buf) \u2192 ResourceStateMap[buf]\
+  \ = MaybeFreed.\n- Then falling through to the shared label calling fastrpc_buf_free(buf)\
+  \ \u2192 checkPreCall sees MaybeFreed and reports \u201CDouble free,\u201D matching\
+  \ the original bug."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"llvm/ADT/SmallSet.h\"\n\nusing namespace clang;\n\
+  using namespace ento;\nusing namespace taint;\n\nREGISTER_MAP_WITH_PROGRAMSTATE(ResourceStateMap,\
+  \ const MemRegion *, unsigned)\nREGISTER_MAP_WITH_PROGRAMSTATE(PtrAliasMap, const\
+  \ MemRegion *, const MemRegion *)\n\n// Resource states\nenum ResourceState : unsigned\
+  \ {\n  RS_Unknown = 0,\n  RS_Allocated = 1,\n  RS_MaybeFreed = 2,\n  RS_Freed =\
+  \ 3\n};\n\nnamespace {\nclass SAGenTestChecker\n    : public Checker<\n        \
+  \  check::PreCall,\n          check::PostCall,\n          check::Bind,\n       \
+  \   check::EndFunction> {\n  mutable std::unique_ptr<BugType> BT;\n\npublic:\n \
+  \ SAGenTestChecker()\n      : BT(new BugType(this, \"Double free of resource\",\
+  \ \"Memory Management\")) {}\n\n  void checkPreCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  void checkPostCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \  void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const;\n\
+  \  void checkEndFunction(const ReturnStmt *RS, CheckerContext &C) const;\n\nprivate:\n\
+  \  // Helpers for function identification\n  bool isAllocCall(const CallEvent &Call,\
+  \ CheckerContext &C) const;\n  bool isFreeCall(const CallEvent &Call, CheckerContext\
+  \ &C) const;\n  bool isMaybeFreeCall(const CallEvent &Call, CheckerContext &C) const;\n\
+  \n  // Alias helpers\n  const MemRegion *getRootAlias(ProgramStateRef State, const\
+  \ MemRegion *R) const;\n  ProgramStateRef setAlias(ProgramStateRef State, const\
+  \ MemRegion *Dst,\n                           const MemRegion *SrcRoot) const;\n\
+  \n  // Resource state helpers\n  unsigned getResState(ProgramStateRef State, const\
+  \ MemRegion *R) const;\n  ProgramStateRef setResState(ProgramStateRef State, const\
+  \ MemRegion *R,\n                              unsigned NewState) const;\n\n  //\
+  \ Utility to extract and canonicalize region from a call argument\n  const MemRegion\
+  \ *getArgBaseRegion(const CallEvent &Call, unsigned Idx,\n                     \
+  \               CheckerContext &C) const;\n\n  void reportDoubleFree(const CallEvent\
+  \ &Call, CheckerContext &C,\n                        const MemRegion *Root) const;\n\
+  };\n\n// ================== Helper Implementations ==================\n\nbool SAGenTestChecker::isAllocCall(const\
+  \ CallEvent &Call,\n                                   CheckerContext &C) const\
+  \ {\n  const Expr *E = Call.getOriginExpr();\n  if (!E)\n    return false;\n  return\
+  \ ExprHasName(E, \"fastrpc_buf_alloc\", C) ||\n         ExprHasName(E, \"fastrpc_remote_heap_alloc\"\
+  , C);\n}\n\nbool SAGenTestChecker::isFreeCall(const CallEvent &Call,\n         \
+  \                         CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E)\n    return false;\n  return ExprHasName(E, \"fastrpc_buf_free\", C);\n\
+  }\n\nbool SAGenTestChecker::isMaybeFreeCall(const CallEvent &Call,\n           \
+  \                            CheckerContext &C) const {\n  const Expr *E = Call.getOriginExpr();\n\
+  \  if (!E)\n    return false;\n  return ExprHasName(E, \"fastrpc_req_munmap_impl\"\
+  , C);\n}\n\nconst MemRegion *SAGenTestChecker::getRootAlias(ProgramStateRef State,\n\
+  \                                                const MemRegion *R) const {\n \
+  \ if (!R)\n    return nullptr;\n  const MemRegion *Cur = R->getBaseRegion();\n \
+  \ llvm::SmallSet<const MemRegion *, 8> Visited;\n  while (Cur) {\n    if (!Visited.insert(Cur).second)\
+  \ // loop detected\n      break;\n    const MemRegion *const *Next = State->get<PtrAliasMap>(Cur);\n\
+  \    if (!Next)\n      break;\n    Cur = (*Next)->getBaseRegion();\n  }\n  return\
+  \ Cur ? Cur->getBaseRegion() : nullptr;\n}\n\nProgramStateRef SAGenTestChecker::setAlias(ProgramStateRef\
+  \ State,\n                                           const MemRegion *Dst,\n   \
+  \                                        const MemRegion *SrcRoot) const {\n  if\
+  \ (!Dst || !SrcRoot)\n    return State;\n  const MemRegion *DstRoot = Dst->getBaseRegion();\n\
+  \  const MemRegion *SrcCanon = getRootAlias(State, SrcRoot);\n  if (!DstRoot ||\
+  \ !SrcCanon)\n    return State;\n  // Map destination root to source canonical root\n\
+  \  State = State->set<PtrAliasMap>(DstRoot, SrcCanon);\n  return State;\n}\n\nunsigned\
+  \ SAGenTestChecker::getResState(ProgramStateRef State,\n                       \
+  \                const MemRegion *R) const {\n  if (!R)\n    return RS_Unknown;\n\
+  \  const MemRegion *Root = getRootAlias(State, R);\n  if (!Root)\n    return RS_Unknown;\n\
+  \  const unsigned *St = State->get<ResourceStateMap>(Root);\n  return St ? *St :\
+  \ RS_Unknown;\n}\n\nProgramStateRef SAGenTestChecker::setResState(ProgramStateRef\
+  \ State,\n                                              const MemRegion *R,\n  \
+  \                                            unsigned NewState) const {\n  if (!R)\n\
+  \    return State;\n  const MemRegion *Root = getRootAlias(State, R);\n  if (!Root)\n\
+  \    Root = R->getBaseRegion();\n  if (!Root)\n    return State;\n  return State->set<ResourceStateMap>(Root,\
+  \ NewState);\n}\n\nconst MemRegion *SAGenTestChecker::getArgBaseRegion(const CallEvent\
+  \ &Call,\n                                                    unsigned Idx,\n  \
+  \                                                  CheckerContext &C) const {\n\
+  \  if (Idx >= Call.getNumArgs())\n    return nullptr;\n  const Expr *ArgE = Call.getArgExpr(Idx);\n\
+  \  if (!ArgE)\n    return nullptr;\n  const MemRegion *MR = getMemRegionFromExpr(ArgE,\
+  \ C);\n  if (!MR)\n    return nullptr;\n  return MR->getBaseRegion();\n}\n\nvoid\
+  \ SAGenTestChecker::reportDoubleFree(const CallEvent &Call,\n                  \
+  \                      CheckerContext &C,\n                                    \
+  \    const MemRegion *Root) const {\n  ExplodedNode *N = C.generateNonFatalErrorNode();\n\
+  \  if (!N)\n    return;\n\n  auto R = std::make_unique<PathSensitiveBugReport>(\n\
+  \      *BT, \"Double free: resource may have been released earlier in error path\"\
+  ,\n      N);\n  R->addRange(Call.getSourceRange());\n  if (Root)\n    R->markInteresting(Root);\n\
+  \  C.emitReport(std::move(R));\n}\n\n// ================== Checker Callbacks ==================\n\
+  \nvoid SAGenTestChecker::checkPreCall(const CallEvent &Call,\n                 \
+  \                   CheckerContext &C) const {\n  // Warn before a second free happens.\n\
+  \  if (!isFreeCall(Call, C))\n    return;\n\n  ProgramStateRef State = C.getState();\n\
+  \  const MemRegion *MR = getArgBaseRegion(Call, 0, C);\n  if (!MR)\n    return;\n\
+  \n  const MemRegion *Root = getRootAlias(State, MR);\n  if (!Root)\n    Root = MR->getBaseRegion();\n\
+  \n  unsigned St = getResState(State, Root);\n  if (St == RS_MaybeFreed || St ==\
+  \ RS_Freed) {\n    reportDoubleFree(Call, C, Root);\n  }\n}\n\nvoid SAGenTestChecker::checkPostCall(const\
+  \ CallEvent &Call,\n                                     CheckerContext &C) const\
+  \ {\n  ProgramStateRef State = C.getState();\n\n  // Model allocation: out-param\
+  \ at index 3 -> Allocated\n  if (isAllocCall(Call, C)) {\n    const MemRegion *OutMR\
+  \ = getArgBaseRegion(Call, 3, C);\n    if (OutMR) {\n      const MemRegion *Root\
+  \ = getRootAlias(State, OutMR);\n      if (!Root)\n        Root = OutMR->getBaseRegion();\n\
+  \      if (Root) {\n        State = State->set<ResourceStateMap>(Root, RS_Allocated);\n\
+  \        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\n  // Model\
+  \ maybe-free helper: arg1 -> MaybeFreed\n  if (isMaybeFreeCall(Call, C)) {\n   \
+  \ const MemRegion *ArgMR = getArgBaseRegion(Call, 1, C);\n    if (ArgMR) {\n   \
+  \   const MemRegion *Root = getRootAlias(State, ArgMR);\n      if (!Root)\n    \
+  \    Root = ArgMR->getBaseRegion();\n      if (Root) {\n        // Transition to\
+  \ MaybeFreed regardless of previous state to reflect\n        // that the helper\
+  \ might have released the resource.\n        State = State->set<ResourceStateMap>(Root,\
+  \ RS_MaybeFreed);\n        C.addTransition(State);\n      }\n    }\n    return;\n\
+  \  }\n\n  // Model direct free: arg0 -> Freed\n  if (isFreeCall(Call, C)) {\n  \
+  \  const MemRegion *ArgMR = getArgBaseRegion(Call, 0, C);\n    if (ArgMR) {\n  \
+  \    const MemRegion *Root = getRootAlias(State, ArgMR);\n      if (!Root)\n   \
+  \     Root = ArgMR->getBaseRegion();\n      if (Root) {\n        State = State->set<ResourceStateMap>(Root,\
+  \ RS_Freed);\n        C.addTransition(State);\n      }\n    }\n    return;\n  }\n\
+  }\n\nvoid SAGenTestChecker::checkBind(SVal Loc, SVal Val, const Stmt *S,\n     \
+  \                            CheckerContext &C) const {\n  ProgramStateRef State\
+  \ = C.getState();\n  const MemRegion *Dst = Loc.getAsRegion();\n  if (!Dst) {\n\
+  \    C.addTransition(State);\n    return;\n  }\n  Dst = Dst->getBaseRegion();\n\
+  \  if (!Dst) {\n    C.addTransition(State);\n    return;\n  }\n\n  if (const MemRegion\
+  \ *Src = Val.getAsRegion()) {\n    Src = Src->getBaseRegion();\n    if (Src) {\n\
+  \      State = setAlias(State, Dst, Src);\n      C.addTransition(State);\n     \
+  \ return;\n    }\n  }\n\n  // No aliasing to record for other kinds of values.\n\
+  \  C.addTransition(State);\n}\n\nvoid SAGenTestChecker::checkEndFunction(const ReturnStmt\
+  \ *RS,\n                                        CheckerContext &C) const {\n  ProgramStateRef\
+  \ State = C.getState();\n  State = State->remove<ResourceStateMap>();\n  State =\
+  \ State->remove<PtrAliasMap>();\n  C.addTransition(State);\n}\n\n} // end anonymous\
+  \ namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry)\
+  \ {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects double free when a helper may free and then a shared cleanup\
+  \ frees again\",\n      \"\");\n}\n\nextern \"C\" const char clang_analyzerAPIVersionString[]\
+  \ =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 1

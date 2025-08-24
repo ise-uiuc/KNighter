@@ -1,0 +1,6 @@
+- Decision: NotABug
+- Reason: The flagged code is not an index/array bound check and does not match the target bug pattern. In ext4_inode_info_init(), the code validates superblock fields s_want_extra_isize and s_min_extra_isize against a computed maximum extra inode size:
+  - max = s_inode_size - EXT4_GOOD_OLD_INODE_SIZE
+  - It checks if (v > max), rejecting values strictly greater than the available extra space. Allowing v == max is correct, since it means using exactly all extra bytes beyond the legacy inode size, which is valid by design.
+  - There is no subsequent use of v as an array index nor any array access predicated on this check. This is a size validation, not an index validation. Changing the check to v >= max would incorrectly reject a valid boundary value.
+  - The function has already validated s_inode_size’s range and alignment, and this check prevents overflow of the extra inode area. No out-of-bounds access arises from v == max.

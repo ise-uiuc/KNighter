@@ -1,0 +1,251 @@
+--- original_code.cpp+++ semantic_correct_refine_code.cpp@@ -714,7 +714,6 @@     return false;
+   }
+
+-  // New: Detect that the same LHS participates in a paired lower-bound range guard within the same condition.
+   static bool hasPairedLowerBoundGuardForSameLHS(const Expr *FullCond, const Expr *LHS, CheckerContext &C) {
+     if (!FullCond || !LHS) return false;
+
+@@ -765,100 +764,6 @@     return HasControlTok && HasValueTok;
+   }
+
+-  static bool hasZeroOrOneGuardForVar(const Expr *E, const Expr *LHSVar, CheckerContext &C) {
+-    if (!E || !LHSVar) return false;
+-    E = E->IgnoreParenImpCasts();
+-
+-    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+-      if (UO->getOpcode() == UO_LNot) {
+-        const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
+-        if (sameReferencedVar(Sub, LHSVar))
+-          return true;
+-      }
+-      return hasZeroOrOneGuardForVar(UO->getSubExpr(), LHSVar, C);
+-    }
+-
+-    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+-      BinaryOperatorKind Op = BO->getOpcode();
+-      if (Op == BO_LAnd || Op == BO_LOr) {
+-        return hasZeroOrOneGuardForVar(BO->getLHS(), LHSVar, C) ||
+-               hasZeroOrOneGuardForVar(BO->getRHS(), LHSVar, C);
+-      }
+-
+-      const Expr *L = BO->getLHS()->IgnoreParenImpCasts();
+-      const Expr *R = BO->getRHS()->IgnoreParenImpCasts();
+-
+-      auto checkVarZero = [&](const Expr *VarSide, const Expr *OtherSide, BinaryOperatorKind Op2) -> bool {
+-        if (!sameReferencedVar(VarSide, LHSVar))
+-          return false;
+-        if (Op2 == BO_EQ && isIntLiteralEqual(OtherSide, 0))
+-          return true;
+-        if (Op2 == BO_LE && isIntLiteralEqual(OtherSide, 0))
+-          return true;
+-        if (Op2 == BO_LT && isIntLiteralEqual(OtherSide, 1))
+-          return true;
+-        return false;
+-      };
+-
+-      if (checkVarZero(L, R, Op) || checkVarZero(R, L, Op))
+-        return true;
+-
+-      return hasZeroOrOneGuardForVar(BO->getLHS(), LHSVar, C) ||
+-             hasZeroOrOneGuardForVar(BO->getRHS(), LHSVar, C);
+-    }
+-
+-    if (const auto *CO = dyn_cast<ConditionalOperator>(E)) {
+-      return hasZeroOrOneGuardForVar(CO->getCond(), LHSVar, C) ||
+-             hasZeroOrOneGuardForVar(CO->getTrueExpr(), LHSVar, C) ||
+-             hasZeroOrOneGuardForVar(CO->getFalseExpr(), LHSVar, C);
+-    }
+-
+-    return false;
+-  }
+-
+-  static bool isLikelyIndexExpr(const Expr *E, const Expr *RHSForContext = nullptr, CheckerContext *PCtx = nullptr) {
+-    E = E ? E->IgnoreParenCasts() : nullptr;
+-    if (!E)
+-      return false;
+-
+-    if (isa<IntegerLiteral>(E))
+-      return false;
+-
+-    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
+-      const Expr *Idx = ASE->getIdx()->IgnoreParenCasts();
+-      if (isa<IntegerLiteral>(Idx))
+-        return false;
+-
+-      if (PCtx && isControlValueArrayAccess(ASE, *PCtx))
+-        return false;
+-
+-      StringRef BaseName = getIdentNameFromExpr(ASE->getBase());
+-      if (BaseName.equals_insensitive("value") || BaseName.equals_insensitive("val"))
+-        return false;
+-
+-      return true;
+-    }
+-
+-    StringRef Name = getIdentNameFromExpr(E);
+-    if (!Name.empty()) {
+-      if (nameLooksLikeLengthOrSize(Name))
+-        return false;
+-      if (looksLikeCountOrOrdinalName(Name))
+-        return false;
+-      if (nameHasTokenMin(Name)) {
+-        if (RHSForContext && PCtx) {
+-          if (rhsHasMaxTokenOrText(RHSForContext, *PCtx))
+-            return false;
+-        }
+-      }
+-    }
+-
+-    if (isa<DeclRefExpr>(E) || isa<MemberExpr>(E))
+-      return true;
+-
+-    return false;
+-  }
+-
+   static bool exprReferencesVar(const Expr *E, const Decl *Var) {
+     if (!E || !Var) return false;
+     E = E->IgnoreParenCasts();
+@@ -894,8 +799,16 @@     return false;
+   }
+
+-  static bool varUsedAsIndexAfterIf(const IfStmt *IS, const Decl *Var, CheckerContext &C) {
++  static bool varUsedAsIndexInElseOrAfter(const IfStmt *IS, const Decl *Var, CheckerContext &C) {
+     if (!IS || !Var) return false;
++
++    // Check Else branch
++    if (const Stmt *ElseS = IS->getElse()) {
++      if (stmtContainsIndexUseOfVar(ElseS, Var))
++        return true;
++    }
++
++    // Check subsequent statements in the parent CompoundStmt
+     const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IS, C);
+     if (!CS) return false;
+     bool SeenIf = false;
+@@ -912,42 +825,21 @@     return false;
+   }
+
+-  static bool stmtHasCountLikeAssignmentFromVar(const Stmt *S, const Decl *Var) {
+-    if (!S || !Var) return false;
+-    if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
+-      if (BO->isAssignmentOp()) {
+-        const Expr *L = BO->getLHS()->IgnoreParenCasts();
+-        const Expr *R = BO->getRHS()->IgnoreParenCasts();
+-        if (exprReferencesVar(R, Var)) {
+-          StringRef LName = getIdentNameFromExpr(L);
+-          if (!LName.empty() && looksLikeCountOrOrdinalName(LName))
+-            return true;
+-        }
+-      }
+-    }
+-    for (const Stmt *Child : S->children()) {
+-      if (Child && stmtHasCountLikeAssignmentFromVar(Child, Var))
+-        return true;
+-    }
+-    return false;
+-  }
+-
+-  static bool flowsIntoCountLikeAfterIf(const IfStmt *IS, const Decl *Var, CheckerContext &C) {
+-    if (!IS || !Var) return false;
+-    const CompoundStmt *CS = findSpecificTypeInParents<CompoundStmt>(IS, C);
+-    if (!CS) return false;
+-    bool SeenIf = false;
+-    for (const Stmt *S : CS->body()) {
+-      if (!SeenIf) {
+-        if (S == IS)
+-          SeenIf = true;
+-        continue;
+-      }
+-      if (!S) continue;
+-      if (stmtHasCountLikeAssignmentFromVar(S, Var))
+-        return true;
+-    }
+-    return false;
++  static const FunctionDecl* getEnclosingFunctionDecl(CheckerContext &C) {
++    const LocationContext *LCtx = C.getLocationContext();
++    while (LCtx) {
++      if (const auto *FD = dyn_cast_or_null<FunctionDecl>(LCtx->getDecl()))
++        return FD;
++      LCtx = LCtx->getParent();
++    }
++    return nullptr;
++  }
++
++  static bool functionContainsIndexUseOfVar(const FunctionDecl *FD, const Decl *Var) {
++    if (!FD || !Var) return false;
++    const Stmt *Body = FD->getBody();
++    if (!Body) return false;
++    return stmtContainsIndexUseOfVar(Body, Var);
+   }
+
+   bool isCandidateGtComparison(const BinaryOperator *BO, const IfStmt *EnclosingIf, const Expr *FullCond, CheckerContext &C) const {
+@@ -960,9 +852,18 @@     if (!LHS || !RHS)
+       return false;
+
+-    if (!isLikelyIndexExpr(LHS, RHS, &C))
+-      return false;
+-
++    // Require strong evidence of index-ness:
++    bool LHSIsArray = isa<ArraySubscriptExpr>(LHS);
++
++    const Decl *Var = getReferencedDecl(LHS);
++    bool UsedAsIndexElseOrAfter = Var ? varUsedAsIndexInElseOrAfter(EnclosingIf, Var, C) : false;
++    bool UsedAsIndexSomewhere = Var ? functionContainsIndexUseOfVar(getEnclosingFunctionDecl(C), Var) : false;
++
++    if (!LHSIsArray && !UsedAsIndexElseOrAfter && !UsedAsIndexSomewhere)
++      return false;
++
++    // Suppress if there's also a lower-bound paired guard on the same LHS in the same condition,
++    // unless LHS is an actual array subscript (already passed above).
+     if (hasPairedLowerBoundGuardForArrayLHS(FullCond, LHS, C))
+       return false;
+
+@@ -975,31 +876,11 @@     if (isFalsePositive(LHS, RHS, C))
+       return false;
+
+-    // New suppression: If the condition also has a paired lower-bound guard on the same LHS,
+-    // suppress unless the LHS is clearly index-like or used as an array index later.
+-    if (hasPairedLowerBoundGuardForSameLHS(FullCond, LHS, C)) {
+-      if (!isa<ArraySubscriptExpr>(LHS)) {
+-        const Decl *Var = getReferencedDecl(LHS);
+-        StringRef LName = getIdentNameFromExpr(LHS);
+-        bool StrongIndexName = looksLikeIndexName(LName);
+-        bool UsedAsIndexLater = Var ? varUsedAsIndexAfterIf(EnclosingIf, Var, C) : false;
+-        if (!StrongIndexName && !UsedAsIndexLater)
+-          return false;
+-      }
+-    }
+-
+-    // For non-array LHS, require strong evidence of index-ness, and check flows-to-count.
+-    if (!isa<ArraySubscriptExpr>(LHS)) {
+-      const Decl *Var = getReferencedDecl(LHS);
++    // Additional conservative suppression: if LHS is not an array subscript and the LHS name
++    // looks like a size/length metric, don't warn (sizes aren't indices).
++    if (!LHSIsArray) {
+       StringRef LName = getIdentNameFromExpr(LHS);
+-      bool StrongIndexName = looksLikeIndexName(LName);
+-      bool UsedAsIndexLater = Var ? varUsedAsIndexAfterIf(EnclosingIf, Var, C) : false;
+-      bool FlowsToCount = Var ? flowsIntoCountLikeAfterIf(EnclosingIf, Var, C) : false;
+-
+-      if (FlowsToCount)
+-        return false;
+-
+-      if (!StrongIndexName && !UsedAsIndexLater)
++      if (nameLooksLikeLengthOrSize(LName))
+         return false;
+     }
+
+@@ -1033,8 +914,12 @@     if (!isCandidateGtComparison(BO, IS, CondE, C))
+       continue;
+
+-    if (hasZeroOrOneGuardForVar(CondE, BO->getLHS(), C))
+-      continue;
++    if (hasPairedLowerBoundGuardForSameLHS(CondE, BO->getLHS(), C)) {
++      // If there's a paired lower-bound guard, we have to be more certain;
++      // LHS will only pass earlier if it's an array or used as index elsewhere.
++      // So we just keep the suppression in isCandidateGtComparison.
++      // Nothing to do here.
++    }
+
+     ExplodedNode *N = C.generateNonFatalErrorNode();
+     if (!N)

@@ -1,0 +1,166 @@
+# Instruction
+
+Determine whether the static analyzer report is a real bug in the Linux kernel and matches the target bug pattern
+
+Your analysis should:
+- **Compare the report against the provided target bug pattern specification,** using the **buggy function (pre-patch)** and the **fix patch** as the reference.
+- Explain your reasoning for classifying this as either:
+  - **A true positive** (matches the target bug pattern **and** is a real bug), or
+  - **A false positive** (does **not** match the target bug pattern **or** is **not** a real bug).
+
+Please evaluate thoroughly using the following process:
+
+- **First, understand** the reported code pattern and its control/data flow.
+- **Then, compare** it against the target bug pattern characteristics.
+- **Finally, validate** against the **pre-/post-patch** behavior:
+  - The reported case demonstrates the same root cause pattern as the target bug pattern/function and would be addressed by a similar fix.
+
+- **Numeric / bounds feasibility** (if applicable):
+  - Infer tight **min/max** ranges for all involved variables from types, prior checks, and loop bounds.
+  - Show whether overflow/underflow or OOB is actually triggerable (compute the smallest/largest values that violate constraints).
+
+- **Null-pointer dereference feasibility** (if applicable):
+  1. **Identify the pointer source** and return convention of the producing function(s) in this path (e.g., returns **NULL**, **ERR_PTR**, negative error code via cast, or never-null).
+  2. **Check real-world feasibility in this specific driver/socket/filesystem/etc.**:
+     - Enumerate concrete conditions under which the producer can return **NULL/ERR_PTR** here (e.g., missing DT/ACPI property, absent PCI device/function, probe ordering, hotplug/race, Kconfig options, chip revision/quirks).
+     - Verify whether those conditions can occur given the driver’s init/probe sequence and the kernel helpers used.
+  3. **Lifetime & concurrency**: consider teardown paths, RCU usage, refcounting (`get/put`), and whether the pointer can become invalid/NULL across yields or callbacks.
+  4. If the producer is provably non-NULL in this context (by spec or preceding checks), classify as **false positive**.
+
+If there is any uncertainty in the classification, **err on the side of caution and classify it as a false positive**. Your analysis will be used to improve the static analyzer's accuracy.
+
+## Bug Pattern
+
+Copying a user-supplied number of bytes into a fixed-size kernel buffer without bounding the copy to the buffer size (and without ensuring NUL-termination for subsequent string use), e.g.:
+
+char buf[64];
+/* nbytes comes from userspace and is unchecked */
+if (copy_from_user(buf, user_buf, nbytes))
+    return -EFAULT;
+
+This unchecked copy_from_user can overflow the stack buffer. The correct pattern is to clamp the length to min(nbytes, sizeof(buf) - 1) and use that for the copy, returning the actual copied size.
+
+## Bug Pattern
+
+Copying a user-supplied number of bytes into a fixed-size kernel buffer without bounding the copy to the buffer size (and without ensuring NUL-termination for subsequent string use), e.g.:
+
+char buf[64];
+/* nbytes comes from userspace and is unchecked */
+if (copy_from_user(buf, user_buf, nbytes))
+    return -EFAULT;
+
+This unchecked copy_from_user can overflow the stack buffer. The correct pattern is to clamp the length to min(nbytes, sizeof(buf) - 1) and use that for the copy, returning the actual copied size.
+
+# Report
+
+### Report Summary
+
+File:| drivers/net/wireless/ath/ath10k/spectral.c
+---|---
+Warning:| line 311, column 6
+copy_from_user length not bounded by destination buffer size
+
+### Annotated Source Code
+
+
+251   | 	arg.scan_noise_floor_ref = WMI_SPECTRAL_NOISE_FLOOR_REF_DEFAULT;
+252   | 	arg.scan_init_delay = WMI_SPECTRAL_INIT_DELAY_DEFAULT;
+253   | 	arg.scan_nb_tone_thr = WMI_SPECTRAL_NB_TONE_THR_DEFAULT;
+254   | 	arg.scan_str_bin_thr = WMI_SPECTRAL_STR_BIN_THR_DEFAULT;
+255   | 	arg.scan_wb_rpt_mode = WMI_SPECTRAL_WB_RPT_MODE_DEFAULT;
+256   | 	arg.scan_rssi_rpt_mode = WMI_SPECTRAL_RSSI_RPT_MODE_DEFAULT;
+257   | 	arg.scan_rssi_thr = WMI_SPECTRAL_RSSI_THR_DEFAULT;
+258   | 	arg.scan_pwr_format = WMI_SPECTRAL_PWR_FORMAT_DEFAULT;
+259   | 	arg.scan_rpt_mode = WMI_SPECTRAL_RPT_MODE_DEFAULT;
+260   | 	arg.scan_bin_scale = WMI_SPECTRAL_BIN_SCALE_DEFAULT;
+261   | 	arg.scan_dbm_adj = WMI_SPECTRAL_DBM_ADJ_DEFAULT;
+262   | 	arg.scan_chn_mask = WMI_SPECTRAL_CHN_MASK_DEFAULT;
+263   |
+264   | 	res = ath10k_wmi_vdev_spectral_conf(ar, &arg);
+265   |  if (res < 0) {
+266   | 		ath10k_warn(ar, "failed to configure spectral scan: %d\n", res);
+267   |  return res;
+268   | 	}
+269   |
+270   |  return 0;
+271   | }
+272   |
+273   | static ssize_t read_file_spec_scan_ctl(struct file *file, char __user *user_buf,
+274   | 				       size_t count, loff_t *ppos)
+275   | {
+276   |  struct ath10k *ar = file->private_data;
+277   |  char *mode = "";
+278   | 	size_t len;
+279   |  enum ath10k_spectral_mode spectral_mode;
+280   |
+281   |  mutex_lock(&ar->conf_mutex);
+282   | 	spectral_mode = ar->spectral.mode;
+283   | 	mutex_unlock(&ar->conf_mutex);
+284   |
+285   |  switch (spectral_mode) {
+286   |  case SPECTRAL_DISABLED:
+287   | 		mode = "disable";
+288   |  break;
+289   |  case SPECTRAL_BACKGROUND:
+290   | 		mode = "background";
+291   |  break;
+292   |  case SPECTRAL_MANUAL:
+293   | 		mode = "manual";
+294   |  break;
+295   | 	}
+296   |
+297   | 	len = strlen(mode);
+298   |  return simple_read_from_buffer(user_buf, count, ppos, mode, len);
+299   | }
+300   |
+301   | static ssize_t write_file_spec_scan_ctl(struct file *file,
+302   |  const char __user *user_buf,
+303   | 					size_t count, loff_t *ppos)
+304   | {
+305   |  struct ath10k *ar = file->private_data;
+306   |  char buf[32];
+307   | 	ssize_t len;
+308   |  int res;
+309   |
+310   |  len = min(count, sizeof(buf) - 1);
+    1Assuming '__UNIQUE_ID___x1868' is >= '__UNIQUE_ID___y1869'→
+    2←'?' condition is false→
+311   |  if (copy_from_user(buf, user_buf, len))
+    3←copy_from_user length not bounded by destination buffer size
+312   |  return -EFAULT;
+313   |
+314   | 	buf[len] = '\0';
+315   |
+316   |  mutex_lock(&ar->conf_mutex);
+317   |
+318   |  if (strncmp("trigger", buf, 7) == 0) {
+319   |  if (ar->spectral.mode == SPECTRAL_MANUAL ||
+320   | 		    ar->spectral.mode == SPECTRAL_BACKGROUND) {
+321   |  /* reset the configuration to adopt possibly changed
+322   |  * debugfs parameters
+323   |  */
+324   | 			res = ath10k_spectral_scan_config(ar,
+325   | 							  ar->spectral.mode);
+326   |  if (res < 0) {
+327   | 				ath10k_warn(ar, "failed to reconfigure spectral scan: %d\n",
+328   | 					    res);
+329   | 			}
+330   | 			res = ath10k_spectral_scan_trigger(ar);
+331   |  if (res < 0) {
+332   | 				ath10k_warn(ar, "failed to trigger spectral scan: %d\n",
+333   | 					    res);
+334   | 			}
+335   | 		} else {
+336   | 			res = -EINVAL;
+337   | 		}
+338   | 	} else if (strncmp("background", buf, 10) == 0) {
+339   | 		res = ath10k_spectral_scan_config(ar, SPECTRAL_BACKGROUND);
+340   | 	} else if (strncmp("manual", buf, 6) == 0) {
+341   | 		res = ath10k_spectral_scan_config(ar, SPECTRAL_MANUAL);
+
+# Formatting
+
+Please provide your answer in the following format:
+
+- Decision: {Bug/NotABug}
+- Reason: {Your reason here}

@@ -1,0 +1,595 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: 7d42e097607c4d246d99225bf2b195b6167a210c
+commit_type: Concurrency
+index: 3
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\n#include \"llvm/ADT/DenseMap.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nnamespace\
+  \ {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker : public\
+  \ Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Workqueue timeout may cause use-after-free\"\
+  , \"Memory Error\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n\n   private:\n\n      // Core helpers\n      static\
+  \ bool isWaitForCompletionTimeoutCall(const CallExpr *CE);\n      static bool isFreeLikeCallee(const\
+  \ FunctionDecl *FD);\n      static bool exprEvaluatesToZero(const Expr *E, ASTContext\
+  \ &AC);\n      static const VarDecl* getCtxVarFromCompletionArg(const Expr *Arg);\n\
+  \      static const VarDecl* getDeclRefVar(const Expr *E);\n\n      enum TimeoutBranchKind\
+  \ { TB_Unknown, TB_Then, TB_Else };\n\n      // Condition analysis: classify which\
+  \ branch (then/else) is the \"timeout\" path\n      static TimeoutBranchKind classifyTimeoutBranch(const\
+  \ Expr *Cond,\n                                                     const llvm::DenseMap<const\
+  \ VarDecl*, const VarDecl*> &RetToCtx,\n                                       \
+  \              const VarDecl* &OutCtx,\n                                       \
+  \              ASTContext &AC);\n\n      // Mapping collector: ret = wait_for_completion_timeout(&ctx->compl,\
+  \ ...)\n      class RetToCtxCollector : public RecursiveASTVisitor<RetToCtxCollector>\
+  \ {\n        llvm::DenseMap<const VarDecl*, const VarDecl*> &Map;\n        ASTContext\
+  \ &AC;\n      public:\n        RetToCtxCollector(llvm::DenseMap<const VarDecl*,\
+  \ const VarDecl*> &M, ASTContext &Ctx)\n          : Map(M), AC(Ctx) {}\n\n     \
+  \   bool VisitBinaryOperator(BinaryOperator *BO) {\n          if (!BO || !BO->isAssignmentOp())\n\
+  \            return true;\n          const Expr *RHS = BO->getRHS();\n         \
+  \ RHS = RHS ? RHS->IgnoreParenImpCasts() : nullptr;\n          const Expr *LHS =\
+  \ BO->getLHS();\n          LHS = LHS ? LHS->IgnoreParenImpCasts() : nullptr;\n\n\
+  \          const auto *CE = RHS ? dyn_cast<CallExpr>(RHS) : nullptr;\n         \
+  \ if (!CE || !isWaitForCompletionTimeoutCall(CE))\n            return true;\n\n\
+  \          const VarDecl *RetVD = nullptr;\n          if (const auto *DRE = LHS\
+  \ ? dyn_cast<DeclRefExpr>(LHS) : nullptr) {\n            RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \          }\n          if (!RetVD)\n            return true;\n\n          if (CE->getNumArgs()\
+  \ >= 1) {\n            const VarDecl *CtxVD = getCtxVarFromCompletionArg(CE->getArg(0));\n\
+  \            if (CtxVD) {\n              Map[RetVD] = CtxVD;\n            }\n  \
+  \        }\n          return true;\n        }\n\n        bool VisitDeclStmt(DeclStmt\
+  \ *DS) {\n          if (!DS)\n            return true;\n          for (auto *DI\
+  \ : DS->decls()) {\n            auto *VD = dyn_cast<VarDecl>(DI);\n            if\
+  \ (!VD || !VD->hasInit())\n              continue;\n            const Expr *Init\
+  \ = VD->getInit();\n            Init = Init ? Init->IgnoreParenImpCasts() : nullptr;\n\
+  \            const auto *CE = Init ? dyn_cast<CallExpr>(Init) : nullptr;\n     \
+  \       if (!CE || !isWaitForCompletionTimeoutCall(CE))\n              continue;\n\
+  \n            if (CE->getNumArgs() >= 1) {\n              const VarDecl *CtxVD =\
+  \ getCtxVarFromCompletionArg(CE->getArg(0));\n              if (CtxVD) {\n     \
+  \           Map[VD] = CtxVD;\n              }\n            }\n          }\n    \
+  \      return true;\n        }\n      };\n\n      // Branch search: does S contain\
+  \ a free(ctx) call? If yes, return that CallExpr\n      static const CallExpr* findFreeOfCtx(const\
+  \ Stmt *S, const VarDecl *CtxVD);\n      // Check immediate next statement after\
+  \ an IfStmt within the same CompoundStmt\n      static const CallExpr* findUnconditionalFreeAfterIf(const\
+  \ CompoundStmt *ParentCS,\n                                                    \
+  \      CompoundStmt::const_body_iterator ItAfterIfEnd,\n                       \
+  \                                   const VarDecl *CtxVD);\n      // Process a compound\
+  \ statement recursively\n      static void processCompoundStmt(const CompoundStmt\
+  \ *CS,\n                                      const llvm::DenseMap<const VarDecl*,\
+  \ const VarDecl*> &RetToCtx,\n                                      ASTContext &AC,\
+  \ BugReporter &BR, BugType &BT);\n};\n\n// ---- Helper implementations ----\n\n\
+  static bool calleeNamed(const CallExpr *CE, StringRef Name) {\n  if (!CE)\n    return\
+  \ false;\n  const FunctionDecl *FD = CE->getDirectCallee();\n  if (!FD)\n    return\
+  \ false;\n  if (const IdentifierInfo *II = FD->getIdentifier())\n    return II->getName()\
+  \ == Name;\n  return false;\n}\n\nbool SAGenTestChecker::isWaitForCompletionTimeoutCall(const\
+  \ CallExpr *CE) {\n  return calleeNamed(CE, \"wait_for_completion_timeout\");\n\
+  }\n\nbool SAGenTestChecker::isFreeLikeCallee(const FunctionDecl *FD) {\n  if (!FD)\
+  \ return false;\n  const IdentifierInfo *II = FD->getIdentifier();\n  if (!II) return\
+  \ false;\n  StringRef N = II->getName();\n  return N == \"kfree\" || N == \"kvfree\"\
+  \ || N == \"vfree\";\n}\n\nbool SAGenTestChecker::exprEvaluatesToZero(const Expr\
+  \ *E, ASTContext &AC) {\n  if (!E) return false;\n  Expr::EvalResult R;\n  if (E->EvaluateAsInt(R,\
+  \ AC)) {\n    return R.Val.getInt().isZero();\n  }\n  return false;\n}\n\nconst\
+  \ VarDecl* SAGenTestChecker::getDeclRefVar(const Expr *E) {\n  if (!E) return nullptr;\n\
+  \  // Try direct DeclRefExpr first\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts()))\
+  \ {\n    return dyn_cast<VarDecl>(DRE->getDecl());\n  }\n  // Fallback: search in\
+  \ children\n  if (const auto *DRE2 = findSpecificTypeInChildren<DeclRefExpr>(E))\
+  \ {\n    return dyn_cast<VarDecl>(DRE2->getDecl());\n  }\n  return nullptr;\n}\n\
+  \nconst VarDecl* SAGenTestChecker::getCtxVarFromCompletionArg(const Expr *Arg) {\n\
+  \  if (!Arg) return nullptr;\n  // Typical form: &ctx->compl or &reset_data.compl\n\
+  \  // Find the DeclRefExpr in children, which should refer to the base variable\
+  \ 'ctx'/'reset_data'.\n  if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(Arg))\
+  \ {\n    return dyn_cast<VarDecl>(DRE->getDecl());\n  }\n  return nullptr;\n}\n\n\
+  SAGenTestChecker::TimeoutBranchKind\nSAGenTestChecker::classifyTimeoutBranch(const\
+  \ Expr *Cond,\n                                        const llvm::DenseMap<const\
+  \ VarDecl*, const VarDecl*> &RetToCtx,\n                                       \
+  \ const VarDecl* &OutCtx,\n                                        ASTContext &AC)\
+  \ {\n  OutCtx = nullptr;\n  if (!Cond) return TB_Unknown;\n\n  const Expr *E = Cond->IgnoreParenImpCasts();\n\
+  \n  // Case 1: if (wait_for_completion_timeout(...))\n  if (const auto *CE = dyn_cast<CallExpr>(E))\
+  \ {\n    if (isWaitForCompletionTimeoutCall(CE)) {\n      if (CE->getNumArgs() >=\
+  \ 1) {\n        OutCtx = getCtxVarFromCompletionArg(CE->getArg(0));\n      }\n \
+  \     // Non-zero => success, zero => timeout\n      return OutCtx ? TB_Else : TB_Unknown;\n\
+  \    }\n  }\n\n  // Case 2: if (! <expr>)\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();\n\
+  \      if (const auto *CE = dyn_cast<CallExpr>(Sub)) {\n        if (isWaitForCompletionTimeoutCall(CE))\
+  \ {\n          if (CE->getNumArgs() >= 1) {\n            OutCtx = getCtxVarFromCompletionArg(CE->getArg(0));\n\
+  \          }\n          return OutCtx ? TB_Then : TB_Unknown;\n        }\n     \
+  \ } else if (const auto *DRE = dyn_cast<DeclRefExpr>(Sub)) {\n        const VarDecl\
+  \ *RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n        if (RetVD) {\n          auto\
+  \ It = RetToCtx.find(RetVD);\n          if (It != RetToCtx.end()) {\n          \
+  \  OutCtx = It->second;\n            return TB_Then; // !ret => timeout\n      \
+  \    }\n        }\n      }\n    }\n  }\n\n  // Case 3: Binary comparisons with zero\n\
+  \  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {\n    const Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \    const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\n    auto isZero = [&](const\
+  \ Expr *X){ return exprEvaluatesToZero(X, AC); };\n\n    // LHS is call or ret var,\
+  \ RHS is zero\n    if (isZero(R)) {\n      // LHS can be call or DeclRef\n     \
+  \ if (const auto *CE = dyn_cast<CallExpr>(L)) {\n        if (isWaitForCompletionTimeoutCall(CE))\
+  \ {\n          if (CE->getNumArgs() >= 1) {\n            OutCtx = getCtxVarFromCompletionArg(CE->getArg(0));\n\
+  \          }\n          if (!OutCtx) return TB_Unknown;\n          if (BO->getOpcode()\
+  \ == BO_EQ)\n            return TB_Then; // call == 0 => timeout in then\n     \
+  \     if (BO->getOpcode() == BO_NE)\n            return TB_Else; // call != 0 =>\
+  \ timeout in else (success in then)\n        }\n      } else if (const auto *DRE\
+  \ = dyn_cast<DeclRefExpr>(L)) {\n        const VarDecl *RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \        if (RetVD) {\n          auto It = RetToCtx.find(RetVD);\n          if (It\
+  \ != RetToCtx.end()) {\n            OutCtx = It->second;\n            if (BO->getOpcode()\
+  \ == BO_EQ)\n              return TB_Then; // ret == 0 => timeout\n            if\
+  \ (BO->getOpcode() == BO_NE)\n              return TB_Else; // ret != 0 => success\n\
+  \          }\n        }\n      }\n    }\n\n    // RHS is call/ret, LHS is zero\n\
+  \    if (isZero(L)) {\n      if (const auto *CE = dyn_cast<CallExpr>(R)) {\n   \
+  \     if (isWaitForCompletionTimeoutCall(CE)) {\n          if (CE->getNumArgs()\
+  \ >= 1) {\n            OutCtx = getCtxVarFromCompletionArg(CE->getArg(0));\n   \
+  \       }\n          if (!OutCtx) return TB_Unknown;\n          if (BO->getOpcode()\
+  \ == BO_EQ)\n            return TB_Then; // 0 == call => timeout\n          if (BO->getOpcode()\
+  \ == BO_NE)\n            return TB_Else; // 0 != call => success\n        }\n  \
+  \    } else if (const auto *DRE = dyn_cast<DeclRefExpr>(R)) {\n        const VarDecl\
+  \ *RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n        if (RetVD) {\n          auto\
+  \ It = RetToCtx.find(RetVD);\n          if (It != RetToCtx.end()) {\n          \
+  \  OutCtx = It->second;\n            if (BO->getOpcode() == BO_EQ)\n           \
+  \   return TB_Then; // 0 == ret => timeout\n            if (BO->getOpcode() == BO_NE)\n\
+  \              return TB_Else; // 0 != ret => success\n          }\n        }\n\
+  \      }\n    }\n  }\n\n  // Case 4: if (ret)\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n    const VarDecl *RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n    if (RetVD)\
+  \ {\n      auto It = RetToCtx.find(RetVD);\n      if (It != RetToCtx.end()) {\n\
+  \        OutCtx = It->second;\n        return TB_Else; // ret != 0 => success, else\
+  \ => timeout\n      }\n    }\n  }\n\n  return TB_Unknown;\n}\n\nconst CallExpr*\
+  \ SAGenTestChecker::findFreeOfCtx(const Stmt *S, const VarDecl *CtxVD) {\n  if (!S\
+  \ || !CtxVD) return nullptr;\n\n  class Finder : public RecursiveASTVisitor<Finder>\
+  \ {\n    const VarDecl *Target;\n    const CallExpr *Found = nullptr;\n  public:\n\
+  \    Finder(const VarDecl *VD) : Target(VD) {}\n    bool VisitCallExpr(CallExpr\
+  \ *CE) {\n      if (Found || !CE) return true;\n      const FunctionDecl *FD = CE->getDirectCallee();\n\
+  \      if (!FD || !isFreeLikeCallee(FD))\n        return true;\n      if (CE->getNumArgs()\
+  \ < 1)\n        return true;\n      const VarDecl *ArgVD = getDeclRefVar(CE->getArg(0));\n\
+  \      if (ArgVD && ArgVD == Target) {\n        Found = CE;\n        // We can stop\
+  \ traversal here by returning false, but we need to keep the API consistent.\n \
+  \       // Returning true is also fine; we will just ignore further matches.\n \
+  \     }\n      return true;\n    }\n    const CallExpr* get() const { return Found;\
+  \ }\n  };\n\n  Finder F(CtxVD);\n  F.TraverseStmt(const_cast<Stmt*>(S));\n  return\
+  \ F.get();\n}\n\nconst CallExpr* SAGenTestChecker::findUnconditionalFreeAfterIf(const\
+  \ CompoundStmt *ParentCS,\n                                                    \
+  \           CompoundStmt::const_body_iterator ItAfterIfEnd,\n                  \
+  \                                             const VarDecl *CtxVD) {\n  if (!ParentCS\
+  \ || !CtxVD) return nullptr;\n  // Look only at the immediate next statements until\
+  \ a ReturnStmt or another IfStmt.\n  for (auto It = ItAfterIfEnd; It != ParentCS->body_end();\
+  \ ++It) {\n    const Stmt *S = *It;\n    if (!S) continue;\n    if (isa<ReturnStmt>(S)\
+  \ || isa<IfStmt>(S))\n      break;\n\n    // Only consider a direct call as being\
+  \ unconditional\n    if (const auto *CE = dyn_cast<CallExpr>(S)) {\n      const\
+  \ FunctionDecl *FD = CE->getDirectCallee();\n      if (!FD) continue;\n      if\
+  \ (!isFreeLikeCallee(FD)) continue;\n\n      if (CE->getNumArgs() >= 1) {\n    \
+  \    const VarDecl *ArgVD = getDeclRefVar(CE->getArg(0));\n        if (ArgVD &&\
+  \ ArgVD == CtxVD) {\n          return CE;\n        }\n      }\n    }\n    // If\
+  \ we hit any other kind of statement, we continue to see if the next one is a direct\
+  \ free.\n    // Stop if statement list grows long to avoid noise; but keeping it\
+  \ simple for now.\n  }\n  return nullptr;\n}\n\nvoid SAGenTestChecker::processCompoundStmt(const\
+  \ CompoundStmt *CS,\n                                           const llvm::DenseMap<const\
+  \ VarDecl*, const VarDecl*> &RetToCtx,\n                                       \
+  \    ASTContext &AC, BugReporter &BR, BugType &BT) {\n  if (!CS) return;\n\n  //\
+  \ Iterate with index/iterators to be able to inspect the next statement.\n  for\
+  \ (auto It = CS->body_begin(), E = CS->body_end(); It != E; ++It) {\n    const Stmt\
+  \ *S = *It;\n\n    // Recurse into nested CompoundStmts to find inner patterns as\
+  \ well.\n    if (const auto *InnerCS = dyn_cast<CompoundStmt>(S)) {\n      processCompoundStmt(InnerCS,\
+  \ RetToCtx, AC, BR, BT);\n    }\n\n    const auto *IfS = dyn_cast<IfStmt>(S);\n\
+  \    if (!IfS)\n      continue;\n\n    const Expr *Cond = IfS->getCond();\n    const\
+  \ VarDecl *CtxVD = nullptr;\n    TimeoutBranchKind TB = classifyTimeoutBranch(Cond,\
+  \ RetToCtx, CtxVD, AC);\n    if (TB == TB_Unknown || !CtxVD)\n      continue;\n\n\
+  \    // Identify the timeout branch\n    const Stmt *TimeoutBranch = (TB == TB_Then)\
+  \ ? IfS->getThen() : IfS->getElse();\n\n    // 1) Definite bug: free(ctx) in the\
+  \ timeout branch\n    if (TimeoutBranch) {\n      if (const CallExpr *FreeCE = findFreeOfCtx(TimeoutBranch,\
+  \ CtxVD)) {\n        PathDiagnosticLocation Loc(FreeCE->getExprLoc(), BR.getSourceManager());\n\
+  \        auto R = std::make_unique<BasicBugReport>(\n            BT,\n         \
+  \   \"Freeing work context on timeout after wait_for_completion_timeout; worker\
+  \ may still use it (use-after-free).\",\n            Loc);\n        R->addRange(FreeCE->getSourceRange());\n\
+  \        BR.emitReport(std::move(R));\n      }\n    }\n\n    // 2) Suspicious bug:\
+  \ unconditional free(ctx) right after the if-statement\n    auto NextIt = It;\n\
+  \    ++NextIt;\n    if (const CallExpr *FreeCE = findUnconditionalFreeAfterIf(CS,\
+  \ NextIt, CtxVD)) {\n      PathDiagnosticLocation Loc(FreeCE->getExprLoc(), BR.getSourceManager());\n\
+  \      auto R = std::make_unique<BasicBugReport>(\n          BT,\n          \"Freeing\
+  \ work context unconditionally after wait_for_completion_timeout; may free on timeout\
+  \ while worker still uses it.\",\n          Loc);\n      R->addRange(FreeCE->getSourceRange());\n\
+  \      BR.emitReport(std::move(R));\n    }\n\n    // Recurse into then/else branches\
+  \ to detect nested constructs\n    if (const auto *ThenCS = dyn_cast_or_null<CompoundStmt>(IfS->getThen()))\n\
+  \      processCompoundStmt(ThenCS, RetToCtx, AC, BR, BT);\n    if (const auto *ElseCS\
+  \ = dyn_cast_or_null<CompoundStmt>(IfS->getElse()))\n      processCompoundStmt(ElseCS,\
+  \ RetToCtx, AC, BR, BT);\n  }\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD)\n    return;\n  const Stmt *Body = FD->getBody();\n  if (!Body)\n  \
+  \  return;\n\n  ASTContext &AC = Mgr.getASTContext();\n\n  // Build ret -> ctx mapping\
+  \ for the entire function body\n  llvm::DenseMap<const VarDecl*, const VarDecl*>\
+  \ RetToCtx;\n  RetToCtxCollector Collector(RetToCtx, AC);\n  Collector.TraverseStmt(const_cast<Stmt*>(Body));\n\
+  \n  const auto *CS = dyn_cast<CompoundStmt>(Body);\n  if (!CS)\n    return;\n\n\
+  \  processCompoundStmt(CS, RetToCtx, AC, BR, *BT);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects freeing a work context on wait_for_completion_timeout\
+  \ timeout path leading to possible UAF\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\ncrypto: qat - resolve race condition during AER recovery\n\
+  \nDuring the PCI AER system's error recovery process, the kernel driver\nmay encounter\
+  \ a race condition with freeing the reset_data structure's\nmemory. If the device\
+  \ restart will take more than 10 seconds the function\nscheduling that restart will\
+  \ exit due to a timeout, and the reset_data\nstructure will be freed. However, this\
+  \ data structure is used for\ncompletion notification after the restart is completed,\
+  \ which leads\nto a UAF bug.\n\nThis results in a KFENCE bug notice.\n\n  BUG: KFENCE:\
+  \ use-after-free read in adf_device_reset_worker+0x38/0xa0 [intel_qat]\n  Use-after-free\
+  \ read at 0x00000000bc56fddf (in kfence-#142):\n  adf_device_reset_worker+0x38/0xa0\
+  \ [intel_qat]\n  process_one_work+0x173/0x340\n\nTo resolve this race condition,\
+  \ the memory associated to the container\nof the work_struct is freed on the worker\
+  \ if the timeout expired,\notherwise on the function that schedules the worker.\n\
+  The timeout detection can be done by checking if the caller is\nstill waiting for\
+  \ completion or not by using completion_done() function.\n\nFixes: d8cba25d2c68\
+  \ (\"crypto: qat - Intel(R) QAT driver framework\")\nCc: <stable@vger.kernel.org>\n\
+  Signed-off-by: Damian Muszynski <damian.muszynski@intel.com>\nReviewed-by: Giovanni\
+  \ Cabiddu <giovanni.cabiddu@intel.com>\nSigned-off-by: Herbert Xu <herbert@gondor.apana.org.au>\n\
+  \n## Buggy Code\n\n```c\n// Function: adf_device_reset_worker in drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  static void adf_device_reset_worker(struct work_struct *work)\n{\n\tstruct adf_reset_dev_data\
+  \ *reset_data =\n\t\t  container_of(work, struct adf_reset_dev_data, reset_work);\n\
+  \tstruct adf_accel_dev *accel_dev = reset_data->accel_dev;\n\tunsigned long wait_jiffies\
+  \ = msecs_to_jiffies(10000);\n\tstruct adf_sriov_dev_data sriov_data;\n\n\tadf_dev_restarting_notify(accel_dev);\n\
+  \tif (adf_dev_restart(accel_dev)) {\n\t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n\t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n\t\t\tkfree(reset_data);\n\
+  \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\n\");\n\t\treturn;\n\
+  \t}\n\n\tsriov_data.accel_dev = accel_dev;\n\tinit_completion(&sriov_data.compl);\n\
+  \tINIT_WORK(&sriov_data.sriov_work, adf_device_sriov_worker);\n\tqueue_work(device_sriov_wq,\
+  \ &sriov_data.sriov_work);\n\tif (wait_for_completion_timeout(&sriov_data.compl,\
+  \ wait_jiffies))\n\t\tadf_pf2vf_notify_restarted(accel_dev);\n\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\n\t/* The dev is back\
+  \ alive. Notify the caller if in sync mode */\n\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n\
+  \t\tcomplete(&reset_data->compl);\n\telse\n\t\tkfree(reset_data);\n}\n```\n\n```c\n\
+  // Function: adf_slot_reset in drivers/crypto/intel/qat/qat_common/adf_aer.c\nstatic\
+  \ pci_ers_result_t adf_slot_reset(struct pci_dev *pdev)\n{\n\tstruct adf_accel_dev\
+  \ *accel_dev = adf_devmgr_pci_to_accel_dev(pdev);\n\tint res = 0;\n\n\tif (!accel_dev)\
+  \ {\n\t\tpr_err(\"QAT: Can't find acceleration device\\n\");\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\
+  \t}\n\n\tif (!pdev->is_busmaster)\n\t\tpci_set_master(pdev);\n\tpci_restore_state(pdev);\n\
+  \tpci_save_state(pdev);\n\tres = adf_dev_up(accel_dev, false);\n\tif (res && res\
+  \ != -EALREADY)\n\t\treturn PCI_ERS_RESULT_DISCONNECT;\n\n\tadf_reenable_sriov(accel_dev);\n\
+  \tadf_pf2vf_notify_restarted(accel_dev);\n\tadf_dev_restarted_notify(accel_dev);\n\
+  \tclear_bit(ADF_STATUS_RESTARTING, &accel_dev->status);\n\treturn PCI_ERS_RESULT_RECOVERED;\n\
+  }\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/crypto/intel/qat/qat_common/adf_aer.c\
+  \ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\nindex 3597e7605a14..9da2278bd5b7\
+  \ 100644\n--- a/drivers/crypto/intel/qat/qat_common/adf_aer.c\n+++ b/drivers/crypto/intel/qat/qat_common/adf_aer.c\n\
+  @@ -130,7 +130,8 @@ static void adf_device_reset_worker(struct work_struct *work)\n\
+  \ \tif (adf_dev_restart(accel_dev)) {\n \t\t/* The device hanged and we can't restart\
+  \ it so stop here */\n \t\tdev_err(&GET_DEV(accel_dev), \"Restart device failed\\\
+  n\");\n-\t\tif (reset_data->mode == ADF_DEV_RESET_ASYNC)\n+\t\tif (reset_data->mode\
+  \ == ADF_DEV_RESET_ASYNC ||\n+\t\t    completion_done(&reset_data->compl))\n \t\t\
+  \tkfree(reset_data);\n \t\tWARN(1, \"QAT: device restart failed. Device is unusable\\\
+  n\");\n \t\treturn;\n@@ -146,11 +147,19 @@ static void adf_device_reset_worker(struct\
+  \ work_struct *work)\n \tadf_dev_restarted_notify(accel_dev);\n \tclear_bit(ADF_STATUS_RESTARTING,\
+  \ &accel_dev->status);\n \n-\t/* The dev is back alive. Notify the caller if in\
+  \ sync mode */\n-\tif (reset_data->mode == ADF_DEV_RESET_SYNC)\n-\t\tcomplete(&reset_data->compl);\n\
+  -\telse\n+\t/*\n+\t * The dev is back alive. Notify the caller if in sync mode\n\
+  +\t *\n+\t * If device restart will take a more time than expected,\n+\t * the schedule_reset()\
+  \ function can timeout and exit. This can be\n+\t * detected by calling the completion_done()\
+  \ function. In this case\n+\t * the reset_data structure needs to be freed here.\n\
+  +\t */\n+\tif (reset_data->mode == ADF_DEV_RESET_ASYNC ||\n+\t    completion_done(&reset_data->compl))\n\
+  \ \t\tkfree(reset_data);\n+\telse\n+\t\tcomplete(&reset_data->compl);\n }\n \n static\
+  \ int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n@@ -183,8 +192,9\
+  \ @@ static int adf_dev_aer_schedule_reset(struct adf_accel_dev *accel_dev,\n \t\
+  \t\tdev_err(&GET_DEV(accel_dev),\n \t\t\t\t\"Reset device timeout expired\\n\");\n\
+  \ \t\t\tret = -EFAULT;\n+\t\t} else {\n+\t\t\tkfree(reset_data);\n \t\t}\n-\t\t\
+  kfree(reset_data);\n \t\treturn ret;\n \t}\n \treturn 0;\n```\n"
+pattern: "## Bug Pattern\n\nFreeing a work item\u2019s context structure in the scheduler\u2019\
+  s timeout path while the workqueue worker still references it (e.g., to signal a\
+  \ completion), causing a use-after-free.\n\nTypical shape:\n- A worker uses container_of(work,\
+  \ ctx, work) to access a heap-allocated ctx that also holds a completion for synchronous\
+  \ callers.\n- The caller schedules the work and waits with wait_for_completion_timeout(&ctx->done,\
+  \ tmo).\n- On timeout, the caller unconditionally kfree(ctx), but the worker will\
+  \ later access ctx (e.g., complete(&ctx->done) or other fields), leading to UAF.\n\
+  - Ownership/lifetime of ctx is not clearly separated between the caller and the\
+  \ worker, especially for the timeout case.\n\nFix pattern:\n- Only free ctx in one\
+  \ place depending on whether the waiter is still waiting or has timed out (e.g.,\
+  \ use completion_done() to decide), and avoid freeing on both sides or freeing on\
+  \ timeout while the worker still runs."
+plan: "Plan: Detect freeing a work item\u2019s context in the scheduler\u2019s timeout\
+  \ path after wait_for_completion_timeout, which can race with the worker still using\
+  \ the context\n\n1) Program State\n- No custom program states are required. We will\
+  \ implement a local, AST-based checker working within a single function body to\
+  \ keep it simple and robust.\n\n2) Chosen callbacks\n- Use checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR):\n  - We will analyze each function\
+  \ body once, scan its statements, and recognize:\n    - A wait_for_completion_timeout()\
+  \ check in an if-condition (directly or via a temporary/ret variable).\n    - The\
+  \ branch that corresponds to the timeout case.\n    - A free of the same context\
+  \ pointer (kfree(ctx)) in the timeout branch, or unconditionally after the if-statement\
+  \ (both branches).\n  - Emit a bug if freeing occurs on the timeout path (definite)\
+  \ or is unconditional after the timeout test (suspicious).\n\n3) High-level detection\
+  \ strategy\n- Target AST shape:\n  - queue_work(..., &ctx->work) [optional]\n  -\
+  \ ret = wait_for_completion_timeout(&ctx->compl, tmo); or if (wait_for_completion_timeout(&ctx->compl,\
+  \ tmo)) ...\n  - if (ret) / if (!ret) / if (ret == 0) / if (ret != 0) / if (wait_for_completion_timeout(...))\
+  \ / if (!wait_for_completion_timeout(...)) / if (wait_for_completion_timeout(...)\
+  \ == 0) ...\n  - timeout branch code\n  - kfree(ctx) in timeout branch (definite\
+  \ bug) OR kfree(ctx) unconditionally after the if-statement (suspicious bug)\n-\
+  \ Rationale:\n  - If ctx is freed on timeout, the worker (which still references\
+  \ ctx to signal completion or use other fields) can dereference freed memory \u2192\
+  \ UAF.\n  - The patch\u2019s fix uses completion_done(&ctx->compl) and \u201Cfree-only-in-one-place\u201D\
+  \ ownership separation.\n\n4) Core helpers to implement (local to the checker)\n\
+  - isWaitForCompletionTimeoutCall(const CallExpr *CE):\n  - Return true if callee\
+  \ name is \"wait_for_completion_timeout\".\n- getCtxVarFromCompletionArg(const Expr\
+  \ *Arg) -> const VarDecl*:\n  - Arg is the first argument to wait_for_completion_timeout\
+  \ (e.g., &ctx->compl).\n  - Strategy:\n    - Strip implicit casts/paren.\n    -\
+  \ Find a DeclRefExpr in children (using findSpecificTypeInChildren<DeclRefExpr>(Arg)).\n\
+  \    - Return its VarDecl (this is the base \u201Cctx\u201D variable).\n  - Note:\
+  \ This works for typical \u201C&ctx->done/compl\u201D and \u201C&reset_data.compl\u201D\
+  \ cases; we match the first DeclRefExpr as the base.\n- getDeclRefVar(const Expr\
+  \ *E) -> const VarDecl*:\n  - Given an expression (e.g., kfree(ctx)), find the DeclRefExpr\
+  \ in it (findSpecificTypeInChildren<DeclRefExpr>) and return its VarDecl.\n- conditionClassifyTimeoutBranch(const\
+  \ Expr *CondExpr, const VarDecl* &CtxVD, const VarDecl* &RetVD, AnalysisManager\
+  \ &Mgr) -> enum { TimeoutIsThen, TimeoutIsElse, Unknown }:\n  - Normalize CondExpr\
+  \ via IgnoreParenImpCasts.\n  - Handle forms:\n    - Direct call: if (wait_for_completion_timeout(&ctx->compl,\
+  \ ...))\n      - CtxVD = getCtxVarFromCompletionArg(Call->getArg(0))\n      - TimeoutIsElse\
+  \ (nonzero => success, zero => timeout).\n    - Negated direct call: if (!wait_for_completion_timeout(...))\n\
+  \      - CtxVD as above; TimeoutIsThen.\n    - Binary compare with zero/null: wait_for_completion_timeout(...)\
+  \ == 0 => TimeoutIsThen; != 0 => TimeoutIsElse. Same if LHS is a DeclRef (ret).\n\
+  \    - DeclRef variable: if (ret) => TimeoutIsElse; if (!ret) => TimeoutIsThen.\n\
+  \      - RetVD is the DeclRef\u2019s VarDecl.\n  - If condition uses a variable\
+  \ ret, we must resolve which ctx that ret came from. We do this with a preceding-statement\
+  \ scan (below).\n- findRetVarToCtxMap(CompoundStmt *Body):\n  - While scanning statements\
+  \ top-down within the CompoundStmt, for each assignment:\n    - ret = wait_for_completion_timeout(&ctx->compl,\
+  \ ...);\n    - Record a mapping RetVarToCtx: VarDecl* ret -> VarDecl* ctx.\n  -\
+  \ Keep this simple map local to the function body scan.\n- findTimeoutBranchForIf(const\
+  \ IfStmt *IfS, const VarDecl *CtxFromCond, const VarDecl *RetFromCond, const llvm::DenseMap<const\
+  \ VarDecl*, const VarDecl*> &RetVarToCtx, AnalysisManager &Mgr) -> pair<const Stmt*,\
+  \ const VarDecl*>:\n  - Use conditionClassifyTimeoutBranch to determine which branch\
+  \ is timeout.\n  - If condition referenced a ret variable, look up RetVarToCtx to\
+  \ get CtxVD; if missing, return unknown.\n  - Return the Stmt* corresponding to\
+  \ timeout branch (IfS->getThen() or IfS->getElse()) and the CtxVD.\n- hasFreeOfCtx(const\
+  \ Stmt *S, const VarDecl *CtxVD, AnalysisManager &Mgr) -> bool:\n  - Recursively\
+  \ traverse S\u2019s children to find a CallExpr to \u201Ckfree\u201D, \u201Ckvfree\u201D\
+  , or \u201Cvfree\u201D.\n  - For each such Call, extract first argument\u2019s VarDecl\
+  \ via getDeclRefVar and compare pointer equality with CtxVD.\n  - Return true on\
+  \ first match.\n- findUnconditionalFreeAfterIf(const IfStmt *IfS, const VarDecl\
+  \ *CtxVD) -> bool:\n  - Get parent CompoundStmt via findSpecificTypeInParents<CompoundStmt>(IfS,\
+  \ Ctx placeholder).\n  - Scan the CompoundStmt\u2019s children to find the IfS;\
+  \ then inspect subsequent statements (until next control-flow barrier like return/break)\
+  \ for a top-level kfree(ctx).\n  - If found, report as suspicious unconditional\
+  \ free.\n  - Keep it simple: stop when encountering another IfStmt/ReturnStmt; only\
+  \ check immediate successive statements.\n- Optional aid: ExprHasName for fallback\
+  \ matching if DRE extraction fails (e.g., compare textual base names in \u201C&reset_data.compl\u201D\
+  \ and \u201Ckfree(reset_data)\u201D).\n\n5) Implementation in checkASTCodeBody\n\
+  - For each function with a body:\n  - Obtain the top CompoundStmt (body).\n  - Build\
+  \ RetVarToCtx map:\n    - Walk statements; when you encounter a BinaryOperator assignment\
+  \ whose RHS is a CallExpr to wait_for_completion_timeout, record mapping retVar\
+  \ -> ctxVar via getCtxVarFromCompletionArg.\n  - Walk statements again to find IfStmt\
+  \ nodes:\n    - For each IfStmt:\n      - Use findTimeoutBranchForIf to figure out\
+  \ timeout branch and ctxVar.\n      - If unknown (cannot resolve ctx), skip.\n \
+  \     - Check if the timeout branch exists and contains kfree(ctx) using hasFreeOfCtx.\
+  \ If yes, emit a report:\n        - Title: Freeing work context on timeout may cause\
+  \ UAF\n        - Message: ctx freed in timeout path after wait_for_completion_timeout;\
+  \ worker may still use it. Use completion_done() and free in one place.\n      -\
+  \ Else, check if there is an unconditional free after the IfStmt using findUnconditionalFreeAfterIf.\
+  \ If yes, emit a lower-confidence report:\n        - Title: Possibly freeing work\
+  \ context regardless of wait outcome\n        - Message: ctx freed unconditionally\
+  \ after wait_for_completion_timeout; ensure timeout ownership is handled by worker\
+  \ (e.g., via completion_done()).\n- Reporting:\n  - Create a BugType once per checker\
+  \ (e.g., \u201CWorkqueue timeout UAF\u201D).\n  - Use PathSensitiveBugReport or\
+  \ BasicBugReport (Basic is sufficient here).\n  - Attach a range on the kfree call\u2019\
+  s argument for clarity if possible.\n\n6) Notes and heuristics to reduce false positives\n\
+  - Only warn for kfree() of the same ctx variable that appears as the base in &ctx->compl.\n\
+  - Only trigger on wait_for_completion_timeout to limit scope to the intended synchronization\
+  \ primitive.\n- Prefer the \u201Cdefinite\u201D case (free in timeout branch). The\
+  \ \u201Cunconditional after if\u201D case should be marked as \"suspicious\" (optional\
+  \ severity tag in message) to avoid noise.\n\n7) Utility function usage\n- findSpecificTypeInChildren:\n\
+  \  - To extract DeclRefExpr from the first argument of wait_for_completion_timeout\
+  \ and from kfree arguments.\n- findSpecificTypeInParents:\n  - To locate the parent\
+  \ CompoundStmt of an IfStmt to search for unconditional frees after it.\n- ExprHasName:\n\
+  \  - As a fallback when DeclRef extraction fails; check that both the wait arg and\
+  \ kfree arg contain the same base identifier text (e.g., \u201Creset_data\u201D\
+  ).\n\n8) Edge cases handled\n- Condition forms:\n  - Direct call, negated call,\
+  \ ret variable, negated ret, compare to 0 or NULL.\n- Free functions:\n  - kfree,\
+  \ kvfree, vfree (extendable).\n- The ctx may have different identifier names (we\
+  \ key by VarDecl identity, not by string, when possible).\n\nThis plan keeps the\
+  \ checker simple (single AST callback), precise for the most error-prone pattern\
+  \ (free-on-timeout), and mirrors the fix pattern (use completion_done() and free\
+  \ only in one place)."
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/AST/ASTContext.h\"\n#include \"clang/AST/Expr.h\"\n#include \"\
+  clang/AST/Stmt.h\"\n#include \"clang/AST/Decl.h\"\n#include \"llvm/ADT/DenseMap.h\"\
+  \n\nusing namespace clang;\nusing namespace ento;\nusing namespace taint;\n\nnamespace\
+  \ {\n/* The checker callbacks are to be decided. */\nclass SAGenTestChecker : public\
+  \ Checker<check::ASTCodeBody> {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n\
+  \      SAGenTestChecker() : BT(new BugType(this, \"Workqueue timeout may cause use-after-free\"\
+  , \"Memory Error\")) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager\
+  \ &Mgr, BugReporter &BR) const;\n\n   private:\n\n      // Core helpers\n      static\
+  \ bool isWaitForCompletionTimeoutCall(const CallExpr *CE);\n      static bool isFreeLikeCallee(const\
+  \ FunctionDecl *FD);\n      static bool exprEvaluatesToZero(const Expr *E, ASTContext\
+  \ &AC);\n      static const VarDecl* getCtxVarFromCompletionArg(const Expr *Arg);\n\
+  \      static const VarDecl* getDeclRefVar(const Expr *E);\n\n      enum TimeoutBranchKind\
+  \ { TB_Unknown, TB_Then, TB_Else };\n\n      // Condition analysis: classify which\
+  \ branch (then/else) is the \"timeout\" path\n      static TimeoutBranchKind classifyTimeoutBranch(const\
+  \ Expr *Cond,\n                                                     const llvm::DenseMap<const\
+  \ VarDecl*, const VarDecl*> &RetToCtx,\n                                       \
+  \              const VarDecl* &OutCtx,\n                                       \
+  \              ASTContext &AC);\n\n      // Mapping collector: ret = wait_for_completion_timeout(&ctx->compl,\
+  \ ...)\n      class RetToCtxCollector : public RecursiveASTVisitor<RetToCtxCollector>\
+  \ {\n        llvm::DenseMap<const VarDecl*, const VarDecl*> &Map;\n        ASTContext\
+  \ &AC;\n      public:\n        RetToCtxCollector(llvm::DenseMap<const VarDecl*,\
+  \ const VarDecl*> &M, ASTContext &Ctx)\n          : Map(M), AC(Ctx) {}\n\n     \
+  \   bool VisitBinaryOperator(BinaryOperator *BO) {\n          if (!BO || !BO->isAssignmentOp())\n\
+  \            return true;\n          const Expr *RHS = BO->getRHS();\n         \
+  \ RHS = RHS ? RHS->IgnoreParenImpCasts() : nullptr;\n          const Expr *LHS =\
+  \ BO->getLHS();\n          LHS = LHS ? LHS->IgnoreParenImpCasts() : nullptr;\n\n\
+  \          const auto *CE = RHS ? dyn_cast<CallExpr>(RHS) : nullptr;\n         \
+  \ if (!CE || !isWaitForCompletionTimeoutCall(CE))\n            return true;\n\n\
+  \          const VarDecl *RetVD = nullptr;\n          if (const auto *DRE = LHS\
+  \ ? dyn_cast<DeclRefExpr>(LHS) : nullptr) {\n            RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \          }\n          if (!RetVD)\n            return true;\n\n          if (CE->getNumArgs()\
+  \ >= 1) {\n            const VarDecl *CtxVD = getCtxVarFromCompletionArg(CE->getArg(0));\n\
+  \            if (CtxVD) {\n              Map[RetVD] = CtxVD;\n            }\n  \
+  \        }\n          return true;\n        }\n\n        bool VisitDeclStmt(DeclStmt\
+  \ *DS) {\n          if (!DS)\n            return true;\n          for (auto *DI\
+  \ : DS->decls()) {\n            auto *VD = dyn_cast<VarDecl>(DI);\n            if\
+  \ (!VD || !VD->hasInit())\n              continue;\n            const Expr *Init\
+  \ = VD->getInit();\n            Init = Init ? Init->IgnoreParenImpCasts() : nullptr;\n\
+  \            const auto *CE = Init ? dyn_cast<CallExpr>(Init) : nullptr;\n     \
+  \       if (!CE || !isWaitForCompletionTimeoutCall(CE))\n              continue;\n\
+  \n            if (CE->getNumArgs() >= 1) {\n              const VarDecl *CtxVD =\
+  \ getCtxVarFromCompletionArg(CE->getArg(0));\n              if (CtxVD) {\n     \
+  \           Map[VD] = CtxVD;\n              }\n            }\n          }\n    \
+  \      return true;\n        }\n      };\n\n      // Branch search: does S contain\
+  \ a free(ctx) call? If yes, return that CallExpr\n      static const CallExpr* findFreeOfCtx(const\
+  \ Stmt *S, const VarDecl *CtxVD);\n      // Check immediate next statement after\
+  \ an IfStmt within the same CompoundStmt\n      static const CallExpr* findUnconditionalFreeAfterIf(const\
+  \ CompoundStmt *ParentCS,\n                                                    \
+  \      CompoundStmt::const_body_iterator ItAfterIfEnd,\n                       \
+  \                                   const VarDecl *CtxVD);\n      // Process a compound\
+  \ statement recursively\n      static void processCompoundStmt(const CompoundStmt\
+  \ *CS,\n                                      const llvm::DenseMap<const VarDecl*,\
+  \ const VarDecl*> &RetToCtx,\n                                      ASTContext &AC,\
+  \ BugReporter &BR, BugType &BT);\n};\n\n// ---- Helper implementations ----\n\n\
+  static bool calleeNamed(const CallExpr *CE, StringRef Name) {\n  if (!CE)\n    return\
+  \ false;\n  const FunctionDecl *FD = CE->getDirectCallee();\n  if (!FD)\n    return\
+  \ false;\n  if (const IdentifierInfo *II = FD->getIdentifier())\n    return II->getName()\
+  \ == Name;\n  return false;\n}\n\nbool SAGenTestChecker::isWaitForCompletionTimeoutCall(const\
+  \ CallExpr *CE) {\n  return calleeNamed(CE, \"wait_for_completion_timeout\");\n\
+  }\n\nbool SAGenTestChecker::isFreeLikeCallee(const FunctionDecl *FD) {\n  if (!FD)\
+  \ return false;\n  const IdentifierInfo *II = FD->getIdentifier();\n  if (!II) return\
+  \ false;\n  StringRef N = II->getName();\n  return N == \"kfree\" || N == \"kvfree\"\
+  \ || N == \"vfree\";\n}\n\nbool SAGenTestChecker::exprEvaluatesToZero(const Expr\
+  \ *E, ASTContext &AC) {\n  if (!E) return false;\n  Expr::EvalResult R;\n  if (E->EvaluateAsInt(R,\
+  \ AC)) {\n    return R.Val.getInt().isZero();\n  }\n  return false;\n}\n\nconst\
+  \ VarDecl* SAGenTestChecker::getDeclRefVar(const Expr *E) {\n  if (!E) return nullptr;\n\
+  \  // Try direct DeclRefExpr first\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts()))\
+  \ {\n    return dyn_cast<VarDecl>(DRE->getDecl());\n  }\n  // Fallback: search in\
+  \ children\n  if (const auto *DRE2 = findSpecificTypeInChildren<DeclRefExpr>(E))\
+  \ {\n    return dyn_cast<VarDecl>(DRE2->getDecl());\n  }\n  return nullptr;\n}\n\
+  \nconst VarDecl* SAGenTestChecker::getCtxVarFromCompletionArg(const Expr *Arg) {\n\
+  \  if (!Arg) return nullptr;\n  // Typical form: &ctx->compl or &reset_data.compl\n\
+  \  // Find the DeclRefExpr in children, which should refer to the base variable\
+  \ 'ctx'/'reset_data'.\n  if (const auto *DRE = findSpecificTypeInChildren<DeclRefExpr>(Arg))\
+  \ {\n    return dyn_cast<VarDecl>(DRE->getDecl());\n  }\n  return nullptr;\n}\n\n\
+  SAGenTestChecker::TimeoutBranchKind\nSAGenTestChecker::classifyTimeoutBranch(const\
+  \ Expr *Cond,\n                                        const llvm::DenseMap<const\
+  \ VarDecl*, const VarDecl*> &RetToCtx,\n                                       \
+  \ const VarDecl* &OutCtx,\n                                        ASTContext &AC)\
+  \ {\n  OutCtx = nullptr;\n  if (!Cond) return TB_Unknown;\n\n  const Expr *E = Cond->IgnoreParenImpCasts();\n\
+  \n  // Case 1: if (wait_for_completion_timeout(...))\n  if (const auto *CE = dyn_cast<CallExpr>(E))\
+  \ {\n    if (isWaitForCompletionTimeoutCall(CE)) {\n      if (CE->getNumArgs() >=\
+  \ 1) {\n        OutCtx = getCtxVarFromCompletionArg(CE->getArg(0));\n      }\n \
+  \     // Non-zero => success, zero => timeout\n      return OutCtx ? TB_Else : TB_Unknown;\n\
+  \    }\n  }\n\n  // Case 2: if (! <expr>)\n  if (const auto *UO = dyn_cast<UnaryOperator>(E))\
+  \ {\n    if (UO->getOpcode() == UO_LNot) {\n      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();\n\
+  \      if (const auto *CE = dyn_cast<CallExpr>(Sub)) {\n        if (isWaitForCompletionTimeoutCall(CE))\
+  \ {\n          if (CE->getNumArgs() >= 1) {\n            OutCtx = getCtxVarFromCompletionArg(CE->getArg(0));\n\
+  \          }\n          return OutCtx ? TB_Then : TB_Unknown;\n        }\n     \
+  \ } else if (const auto *DRE = dyn_cast<DeclRefExpr>(Sub)) {\n        const VarDecl\
+  \ *RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n        if (RetVD) {\n          auto\
+  \ It = RetToCtx.find(RetVD);\n          if (It != RetToCtx.end()) {\n          \
+  \  OutCtx = It->second;\n            return TB_Then; // !ret => timeout\n      \
+  \    }\n        }\n      }\n    }\n  }\n\n  // Case 3: Binary comparisons with zero\n\
+  \  if (const auto *BO = dyn_cast<BinaryOperator>(E)) {\n    const Expr *L = BO->getLHS()->IgnoreParenImpCasts();\n\
+  \    const Expr *R = BO->getRHS()->IgnoreParenImpCasts();\n\n    auto isZero = [&](const\
+  \ Expr *X){ return exprEvaluatesToZero(X, AC); };\n\n    // LHS is call or ret var,\
+  \ RHS is zero\n    if (isZero(R)) {\n      // LHS can be call or DeclRef\n     \
+  \ if (const auto *CE = dyn_cast<CallExpr>(L)) {\n        if (isWaitForCompletionTimeoutCall(CE))\
+  \ {\n          if (CE->getNumArgs() >= 1) {\n            OutCtx = getCtxVarFromCompletionArg(CE->getArg(0));\n\
+  \          }\n          if (!OutCtx) return TB_Unknown;\n          if (BO->getOpcode()\
+  \ == BO_EQ)\n            return TB_Then; // call == 0 => timeout in then\n     \
+  \     if (BO->getOpcode() == BO_NE)\n            return TB_Else; // call != 0 =>\
+  \ timeout in else (success in then)\n        }\n      } else if (const auto *DRE\
+  \ = dyn_cast<DeclRefExpr>(L)) {\n        const VarDecl *RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n\
+  \        if (RetVD) {\n          auto It = RetToCtx.find(RetVD);\n          if (It\
+  \ != RetToCtx.end()) {\n            OutCtx = It->second;\n            if (BO->getOpcode()\
+  \ == BO_EQ)\n              return TB_Then; // ret == 0 => timeout\n            if\
+  \ (BO->getOpcode() == BO_NE)\n              return TB_Else; // ret != 0 => success\n\
+  \          }\n        }\n      }\n    }\n\n    // RHS is call/ret, LHS is zero\n\
+  \    if (isZero(L)) {\n      if (const auto *CE = dyn_cast<CallExpr>(R)) {\n   \
+  \     if (isWaitForCompletionTimeoutCall(CE)) {\n          if (CE->getNumArgs()\
+  \ >= 1) {\n            OutCtx = getCtxVarFromCompletionArg(CE->getArg(0));\n   \
+  \       }\n          if (!OutCtx) return TB_Unknown;\n          if (BO->getOpcode()\
+  \ == BO_EQ)\n            return TB_Then; // 0 == call => timeout\n          if (BO->getOpcode()\
+  \ == BO_NE)\n            return TB_Else; // 0 != call => success\n        }\n  \
+  \    } else if (const auto *DRE = dyn_cast<DeclRefExpr>(R)) {\n        const VarDecl\
+  \ *RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n        if (RetVD) {\n          auto\
+  \ It = RetToCtx.find(RetVD);\n          if (It != RetToCtx.end()) {\n          \
+  \  OutCtx = It->second;\n            if (BO->getOpcode() == BO_EQ)\n           \
+  \   return TB_Then; // 0 == ret => timeout\n            if (BO->getOpcode() == BO_NE)\n\
+  \              return TB_Else; // 0 != ret => success\n          }\n        }\n\
+  \      }\n    }\n  }\n\n  // Case 4: if (ret)\n  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))\
+  \ {\n    const VarDecl *RetVD = dyn_cast<VarDecl>(DRE->getDecl());\n    if (RetVD)\
+  \ {\n      auto It = RetToCtx.find(RetVD);\n      if (It != RetToCtx.end()) {\n\
+  \        OutCtx = It->second;\n        return TB_Else; // ret != 0 => success, else\
+  \ => timeout\n      }\n    }\n  }\n\n  return TB_Unknown;\n}\n\nconst CallExpr*\
+  \ SAGenTestChecker::findFreeOfCtx(const Stmt *S, const VarDecl *CtxVD) {\n  if (!S\
+  \ || !CtxVD) return nullptr;\n\n  class Finder : public RecursiveASTVisitor<Finder>\
+  \ {\n    const VarDecl *Target;\n    const CallExpr *Found = nullptr;\n  public:\n\
+  \    Finder(const VarDecl *VD) : Target(VD) {}\n    bool VisitCallExpr(CallExpr\
+  \ *CE) {\n      if (Found || !CE) return true;\n      const FunctionDecl *FD = CE->getDirectCallee();\n\
+  \      if (!FD || !isFreeLikeCallee(FD))\n        return true;\n      if (CE->getNumArgs()\
+  \ < 1)\n        return true;\n      const VarDecl *ArgVD = getDeclRefVar(CE->getArg(0));\n\
+  \      if (ArgVD && ArgVD == Target) {\n        Found = CE;\n        // We can stop\
+  \ traversal here by returning false, but we need to keep the API consistent.\n \
+  \       // Returning true is also fine; we will just ignore further matches.\n \
+  \     }\n      return true;\n    }\n    const CallExpr* get() const { return Found;\
+  \ }\n  };\n\n  Finder F(CtxVD);\n  F.TraverseStmt(const_cast<Stmt*>(S));\n  return\
+  \ F.get();\n}\n\nconst CallExpr* SAGenTestChecker::findUnconditionalFreeAfterIf(const\
+  \ CompoundStmt *ParentCS,\n                                                    \
+  \           CompoundStmt::const_body_iterator ItAfterIfEnd,\n                  \
+  \                                             const VarDecl *CtxVD) {\n  if (!ParentCS\
+  \ || !CtxVD) return nullptr;\n  // Look only at the immediate next statements until\
+  \ a ReturnStmt or another IfStmt.\n  for (auto It = ItAfterIfEnd; It != ParentCS->body_end();\
+  \ ++It) {\n    const Stmt *S = *It;\n    if (!S) continue;\n    if (isa<ReturnStmt>(S)\
+  \ || isa<IfStmt>(S))\n      break;\n\n    // Only consider a direct call as being\
+  \ unconditional\n    if (const auto *CE = dyn_cast<CallExpr>(S)) {\n      const\
+  \ FunctionDecl *FD = CE->getDirectCallee();\n      if (!FD) continue;\n      if\
+  \ (!isFreeLikeCallee(FD)) continue;\n\n      if (CE->getNumArgs() >= 1) {\n    \
+  \    const VarDecl *ArgVD = getDeclRefVar(CE->getArg(0));\n        if (ArgVD &&\
+  \ ArgVD == CtxVD) {\n          return CE;\n        }\n      }\n    }\n    // If\
+  \ we hit any other kind of statement, we continue to see if the next one is a direct\
+  \ free.\n    // Stop if statement list grows long to avoid noise; but keeping it\
+  \ simple for now.\n  }\n  return nullptr;\n}\n\nvoid SAGenTestChecker::processCompoundStmt(const\
+  \ CompoundStmt *CS,\n                                           const llvm::DenseMap<const\
+  \ VarDecl*, const VarDecl*> &RetToCtx,\n                                       \
+  \    ASTContext &AC, BugReporter &BR, BugType &BT) {\n  if (!CS) return;\n\n  //\
+  \ Iterate with index/iterators to be able to inspect the next statement.\n  for\
+  \ (auto It = CS->body_begin(), E = CS->body_end(); It != E; ++It) {\n    const Stmt\
+  \ *S = *It;\n\n    // Recurse into nested CompoundStmts to find inner patterns as\
+  \ well.\n    if (const auto *InnerCS = dyn_cast<CompoundStmt>(S)) {\n      processCompoundStmt(InnerCS,\
+  \ RetToCtx, AC, BR, BT);\n    }\n\n    const auto *IfS = dyn_cast<IfStmt>(S);\n\
+  \    if (!IfS)\n      continue;\n\n    const Expr *Cond = IfS->getCond();\n    const\
+  \ VarDecl *CtxVD = nullptr;\n    TimeoutBranchKind TB = classifyTimeoutBranch(Cond,\
+  \ RetToCtx, CtxVD, AC);\n    if (TB == TB_Unknown || !CtxVD)\n      continue;\n\n\
+  \    // Identify the timeout branch\n    const Stmt *TimeoutBranch = (TB == TB_Then)\
+  \ ? IfS->getThen() : IfS->getElse();\n\n    // 1) Definite bug: free(ctx) in the\
+  \ timeout branch\n    if (TimeoutBranch) {\n      if (const CallExpr *FreeCE = findFreeOfCtx(TimeoutBranch,\
+  \ CtxVD)) {\n        PathDiagnosticLocation Loc(FreeCE->getExprLoc(), BR.getSourceManager());\n\
+  \        auto R = std::make_unique<BasicBugReport>(\n            BT,\n         \
+  \   \"Freeing work context on timeout after wait_for_completion_timeout; worker\
+  \ may still use it (use-after-free).\",\n            Loc);\n        R->addRange(FreeCE->getSourceRange());\n\
+  \        BR.emitReport(std::move(R));\n      }\n    }\n\n    // 2) Suspicious bug:\
+  \ unconditional free(ctx) right after the if-statement\n    auto NextIt = It;\n\
+  \    ++NextIt;\n    if (const CallExpr *FreeCE = findUnconditionalFreeAfterIf(CS,\
+  \ NextIt, CtxVD)) {\n      PathDiagnosticLocation Loc(FreeCE->getExprLoc(), BR.getSourceManager());\n\
+  \      auto R = std::make_unique<BasicBugReport>(\n          BT,\n          \"Freeing\
+  \ work context unconditionally after wait_for_completion_timeout; may free on timeout\
+  \ while worker still uses it.\",\n          Loc);\n      R->addRange(FreeCE->getSourceRange());\n\
+  \      BR.emitReport(std::move(R));\n    }\n\n    // Recurse into then/else branches\
+  \ to detect nested constructs\n    if (const auto *ThenCS = dyn_cast_or_null<CompoundStmt>(IfS->getThen()))\n\
+  \      processCompoundStmt(ThenCS, RetToCtx, AC, BR, BT);\n    if (const auto *ElseCS\
+  \ = dyn_cast_or_null<CompoundStmt>(IfS->getElse()))\n      processCompoundStmt(ElseCS,\
+  \ RetToCtx, AC, BR, BT);\n  }\n}\n\nvoid SAGenTestChecker::checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n\
+  \  if (!FD)\n    return;\n  const Stmt *Body = FD->getBody();\n  if (!Body)\n  \
+  \  return;\n\n  ASTContext &AC = Mgr.getASTContext();\n\n  // Build ret -> ctx mapping\
+  \ for the entire function body\n  llvm::DenseMap<const VarDecl*, const VarDecl*>\
+  \ RetToCtx;\n  RetToCtxCollector Collector(RetToCtx, AC);\n  Collector.TraverseStmt(const_cast<Stmt*>(Body));\n\
+  \n  const auto *CS = dyn_cast<CompoundStmt>(Body);\n  if (!CS)\n    return;\n\n\
+  \  processCompoundStmt(CS, RetToCtx, AC, BR, *BT);\n}\n\n} // end anonymous namespace\n\
+  \nextern \"C\" void clang_registerCheckers(CheckerRegistry &registry) {\n  registry.addChecker<SAGenTestChecker>(\n\
+  \      \"custom.SAGenTestChecker\",\n      \"Detects freeing a work context on wait_for_completion_timeout\
+  \ timeout path leading to possible UAF\",\n      \"\");\n}\n\nextern \"C\" const\
+  \ char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0

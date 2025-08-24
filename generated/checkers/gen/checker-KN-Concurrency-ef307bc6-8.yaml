@@ -1,0 +1,538 @@
+_base_result_dir: /scratch/chenyuan-data/knighter-dev/result-gpt-5-0814
+commit_id: ef307bc6ef04e8c1ea843231db58e3afaafa9fa6
+commit_type: Concurrency
+index: 8
+initial_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"clang/AST/ASTContext.h\"\n#include\
+  \ \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"llvm/ADT/StringRef.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n#include <string>\n#include <vector>\n#include\
+  \ <set>\n#include <map>\n#include <utility>\n#include <algorithm>\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// No custom program\
+  \ states\n\nnamespace {\n\nstruct ReaderFact {\n  std::string LockText;\n  std::string\
+  \ PtrText;\n  const FunctionDecl *FD = nullptr;\n  SourceLocation CheckLoc;\n  SourceLocation\
+  \ UseLoc;\n};\n\nstruct WriterFact {\n  std::string PtrText;\n  std::set<std::string>\
+  \ HeldLocks;\n  const FunctionDecl *FD = nullptr;\n  SourceLocation AssignLoc;\n\
+  };\n\nstatic std::string trimSpaces(std::string S) {\n  auto isSpace = [](char c){\
+  \ return c==' ' || c=='\\t' || c=='\\n' || c=='\\r' || c=='\\f' || c=='\\v'; };\n\
+  \  size_t B = 0, E = S.size();\n  while (B < E && isSpace(S[B])) ++B;\n  while (E\
+  \ > B && isSpace(S[E-1])) --E;\n  return S.substr(B, E-B);\n}\n\nstatic std::string\
+  \ stripOuterParens(std::string S) {\n  S = trimSpaces(S);\n  bool Changed = true;\n\
+  \  while (Changed && S.size() >= 2) {\n    Changed = false;\n    if (S.front() ==\
+  \ '(' && S.back() == ')') {\n      // naive balance check: ensure outermost parens\
+  \ match (best-effort)\n      int balance = 0;\n      bool ok = true;\n      for\
+  \ (size_t i = 0; i < S.size(); ++i) {\n        if (S[i] == '(') balance++;\n   \
+  \     else if (S[i] == ')') {\n          balance--;\n          if (balance == 0\
+  \ && i != S.size() - 1) { ok = false; break; }\n          if (balance < 0) { ok\
+  \ = false; break; }\n        }\n      }\n      if (ok && balance == 0) {\n     \
+  \   S = trimSpaces(S.substr(1, S.size()-2));\n        Changed = true;\n      }\n\
+  \    }\n  }\n  return S;\n}\n\nstatic std::string removeAllSpaces(const std::string\
+  \ &S) {\n  std::string R;\n  R.reserve(S.size());\n  for (char c : S) {\n    if\
+  \ (c != ' ' && c != '\\t' && c != '\\n' && c != '\\r' && c != '\\f' && c != '\\\
+  v')\n      R.push_back(c);\n  }\n  return R;\n}\n\nstatic std::string normalizeLockText(const\
+  \ std::string &SIn) {\n  std::string S = stripOuterParens(SIn);\n  S = trimSpaces(S);\n\
+  \  // Remove leading '&' symbols and spaces\n  while (!S.empty() && (S[0] == '&'\
+  \ || S[0] == ' ' || S[0] == '\\t'))\n    S.erase(S.begin());\n  S = stripOuterParens(S);\n\
+  \  // Remove all spaces for lock names to be robust\n  S = removeAllSpaces(S);\n\
+  \  return S;\n}\n\nstatic std::string normalizePtrText(const std::string &SIn) {\n\
+  \  std::string S = stripOuterParens(SIn);\n  S = trimSpaces(S);\n  // Do not remove\
+  \ '&' for pointer text\n  S = stripOuterParens(S);\n  // Remove redundant spaces\
+  \ inside to be more robust\n  S = removeAllSpaces(S);\n  return S;\n}\n\nstatic\
+  \ std::string getExprText(const Expr *E, ASTContext &Ctx) {\n  if (!E) return std::string();\n\
+  \  const SourceManager &SM = Ctx.getSourceManager();\n  const LangOptions &Lang\
+  \ = Ctx.getLangOpts();\n  SourceRange R = E->getSourceRange();\n  CharSourceRange\
+  \ CR = CharSourceRange::getTokenRange(R);\n  StringRef SR = Lexer::getSourceText(CR,\
+  \ SM, Lang);\n  return SR.str();\n}\n\nstatic bool isNullPtrExpr(const Expr *E,\
+  \ ASTContext &Ctx) {\n  if (!E) return false;\n  return E->isNullPointerConstant(Ctx,\
+  \ Expr::NPC_ValueDependentIsNull);\n}\n\nstatic bool isPointerTypeExpr(const Expr\
+  \ *E) {\n  if (!E) return false;\n  QualType QT = E->getType();\n  return !QT.isNull()\
+  \ && QT->isPointerType();\n}\n\nstatic bool getLockNameFromCall(const CallExpr *CE,\
+  \ std::string &LockName, bool &IsLock) {\n  IsLock = false;\n  if (!CE) return false;\n\
+  \  const FunctionDecl *FD = CE->getDirectCallee();\n  if (!FD) return false;\n \
+  \ StringRef Name = FD->getName();\n  bool isLock = (Name == \"spin_lock\" || Name\
+  \ == \"spin_lock_irqsave\" || Name == \"spin_lock_bh\");\n  bool isUnlock = (Name\
+  \ == \"spin_unlock\" || Name == \"spin_unlock_irqrestore\" || Name == \"spin_unlock_bh\"\
+  );\n  if (!isLock && !isUnlock)\n    return false;\n\n  if (CE->getNumArgs() < 1)\
+  \ return false;\n  const Expr *Arg0 = CE->getArg(0);\n  if (!Arg0) return false;\n\
+  \  ASTContext &Ctx = FD->getASTContext();\n  std::string ArgText = getExprText(Arg0,\
+  \ Ctx);\n  LockName = normalizeLockText(ArgText);\n  IsLock = isLock;\n  return\
+  \ true;\n}\n\nstatic bool isNullCheckOrTruthiness(const Expr *Cond, ASTContext &Ctx,\
+  \ std::string &PtrTextOut) {\n  if (!Cond) return false;\n  const Expr *E = Cond->IgnoreParenCasts();\n\
+  \  // if (!P)\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode()\
+  \ == UO_LNot) {\n      const Expr *Sub = UO->getSubExpr()->IgnoreParenCasts();\n\
+  \      if (isPointerTypeExpr(Sub)) {\n        PtrTextOut = normalizePtrText(getExprText(Sub,\
+  \ Ctx));\n        return !PtrTextOut.empty();\n      }\n    }\n  }\n  // if (P ==\
+  \ NULL) or (P != NULL) or (NULL == P)\n  if (const auto *BO = dyn_cast<BinaryOperator>(E))\
+  \ {\n    BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op == BO_EQ || Op\
+  \ == BO_NE) {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n     \
+  \ const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n      bool LHSNull = isNullPtrExpr(LHS,\
+  \ Ctx);\n      bool RHSNull = isNullPtrExpr(RHS, Ctx);\n      if (LHSNull ^ RHSNull)\
+  \ {\n        const Expr *PtrE = LHSNull ? RHS : LHS;\n        if (isPointerTypeExpr(PtrE))\
+  \ {\n          PtrTextOut = normalizePtrText(getExprText(PtrE, Ctx));\n        \
+  \  return !PtrTextOut.empty();\n        }\n      }\n    }\n  }\n  // if (P) where\
+  \ P is a pointer-typed expr\n  if (isPointerTypeExpr(E)) {\n    PtrTextOut = normalizePtrText(getExprText(E,\
+  \ Ctx));\n    return !PtrTextOut.empty();\n  }\n  return false;\n}\n\nstatic bool\
+  \ exprTextContains(const Expr *E, StringRef Name, ASTContext &Ctx) {\n  if (!E)\
+  \ return false;\n  std::string T = removeAllSpaces(getExprText(E, Ctx));\n  return\
+  \ StringRef(T).contains(Name);\n}\n\nclass FuncBodyVisitor : public RecursiveASTVisitor<FuncBodyVisitor>\
+  \ {\npublic:\n  FuncBodyVisitor(ASTContext &Ctx,\n                  const FunctionDecl\
+  \ *FD,\n                  std::vector<ReaderFact> &Readers,\n                  std::vector<WriterFact>\
+  \ &Writers)\n      : Ctx(Ctx), FD(FD), Readers(Readers), Writers(Writers),\n   \
+  \     SM(Ctx.getSourceManager()) {}\n\n  bool VisitCallExpr(CallExpr *CE) {\n  \
+  \  std::string LockName;\n    bool IsLock = false;\n    if (getLockNameFromCall(CE,\
+  \ LockName, IsLock)) {\n      if (IsLock) {\n        if (!LockName.empty())\n  \
+  \        LockStack.push_back(LockName);\n      } else {\n        // unlock\n   \
+  \     if (!LockStack.empty())\n          LockStack.pop_back();\n      }\n      return\
+  \ true;\n    }\n\n    // Under a lock? Check for pointer uses as call arguments\n\
+  \    if (!LockStack.empty()) {\n      const std::string &TopLock = LockStack.back();\n\
+  \      auto It = CheckedByLock.find(TopLock);\n      if (It != CheckedByLock.end())\
+  \ {\n        for (const auto &P : It->second) {\n          const std::string &PtrText\
+  \ = P.first;\n          SourceLocation CheckLoc = P.second;\n          // For each\
+  \ argument, see if it contains PtrText\n          bool Used = false;\n         \
+  \ for (unsigned i = 0; i < CE->getNumArgs(); ++i) {\n            if (exprTextContains(CE->getArg(i),\
+  \ PtrText, Ctx)) {\n              Used = true;\n              break;\n         \
+  \   }\n          }\n          if (Used) {\n            // Ensure source order: use\
+  \ after check\n            SourceLocation UseLoc = CE->getExprLoc();\n         \
+  \   if (SM.isBeforeInTranslationUnit(CheckLoc, UseLoc)) {\n              ReaderFact\
+  \ RF;\n              RF.LockText = TopLock;\n              RF.PtrText = PtrText;\n\
+  \              RF.FD = FD;\n              RF.CheckLoc = CheckLoc;\n            \
+  \  RF.UseLoc = UseLoc;\n              Readers.push_back(RF);\n            }\n  \
+  \        }\n        }\n      }\n    }\n    return true;\n  }\n\n  bool VisitIfStmt(IfStmt\
+  \ *IS) {\n    if (LockStack.empty())\n      return true;\n\n    const Expr *Cond\
+  \ = IS->getCond();\n    std::string PtrText;\n    if (isNullCheckOrTruthiness(Cond,\
+  \ Ctx, PtrText)) {\n      const std::string &TopLock = LockStack.back();\n     \
+  \ if (!PtrText.empty()) {\n        CheckedByLock[TopLock].push_back({PtrText, IS->getIfLoc()});\n\
+  \      }\n    }\n    return true;\n  }\n\n  bool VisitUnaryOperator(UnaryOperator\
+  \ *UO) {\n    if (LockStack.empty())\n      return true;\n\n    if (UO->getOpcode()\
+  \ == UO_Deref) {\n      const Expr *Sub = UO->getSubExpr();\n      const std::string\
+  \ &TopLock = LockStack.back();\n      auto It = CheckedByLock.find(TopLock);\n \
+  \     if (It != CheckedByLock.end()) {\n        for (const auto &P : It->second)\
+  \ {\n          const std::string &PtrText = P.first;\n          SourceLocation CheckLoc\
+  \ = P.second;\n          if (exprTextContains(Sub, PtrText, Ctx)) {\n          \
+  \  SourceLocation UseLoc = UO->getExprLoc();\n            if (SM.isBeforeInTranslationUnit(CheckLoc,\
+  \ UseLoc)) {\n              ReaderFact RF;\n              RF.LockText = TopLock;\n\
+  \              RF.PtrText = PtrText;\n              RF.FD = FD;\n              RF.CheckLoc\
+  \ = CheckLoc;\n              RF.UseLoc = UseLoc;\n              Readers.push_back(RF);\n\
+  \            }\n          }\n        }\n      }\n    }\n    return true;\n  }\n\n\
+  \  bool VisitBinaryOperator(BinaryOperator *BO) {\n    if (!BO)\n      return true;\n\
+  \n    if (BO->getOpcode() == BO_Assign) {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n\
+  \      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n      if (LHS && RHS\
+  \ && isPointerTypeExpr(LHS) && isNullPtrExpr(RHS, Ctx)) {\n        std::string LText\
+  \ = normalizePtrText(getExprText(LHS, Ctx));\n        if (!LText.empty()) {\n  \
+  \        WriterFact WF;\n          WF.PtrText = LText;\n          WF.FD = FD;\n\
+  \          WF.AssignLoc = BO->getOperatorLoc();\n          // Collect currently\
+  \ held locks\n          for (const auto &L : LockStack)\n            WF.HeldLocks.insert(L);\n\
+  \          Writers.push_back(WF);\n        }\n      }\n    }\n    return true;\n\
+  \  }\n\nprivate:\n  ASTContext &Ctx;\n  const FunctionDecl *FD;\n  std::vector<ReaderFact>\
+  \ &Readers;\n  std::vector<WriterFact> &Writers;\n  const SourceManager &SM;\n\n\
+  \  std::vector<std::string> LockStack;\n  // For each lock, list of (PtrText, CheckLoc)\n\
+  \  std::map<std::string, std::vector<std::pair<std::string, SourceLocation>>> CheckedByLock;\n\
+  };\n\nclass SAGenTestChecker : public Checker<check::ASTCodeBody, check::EndAnalysis>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Inconsistent locking on a shared pointer\", \"Concurrency\"\
+  )) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const;\n      void checkEndAnalysis(ExplodedGraph &G, BugReporter &BR, ExprEngine\
+  \ &Eng) const;\n\n   private:\n      // Collected cross-function facts\n      mutable\
+  \ std::vector<ReaderFact> Readers;\n      mutable std::vector<WriterFact> Writers;\n\
+  \n      void report(const WriterFact &W, const ReaderFact &R, BugReporter &BR) const;\n\
+  };\n\nvoid SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr,\
+  \ BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n  if\
+  \ (!FD) return;\n  if (!FD->hasBody()) return;\n\n  ASTContext &Ctx = Mgr.getASTContext();\n\
+  \  const Stmt *Body = FD->getBody();\n  if (!Body) return;\n\n  FuncBodyVisitor\
+  \ V(Ctx, FD, Readers, Writers);\n  V.TraverseStmt(const_cast<Stmt *>(Body));\n}\n\
+  \nvoid SAGenTestChecker::report(const WriterFact &W, const ReaderFact &R, BugReporter\
+  \ &BR) const {\n  // Create a BasicBugReport at the writer's assignment\n  PathDiagnosticLocation\
+  \ ELoc(W.AssignLoc, BR.getSourceManager(), W.FD);\n  auto Rpt = std::make_unique<BasicBugReport>(\n\
+  \      *BT,\n      (\"Clearing '\" + R.PtrText + \"' outside lock '\" + R.LockText\
+  \ +\n       \"'; can race with NULL-checked use under lock.\")\n          .c_str(),\n\
+  \      ELoc);\n  BR.emitReport(std::move(Rpt));\n}\n\nvoid SAGenTestChecker::checkEndAnalysis(ExplodedGraph\
+  \ &G, BugReporter &BR, ExprEngine &Eng) const {\n  // Match readers to writers\n\
+  \  // De-duplicate by (WriterLoc, LockText, PtrText)\n  std::set<std::string> Emitted;\n\
+  \n  const SourceManager &SM = BR.getSourceManager();\n  for (const auto &R : Readers)\
+  \ {\n    for (const auto &W : Writers) {\n      if (R.PtrText == W.PtrText) {\n\
+  \        // If the writer is not holding the reader's lock\n        if (W.HeldLocks.find(R.LockText)\
+  \ == W.HeldLocks.end()) {\n          // Build key\n          std::string Key = std::to_string(W.AssignLoc.getRawEncoding())\
+  \ + \"|\" + R.LockText + \"|\" + R.PtrText;\n          if (Emitted.insert(Key).second)\
+  \ {\n            report(W, R, BR);\n          }\n        }\n      }\n    }\n  }\n\
+  \n  // Clear facts for next analysis (if any)\n  Readers.clear();\n  Writers.clear();\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects clearing a shared pointer outside the protecting spinlock when\
+  \ it is NULL-checked and used under that lock elsewhere\",\n      \"\");\n}\n\n\
+  extern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+patch: "## Patch Description\n\nusb: dwc2: fix possible NULL pointer dereference caused\
+  \ by driver concurrency\n\nIn _dwc2_hcd_urb_enqueue(), \"urb->hcpriv = NULL\" is\
+  \ executed without\nholding the lock \"hsotg->lock\". In _dwc2_hcd_urb_dequeue():\n\
+  \n    spin_lock_irqsave(&hsotg->lock, flags);\n    ...\n\tif (!urb->hcpriv) {\n\t\
+  \tdev_dbg(hsotg->dev, \"## urb->hcpriv is NULL ##\\n\");\n\t\tgoto out;\n\t}\n \
+  \   rc = dwc2_hcd_urb_dequeue(hsotg, urb->hcpriv); // Use urb->hcpriv\n    ...\n\
+  out:\n    spin_unlock_irqrestore(&hsotg->lock, flags);\n\nWhen _dwc2_hcd_urb_enqueue()\
+  \ and _dwc2_hcd_urb_dequeue() are\nconcurrently executed, the NULL check of \"urb->hcpriv\"\
+  \ can be executed\nbefore \"urb->hcpriv = NULL\". After urb->hcpriv is NULL, it\
+  \ can be used\nin the function call to dwc2_hcd_urb_dequeue(), which can cause a\
+  \ NULL\npointer dereference.\n\nThis possible bug is found by an experimental static\
+  \ analysis tool\ndeveloped by myself. This tool analyzes the locking APIs to extract\n\
+  function pairs that can be concurrently executed, and then analyzes the\ninstructions\
+  \ in the paired functions to identify possible concurrency\nbugs including data\
+  \ races and atomicity violations. The above possible\nbug is reported, when my tool\
+  \ analyzes the source code of Linux 6.5.\n\nTo fix this possible bug, \"urb->hcpriv\
+  \ = NULL\" should be executed with\nholding the lock \"hsotg->lock\". After using\
+  \ this patch, my tool never\nreports the possible bug, with the kernelconfiguration\
+  \ allyesconfig for\nx86_64. Because I have no associated hardware, I cannot test\
+  \ the patch\nin runtime testing, and just verify it according to the code logic.\n\
+  \nFixes: 33ad261aa62b (\"usb: dwc2: host: spinlock urb_enqueue\")\nSigned-off-by:\
+  \ Jia-Ju Bai <baijiaju@buaa.edu.cn>\nLink: https://lore.kernel.org/r/20230926024404.832096-1-baijiaju@buaa.edu.cn\n\
+  Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>\n\n## Buggy Code\n\
+  \n```c\n// Function: _dwc2_hcd_urb_enqueue in drivers/usb/dwc2/hcd.c\nstatic int\
+  \ _dwc2_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,\n\t\t\t\t gfp_t mem_flags)\n\
+  {\n\tstruct dwc2_hsotg *hsotg = dwc2_hcd_to_hsotg(hcd);\n\tstruct usb_host_endpoint\
+  \ *ep = urb->ep;\n\tstruct dwc2_hcd_urb *dwc2_urb;\n\tint i;\n\tint retval;\n\t\
+  int alloc_bandwidth = 0;\n\tu8 ep_type = 0;\n\tu32 tflags = 0;\n\tvoid *buf;\n\t\
+  unsigned long flags;\n\tstruct dwc2_qh *qh;\n\tbool qh_allocated = false;\n\tstruct\
+  \ dwc2_qtd *qtd;\n\tstruct dwc2_gregs_backup *gr;\n\n\tgr = &hsotg->gr_backup;\n\
+  \n\tif (dbg_urb(urb)) {\n\t\tdev_vdbg(hsotg->dev, \"DWC OTG HCD URB Enqueue\\n\"\
+  );\n\t\tdwc2_dump_urb_info(hcd, urb, \"urb_enqueue\");\n\t}\n\n\tif (hsotg->hibernated)\
+  \ {\n\t\tif (gr->gotgctl & GOTGCTL_CURMODE_HOST)\n\t\t\tretval = dwc2_exit_hibernation(hsotg,\
+  \ 0, 0, 1);\n\t\telse\n\t\t\tretval = dwc2_exit_hibernation(hsotg, 0, 0, 0);\n\n\
+  \t\tif (retval)\n\t\t\tdev_err(hsotg->dev,\n\t\t\t\t\"exit hibernation failed.\\\
+  n\");\n\t}\n\n\tif (hsotg->in_ppd) {\n\t\tretval = dwc2_exit_partial_power_down(hsotg,\
+  \ 0, true);\n\t\tif (retval)\n\t\t\tdev_err(hsotg->dev,\n\t\t\t\t\"exit partial_power_down\
+  \ failed\\n\");\n\t}\n\n\tif (hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE\
+  \ &&\n\t    hsotg->bus_suspended) {\n\t\tif (dwc2_is_device_mode(hsotg))\n\t\t\t\
+  dwc2_gadget_exit_clock_gating(hsotg, 0);\n\t\telse\n\t\t\tdwc2_host_exit_clock_gating(hsotg,\
+  \ 0);\n\t}\n\n\tif (!ep)\n\t\treturn -EINVAL;\n\n\tif (usb_pipetype(urb->pipe) ==\
+  \ PIPE_ISOCHRONOUS ||\n\t    usb_pipetype(urb->pipe) == PIPE_INTERRUPT) {\n\t\t\
+  spin_lock_irqsave(&hsotg->lock, flags);\n\t\tif (!dwc2_hcd_is_bandwidth_allocated(hsotg,\
+  \ ep))\n\t\t\talloc_bandwidth = 1;\n\t\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\
+  \t}\n\n\tswitch (usb_pipetype(urb->pipe)) {\n\tcase PIPE_CONTROL:\n\t\tep_type =\
+  \ USB_ENDPOINT_XFER_CONTROL;\n\t\tbreak;\n\tcase PIPE_ISOCHRONOUS:\n\t\tep_type\
+  \ = USB_ENDPOINT_XFER_ISOC;\n\t\tbreak;\n\tcase PIPE_BULK:\n\t\tep_type = USB_ENDPOINT_XFER_BULK;\n\
+  \t\tbreak;\n\tcase PIPE_INTERRUPT:\n\t\tep_type = USB_ENDPOINT_XFER_INT;\n\t\tbreak;\n\
+  \t}\n\n\tdwc2_urb = dwc2_hcd_urb_alloc(hsotg, urb->number_of_packets,\n\t\t\t\t\
+  \      mem_flags);\n\tif (!dwc2_urb)\n\t\treturn -ENOMEM;\n\n\tdwc2_hcd_urb_set_pipeinfo(hsotg,\
+  \ dwc2_urb, usb_pipedevice(urb->pipe),\n\t\t\t\t  usb_pipeendpoint(urb->pipe), ep_type,\n\
+  \t\t\t\t  usb_pipein(urb->pipe),\n\t\t\t\t  usb_endpoint_maxp(&ep->desc),\n\t\t\t\
+  \t  usb_endpoint_maxp_mult(&ep->desc));\n\n\tbuf = urb->transfer_buffer;\n\n\tif\
+  \ (hcd_uses_dma(hcd)) {\n\t\tif (!buf && (urb->transfer_dma & 3)) {\n\t\t\tdev_err(hsotg->dev,\n\
+  \t\t\t\t\"%s: unaligned transfer with no transfer_buffer\",\n\t\t\t\t__func__);\n\
+  \t\t\tretval = -EINVAL;\n\t\t\tgoto fail0;\n\t\t}\n\t}\n\n\tif (!(urb->transfer_flags\
+  \ & URB_NO_INTERRUPT))\n\t\ttflags |= URB_GIVEBACK_ASAP;\n\tif (urb->transfer_flags\
+  \ & URB_ZERO_PACKET)\n\t\ttflags |= URB_SEND_ZERO_PACKET;\n\n\tdwc2_urb->priv =\
+  \ urb;\n\tdwc2_urb->buf = buf;\n\tdwc2_urb->dma = urb->transfer_dma;\n\tdwc2_urb->length\
+  \ = urb->transfer_buffer_length;\n\tdwc2_urb->setup_packet = urb->setup_packet;\n\
+  \tdwc2_urb->setup_dma = urb->setup_dma;\n\tdwc2_urb->flags = tflags;\n\tdwc2_urb->interval\
+  \ = urb->interval;\n\tdwc2_urb->status = -EINPROGRESS;\n\n\tfor (i = 0; i < urb->number_of_packets;\
+  \ ++i)\n\t\tdwc2_hcd_urb_set_iso_desc_params(dwc2_urb, i,\n\t\t\t\t\t\t urb->iso_frame_desc[i].offset,\n\
+  \t\t\t\t\t\t urb->iso_frame_desc[i].length);\n\n\turb->hcpriv = dwc2_urb;\n\tqh\
+  \ = (struct dwc2_qh *)ep->hcpriv;\n\t/* Create QH for the endpoint if it doesn't\
+  \ exist */\n\tif (!qh) {\n\t\tqh = dwc2_hcd_qh_create(hsotg, dwc2_urb, mem_flags);\n\
+  \t\tif (!qh) {\n\t\t\tretval = -ENOMEM;\n\t\t\tgoto fail0;\n\t\t}\n\t\tep->hcpriv\
+  \ = qh;\n\t\tqh_allocated = true;\n\t}\n\n\tqtd = kzalloc(sizeof(*qtd), mem_flags);\n\
+  \tif (!qtd) {\n\t\tretval = -ENOMEM;\n\t\tgoto fail1;\n\t}\n\n\tspin_lock_irqsave(&hsotg->lock,\
+  \ flags);\n\tretval = usb_hcd_link_urb_to_ep(hcd, urb);\n\tif (retval)\n\t\tgoto\
+  \ fail2;\n\n\tretval = dwc2_hcd_urb_enqueue(hsotg, dwc2_urb, qh, qtd);\n\tif (retval)\n\
+  \t\tgoto fail3;\n\n\tif (alloc_bandwidth) {\n\t\tdwc2_allocate_bus_bandwidth(hcd,\n\
+  \t\t\t\tdwc2_hcd_get_ep_bandwidth(hsotg, ep),\n\t\t\t\turb);\n\t}\n\n\tspin_unlock_irqrestore(&hsotg->lock,\
+  \ flags);\n\n\treturn 0;\n\nfail3:\n\tdwc2_urb->priv = NULL;\n\tusb_hcd_unlink_urb_from_ep(hcd,\
+  \ urb);\n\tif (qh_allocated && qh->channel && qh->channel->qh == qh)\n\t\tqh->channel->qh\
+  \ = NULL;\nfail2:\n\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\turb->hcpriv\
+  \ = NULL;\n\tkfree(qtd);\nfail1:\n\tif (qh_allocated) {\n\t\tstruct dwc2_qtd *qtd2,\
+  \ *qtd2_tmp;\n\n\t\tep->hcpriv = NULL;\n\t\tdwc2_hcd_qh_unlink(hsotg, qh);\n\t\t\
+  /* Free each QTD in the QH's QTD list */\n\t\tlist_for_each_entry_safe(qtd2, qtd2_tmp,\
+  \ &qh->qtd_list,\n\t\t\t\t\t qtd_list_entry)\n\t\t\tdwc2_hcd_qtd_unlink_and_free(hsotg,\
+  \ qtd2, qh);\n\t\tdwc2_hcd_qh_free(hsotg, qh);\n\t}\nfail0:\n\tkfree(dwc2_urb);\n\
+  \n\treturn retval;\n}\n```\n\n## Bug Fix Patch\n\n```diff\ndiff --git a/drivers/usb/dwc2/hcd.c\
+  \ b/drivers/usb/dwc2/hcd.c\nindex 657f1f659ffa..35c7a4df8e71 100644\n--- a/drivers/usb/dwc2/hcd.c\n\
+  +++ b/drivers/usb/dwc2/hcd.c\n@@ -4769,8 +4769,8 @@ static int _dwc2_hcd_urb_enqueue(struct\
+  \ usb_hcd *hcd, struct urb *urb,\n \tif (qh_allocated && qh->channel && qh->channel->qh\
+  \ == qh)\n \t\tqh->channel->qh = NULL;\n fail2:\n-\tspin_unlock_irqrestore(&hsotg->lock,\
+  \ flags);\n \turb->hcpriv = NULL;\n+\tspin_unlock_irqrestore(&hsotg->lock, flags);\n\
+  \ \tkfree(qtd);\n fail1:\n \tif (qh_allocated) {\n```\n"
+pattern: "## Bug Pattern\n\nInconsistent locking on a shared pointer leading to a\
+  \ check-then-use race:\n- One path reads and checks a shared pointer under a spinlock\
+  \ and then uses it:\n  spin_lock(&lock);\n  if (!obj->ptr)\n      goto out;\n  use(obj->ptr);\n\
+  \  out:\n  spin_unlock(&lock);\n- Another path clears the same pointer outside the\
+  \ protecting lock:\n  /* no lock held */\n  obj->ptr = NULL;\n\nBecause the writer\
+  \ updates the pointer without holding the lock, the reader can pass the NULL check\
+  \ and then observe the pointer become NULL before use, causing a NULL pointer dereference.\
+  \ The fix is to perform the pointer update (obj->ptr = NULL) while holding the same\
+  \ lock."
+plan: "```\nGoal\nDetect inconsistent locking on a shared pointer leading to a check-then-use\
+  \ race:\n- A reader path checks a shared pointer under a spinlock and then uses\
+  \ it under that lock.\n- A writer path clears the same pointer to NULL outside the\
+  \ protecting lock.\n\nWe will implement an AST-oriented checker that:\n1) Summarizes\
+  \ \u201Creader\u201D patterns (NULL-check and subsequent use of a pointer under\
+  \ a specific spinlock).\n2) Summarizes \u201Cwriter\u201D patterns (assignment of\
+  \ the same pointer to NULL while not holding that spinlock).\n3) Matches readers\
+  \ to writers across functions and reports when a writer clears the pointer without\
+  \ holding the lock that protects the reader.\n\n1) Program State\n- No custom symbolic\
+  \ program state is needed. We will not use REGISTER_MAP_WITH_PROGRAMSTATE or REGISTER_TRAIT_WITH_PROGRAMSTATE.\n\
+  - Store cross-function summaries in checker member containers (vectors/maps) and\
+  \ consolidate in checkEndAnalysis.\n\n2) Callback Functions\n- checkASTCodeBody(const\
+  \ Decl *D, AnalysisManager &Mgr, BugReporter &BR):\n  Purpose: Walk each function\
+  \ body\u2019s AST to extract \u201CReaderFacts\u201D and \u201CWriterFacts\u201D\
+  .\n  Steps:\n  a. Preparation\n     - Obtain ASTContext, SourceManager, LangOptions\
+  \ via Mgr.getASTContext().\n     - Define helper to extract textual representation\
+  \ for expressions: getExprText(E) using Lexer::getSourceText on token range (same\
+  \ approach as ExprHasName does internally).\n     - Define recognizers for spin\
+  \ locks:\n       \u2022 Lock calls: spin_lock, spin_lock_irqsave, spin_lock_bh.\n\
+  \       \u2022 Unlock calls: spin_unlock, spin_unlock_irqrestore, spin_unlock_bh.\n\
+  \       For a CallExpr CE, isSpinLock(CE, &LockTextOut) returns true and captures\
+  \ LockTextOut as text of CE->getArg(0). Similarly for isSpinUnlock.\n     - Define\
+  \ recognizer for NULL literal: isNullLiteral(Expr *E) detects IntegerLiteral 0,\
+  \ GNUNullExpr, or CXXNullPtrLiteralExpr, and also macro NULL (by token text match).\n\
+  \     - Define recognizer to extract pointer being checked in conditions:\n    \
+  \   \u2022 isNullCheckOrTruthiness(const Expr *Cond, std::string &PtrTextOut) returns\
+  \ true if:\n         - UnaryOperator \u2018!\u2019 applied to a pointer expr: !P\n\
+  \         - BinaryOperator \u2018==\u2019 or \u2018!=\u2019 with one side NULL and\
+  \ the other side a pointer expr: (P == NULL), (NULL == P), (P != NULL)\n       \
+  \  - Plain pointer truthiness: if (P)\n         Extract PtrTextOut using getExprText\
+  \ on the pointer side (IgnoreParenImpCasts).\n     - Define use detection: isPointerUseOf(const\
+  \ Stmt *S, StringRef PtrText, ASTContext &Ctx) returns true if within S we see:\n\
+  \         - A CallExpr argument whose source text contains PtrText (use ExprHasName\
+  \ for convenience).\n         - A UnaryOperator UO_Deref whose subexpr contains\
+  \ PtrText.\n         - A MemberExpr with isArrow() whose base contains PtrText.\n\
+  \       Note: Optionally refine by functionKnownToDeref(Call, DerefParams) and checking\
+  \ if PtrText matches one of those argv expressions, to reduce false positives. If\
+  \ the table is empty/not found, fall back to generic argument/use matching.\n  b.\
+  \ Traversal and lock region tracking\n     - Traverse the function body statements\
+  \ in source order (write a simple recursive walker). Maintain:\n       \u2022 LockStack:\
+  \ vector<string> for currently-held locks (top is innermost).\n       \u2022 For\
+  \ the currently held lock (top), maintain a small per-lock map of \u201Clast checked\
+  \ pointer\u201D to the source location it was checked: CheckedByLock[LockText] ->\
+  \ set/map of PtrText -> CheckLoc.\n     - At each CallExpr:\n       \u2022 If isSpinLock,\
+  \ push LockText onto LockStack.\n       \u2022 If isSpinUnlock, pop one (if matches;\
+  \ best-effort LIFO).\n       \u2022 Otherwise normal call, also evaluate for use:\n\
+  \         If LockStack not empty, for each Ptr in CheckedByLock[topLock], if isPointerUseOf(call,\
+  \ Ptr), record a ReaderFact:\n           ReaderFacts.emplace_back(Lock=topLock,\
+  \ Ptr=Ptr, FD, CheckLoc, UseLoc=call->getExprLoc()).\n     - At each IfStmt:\n \
+  \      \u2022 If LockStack not empty:\n         Extract its condition; if isNullCheckOrTruthiness,\
+  \ get PtrTextOut and record CheckedByLock[topLock].insert(PtrTextOut) with CheckLoc\
+  \ = IfStmt->getIfLoc().\n       \u2022 Optionally, also check for uses in its then/else\
+  \ while still the same lock is held (the recursive traversal will naturally find\
+  \ uses under this lock).\n     - At each UnaryOperator / MemberExpr:\n       \u2022\
+  \ If LockStack not empty, check if it uses any Ptr in CheckedByLock[topLock]. If\
+  \ yes, record a ReaderFact with current node\u2019s location as UseLoc.\n     -\
+  \ At each BinaryOperator (assignment):\n       \u2022 If it is LHS = RHS, RHS is\
+  \ NULL literal, and LHS is pointer-typed:\n           - Extract PtrTextLHS = getExprText(LHS->IgnoreParenImpCasts()).\n\
+  \           - Let HeldLocks = set of LockStack contents (strings).\n           -\
+  \ Record a WriterFact: {Ptr = PtrTextLHS, HeldLocks, FD, AssignLoc = BO->getOperatorLoc()}.\n\
+  \     - Important: We do not emit any report in this callback; we only collect facts.\n\
+  \n- checkEndAnalysis(ExplodedGraph &G, BugReporter &BR, ExprEngine &Eng):\n  Purpose:\
+  \ Connect readers with writers across the TU and emit reports.\n  Steps:\n  a. For\
+  \ every ReaderFact R with (LockTextR, PtrTextR):\n     - For every WriterFact W\
+  \ with PtrTextW equal to PtrTextR:\n       \u2022 If W.HeldLocks does NOT contain\
+  \ LockTextR:\n         - Emit a BasicBugReport at W.AssignLoc.\n         - Message:\
+  \ \"Clearing \u2018PtrTextR\u2019 outside lock \u2018LockTextR\u2019; can race with\
+  \ NULL-checked use under lock.\"\n         - One report per W/R pair is enough;\
+  \ de-duplicate if desired (e.g., use a small set of (W.AssignLoc, LockTextR, PtrTextR)).\n\
+  \  b. Create a BugType member once (e.g., \"Inconsistent locking on shared pointer\"\
+  ) and reuse it.\n\n3) Matching and Normalization Details\n- Expression identity:\n\
+  \  - We use source text string equality for both lock and pointer identification:\n\
+  \    \u2022 LockText: text of the first argument of a spin_lock/spin_unlock (e.g.,\
+  \ \"&hsotg->lock\" or \"(&hsotg->lock)\").\n    \u2022 PtrText: text of the pointer\
+  \ expression (e.g., \"urb->hcpriv\").\n  - To improve robustness, normalize by stripping\
+  \ surrounding parentheses and whitespace from the text. For locks, also remove a\
+  \ leading '&' when present so \"&hsotg->lock\" and \"hsotg->lock\" unify.\n- Use\
+  \ detection:\n  - Prefer functionKnownToDeref(Call, DerefParams) when available;\
+  \ otherwise treat passing pointer as an argument as a use. Also detect explicit\
+  \ deref operators (*P) and P->field.\n- Lock variants:\n  - Recognize at least:\n\
+  \    \u2022 spin_lock, spin_lock_irqsave, spin_lock_bh as lock-acquire.\n    \u2022\
+  \ spin_unlock, spin_unlock_irqrestore, spin_unlock_bh as lock-release.\n  - Only\
+  \ the first parameter is used to identify the lock.\n- NULL checks:\n  - Support:\
+  \ !P, P == NULL, NULL == P, P != NULL, and if (P).\n  - For truthiness (if (P)),\
+  \ treat as a check; combine with a subsequent \u201Cuse\u201D to build a reader\
+  \ fact.\n\n4) Reporting\n- Report site: at the writer assignment location where\
+  \ Ptr = NULL happens while not holding the reader\u2019s lock.\n- Bug type: \"Inconsistent\
+  \ locking on a shared pointer\".\n- Message: short and clear: \"Clearing \u2018\
+  urb->hcpriv\u2019 outside lock \u2018hsotg->lock\u2019; can race with NULL-checked\
+  \ use under lock.\"\n- Use BasicBugReport with the assignment SourceLocation as\
+  \ the primary location.\n\n5) Notes and Simplifications\n- No path-sensitive state,\
+  \ no alias tracking: we rely on string equality of expressions; this is sufficient\
+  \ for the target patch since both functions use the same textual expressions \"\
+  hsotg->lock\" and \"urb->hcpriv\".\n- This also detects the local anti-pattern in\
+  \ the patch where spin_unlock precedes \u201Curb->hcpriv = NULL\u201D (the writer\
+  \ fact will have an empty HeldLocks set).\n- False positives are reduced by requiring:\n\
+  \  - A reader fact must have both a NULL-check and a subsequent use of the pointer\
+  \ under the same lock, within the same locked region.\n  - A writer is only flagged\
+  \ if it clears the exact same pointer text and does not hold the reader\u2019s lock\
+  \ at that assignment point.\n\n6) Optional Refinements (if needed)\n- De-duplicate\
+  \ reports across different reader functions (same (Ptr, Lock, WriterLoc)).\n- Enhance\
+  \ pointer \u201Cuse\u201D recognition using functionKnownToDeref to limit to calls\
+  \ that likely dereference their pointer parameters.\n- Add minimal normalization\
+  \ so \"&hsotg->lock\" and \"hsotg->lock\" match across code variations.\n```"
+refined_plan: null
+repaired_checker_code: "#include \"clang/StaticAnalyzer/Core/BugReporter/BugReporter.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/BugReporter/BugType.h\"\n#include \"clang/StaticAnalyzer/Checkers/Taint.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/Checker.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/Environment.h\"\n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h\"\
+  \n#include \"clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h\"\n#include\
+  \ \"clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h\"\n#include \"clang/StaticAnalyzer/Frontend/CheckerRegistry.h\"\
+  \n#include \"clang/AST/RecursiveASTVisitor.h\"\n#include \"clang/AST/StmtVisitor.h\"\
+  \n#include \"llvm/Support/raw_ostream.h\"\n#include \"clang/StaticAnalyzer/Checkers/utility.h\"\
+  \n#include \"clang/Lex/Lexer.h\"\n#include \"clang/AST/ASTContext.h\"\n#include\
+  \ \"clang/AST/Expr.h\"\n#include \"clang/AST/Stmt.h\"\n#include \"llvm/ADT/StringRef.h\"\
+  \n#include \"llvm/ADT/SmallVector.h\"\n#include <string>\n#include <vector>\n#include\
+  \ <set>\n#include <map>\n#include <utility>\n#include <algorithm>\n\nusing namespace\
+  \ clang;\nusing namespace ento;\nusing namespace taint;\n\n// No custom program\
+  \ states\n\nnamespace {\n\nstruct ReaderFact {\n  std::string LockText;\n  std::string\
+  \ PtrText;\n  const FunctionDecl *FD = nullptr;\n  SourceLocation CheckLoc;\n  SourceLocation\
+  \ UseLoc;\n};\n\nstruct WriterFact {\n  std::string PtrText;\n  std::set<std::string>\
+  \ HeldLocks;\n  const FunctionDecl *FD = nullptr;\n  SourceLocation AssignLoc;\n\
+  };\n\nstatic std::string trimSpaces(std::string S) {\n  auto isSpace = [](char c){\
+  \ return c==' ' || c=='\\t' || c=='\\n' || c=='\\r' || c=='\\f' || c=='\\v'; };\n\
+  \  size_t B = 0, E = S.size();\n  while (B < E && isSpace(S[B])) ++B;\n  while (E\
+  \ > B && isSpace(S[E-1])) --E;\n  return S.substr(B, E-B);\n}\n\nstatic std::string\
+  \ stripOuterParens(std::string S) {\n  S = trimSpaces(S);\n  bool Changed = true;\n\
+  \  while (Changed && S.size() >= 2) {\n    Changed = false;\n    if (S.front() ==\
+  \ '(' && S.back() == ')') {\n      // naive balance check: ensure outermost parens\
+  \ match (best-effort)\n      int balance = 0;\n      bool ok = true;\n      for\
+  \ (size_t i = 0; i < S.size(); ++i) {\n        if (S[i] == '(') balance++;\n   \
+  \     else if (S[i] == ')') {\n          balance--;\n          if (balance == 0\
+  \ && i != S.size() - 1) { ok = false; break; }\n          if (balance < 0) { ok\
+  \ = false; break; }\n        }\n      }\n      if (ok && balance == 0) {\n     \
+  \   S = trimSpaces(S.substr(1, S.size()-2));\n        Changed = true;\n      }\n\
+  \    }\n  }\n  return S;\n}\n\nstatic std::string removeAllSpaces(const std::string\
+  \ &S) {\n  std::string R;\n  R.reserve(S.size());\n  for (char c : S) {\n    if\
+  \ (c != ' ' && c != '\\t' && c != '\\n' && c != '\\r' && c != '\\f' && c != '\\\
+  v')\n      R.push_back(c);\n  }\n  return R;\n}\n\nstatic std::string normalizeLockText(const\
+  \ std::string &SIn) {\n  std::string S = stripOuterParens(SIn);\n  S = trimSpaces(S);\n\
+  \  // Remove leading '&' symbols and spaces\n  while (!S.empty() && (S[0] == '&'\
+  \ || S[0] == ' ' || S[0] == '\\t'))\n    S.erase(S.begin());\n  S = stripOuterParens(S);\n\
+  \  // Remove all spaces for lock names to be robust\n  S = removeAllSpaces(S);\n\
+  \  return S;\n}\n\nstatic std::string normalizePtrText(const std::string &SIn) {\n\
+  \  std::string S = stripOuterParens(SIn);\n  S = trimSpaces(S);\n  // Do not remove\
+  \ '&' for pointer text\n  S = stripOuterParens(S);\n  // Remove redundant spaces\
+  \ inside to be more robust\n  S = removeAllSpaces(S);\n  return S;\n}\n\nstatic\
+  \ std::string getExprText(const Expr *E, ASTContext &Ctx) {\n  if (!E) return std::string();\n\
+  \  const SourceManager &SM = Ctx.getSourceManager();\n  const LangOptions &Lang\
+  \ = Ctx.getLangOpts();\n  SourceRange R = E->getSourceRange();\n  CharSourceRange\
+  \ CR = CharSourceRange::getTokenRange(R);\n  StringRef SR = Lexer::getSourceText(CR,\
+  \ SM, Lang);\n  return SR.str();\n}\n\nstatic bool isNullPtrExpr(const Expr *E,\
+  \ ASTContext &Ctx) {\n  if (!E) return false;\n  return E->isNullPointerConstant(Ctx,\
+  \ Expr::NPC_ValueDependentIsNull);\n}\n\nstatic bool isPointerTypeExpr(const Expr\
+  \ *E) {\n  if (!E) return false;\n  QualType QT = E->getType();\n  return !QT.isNull()\
+  \ && QT->isPointerType();\n}\n\nstatic bool getLockNameFromCall(const CallExpr *CE,\
+  \ std::string &LockName, bool &IsLock) {\n  IsLock = false;\n  if (!CE) return false;\n\
+  \  const FunctionDecl *FD = CE->getDirectCallee();\n  if (!FD) return false;\n \
+  \ StringRef Name = FD->getName();\n  bool isLock = (Name == \"spin_lock\" || Name\
+  \ == \"spin_lock_irqsave\" || Name == \"spin_lock_bh\");\n  bool isUnlock = (Name\
+  \ == \"spin_unlock\" || Name == \"spin_unlock_irqrestore\" || Name == \"spin_unlock_bh\"\
+  );\n  if (!isLock && !isUnlock)\n    return false;\n\n  if (CE->getNumArgs() < 1)\
+  \ return false;\n  const Expr *Arg0 = CE->getArg(0);\n  if (!Arg0) return false;\n\
+  \  ASTContext &Ctx = FD->getASTContext();\n  std::string ArgText = getExprText(Arg0,\
+  \ Ctx);\n  LockName = normalizeLockText(ArgText);\n  IsLock = isLock;\n  return\
+  \ true;\n}\n\nstatic bool isNullCheckOrTruthiness(const Expr *Cond, ASTContext &Ctx,\
+  \ std::string &PtrTextOut) {\n  if (!Cond) return false;\n  const Expr *E = Cond->IgnoreParenCasts();\n\
+  \  // if (!P)\n  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {\n    if (UO->getOpcode()\
+  \ == UO_LNot) {\n      const Expr *Sub = UO->getSubExpr()->IgnoreParenCasts();\n\
+  \      if (isPointerTypeExpr(Sub)) {\n        PtrTextOut = normalizePtrText(getExprText(Sub,\
+  \ Ctx));\n        return !PtrTextOut.empty();\n      }\n    }\n  }\n  // if (P ==\
+  \ NULL) or (P != NULL) or (NULL == P)\n  if (const auto *BO = dyn_cast<BinaryOperator>(E))\
+  \ {\n    BinaryOperator::Opcode Op = BO->getOpcode();\n    if (Op == BO_EQ || Op\
+  \ == BO_NE) {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n     \
+  \ const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n      bool LHSNull = isNullPtrExpr(LHS,\
+  \ Ctx);\n      bool RHSNull = isNullPtrExpr(RHS, Ctx);\n      if (LHSNull ^ RHSNull)\
+  \ {\n        const Expr *PtrE = LHSNull ? RHS : LHS;\n        if (isPointerTypeExpr(PtrE))\
+  \ {\n          PtrTextOut = normalizePtrText(getExprText(PtrE, Ctx));\n        \
+  \  return !PtrTextOut.empty();\n        }\n      }\n    }\n  }\n  // if (P) where\
+  \ P is a pointer-typed expr\n  if (isPointerTypeExpr(E)) {\n    PtrTextOut = normalizePtrText(getExprText(E,\
+  \ Ctx));\n    return !PtrTextOut.empty();\n  }\n  return false;\n}\n\nstatic bool\
+  \ exprTextContains(const Expr *E, StringRef Name, ASTContext &Ctx) {\n  if (!E)\
+  \ return false;\n  std::string T = removeAllSpaces(getExprText(E, Ctx));\n  return\
+  \ StringRef(T).contains(Name);\n}\n\nclass FuncBodyVisitor : public RecursiveASTVisitor<FuncBodyVisitor>\
+  \ {\npublic:\n  FuncBodyVisitor(ASTContext &Ctx,\n                  const FunctionDecl\
+  \ *FD,\n                  std::vector<ReaderFact> &Readers,\n                  std::vector<WriterFact>\
+  \ &Writers)\n      : Ctx(Ctx), FD(FD), Readers(Readers), Writers(Writers),\n   \
+  \     SM(Ctx.getSourceManager()) {}\n\n  bool VisitCallExpr(CallExpr *CE) {\n  \
+  \  std::string LockName;\n    bool IsLock = false;\n    if (getLockNameFromCall(CE,\
+  \ LockName, IsLock)) {\n      if (IsLock) {\n        if (!LockName.empty())\n  \
+  \        LockStack.push_back(LockName);\n      } else {\n        // unlock\n   \
+  \     if (!LockStack.empty())\n          LockStack.pop_back();\n      }\n      return\
+  \ true;\n    }\n\n    // Under a lock? Check for pointer uses as call arguments\n\
+  \    if (!LockStack.empty()) {\n      const std::string &TopLock = LockStack.back();\n\
+  \      auto It = CheckedByLock.find(TopLock);\n      if (It != CheckedByLock.end())\
+  \ {\n        for (const auto &P : It->second) {\n          const std::string &PtrText\
+  \ = P.first;\n          SourceLocation CheckLoc = P.second;\n          // For each\
+  \ argument, see if it contains PtrText\n          bool Used = false;\n         \
+  \ for (unsigned i = 0; i < CE->getNumArgs(); ++i) {\n            if (exprTextContains(CE->getArg(i),\
+  \ PtrText, Ctx)) {\n              Used = true;\n              break;\n         \
+  \   }\n          }\n          if (Used) {\n            // Ensure source order: use\
+  \ after check\n            SourceLocation UseLoc = CE->getExprLoc();\n         \
+  \   if (SM.isBeforeInTranslationUnit(CheckLoc, UseLoc)) {\n              ReaderFact\
+  \ RF;\n              RF.LockText = TopLock;\n              RF.PtrText = PtrText;\n\
+  \              RF.FD = FD;\n              RF.CheckLoc = CheckLoc;\n            \
+  \  RF.UseLoc = UseLoc;\n              Readers.push_back(RF);\n            }\n  \
+  \        }\n        }\n      }\n    }\n    return true;\n  }\n\n  bool VisitIfStmt(IfStmt\
+  \ *IS) {\n    if (LockStack.empty())\n      return true;\n\n    const Expr *Cond\
+  \ = IS->getCond();\n    std::string PtrText;\n    if (isNullCheckOrTruthiness(Cond,\
+  \ Ctx, PtrText)) {\n      const std::string &TopLock = LockStack.back();\n     \
+  \ if (!PtrText.empty()) {\n        CheckedByLock[TopLock].push_back({PtrText, IS->getIfLoc()});\n\
+  \      }\n    }\n    return true;\n  }\n\n  bool VisitUnaryOperator(UnaryOperator\
+  \ *UO) {\n    if (LockStack.empty())\n      return true;\n\n    if (UO->getOpcode()\
+  \ == UO_Deref) {\n      const Expr *Sub = UO->getSubExpr();\n      const std::string\
+  \ &TopLock = LockStack.back();\n      auto It = CheckedByLock.find(TopLock);\n \
+  \     if (It != CheckedByLock.end()) {\n        for (const auto &P : It->second)\
+  \ {\n          const std::string &PtrText = P.first;\n          SourceLocation CheckLoc\
+  \ = P.second;\n          if (exprTextContains(Sub, PtrText, Ctx)) {\n          \
+  \  SourceLocation UseLoc = UO->getExprLoc();\n            if (SM.isBeforeInTranslationUnit(CheckLoc,\
+  \ UseLoc)) {\n              ReaderFact RF;\n              RF.LockText = TopLock;\n\
+  \              RF.PtrText = PtrText;\n              RF.FD = FD;\n              RF.CheckLoc\
+  \ = CheckLoc;\n              RF.UseLoc = UseLoc;\n              Readers.push_back(RF);\n\
+  \            }\n          }\n        }\n      }\n    }\n    return true;\n  }\n\n\
+  \  bool VisitBinaryOperator(BinaryOperator *BO) {\n    if (!BO)\n      return true;\n\
+  \n    if (BO->getOpcode() == BO_Assign) {\n      const Expr *LHS = BO->getLHS()->IgnoreParenCasts();\n\
+  \      const Expr *RHS = BO->getRHS()->IgnoreParenCasts();\n      if (LHS && RHS\
+  \ && isPointerTypeExpr(LHS) && isNullPtrExpr(RHS, Ctx)) {\n        std::string LText\
+  \ = normalizePtrText(getExprText(LHS, Ctx));\n        if (!LText.empty()) {\n  \
+  \        WriterFact WF;\n          WF.PtrText = LText;\n          WF.FD = FD;\n\
+  \          WF.AssignLoc = BO->getOperatorLoc();\n          // Collect currently\
+  \ held locks\n          for (const auto &L : LockStack)\n            WF.HeldLocks.insert(L);\n\
+  \          Writers.push_back(WF);\n        }\n      }\n    }\n    return true;\n\
+  \  }\n\nprivate:\n  ASTContext &Ctx;\n  const FunctionDecl *FD;\n  std::vector<ReaderFact>\
+  \ &Readers;\n  std::vector<WriterFact> &Writers;\n  const SourceManager &SM;\n\n\
+  \  std::vector<std::string> LockStack;\n  // For each lock, list of (PtrText, CheckLoc)\n\
+  \  std::map<std::string, std::vector<std::pair<std::string, SourceLocation>>> CheckedByLock;\n\
+  };\n\nclass SAGenTestChecker : public Checker<check::ASTCodeBody, check::EndAnalysis>\
+  \ {\n   mutable std::unique_ptr<BugType> BT;\n\n   public:\n      SAGenTestChecker()\
+  \ : BT(new BugType(this, \"Inconsistent locking on a shared pointer\", \"Concurrency\"\
+  )) {}\n\n      void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter\
+  \ &BR) const;\n      void checkEndAnalysis(ExplodedGraph &G, BugReporter &BR, ExprEngine\
+  \ &Eng) const;\n\n   private:\n      // Collected cross-function facts\n      mutable\
+  \ std::vector<ReaderFact> Readers;\n      mutable std::vector<WriterFact> Writers;\n\
+  \n      void report(const WriterFact &W, const ReaderFact &R, BugReporter &BR) const;\n\
+  };\n\nvoid SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr,\
+  \ BugReporter &BR) const {\n  const auto *FD = dyn_cast<FunctionDecl>(D);\n  if\
+  \ (!FD) return;\n  if (!FD->hasBody()) return;\n\n  ASTContext &Ctx = Mgr.getASTContext();\n\
+  \  const Stmt *Body = FD->getBody();\n  if (!Body) return;\n\n  FuncBodyVisitor\
+  \ V(Ctx, FD, Readers, Writers);\n  V.TraverseStmt(const_cast<Stmt *>(Body));\n}\n\
+  \nvoid SAGenTestChecker::report(const WriterFact &W, const ReaderFact &R, BugReporter\
+  \ &BR) const {\n  // Create a BasicBugReport at the writer's assignment\n  PathDiagnosticLocation\
+  \ ELoc(W.AssignLoc, BR.getSourceManager());\n  auto Rpt = std::make_unique<BasicBugReport>(\n\
+  \      *BT,\n      (\"Clearing '\" + R.PtrText + \"' outside lock '\" + R.LockText\
+  \ +\n       \"'; can race with NULL-checked use under lock.\")\n          .c_str(),\n\
+  \      ELoc);\n  BR.emitReport(std::move(Rpt));\n}\n\nvoid SAGenTestChecker::checkEndAnalysis(ExplodedGraph\
+  \ &G, BugReporter &BR, ExprEngine &Eng) const {\n  // Match readers to writers\n\
+  \  // De-duplicate by (WriterLoc, LockText, PtrText)\n  std::set<std::string> Emitted;\n\
+  \n  const SourceManager &SM = BR.getSourceManager();\n  for (const auto &R : Readers)\
+  \ {\n    for (const auto &W : Writers) {\n      if (R.PtrText == W.PtrText) {\n\
+  \        // If the writer is not holding the reader's lock\n        if (W.HeldLocks.find(R.LockText)\
+  \ == W.HeldLocks.end()) {\n          // Build key\n          std::string Key = std::to_string(W.AssignLoc.getRawEncoding())\
+  \ + \"|\" + R.LockText + \"|\" + R.PtrText;\n          if (Emitted.insert(Key).second)\
+  \ {\n            report(W, R, BR);\n          }\n        }\n      }\n    }\n  }\n\
+  \n  // Clear facts for next analysis (if any)\n  Readers.clear();\n  Writers.clear();\n\
+  }\n\n} // end anonymous namespace\n\nextern \"C\" void clang_registerCheckers(CheckerRegistry\
+  \ &registry) {\n  registry.addChecker<SAGenTestChecker>(\n      \"custom.SAGenTestChecker\"\
+  ,\n      \"Detects clearing a shared pointer outside the protecting spinlock when\
+  \ it is NULL-checked and used under that lock elsewhere\",\n      \"\");\n}\n\n\
+  extern \"C\" const char clang_analyzerAPIVersionString[] =\n    CLANG_ANALYZER_API_VERSION_STRING;\n"
+tn_score: 1
+tp_score: 0
