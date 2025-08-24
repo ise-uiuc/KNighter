@@ -1093,7 +1093,7 @@ def _process_reports(
 ) -> List[ReportData]:
     """Process and extract reports from kernel scan."""
     try:
-        seed = attempt_id if last_scan_id else 0
+        seed = attempt_id + 1 if last_scan_id else 0
         reports, total_report = global_config.backend.extract_reports(
             kernel_report_dir,
             kernel_report_dir.parent / "reports",
