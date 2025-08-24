@@ -141,7 +141,7 @@ Set up the `llm_keys.yaml` file:
 
 ```yaml
 nv_key: "XXX"
-deepseek_key: "XXX" 
+deepseek_key: "XXX"
 azure_key: "XXX"
 openai_key: "XXX"
 google_key: "XXX"
