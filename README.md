@@ -6,42 +6,127 @@
 
 ![Framework](assets/overview.svg)
 
+## Table of Contents
+
+- [About](#about)
+- [Getting Started](#getting-started)
+  - [Docker Setup (Recommended)](#docker-setup-recommended)
+  - [Manual Environment Setup (Alternative)](#manual-environment-setup-alternative)
+- [Running KNighter](#running-knighter)
+- [Architecture Documentation](#architecture-documentation)
+
 ## About
 
-KNighter is a checker synthesis tool that leverages the power of LLMs to generate static analysis checkers 🦉 based on historical patch commits.
+**KNighter** is an innovative checker synthesis tool that leverages Large Language Models (LLMs) to automatically generate static analysis checkers from historical patch commits. 
+
+### Key Features
+
+- **🤖 LLM-Powered Generation**: Automatically synthesizes static analysis checkers using state-of-the-art language models
+- **📊 Multi-step Pipeline**: Employs a sophisticated generation → refinement → triage workflow for high-quality results
+- **🔍 Historical Learning**: Learns from real-world patch commits to understand common bug patterns
+- **⚡ LLVM Integration**: Built on top of LLVM for robust static analysis capabilities
+- **🐧 Linux Kernel Focus**: Specialized for finding bugs in large-scale C/C++ codebases like the Linux kernel
 
 > [!IMPORTANT]
-> We are keeping improving the documents and supporting more features. Please stay tuned for the updates.
+> We are continuously improving the documentation and adding new features. Please stay tuned for updates.
 
-**Contact:** [Chenyuan Yang](https://yangchenyuan.github.io/), [Zijie Zhao](https://zijie.cs.illinois.edu/), [Lingming Zhang](https://lingming.cs.illinois.edu).
+## Getting Started
 
-## Environment Setup
+### Docker Setup (Recommended)
 
-**Step 1**
+<details>
+<summary><b>🐳 Docker Installation Options</b></summary>
 
-Download and build [LLVM-18.1.8](https://github.com/llvm/llvm-project/releases/tag/llvmorg-18.1.8).
+#### Option 1: Docker Hub (Recommended)
+
+```bash
+docker pull knighterhub/knighter
+```
+
+#### Option 2: Build from Source
+
+```bash
+git clone https://github.com/ise-uiuc/KNighter.git KNighter
+cd KNighter
+
+docker build -t knighter .
+```
+
+</details>
+
+<details>
+<summary><b>🚀 Running the Container</b></summary>
+
+```bash
+# Pull from Docker Hub
+docker run -it knighterhub/knighter
+
+# Build from source
+docker run -it knighter
+```
+
+</details>
+
+<details>
+<summary><b>⚙️ Environment Initialization</b></summary>
+
+When running the container for the first time, initialize the environment:
+
+```bash
+cd /app
+# This would take a while to download the dependencies and compile the LLVM
+python3 scripts/init_docker.py
+```
+
+This downloads LLVM and Linux kernel source code into `/data/llvm` and `/data/linux`.
+
+**API Key Configuration:**
+
+```bash
+echo 'openai_key: "YOUR_OPENAI_API_KEY"' > /app/llm_keys.yaml
+```
+
+</details>
+
+### Manual Environment Setup (Alternative)
+
+> **Note**: For detailed setup steps, refer to `scripts/init_docker.py` which contains the complete initialization process.
+
+<details>
+<summary><b>🔧 Manual Installation Steps</b></summary>
+
+**Step 1: Install Dependencies**
+
+Download and build [LLVM-18.1.8](https://github.com/llvm/llvm-project/releases/tag/llvmorg-18.1.8):
 
 ```sh
 wget https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-18.1.8.zip
 unzip llvmorg-18.1.8.zip
 ```
 
-Git clone the Linux kernel source code.
+Git clone the Linux kernel source code:
 
 ```sh
 git clone https://github.com/torvalds/linux.git
 ```
 
-Install the following dependencies:
+Install Python dependencies:
 
 ```sh
+# Option 1: Using uv (recommended for faster installs)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.cargo/env
+uv pip install -r requirements.txt
+
+# Option 2: Using regular pip
 pip3 install -r requirements.txt
+
 git submodule update --init --recursive
 ```
 
-**Step 2**
+**Step 2: Configuration Files**
 
-Set up your `config.yaml`, which includes necessary config settings. Below is an example:
+Set up your `config.yaml` (see `scripts/init_docker.py` for reference):
 
 ```yaml
 result_dir: "result-checkers"
@@ -52,69 +137,108 @@ key_file: "llm_keys.yaml"
 model: "o3-mini"
 ```
 
-- "result_dir": the directory to store the generated checkers.
-- "LLVM_dir": the path to the LLVM environment.
-- "checker_nums": the number of checkers to generate.
-- "linux_dir": the path to the Linux kernel source code.
-- "key_file": the key file for the models.
-- "model": the model for the generated checkers.
-
-You also need to set up the `llm_keys.yaml` file, which includes the key for the LLM model.
+Set up the `llm_keys.yaml` file:
 
 ```yaml
 nv_key: "XXX"
-deepseek_key: "XXX"
+deepseek_key: "XXX" 
 azure_key: "XXX"
 openai_key: "XXX"
 google_key: "XXX"
 ```
 
-You don't need to provide all the keys. If you don't have the key for a specific model, you can leave it empty.
-
-**Step3**
-
-Set up the LLVM environment.
+**Step 3: LLVM Setup**
 
 ```sh
 python3 scripts/setup_llvm.py LLVM_PATH
 ```
 
-## Pipeline Usage
+</details>
 
-Under the directory `src`, run `python3 main.py`.
+## Running KNighter
 
+### Quick Start (Docker)
+
+For rapid evaluation, use the debug dataset:
+
+```bash
+cd /app/src
+
+# Step 1: Generate checkers for debug commits
+python3 main.py gen --config_file /app/config-generate.yaml --commit_file=/app/commits/commits-debug.txt
+
+# Step 2: Refine generated checkers
+python3 main.py refine --config_file /app/config-refine-debug.yaml /app/result-generate
+
+# Step 3: Triage and analyze results
+python3 main.py triage --config_file /app/config-triage-debug.yaml /app/result-refine-debug
 ```
-python main.py gen --commit_file=../commits/commits-selected.txt --config_file=config.yaml
+
+<details>
+<summary><b>📋 Pipeline Modes & Usage</b></summary>
+
+**Available Operation Modes:**
+
+| Mode | Purpose | Description |
+|------|---------|-------------|
+| `gen` | Generation | Generate new checkers from commit patches |
+| `refine` | Refinement | Improve and validate generated checkers |
+| `scan` | Scanning | Scan the kernel with validated checkers |
+| `triage` | Analysis | Analyze and categorize scan results |
+
+**Basic Usage (Manual Setup):**
+
+```bash
+cd src
+python3 main.py <mode> --commit_file=<commits.txt> --config_file=<config.yaml>
 ```
 
-It in total has five models
+**Example:**
+```bash
+python3 main.py gen --commit_file=../commits/commits-selected.txt --config_file=config.yaml
+```
 
-```py
-modes = {
-    "gen": (gen_checker, "Generate new checkers"),
-    "refine": (refine_checker, "Refine and improve checkers"),
-    "scan": (scan, "Scan the kernel with valid checkers"),
-    "triage": (triage_report, "Triage the report"),
-    "label": (label_commits, "Label commits"),
+</details>
+
+<details>
+<summary><b>⚙️ Configuration Files</b></summary>
+
+| File | Purpose | Key Parameters |
+|------|---------|----------------|
+| `config-generate.yaml` | Checker generation | `model`, `checker_nums`, `result_dir` |
+| `config-refine.yaml` | Refinement process | `jobs`, `scan_timeout`, `scan_commit` |
+| `config-triage.yaml` | Result analysis | Analysis parameters |
+
+Modify these files to experiment with different parameters from the paper evaluation.
+
+</details>
+
+## Architecture Documentation
+
+<details>
+<summary><b>🏗️ System Architecture Overview</b></summary>
+
+KNighter implements a multi-stage pipeline for automated checker synthesis:
+
+1. **Commit Analysis**: Extract bug patterns from historical patches
+2. **Checker Generation**: Use LLMs to synthesize static analysis checkers
+3. **Refinement**: Validate and improve generated checkers through compilation and testing
+4. **Deployment**: Apply refined checkers to target codebases
+5. **Triage**: Analyze and categorize detected issues
+
+For comprehensive architecture documentation, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+</details>
+
+
+---
+
+**Citation**: If you use KNighter in your research, please cite our paper:
+```bibtex
+@article{knighter2025,
+  title={KNighter: Transforming Static Analysis with LLM-Synthesized Checkers},
+  author={Yang, Chenyuan and Zhao, Zijie and Zhang, Lingming},
+  journal={arXiv preprint arXiv:2503.09002},
+  year={2025}
 }
 ```
-
-### Example Workflow
-
-1. Generate checkers for the your target commits (e.g., stored in `commit.txt`).
-
-```sh
-# Under src
-python3 main.py gen --commit_file=commits.txt --config_file=config.yaml
-```
-
-The result dir is `/path/to/result-checkers`, which is specified in the `config.yaml`.
-
-2. Collect and refine the checkers.
-
-```sh
-# Under src
-python3 main.py refine --checker_dir=/path/to/result-checkers --config_file=config-refine.yaml
-```
-
-Note, you need to set up the `config-refine.yaml` file, which includes the config settings for the refine process, like the output directory.
