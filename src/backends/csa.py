@@ -825,7 +825,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         # Sample the reports
         filtered_keys = []
         sample_size = min(sampled_num, len(clustered_report_dir))
-        logger.warning(f"Sample size: {sample_size}")
+        logger.warning(f"Sample size: {sample_size} by seed {seed}")
 
         for key in clustered_report_dir.keys():
             if any(pattern in key for pattern in ["_include_"]):
@@ -833,15 +833,13 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 continue
             filtered_keys.append(key)
 
-        if len(filtered_keys) < sampled_num:
-            logger.warning(
-                f"Not enough ({sampled_num - len(filtered_keys)}) keys starting with 'drivers/'..."
-            )
+        if len(filtered_keys) < sample_size:
+            logger.warning(f"Not enough ({sample_size - len(filtered_keys)}) keys")
             other_keys = [
                 key for key in clustered_report_dir.keys() if key not in filtered_keys
             ]
             filtered_keys.extend(
-                random.sample(other_keys, sampled_num - len(filtered_keys))
+                random.sample(other_keys, sample_size - len(filtered_keys))
             )
 
         selected_keys = random.sample(filtered_keys, sample_size)
