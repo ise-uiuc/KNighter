@@ -661,3 +661,47 @@ def truncate_large_file(content: str, max_lines: int = 500) -> str:
     truncated_content += "\n".join(last_part)
 
     return truncated_content
+
+def grab_yaml_code(llm_response: str) -> str:
+    """Extract YAML code block from LLM response."""
+    # Try different YAML block patterns
+    patterns = [
+        r"```ya?ml\n([\s\S]*?)\n```",
+        r"```\n(rules:[\s\S]*?)\n```",
+        r"(rules:\s*\n[\s\S]*)"
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, llm_response, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    
+    return None
+
+def extract_semgrep_rule(llm_response: str) -> str:
+    """Extract semgrep rule from LLM response."""
+    # First try to get YAML code block
+    semgrep_rule = grab_yaml_code(llm_response)
+    
+    if semgrep_rule is None:
+        # If no code block found, try to extract rules: section directly
+        rules_pattern = r"(rules:\s*\n[\s\S]*)"
+        match = re.search(rules_pattern, llm_response, re.IGNORECASE)
+        if match:
+            semgrep_rule = match.group(1)
+        else:
+            return None
+    
+    # Clean up the rule
+    if semgrep_rule:
+        # Remove markdown code block markers if present
+        semgrep_rule = re.sub(r'^```ya?ml\s*\n', '', semgrep_rule, flags=re.MULTILINE | re.IGNORECASE)
+        semgrep_rule = re.sub(r'\n```\s*$', '', semgrep_rule, flags=re.MULTILINE)
+        
+        # Ensure it starts with 'rules:'
+        if not semgrep_rule.strip().startswith('rules:'):
+            semgrep_rule = 'rules:\n' + semgrep_rule
+        
+        return semgrep_rule.strip()
+    
+    return None
