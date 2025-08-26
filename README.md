@@ -17,7 +17,7 @@
 
 ## About
 
-**KNighter** is an innovative checker synthesis tool that leverages Large Language Models (LLMs) to automatically generate static analysis checkers from historical patch commits. 
+**KNighter** is an innovative checker synthesis tool that leverages Large Language Models (LLMs) to automatically generate static analysis checkers from historical patch commits.
 
 ### Key Features
 
@@ -137,14 +137,19 @@ key_file: "llm_keys.yaml"
 model: "o3-mini"
 ```
 
-Set up the `llm_keys.yaml` file:
+Set up the `llm_keys.yaml` file (see `llm_keys_example.yaml` for reference):
 
 ```yaml
-nv_key: "XXX"
-deepseek_key: "XXX"
-azure_key: "XXX"
-openai_key: "XXX"
-google_key: "XXX"
+openai_key: "sk-..."
+claude_key: "sk-ant-..."
+google_key: "AIza..."
+deepseek_key: "sk-..."
+
+# For local models (optional)
+# In config, use "local:model_name" format to use local models
+# Like "local:openai/gpt-oss-120b"
+base_url: "http://localhost:8000/v1"
+api_key: "dummy"
 ```
 
 **Step 3: LLVM Setup**

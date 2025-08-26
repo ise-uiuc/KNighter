@@ -149,7 +149,7 @@ def invoke_llm(
     try:
         client, actual_model = get_client_and_model(model)
     except ValueError as e:
-        logger.error(f"Error getting client and model: {e}")
+        logger.error(f"Error getting client and model for  {model}")
         logger.error(str(e))
         return None
 
