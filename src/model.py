@@ -1,10 +1,12 @@
-import time
+"""Simple and clean LLM model interface supporting both cloud and local models"""
 
-import tiktoken
-from azure.ai.inference import ChatCompletionsClient
-from azure.core.credentials import AzureKeyCredential
+import time
+from typing import Any, Dict, Optional
+
 from google import genai
 from openai import OpenAI
+
+from global_config import global_config, logger
 
 try:
     import anthropic
@@ -14,382 +16,211 @@ except ImportError:
     anthropic = None
     ANTHROPIC_AVAILABLE = False
 
-from global_config import global_config, logger
-
-azure_deepseek_client = None
-deepseek_client = None
-nv_client = None
-openai_client = None
-google_client = None
-claude_client = None
-
-local_deepseek_client = OpenAI(
-    base_url="http://localhost:30000/v1",
-    api_key="123",
-)
-
-
+# Global clients
+clients: Dict[str, Any] = {}
 model_config = {
-    "model": "o3-mini",
-    "openai_model": "gpt-4o",
-    "local_deepseek_model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
-    "deepseek_model": "deepseek-reasoner",
-    "model_o1": "o1-preview-2024-09-12",
-    "claude_model": "claude-4-sonnet-20250514",
+    "model": "gpt-4o",
     "temperature": 1.0,
     "max_tokens": 16000,
 }
 
-encoding = tiktoken.encoding_for_model("gpt-4o")
-
 
 def init_llm():
-    key_config = global_config.get_key_config()
-    global azure_deepseek_client, deepseek_client, nv_client, openai_client, google_client, claude_client, model_config
+    """Initialize LLM clients from configuration"""
+    keys = global_config.get_key_config()
 
-    if "azure_key" in key_config:
-        azure_deepseek_client = ChatCompletionsClient(
-            endpoint="XXXX", credential=AzureKeyCredential(key_config["azure_key"])
+    # Initialize OpenAI client (or compatible)
+    if "openai_key" in keys:
+        clients["openai"] = OpenAI(api_key=keys["openai_key"])
+
+    # Initialize local/custom OpenAI-compatible client
+    if "base_url" in keys:
+        clients["local"] = OpenAI(
+            base_url=keys["base_url"], api_key=keys.get("api_key", "dummy")
         )
-    if "deepseek_key" in key_config:
-        deepseek_client = OpenAI(
-            api_key=key_config["deepseek_key"], base_url="https://api.deepseek.com/v1"
+
+    # Initialize Claude client
+    if "claude_key" in keys and ANTHROPIC_AVAILABLE:
+        clients["claude"] = anthropic.Anthropic(api_key=keys["claude_key"])
+
+    # Initialize Google client
+    if "google_key" in keys:
+        clients["google"] = genai.Client(api_key=keys["google_key"])
+
+    # Initialize DeepSeek client
+    if "deepseek_key" in keys:
+        clients["deepseek"] = OpenAI(
+            api_key=keys["deepseek_key"], base_url="https://api.deepseek.com/v1"
         )
-    if "nv_key" in key_config:
-        nv_client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1", api_key=key_config["nv_key"]
+
+    # Initialize custom providers
+    providers = keys.get("providers", {})
+    for name, config in providers.items():
+        clients[name] = OpenAI(
+            base_url=config["base_url"], api_key=config.get("api_key", "dummy")
         )
-    if "openai_key" in key_config:
-        openai_client = OpenAI(api_key=key_config["openai_key"])
 
-    if "google_key" in key_config:
-        google_client = genai.Client(api_key=key_config["google_key"])
+    # Set model configuration from config.yaml
+    model_config["model"] = global_config.get("model", "gpt-4o")
+    model_config["temperature"] = global_config.get("temperature", 1.0)
+    model_config["max_tokens"] = global_config.get("max_tokens", 16000)
 
-    if "claude_key" in key_config:
-        if ANTHROPIC_AVAILABLE:
-            claude_client = anthropic.Anthropic(api_key=key_config["claude_key"])
-            logger.info("Claude client initialized successfully")
-        else:
-            logger.warning(
-                "Claude API key provided but anthropic library not available. Install with: pip install anthropic"
-            )
-
-    if not any(
-        [
-            azure_deepseek_client,
-            deepseek_client,
-            nv_client,
-            openai_client,
-            google_client,
-            claude_client,
-        ]
-    ):
-        raise ValueError("No API key provided")
-
-    model_config["model"] = key_config["model"]
     logger.info(f"Init LLM with model: {model_config['model']}")
 
+    if not clients:
+        raise ValueError("No LLM clients configured")
 
-def num_tokens_from_string(string: str) -> int:
-    """Returns the number of tokens in a text string."""
-    # For Claude models, we use an approximation since tiktoken is OpenAI-specific
-    # Claude roughly uses 1 token per 4 characters for English text
-    if model_config.get("model", "").startswith("claude"):
-        return len(string) // 4
 
-    num_tokens = len(encoding.encode(string))
-    return num_tokens
+def get_client_and_model(model_name: str) -> tuple:
+    """Determine which client to use and actual model name"""
+
+    # Model to client mapping
+    model_mapping = {
+        # OpenAI models
+        "gpt-4o": ("openai", "gpt-4o"),
+        "o1": ("openai", "o1"),
+        "o3-mini": ("openai", "o3-mini"),
+        "o4-mini": ("openai", "o4-mini"),
+        "o1-preview": ("openai", "o1-preview"),
+        "gpt-5": ("openai", "gpt-5"),
+        # Claude models
+        "claude": ("claude", "claude-3-5-sonnet-20241022"),
+        "claude-3-5-sonnet": ("claude", "claude-3-5-sonnet-20241022"),
+        "claude-3-5-haiku": ("claude", "claude-3-5-haiku-20241022"),
+        "claude-3-opus": ("claude", "claude-3-opus-20240229"),
+        # Google models
+        "google": ("google", "gemini-2.0-flash-exp"),
+        "gemini": ("google", "gemini-2.0-flash-exp"),
+        # DeepSeek models
+        "deepseek-reasoner": ("deepseek", "deepseek-reasoner"),
+        "deepseek-chat": ("deepseek", "deepseek-chat"),
+    }
+
+    # Check if it's a known model
+    if model_name in model_mapping:
+        client_name, actual_model = model_mapping[model_name]
+        if client_name in clients:
+            return clients[client_name], actual_model
+
+    # Check if it's a local model (format: local:model_name)
+    if model_name.startswith("local:") and "local" in clients:
+        actual_model = model_name[6:]  # Remove "local:" prefix
+        return clients["local"], actual_model
+
+    # Check custom providers (format: provider:model_name)
+    if ":" in model_name:
+        provider, actual_model = model_name.split(":", 1)
+        if provider in clients:
+            return clients[provider], actual_model
+
+    # Default to local client if available
+    if "local" in clients:
+        return clients["local"], model_name
+
+    # Fallback to OpenAI if available
+    if "openai" in clients:
+        return clients["openai"], model_name
+
+    raise ValueError(f"No client available for model {model_name}")
 
 
 def invoke_llm(
-    prompt,
-    temperature=model_config["temperature"],
-    model=model_config["model"],
-    max_tokens=model_config["max_tokens"],
-) -> str:
-    """Invoke the LLM model with the given prompt."""
-    model = model_config["model"]
+    prompt: str,
+    temperature: Optional[float] = None,
+    model: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+) -> Optional[str]:
+    """Invoke LLM with the given prompt"""
 
-    logger.info(f"start LLM process: {model}")
-    num_tokens = num_tokens_from_string(prompt)
-    logger.info("Token counts: {}".format(num_tokens))
-    if num_tokens > 100000:
-        logger.warning("Token counts exceed the limit. Skip.")
+    model = model or model_config["model"]
+    temperature = (
+        temperature if temperature is not None else model_config["temperature"]
+    )
+    max_tokens = max_tokens or model_config["max_tokens"]
+
+    logger.info(f"Start LLM process: {model}")
+
+    # Simple token check
+    if len(prompt) > 400000:  # ~100k tokens
+        logger.warning("Prompt too long, skipping")
         return None
 
-    failed_count = 0
-    while True:
+    # Get client and actual model name
+    try:
+        client, actual_model = get_client_and_model(model)
+    except ValueError as e:
+        logger.error(f"Error getting client and model: {e}")
+        logger.error(str(e))
+        return None
+
+    # Retry logic
+    for attempt in range(6):
         try:
-            if model in [
-                "gpt-4o",
-                "o1",
-                "o3-mini",
-                "o1-mini",
-                "o1-preview",
-                "o4-mini",
-                "gpt-4.1",
-                "gpt-5",
-            ]:
-                client = openai_client
-            elif model == "deepseek-reasoner":
-                client = deepseek_client
-            elif model == "local-deepseek":
-                client = local_deepseek_client
-                model = model_config["local_deepseek_model"]
-            elif model == "azure-deepseek":
-                client = azure_deepseek_client
-            elif model == "nv-deepseek":
-                client = nv_client
-            elif model == "google":
-                client = google_client
-            elif model in [
-                "claude",
-                "claude-3-5-sonnet",
-                "claude-3-5-haiku",
-                "claude-3-opus",
-                "claude-4-sonnet",
-            ]:
-                if not claude_client:
-                    raise ValueError(
-                        f"Claude model {model} requested but Claude client not initialized. Check your claude_key configuration."
-                    )
-                client = claude_client
-            else:
-                raise ValueError(f"Model {model} not supported")
-
-            if model == "azure-deepseek":
-                payload = {
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                }
-                response = client.complete(payload)
-            elif model == "gpt-5":
-                # GPT-5 does not support temperature
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            elif model in ["o1-preview", "o1-mini", "o1", "o3-mini", "o4-mini"]:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            elif model == "nv-deepseek":
-                response = client.chat.completions.create(
-                    model="deepseek-ai/deepseek-r1",
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-            elif model == "deepseek-reasoner":
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=8192,
-                )
-            elif model == "google":
-                response = client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=prompt,
-                )
-            elif model in [
-                "claude",
-                "claude-3-5-sonnet",
-                "claude-3-5-haiku",
-                "claude-3-opus",
-                "claude-4-sonnet",
-            ]:
-                # Map model names to actual Claude model identifiers
-                claude_model_map = {
-                    "claude": "claude-4-sonnet-20250514",  # Default to Claude 4 Sonnet
-                    "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
-                    "claude-3-5-haiku": "claude-3-5-haiku-20241022",
-                    "claude-3-opus": "claude-3-opus-20240229",
-                    "claude-4-sonnet": "claude-4-sonnet-20250514",
-                }
-                actual_model = claude_model_map.get(model, model_config["claude_model"])
-
+            # Handle different client types
+            if isinstance(
+                client, anthropic.Anthropic if ANTHROPIC_AVAILABLE else type(None)
+            ):
+                # Claude API
                 response = client.messages.create(
                     model=actual_model,
+                    messages=[{"role": "user", "content": prompt}],
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            else:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    n=1,
-                    max_completion_tokens=max_tokens,
-                )
-
-        except Exception as e:
-            logger.error("Error: {}".format(e))
-            failed_count += 1
-            if failed_count > 5:
-                logger.error("Failed too many times. Skip.")
-                raise e
-            time.sleep(2)
-        else:
-            logger.info("finish LLM process")
-
-            if isinstance(response, str):
-                logger.warning("Response is a string")
-                failed_count += 1
-                if failed_count > 5:
-                    logger.error("Failed too many times. Skip.")
-                    return None
-                time.sleep(2)
-                continue
-            if model == "google":
-                return response.text
-            elif model in [
-                "claude",
-                "claude-3-5-sonnet",
-                "claude-3-5-haiku",
-                "claude-3-opus",
-                "claude-4-sonnet",
-            ]:
-                # Claude returns a different response format
-                logger.info(f"Response input tokens: {response.usage.prompt_tokens}")
-                logger.info(
-                    f"Response output tokens: {response.usage.completion_tokens}"
                 )
                 answer = response.content[0].text
-                if "<think>" in answer or "</think>" in answer:
-                    # Delete the content between <think> and </think> tags
-                    answer = answer.split("</think>")[-1].strip()
-                return answer
-            else:
-                logger.info(f"Response input tokens: {response.usage.prompt_tokens}")
-                logger.info(
-                    f"Response output tokens: {response.usage.completion_tokens}"
+
+            elif isinstance(client, genai.Client):
+                response = client.models.generate_content(
+                    model=actual_model,
+                    contents=prompt,
                 )
+                answer = response.text
+
+            else:  # OpenAI or compatible
+                kwargs = {
+                    "model": actual_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_completion_tokens": max_tokens,
+                }
+
+                # Only add temperature for models that support it
+                no_temp_models = ["o1", "o3-mini", "o4-mini", "o1-preview", "gpt-5"]
+                if not any(m in actual_model for m in no_temp_models):
+                    kwargs["temperature"] = temperature
+
+                response = client.chat.completions.create(**kwargs)
                 answer = response.choices[0].message.content
-                if "<think>" in answer or "</think>" in answer:
-                    # Delete the content between <think> and </think> tags
-                    answer = answer.split("</think>")[-1].strip()
-                return answer
+
+            logger.info("Finish LLM process")
+
+            # Remove think tags if present
+            if answer and "<think>" in answer:
+                answer = answer.split("</think>")[-1].strip()
+
+            return answer
+
+        except Exception as e:
+            logger.error(f"Error attempt {attempt + 1}: {e}")
+            if attempt >= 5:
+                logger.error("Failed too many times")
+                raise e
+            time.sleep(2)
+
+    return None
 
 
-def get_embeddings(text: str):
-    """Get embeddings for the given text."""
-    response = openai_client.embeddings.create(
+def get_embeddings(text: str) -> list:
+    """Get embeddings using OpenAI API"""
+    if "openai" not in clients:
+        raise ValueError("OpenAI client required for embeddings")
+
+    response = clients["openai"].embeddings.create(
         input=text, model="text-embedding-ada-002"
     )
     return response.data[0].embedding
 
 
-def list_available_models() -> dict:
-    """
-    List all available models based on initialized clients.
-
-    Returns:
-        dict: Available models by provider
-    """
-    available = {
-        "openai": []
-        if not openai_client
-        else ["gpt-4o", "o1", "o3-mini", "o1-mini", "o1-preview"],
-        "deepseek": [] if not deepseek_client else ["deepseek-reasoner"],
-        "google": [] if not google_client else ["google"],
-        "nvidia": [] if not nv_client else ["nv-deepseek"],
-        "azure": [] if not azure_deepseek_client else ["azure-deepseek"],
-        "local": ["local-deepseek"],  # Always available
-        "claude": []
-        if not claude_client
-        else [
-            "claude",
-            "claude-3-5-sonnet",
-            "claude-3-5-haiku",
-            "claude-3-opus",
-            "claude-4-sonnet",
-        ],
-    }
-
-    # Filter out empty providers
-    return {k: v for k, v in available.items() if v}
-
-
-def get_model_info(model_name: str) -> dict:
-    """
-    Get information about a specific model.
-
-    Args:
-        model_name: Name of the model
-
-    Returns:
-        dict: Model information including provider, capabilities, etc.
-    """
-    model_info = {
-        # OpenAI models
-        "gpt-4o": {
-            "provider": "OpenAI",
-            "type": "chat",
-            "max_tokens": 128000,
-            "capabilities": ["reasoning", "coding"],
-        },
-        "o1": {
-            "provider": "OpenAI",
-            "type": "reasoning",
-            "max_tokens": 65536,
-            "capabilities": ["advanced_reasoning"],
-        },
-        "o3-mini": {
-            "provider": "OpenAI",
-            "type": "reasoning",
-            "max_tokens": 65536,
-            "capabilities": ["reasoning", "efficiency"],
-        },
-        # Claude models
-        "claude": {
-            "provider": "Anthropic",
-            "type": "chat",
-            "max_tokens": 200000,
-            "capabilities": ["reasoning", "coding", "analysis"],
-            "actual_model": "claude-4-sonnet-20250514",
-        },
-        "claude-3-5-sonnet": {
-            "provider": "Anthropic",
-            "type": "chat",
-            "max_tokens": 200000,
-            "capabilities": ["reasoning", "coding", "analysis"],
-        },
-        "claude-3-5-haiku": {
-            "provider": "Anthropic",
-            "type": "chat",
-            "max_tokens": 200000,
-            "capabilities": ["fast_response", "cost_effective"],
-        },
-        "claude-3-opus": {
-            "provider": "Anthropic",
-            "type": "chat",
-            "max_tokens": 200000,
-            "capabilities": ["advanced_reasoning", "complex_tasks"],
-        },
-        "claude-4-sonnet": {
-            "provider": "Anthropic",
-            "type": "chat",
-            "max_tokens": 200000,
-            "capabilities": ["latest_model", "enhanced_reasoning", "improved_coding"],
-        },
-        # Other models
-        "deepseek-reasoner": {
-            "provider": "DeepSeek",
-            "type": "reasoning",
-            "max_tokens": 8192,
-            "capabilities": ["reasoning", "coding"],
-        },
-        "google": {
-            "provider": "Google",
-            "type": "chat",
-            "max_tokens": 2097152,
-            "capabilities": ["multimodal", "reasoning"],
-        },
-    }
-
-    return model_info.get(
-        model_name, {"provider": "Unknown", "type": "unknown", "capabilities": []}
-    )
+# Backwards compatibility
+def num_tokens_from_string(string: str) -> int:
+    """Simple token approximation"""
+    return len(string) // 4

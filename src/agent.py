@@ -346,8 +346,7 @@ def plan2checker(
     path2store.write_text(plan2checker_prompt)
     logger.info("finish plan2checker generation")
 
-    # NOTE: Use gpt-4o for plan2checker
-    response = invoke_llm(plan2checker_prompt, model="gpt-4o")
+    response = invoke_llm(plan2checker_prompt)
     response_store = prompt_history_dir / "response_checker.md"
 
     response_store.write_text(response)
@@ -404,7 +403,7 @@ def reduce_report(id: str, iter: int, report_id, report_md):
     path2store.write_text(reduce_report_prompt)
     logger.info("finish reduce_report generation")
 
-    response = invoke_llm(reduce_report_prompt, model="gpt-4o", temperature=0.01)
+    response = invoke_llm(reduce_report_prompt, temperature=0.01)
 
     if response is not None:
         response_store.write_text(response)
@@ -444,7 +443,7 @@ def repair_FP(
     path2store.write_text(repair_FP_prompt)
     logger.info("finish repair_FP generation")
 
-    response = invoke_llm(repair_FP_prompt, temperature=0.01)
+    response = invoke_llm(repair_FP_prompt)
     response_store = prompt_history_dir / f"response_repair_FP-{commit_id}.md"
 
     response_store.write_text(response)
