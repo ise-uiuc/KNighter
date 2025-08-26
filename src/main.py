@@ -13,7 +13,7 @@ from checker_refine import (
 from checker_scan import scan, scan_single_checker, triage_report
 from commit_label import label_commits
 from global_config import global_config, logger
-from model import init_llm, list_available_models
+from model import init_llm
 
 
 def init_config(config_file: str):
@@ -57,10 +57,6 @@ def main(mode: str, *args, **kwargs):
         "list_changed": (
             list_successfully_changed_checkers,
             "List checkers with successful code changes",
-        ),
-        "list_models": (
-            lambda: print(f"Available models: {list_available_models()}"),
-            "List all available models",
         ),
         "scan": (scan, "Scan the kernel with valid checkers"),
         "scan_single": (scan_single_checker, "Scan with a single checker from file"),
