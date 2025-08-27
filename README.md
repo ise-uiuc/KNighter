@@ -240,9 +240,9 @@ For comprehensive architecture documentation, see [`ARCHITECTURE.md`](ARCHITECTU
 
 **Citation**: If you use KNighter in your research, please cite our paper:
 ```bibtex
-@article{knighter2025,
+@article{knighter,
   title={KNighter: Transforming Static Analysis with LLM-Synthesized Checkers},
-  author={Yang, Chenyuan and Zhao, Zijie and Zhang, Lingming},
+  author={Yang, Chenyuan and Zhao, Zijie and Xie, Zichen and Li, Haoyu and Zhang, Lingming},
   journal={arXiv preprint arXiv:2503.09002},
   year={2025}
 }
