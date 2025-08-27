@@ -208,6 +208,123 @@ def invoke_llm(
 
     return None
 
+def invoke_llm_semgrep(
+    prompt,
+    temperature=model_config["temperature"],
+    model=model_config["model"],
+    max_tokens=model_config["max_tokens"],
+) -> str:
+    """Invoke the LLM model with the given prompt."""
+
+    logger.info(f"start LLM process: {model}")
+    num_tokens = num_tokens_from_string(prompt)
+    logger.info("Token counts: {}".format(num_tokens))
+    if num_tokens > 100000:
+        logger.warning("Token counts exceed the limit. Skip.")
+        return None
+
+    failed_count = 0
+    while True:
+        try:
+            if model in ["gpt-4o", "o1", "o3-mini", "o1-mini", "o1-preview", "gpt-4o-mini"]:
+                client = openai_client
+            elif model == "deepseek-reasoner":
+                client = deepseek_client
+            elif model == "local-deepseek":
+                client = local_deepseek_client
+                model = model_config["local_deepseek_model"]
+            elif model == "azure-deepseek":
+                client = azure_deepseek_client
+            elif model == "nv-deepseek":
+                client = nv_client
+            elif model == "google":
+                client = google_client
+            else:
+                raise ValueError(f"Model {model} not supported")
+
+            if model == "azure-deepseek":
+                payload = {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                }
+                response = client.complete(payload)
+            elif model in ["o1-preview", "o1-mini", "o1", "o3-mini"]:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": 
+                           "system", "content": """You generate Semgrep rules in YAML format. 
+    Return only the raw YAML content without any markdown formatting or additional text.
+    Always include these required fields: id, pattern, message, severity, languages.
+    Focus on detecting security vulnerabilities and coding issues."""},
+                          {"role":
+                           "user", "content": prompt}],
+                )
+            elif model == "nv-deepseek":
+                response = client.chat.completions.create(
+                    model="deepseek-ai/deepseek-r1",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            elif model == "deepseek-reasoner":
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": 
+                           "system", "content": """You generate Semgrep rules in YAML format. 
+    Return only the raw YAML content without any markdown formatting or additional text.
+    Always include these required fields: id, pattern, message, severity, languages.
+    Focus on detecting security vulnerabilities and coding issues."""},
+                          {"role":
+                           "user", "content": prompt}],
+                    max_tokens=8192,
+                )
+            elif model == "google":
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                )
+            else:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": 
+                           "system", "content": """You generate Semgrep rules in YAML format. 
+    Return only the raw YAML content without any markdown formatting or additional text.
+    Always include these required fields: id, pattern, message, severity, languages.
+    Focus on detecting security vulnerabilities and coding issues."""},
+                          {"role":
+                           "user", "content": prompt}],
+                    temperature=temperature,
+                    n=1,
+                    max_tokens=max_tokens,
+                )
+
+        except Exception as e:
+            logger.error("Error: {}".format(e))
+            failed_count += 1
+            if failed_count > 5:
+                logger.error("Failed too many times. Skip.")
+                raise e
+            time.sleep(2)
+        else:
+            logger.info("finish LLM process")
+
+            if isinstance(response, str):
+                logger.warning("Response is a string")
+                failed_count += 1
+                if failed_count > 5:
+                    logger.error("Failed too many times. Skip.")
+                    return None
+                time.sleep(2)
+                continue
+            if model == "google":
+                return response.text
+
+            answer = response.choices[0].message.content
+            if "<think>" in answer or "</think>" in answer:
+                # Delete the content between <think> and </think> tags
+                answer = answer.split("</think>")[-1].strip()
+            return answer
 
 def get_embeddings(text: str) -> list:
     """Get embeddings using OpenAI API"""

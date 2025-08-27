@@ -12,6 +12,8 @@ from checker_refine import (
 )
 from checker_scan import scan, scan_single_checker, triage_report
 from commit_label import label_commits
+from semgrep_gen import semgrep_gen
+from semgrep_repair import repair_semgrep_rule
 from global_config import global_config, logger
 from model import init_llm
 
@@ -62,6 +64,8 @@ def main(mode: str, *args, **kwargs):
         "scan_single": (scan_single_checker, "Scan with a single checker from file"),
         "triage": (triage_report, "Triage the report"),
         "label": (label_commits, "Label commits"),
+        "sem_gen": (semgrep_gen, "Generate semgrep rules using LLM"),
+        "sem_repair": (repair_semgrep_rule, "Repair semgrep rules"),
     }
 
     if mode not in modes:
