@@ -9,6 +9,7 @@ from backends.csa import ClangBackend
 from backends.factory import AnalysisBackendFactory
 from targets.factory import TargetFactory
 from targets.linux import Linux
+from targets.v8 import V8
 
 logger = loguru.logger
 
@@ -44,7 +45,11 @@ class GlobalConfig:
 
         # Init the target and backend
         # FIXME: This should be extended to support other targets and backends
-        self._config["target"] = Linux(self.get("linux_dir"))
+        target_type = self.get("target_type", "linux")
+        if target_type == "v8":
+            self._config["target"] = V8(self.get("v8_dir"))
+        else:
+            self._config["target"] = Linux(self.get("linux_dir"))
         self._config["backend"] = ClangBackend(self.get("LLVM_dir"))
 
     def _init_logger(self):

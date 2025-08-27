@@ -408,6 +408,10 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             return self._validate_checker_linux(
                 checker_code, commit_id, patch, target, skip_build_checker
             )
+        elif target._target_type == "v8":
+            return self._validate_checker_v8(
+                checker_code, commit_id, patch, target, skip_build_checker
+            )
         else:
             raise NotImplementedError(
                 f"Validation for target type {target._target_type} is not implemented."
@@ -442,6 +446,18 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         if target._target_type == "linux":
             return self._run_checker_linux(
+                checker_code,
+                commit_id,
+                target,
+                object_to_analyze=object_to_analyze,
+                jobs=jobs,
+                output_dir=output_dir,
+                skip_build_checker=skip_build_checker,
+                skip_checkout=skip_checkout,
+                **kwargs,
+            )
+        elif target._target_type == "v8":
+            return self._run_checker_v8(
                 checker_code,
                 commit_id,
                 target,
@@ -642,6 +658,183 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             return_code = scan_process.wait()
             if return_code != 0:
                 logger.error("Fail to build the kernel with checker!")
+                logger.error("Return code: " + str(return_code))
+                (output_dir / "scan_error.log").write_text(output)
+                return -999
+            if "No bugs found" not in output:
+                num_bugs = self.get_num_bugs(output)
+                logger.success(f"{num_bugs} bugs found!")
+        elif completed == "Timeout":
+            num_bugs = -1
+            logger.warning("Timeout!")
+        else:
+            num_bugs = -10
+            logger.warning("Too many bugs found!")
+
+        return num_bugs
+    
+    def _validate_checker_v8(
+        self,
+        checker_code: str,
+        commit_id: str,
+        patch: str,
+        target,
+        skip_build_checker=False,
+    ):
+        """
+        Validate the checker against a V8 commit and patch.
+        """
+        from targets.v8 import V8
+        
+        TP, TN = 0, 0
+        if not skip_build_checker:
+            self.build_checker(
+                checker_code,
+                Path("tmp"),
+                attempt=1,
+            )
+
+        comd_prefix = self._generate_command()
+        
+        # Checkout buggy version
+        target.checkout_commit(commit_id, is_before=True, arch="x64", build_config="release")
+
+        # Get the modified objects from the patch
+        num_bug_obj = {}
+        logger.info(f"Collecting modified objects from patch...")
+        objects = target.get_objects_from_patch(patch)
+        logger.info(f"Modified objects: {objects}")
+        for obj in objects:
+            logger.info(f"Building object: {obj}")
+            comd = comd_prefix + f"ninja -C out/x64.release {obj} -j8 2>&1"
+            logger.info("Running: " + comd)
+            try:
+                res = sp.run(
+                    comd,
+                    shell=True,
+                    text=True,
+                    cwd=target.repo.working_dir,
+                    capture_output=True,
+                    timeout=300,
+                )
+                output = res.stdout
+            except sp.TimeoutExpired:
+                raise Exception(f"Compilation Timeout: {comd}")
+
+            logger.info(f"Buggy: {obj} {res.returncode}")
+            if (
+                res.returncode == 0
+                and "Please consider submitting a bug report" in output
+            ):
+                logger.info("Buggy: Error in scan!")
+                logger.debug(output)
+                return -2, -2
+            elif res.returncode == 0 and "No bugs found" not in output:
+                num_bugs = self.get_num_bugs(output)
+                num_bug_obj[obj] = num_bugs
+                TP += 1
+                logger.info(f"Buggy: {num_bugs} bugs found")
+            elif res.returncode == 0:
+                logger.info("Buggy: No bugs found!")
+            elif res.returncode != 0:
+                logger.info("Buggy: Error in build!")
+                return -1, -1
+
+        # Checkout fixed version
+        target.checkout_commit(commit_id, is_before=False, arch="x64", build_config="release")
+        for obj in objects:
+            comd = comd_prefix + f"ninja -C out/x64.release {obj} -j8 2>&1"
+            logger.info("Running: " + comd)
+            try:
+                res = sp.run(
+                    comd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    cwd=target.repo.working_dir,
+                    timeout=300,
+                )
+                output = res.stdout
+            except sp.TimeoutExpired:
+                raise Exception(f"Compilation Timeout: {comd}")
+
+            logger.info(f"Non-buggy: {obj} {res.returncode}")
+
+            if res.returncode == 0 and "No bugs found" in output:
+                TN += 1
+                logger.info("Non-buggy: No bugs found!")
+            elif res.returncode == 0:
+                num_bugs = self.get_num_bugs(output)
+                if num_bugs < num_bug_obj.get(obj, 0) and num_bugs < 5:
+                    TN += 1
+                elif num_bugs > num_bug_obj.get(obj, 0):
+                    TN -= 1
+                logger.info(f"Non-buggy: {num_bugs} bugs found")
+            elif res.returncode != 0:
+                logger.info("Non-buggy: Error in build!")
+                return -1, -1
+        return TP, TN
+
+    def _run_checker_v8(
+        self,
+        checker_code: str,
+        commit_id: str,
+        target,
+        object_to_analyze: str = None,
+        jobs: int = 32,
+        output_dir: str = "tmp",
+        skip_build_checker: bool = False,
+        skip_checkout: bool = False,
+        **kwargs,
+    ):
+        """
+        Run the checker against a V8 commit.
+        """
+        from targets.v8 import V8
+        
+        output_dir = Path(output_dir)
+        arch = kwargs.get("arch", "x64")
+        build_config = kwargs.get("build_config", "release")
+        timeout = kwargs.get("timeout", 1800)
+
+        if not skip_build_checker:
+            build_res, _ = self.build_checker(checker_code, Path("tmp"), attempt=1)
+            if build_res != 0:
+                logger.error("Build failed, skipping analysis.")
+                raise Exception("Build failed, skipping analysis.")
+
+        comd_prefix = self._generate_command(no_output=True)
+        comd_prefix += "-o " + output_dir.absolute().as_posix()
+
+        if not skip_checkout:
+            target.checkout_commit(commit_id, arch=arch, build_config=build_config)
+
+        # Build command for V8
+        build_dir = f"out/{arch}.{build_config}"
+        comd = comd_prefix + f" ninja -C {build_dir} -j{jobs}"
+
+        # Object to analyze
+        if object_to_analyze:
+            comd += f" {object_to_analyze}"
+        
+        logger.info("Running: " + comd)
+
+        scan_process = sp.Popen(
+            comd,
+            shell=True,
+            cwd=target.repo.working_dir,
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+        )
+        output, completed = monitor_build_output(
+            scan_process, warning_limit=100, timeout=timeout
+        )
+
+        num_bugs = 0
+        if completed == "Complete":
+            return_code = scan_process.wait()
+            if return_code != 0:
+                logger.error("Fail to build V8 with checker!")
                 logger.error("Return code: " + str(return_code))
                 (output_dir / "scan_error.log").write_text(output)
                 return -999
