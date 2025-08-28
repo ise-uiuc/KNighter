@@ -182,12 +182,16 @@ class CheckerData:
         self.plan: Optional[str] = None
         self.refined_plan: Optional[str] = None  # Note: often same as plan in snippets
         self.initial_checker_code: Optional[str] = None  # Code before repair/refinement
+                                                          # For CSA: C++ checker code
+                                                          # For Semgrep: YAML rule content
 
         # Syntax Repair
         self.syntax_repair_log: List[RepairResult] = []  # List of repair attempts
         self.repaired_checker_code: Optional[
             str
         ] = None  # Code after repairChecker step
+                  # For CSA: Repaired C++ checker code
+                  # For Semgrep: Repaired YAML rule content
 
         # Evaluation results
         self.tp_score: int = -10  # True Positives, default from checker_gen.py
@@ -195,13 +199,10 @@ class CheckerData:
 
         # Data from the refinement phase (checker_refine.py)
         self.refinement_history: List[RefineResult] = []
-        self.final_checker_code: Optional[str] = None
+        self.final_checker_code: Optional[str] = None  # Final code after refinement
+                                                        # For CSA: Final C++ checker code
+                                                        # For Semgrep: Final YAML rule content
 
-        # Add semgrep-specific fields
-        self.semgrep_rule: Optional[str] = None  # For semgrep rules
-        self.repaired_semgrep_rule: Optional[str] = None  # Repaired semgrep rule
-        self.final_semgrep_rule: Optional[str] = None  # Final semgrep rule
-    
     def update_base_result_dir(self, base_result_dir: Path):
         """Updates the base result directory."""
         self._base_result_dir = base_result_dir
@@ -271,12 +272,6 @@ class CheckerData:
             # "refinement_history": [hist.to_dict() for hist in self.refinement_history],
             # "final_checker_code": self.final_checker_code,
         }
-        # Add semgrep fields
-        result.update({
-            "semgrep_rule": self.semgrep_rule,
-            "repaired_semgrep_rule": self.repaired_semgrep_rule,
-            "final_semgrep_rule": self.final_semgrep_rule,
-        })
         return result
 
     @property
@@ -315,21 +310,31 @@ class CheckerData:
         (output_dir / "pattern.txt").write_text(self.pattern or "")
         (output_dir / "plan.txt").write_text(self.plan or "")
         (output_dir / "refined_plan.txt").write_text(self.refined_plan or "")
-        (output_dir / "checker-initial.cpp").write_text(self.initial_checker_code or "")
-        (output_dir / "checker-repaired.cpp").write_text(
-            self.repaired_checker_code or ""
-        )
-        (output_dir / "checker-final.cpp").write_text(self.final_checker_code or "")
+        
+        # Save initial code with appropriate extension based on content
+        if self.initial_checker_code:
+            if self.initial_checker_code.strip().startswith('rules:'):
+                (output_dir / "checker-initial.yml").write_text(self.initial_checker_code)
+            else:
+                (output_dir / "checker-initial.cpp").write_text(self.initial_checker_code)
+        
+        # Save repaired code with appropriate extension
+        if self.repaired_checker_code:
+            if self.repaired_checker_code.strip().startswith('rules:'):
+                (output_dir / "checker-repaired.yml").write_text(self.repaired_checker_code)
+            else:
+                (output_dir / "checker-repaired.cpp").write_text(self.repaired_checker_code)
+        
+        # Save final code with appropriate extension
+        if self.final_checker_code:
+            if self.final_checker_code.strip().startswith('rules:'):
+                (output_dir / "checker-final.yml").write_text(self.final_checker_code)
+            else:
+                (output_dir / "checker-final.cpp").write_text(self.final_checker_code)
+                
         (output_dir / "score.txt").write_text(
             f"TP: {self.tp_score}\nTN: {self.tn_score}"
         )
-        # Add semgrep rule files
-        if self.semgrep_rule:
-            (output_dir / "semgrep-rule-initial.yml").write_text(self.semgrep_rule)
-        if self.repaired_semgrep_rule:
-            (output_dir / "semgrep-rule-repaired.yml").write_text(self.repaired_semgrep_rule)
-        if self.final_semgrep_rule:
-            (output_dir / "semgrep-rule-final.yml").write_text(self.final_semgrep_rule)
 
     @staticmethod
     def load_checker_data_from_file(file_path: str) -> "CheckerData":
@@ -379,17 +384,27 @@ class CheckerData:
             index=index,
         )
 
-        # Load the files
+        # Load the files - try both extensions
         checker_data.patch = (dir_path / "patch.txt").read_text()
         checker_data.pattern = (dir_path / "pattern.txt").read_text()
         checker_data.plan = (dir_path / "plan.txt").read_text()
         checker_data.refined_plan = (dir_path / "refined_plan.txt").read_text()
-        checker_data.initial_checker_code = (
-            dir_path / "checker-initial.cpp"
-        ).read_text()
-        checker_data.repaired_checker_code = (
-            dir_path / "checker-repaired.cpp"
-        ).read_text()
+        
+        # Load initial code - try both extensions
+        initial_cpp = dir_path / "checker-initial.cpp"
+        initial_yml = dir_path / "checker-initial.yml"
+        if initial_yml.exists():
+            checker_data.initial_checker_code = initial_yml.read_text()
+        elif initial_cpp.exists():
+            checker_data.initial_checker_code = initial_cpp.read_text()
+        
+        # Load repaired code - try both extensions
+        repaired_cpp = dir_path / "checker-repaired.cpp"
+        repaired_yml = dir_path / "checker-repaired.yml"
+        if repaired_yml.exists():
+            checker_data.repaired_checker_code = repaired_yml.read_text()
+        elif repaired_cpp.exists():
+            checker_data.repaired_checker_code = repaired_cpp.read_text()
 
         score_file = dir_path / "score.txt"
         if score_file.exists():
@@ -397,19 +412,6 @@ class CheckerData:
             print(score_content)
             checker_data.tp_score = int(score_content[0].split(":")[-1].strip())
             checker_data.tn_score = int(score_content[1].split(":")[-1].strip())
-
-        # Load semgrep rule files if they exist
-        semgrep_initial_file = dir_path / "semgrep-rule-initial.yml"
-        if semgrep_initial_file.exists():
-            checker_data.semgrep_rule = semgrep_initial_file.read_text()
-            
-        semgrep_repaired_file = dir_path / "semgrep-rule-repaired.yml"
-        if semgrep_repaired_file.exists():
-            checker_data.repaired_semgrep_rule = semgrep_repaired_file.read_text()
-            
-        semgrep_final_file = dir_path / "semgrep-rule-final.yml"
-        if semgrep_final_file.exists():
-            checker_data.final_semgrep_rule = semgrep_final_file.read_text()
         
         return checker_data
 

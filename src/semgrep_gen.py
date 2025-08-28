@@ -153,7 +153,7 @@ def sem_gen_worker(
         # Update the semgrep_data
         semgrep_data.pattern = pattern
         semgrep_data.plan = plan
-        semgrep_data.initial_checker_code = semgrep_rule
+        semgrep_data.initial_checker_code = semgrep_rule  # Store semgrep rule in checker_code field
 
         # Dump the semgrep data
         (intermediate_dir / "pattern.txt").write_text(pattern)
@@ -169,7 +169,7 @@ def sem_gen_worker(
             intermediate_dir=intermediate_dir,
             semgrep_rule=semgrep_rule,
         )
-        semgrep_data.repaired_checker_code = repaired_semgrep_rule
+        semgrep_data.repaired_checker_code = repaired_semgrep_rule  # Store repaired rule in checker_code field
 
         if not ret:
             logger.error(f"Fail to generate valid semgrep rule{i}")

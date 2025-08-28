@@ -27,7 +27,7 @@ def init_config(config_file: str):
 
     logger.debug("Config file: " + config_file)
     logger.debug("Result dir: " + result_dir)
-    logger.debug("Analysis backend: " + str(global_config.get("backend")))
+    logger.debug("Analysis backend: " + str(global_config.get("backend_type")))
     logger.debug("Target: " + str(global_config.get("target")))
 
 

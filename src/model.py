@@ -214,7 +214,7 @@ def invoke_llm_semgrep(
     model=model_config["model"],
     max_tokens=model_config["max_tokens"],
 ) -> str:
-    """Invoke the LLM model with the given prompt."""
+    """Invoke the LLM model with the given prompt for Semgrep rule generation."""
 
     logger.info(f"start LLM process: {model}")
     num_tokens = num_tokens_from_string(prompt)
@@ -226,78 +226,66 @@ def invoke_llm_semgrep(
     failed_count = 0
     while True:
         try:
-            if model in ["gpt-4o", "o1", "o3-mini", "o1-mini", "o1-preview", "gpt-4o-mini"]:
-                client = openai_client
-            elif model == "deepseek-reasoner":
-                client = deepseek_client
-            elif model == "local-deepseek":
-                client = local_deepseek_client
-                model = model_config["local_deepseek_model"]
-            elif model == "azure-deepseek":
-                client = azure_deepseek_client
-            elif model == "nv-deepseek":
-                client = nv_client
-            elif model == "google":
-                client = google_client
-            else:
-                raise ValueError(f"Model {model} not supported")
+            # Get the appropriate client and model
+            client, actual_model = get_client_and_model(model)
 
-            if model == "azure-deepseek":
-                payload = {
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                }
-                response = client.complete(payload)
-            elif model in ["o1-preview", "o1-mini", "o1", "o3-mini"]:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": 
-                           "system", "content": """You generate Semgrep rules in YAML format. 
-    Return only the raw YAML content without any markdown formatting or additional text.
-    Always include these required fields: id, pattern, message, severity, languages.
-    Focus on detecting security vulnerabilities and coding issues."""},
-                          {"role":
-                           "user", "content": prompt}],
-                )
-            elif model == "nv-deepseek":
-                response = client.chat.completions.create(
-                    model="deepseek-ai/deepseek-r1",
-                    messages=[{"role": "user", "content": prompt}],
+            # Handle different client types for Semgrep generation
+            if isinstance(
+                client, anthropic.Anthropic if ANTHROPIC_AVAILABLE else type(None)
+            ):
+                # Claude API
+                system_prompt = """You generate Semgrep rules in YAML format. 
+Return only the raw YAML content without any markdown formatting or additional text.
+Always include these required fields: id, pattern, message, severity, languages.
+Focus on detecting security vulnerabilities and coding issues."""
+                
+                response = client.messages.create(
+                    model=actual_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ],
                     max_tokens=max_tokens,
                     temperature=temperature,
                 )
-            elif model == "deepseek-reasoner":
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": 
-                           "system", "content": """You generate Semgrep rules in YAML format. 
-    Return only the raw YAML content without any markdown formatting or additional text.
-    Always include these required fields: id, pattern, message, severity, languages.
-    Focus on detecting security vulnerabilities and coding issues."""},
-                          {"role":
-                           "user", "content": prompt}],
-                    max_tokens=8192,
-                )
-            elif model == "google":
+                answer = response.content[0].text
+
+            elif isinstance(client, genai.Client):
+                # Google API
+                system_prompt = """You generate Semgrep rules in YAML format. 
+Return only the raw YAML content without any markdown formatting or additional text.
+Always include these required fields: id, pattern, message, severity, languages.
+Focus on detecting security vulnerabilities and coding issues."""
+                
+                full_prompt = f"{system_prompt}\n\n{prompt}"
                 response = client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=prompt,
+                    model=actual_model,
+                    contents=full_prompt,
                 )
-            else:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": 
-                           "system", "content": """You generate Semgrep rules in YAML format. 
-    Return only the raw YAML content without any markdown formatting or additional text.
-    Always include these required fields: id, pattern, message, severity, languages.
-    Focus on detecting security vulnerabilities and coding issues."""},
-                          {"role":
-                           "user", "content": prompt}],
-                    temperature=temperature,
-                    n=1,
-                    max_tokens=max_tokens,
-                )
+                answer = response.text
+
+            else:  # OpenAI or compatible
+                system_content = """You generate Semgrep rules in YAML format. 
+Return only the raw YAML content without any markdown formatting or additional text.
+Always include these required fields: id, pattern, message, severity, languages.
+Focus on detecting security vulnerabilities and coding issues."""
+
+                kwargs = {
+                    "model": actual_model,
+                    "messages": [
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_completion_tokens": max_tokens,
+                }
+
+                # Only add temperature for models that support it
+                no_temp_models = ["o1", "o3-mini", "o4-mini", "o1-preview", "gpt-5"]
+                if not any(m in actual_model for m in no_temp_models):
+                    kwargs["temperature"] = temperature
+
+                response = client.chat.completions.create(**kwargs)
+                answer = response.choices[0].message.content
 
         except Exception as e:
             logger.error("Error: {}".format(e))
@@ -309,22 +297,19 @@ def invoke_llm_semgrep(
         else:
             logger.info("finish LLM process")
 
-            if isinstance(response, str):
-                logger.warning("Response is a string")
+            if isinstance(answer, str):
+                # Remove think tags if present
+                if "<think>" in answer or "</think>" in answer:
+                    answer = answer.split("</think>")[-1].strip()
+                return answer
+            else:
+                logger.warning("Response is not a string")
                 failed_count += 1
                 if failed_count > 5:
                     logger.error("Failed too many times. Skip.")
                     return None
                 time.sleep(2)
                 continue
-            if model == "google":
-                return response.text
-
-            answer = response.choices[0].message.content
-            if "<think>" in answer or "</think>" in answer:
-                # Delete the content between <think> and </think> tags
-                answer = answer.split("</think>")[-1].strip()
-            return answer
 
 def get_embeddings(text: str) -> list:
     """Get embeddings using OpenAI API"""

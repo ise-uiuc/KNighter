@@ -70,13 +70,13 @@ def init_semgrep_example():
         try:
             pattern = (example_dir / "pattern.md").read_text() if (example_dir / "pattern.md").exists() else ""
             plan = (example_dir / "plan.md").read_text() if (example_dir / "plan.md").exists() else ""
-            semgrep_rule = (example_dir / "semgrep_rule.yml").read_text() if (example_dir / "semgrep_rule.yml").exists() else ""
+            checker_code = (example_dir / "semgrep_rule.yml").read_text() if (example_dir / "semgrep_rule.yml").exists() else ""
             
-            # Create a simplified example for semgrep
+            # Create a simplified example for semgrep - use unified field names
             semgrep_example = {
                 'pattern': pattern,
                 'plan': plan,
-                'semgrep_rule': semgrep_rule,
+                'checker_code': checker_code,  # Use unified field name
                 'dir': example_dir
             }
             semgrep_example_list.append(semgrep_example)

@@ -102,72 +102,6 @@ def get_semgrep_example_text(
     if example_list is None:
         example_list = default_semgrep_examples
     
-    if not example_list:
-        # Fallback to hardcoded examples if no files found
-        return """
-## Example 1
-
-### Patch
-```diff
-- if ($PPS[$ID]->$FIELD == false) {
--   ... 
-- }
-+ if ($PPS[$ID] == nullptr || $PPS[$ID]->$FIELD == false) {
-+   ...
-+ }
-```
-
-### Semgrep Rule
-```yaml
-rules:
-- id: vuln-libde265-0b1752ab
-  pattern: "if ($PPS[$ID]->$FIELD == false) {\n  ...\n}\n"
-  pattern-not: "if ($PPS[$ID] == nullptr || $PPS[$ID]->$FIELD == false) {\n  ...\n\
-    }\n"
-  languages:
-  - cpp
-  message: 'Detected a potential null pointer dereference vulnerability. The code
-    checks a field of a PPS object without first verifying that the object is not
-    null. This can lead to a crash or undefined behavior. To fix this, add a null
-    check before accessing the object''s fields.'
-  severity: ERROR
-  metadata:
-    source-url: github.com/strukturag/libde265/commit/0b1752abff97cb542941d317a0d18aa50cb199b1
-    category: security
-    cwe:
-    - CWE-476
-    technology:
-    - cpp
-```
-
-## Example 2
-
-### Patch
-```diff
-- free(buffer);
-- return;
-+ free(buffer);
-+ buffer = NULL;
-+ return;
-```
-
-### Semgrep Rule
-```yaml
-rules:
-  - id: use-after-free
-    pattern: |
-      free($VAR);
-      ...
-      $VAR
-    pattern-not: |
-      free($VAR);
-      $VAR = NULL;
-    languages: ["c"]
-    message: "Potential use-after-free. Set pointer to NULL after freeing."
-    severity: ERROR
-```
-"""
-    
     example_text = ""
     for i, example in enumerate(example_list):
         example_text += f"## Example {i+1}\n"
@@ -620,7 +554,7 @@ def patch2semgrep(id: str, iter: int, patch: str):
     patch2semgrep_prompt = patch2semgrep_prompt.replace("{{examples}}", example_text)
 
     prompt_history_dir = (
-        Path(global_config.get("semgrep_dir", "./semgrep_rules")) / id / "prompt_history" / str(iter)
+        Path(global_config.result_dir) / "semgrep_rules" / id / "prompt_history" / str(iter)
     )
     path2store = prompt_history_dir / "patch2semgrep.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
@@ -662,7 +596,7 @@ def plan2semgrep(
     )
 
     prompt_history_dir = (
-        Path(global_config.get("semgrep_dir", "./semgrep_rules")) / id / "prompt_history" / str(iter)
+        Path(global_config.result_dir) / "semgrep_rules" / id / "prompt_history" / str(iter)
     )
     path2store = prompt_history_dir / "plan2semgrep.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
@@ -686,7 +620,7 @@ def repair_semgrep_syntax(id: str, repair_name: str, times: int, semgrep_rule: s
     )
 
     prompt_history_dir = (
-        Path(global_config.get("semgrep_dir", "./semgrep_rules")) / id / "prompt_history" / repair_name
+        Path(global_config.result_dir) / "semgrep_rules" / id / "prompt_history" / repair_name
     )
     path2store = prompt_history_dir / f"repair_semgrep_syntax-{times}.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
@@ -730,7 +664,6 @@ def pattern2semplan(
 
     if sample_examples:
         logger.warning("Sample examples for pattern2semplan")
-        # TODO: Implement sampling for semgrep examples
         example_text = get_semgrep_example_text(need_pattern=True, need_plan=True, need_semgrep_rule=False)
     else:
         example_text = get_semgrep_example_text(need_pattern=True, need_plan=True, need_semgrep_rule=False)
@@ -768,7 +701,7 @@ def pattern2semplan(
     )
 
     prompt_history_dir = (
-        Path(global_config.get("semgrep_dir", "./semgrep_rules")) / id / "prompt_history" / str(iter)
+        Path(global_config.result_dir) / "semgrep_rules" / id / "prompt_history" / str(iter)
     )
     path2store = prompt_history_dir / "pattern2semplan.md"
     prompt_history_dir.mkdir(parents=True, exist_ok=True)
