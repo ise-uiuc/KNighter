@@ -242,10 +242,16 @@ For comprehensive architecture documentation, see [`ARCHITECTURE.md`](ARCHITECTU
 
 **Citation**: If you use KNighter in your research, please cite our paper:
 ```bibtex
-@article{knighter,
-  title={KNighter: Transforming Static Analysis with LLM-Synthesized Checkers},
-  author={Yang, Chenyuan and Zhao, Zijie and Xie, Zichen and Li, Haoyu and Zhang, Lingming},
-  journal={arXiv preprint arXiv:2503.09002},
-  year={2025}
+@inproceedings{knighter,
+    title = {KNighter: Transforming Static Analysis with LLM-Synthesized Checkers},
+    author = {Yang, Chenyuan and Zhao, Zijie and Xie, Zichen and Li, Haoyu and Zhang, Lingming},
+    year = {2025},
+    publisher = {Association for Computing Machinery},
+    address = {New York, NY, USA},
+    url = {https://doi.org/10.1145/3731569.3764827},
+    doi = {10.1145/3731569.3764827},
+    booktitle = {Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles},
+    location = {Seoul, Republic of Korea},
+    series = {SOSP '25}
 }
 ```
