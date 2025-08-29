@@ -27,6 +27,8 @@
 - **⚡ LLVM Integration**: Built on top of LLVM for robust static analysis capabilities
 - **🐧 Linux Kernel Focus**: Specialized for finding bugs in large-scale C/C++ codebases like the Linux kernel
 
+The detected bugs 🐛 can be found [here](https://docs.google.com/spreadsheets/d/1WzUhbUK0JE9QahywsfEBGEy94-o5F1A0F921ljyPuJk/edit?usp=sharing).
+
 > [!IMPORTANT]
 > We are continuously improving the documentation and adding new features. Please stay tuned for updates.
 
