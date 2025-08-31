@@ -6,6 +6,7 @@ import loguru
 import yaml
 
 from backends.csa import ClangBackend
+from backends.semgrep import SemgrepBackend
 from backends.factory import AnalysisBackendFactory
 from targets.factory import TargetFactory
 from targets.linux import Linux
@@ -45,7 +46,12 @@ class GlobalConfig:
         # Init the target and backend
         # FIXME: This should be extended to support other targets and backends
         self._config["target"] = Linux(self.get("linux_dir"))
-        self._config["backend"] = ClangBackend(self.get("LLVM_dir"))
+        # Initialize backend based on configuration
+        backend_type = self.get("backend_type", "csa")
+        if backend_type == "semgrep":
+            self._config["backend"] = SemgrepBackend(self.get("semgrep_dir", "./semgrep_rules"))
+        else:
+            self._config["backend"] = ClangBackend(self.get("LLVM_dir"))
 
     def _init_logger(self):
         """Initialize the logger."""

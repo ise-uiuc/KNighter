@@ -208,6 +208,108 @@ def invoke_llm(
 
     return None
 
+def invoke_llm_semgrep(
+    prompt,
+    temperature=model_config["temperature"],
+    model=model_config["model"],
+    max_tokens=model_config["max_tokens"],
+) -> str:
+    """Invoke the LLM model with the given prompt for Semgrep rule generation."""
+
+    logger.info(f"start LLM process: {model}")
+    num_tokens = num_tokens_from_string(prompt)
+    logger.info("Token counts: {}".format(num_tokens))
+    if num_tokens > 100000:
+        logger.warning("Token counts exceed the limit. Skip.")
+        return None
+
+    failed_count = 0
+    while True:
+        try:
+            # Get the appropriate client and model
+            client, actual_model = get_client_and_model(model)
+
+            # Handle different client types for Semgrep generation
+            if isinstance(
+                client, anthropic.Anthropic if ANTHROPIC_AVAILABLE else type(None)
+            ):
+                # Claude API
+                system_prompt = """You generate Semgrep rules in YAML format. 
+Return only the raw YAML content without any markdown formatting or additional text.
+Always include these required fields: id, pattern, message, severity, languages.
+Focus on detecting security vulnerabilities and coding issues."""
+                
+                response = client.messages.create(
+                    model=actual_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                answer = response.content[0].text
+
+            elif isinstance(client, genai.Client):
+                # Google API
+                system_prompt = """You generate Semgrep rules in YAML format. 
+Return only the raw YAML content without any markdown formatting or additional text.
+Always include these required fields: id, pattern, message, severity, languages.
+Focus on detecting security vulnerabilities and coding issues."""
+                
+                full_prompt = f"{system_prompt}\n\n{prompt}"
+                response = client.models.generate_content(
+                    model=actual_model,
+                    contents=full_prompt,
+                )
+                answer = response.text
+
+            else:  # OpenAI or compatible
+                system_content = """You generate Semgrep rules in YAML format. 
+Return only the raw YAML content without any markdown formatting or additional text.
+Always include these required fields: id, pattern, message, severity, languages.
+Focus on detecting security vulnerabilities and coding issues."""
+
+                kwargs = {
+                    "model": actual_model,
+                    "messages": [
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_completion_tokens": max_tokens,
+                }
+
+                # Only add temperature for models that support it
+                no_temp_models = ["o1", "o3-mini", "o4-mini", "o1-preview", "gpt-5"]
+                if not any(m in actual_model for m in no_temp_models):
+                    kwargs["temperature"] = temperature
+
+                response = client.chat.completions.create(**kwargs)
+                answer = response.choices[0].message.content
+
+        except Exception as e:
+            logger.error("Error: {}".format(e))
+            failed_count += 1
+            if failed_count > 5:
+                logger.error("Failed too many times. Skip.")
+                raise e
+            time.sleep(2)
+        else:
+            logger.info("finish LLM process")
+
+            if isinstance(answer, str):
+                # Remove think tags if present
+                if "<think>" in answer or "</think>" in answer:
+                    answer = answer.split("</think>")[-1].strip()
+                return answer
+            else:
+                logger.warning("Response is not a string")
+                failed_count += 1
+                if failed_count > 5:
+                    logger.error("Failed too many times. Skip.")
+                    return None
+                time.sleep(2)
+                continue
 
 def get_embeddings(text: str) -> list:
     """Get embeddings using OpenAI API"""

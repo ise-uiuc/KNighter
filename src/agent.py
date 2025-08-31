@@ -5,12 +5,14 @@ from pydantic import BaseModel
 
 from checker_example import choose_example
 from global_config import global_config
-from model import invoke_llm
+from model import invoke_llm, invoke_llm_semgrep
 from tools import error_formatting, grab_error_message
 
 prompt_template_dir = Path(__file__).parent.parent / "prompt_template"
 example_dir = prompt_template_dir / "examples"
 default_checker_examples = []
+semgrep_example_dir = prompt_template_dir / "semgrep_examples"
+default_semgrep_examples = []
 
 UTILITY_FUNCTION = (prompt_template_dir / "knowledge" / "utility.md").read_text()
 SUGGESTIONS = (prompt_template_dir / "knowledge" / "suggestions.md").read_text()
@@ -35,11 +37,36 @@ class Example(BaseModel):
             patch=patch, pattern=pattern, plan=plan, checker_code=checker_code
         )
 
+class SemgrepExample(BaseModel):
+    patch: str
+    pattern: str
+    plan: str
+    semgrep_rule: str
+
+    @staticmethod
+    def load_example_from_dir(example_dir: str):
+        example_dir = Path(example_dir)
+        patch = (example_dir / "patch.md").read_text()
+        pattern = (example_dir / "pattern.md").read_text() if (example_dir / "pattern.md").exists() else ""
+        plan = (example_dir / "plan.md").read_text() if (example_dir / "plan.md").exists() else ""
+        semgrep_rule = (example_dir / "semgrep_rule.yml").read_text() if (example_dir / "semgrep_rule.yml").exists() else ""
+
+        return SemgrepExample(
+            patch=patch, pattern=pattern, plan=plan, semgrep_rule=semgrep_rule
+        )
+
 
 for checker_dir in example_dir.iterdir():
     if not checker_dir.is_dir():
         continue
     default_checker_examples.append(Example.load_example_from_dir(checker_dir))
+
+# Load semgrep examples
+if semgrep_example_dir.exists():
+    for semgrep_dir in semgrep_example_dir.iterdir():
+        if not semgrep_dir.is_dir():
+            continue
+        default_semgrep_examples.append(SemgrepExample.load_example_from_dir(semgrep_dir))
 
 
 def get_example_text(
@@ -64,6 +91,31 @@ def get_example_text(
             example_text += "```\n\n"
     return example_text
 
+def get_semgrep_example_text(
+    example_list=None,
+    need_patch: bool = True,
+    need_pattern: bool = False,
+    need_plan: bool = False,
+    need_semgrep_rule: bool = True,
+):
+    """Get example text for Semgrep rules from actual example files."""
+    if example_list is None:
+        example_list = default_semgrep_examples
+    
+    example_text = ""
+    for i, example in enumerate(example_list):
+        example_text += f"## Example {i+1}\n"
+        if need_patch:
+            example_text += example.patch + "\n\n"
+        if need_pattern and example.pattern:
+            example_text += example.pattern + "\n\n"
+        if need_plan and example.plan:
+            example_text += example.plan + "\n\n"
+        if need_semgrep_rule and example.semgrep_rule:
+            example_text += "### Semgrep Rule\n```yaml\n"
+            example_text += example.semgrep_rule
+            example_text += "```\n\n"
+    return example_text
 
 patch2checker_template = (prompt_template_dir / "patch2checker.md").read_text()
 patch2pattern_template = (
@@ -475,5 +527,190 @@ def repair_syntax(id: str, iter: int, times, checker_code, error_content):
         response = "SKIP"
 
     response_store = prompt_history_dir / f"response_repair_syntax-{times}.md"
+    response_store.write_text(response)
+    return response
+
+"""Patch to Semgrep Rule"""
+patch2semgrep_template = (prompt_template_dir / "patch2semgrep.md").read_text()
+
+"""Pattern to Semgrep Plan"""
+pattern2semplan_template = (prompt_template_dir / "pattern2semplan.md").read_text()
+
+"""Plan to Semgrep Rule"""
+plan2semgrep_template = (prompt_template_dir / "plan2semgrep.md").read_text()
+
+"""Repair Semgrep Rule"""
+repair_semgrep_template = (prompt_template_dir / "repair_semgrep.md").read_text()
+
+
+def patch2semgrep(id: str, iter: int, patch: str):
+    """Generate Semgrep rule directly from patch."""
+    logger.info("start generating patch2semgrep prompts")
+    
+    # Use semgrep examples if available
+    example_text = get_semgrep_example_text()
+    
+    patch2semgrep_prompt = patch2semgrep_template.replace("{{input_patch}}", patch)
+    patch2semgrep_prompt = patch2semgrep_prompt.replace("{{examples}}", example_text)
+
+    prompt_history_dir = (
+        Path(global_config.result_dir) / "semgrep_rules" / id / "prompt_history" / str(iter)
+    )
+    path2store = prompt_history_dir / "patch2semgrep.md"
+    prompt_history_dir.mkdir(parents=True, exist_ok=True)
+
+    path2store.write_text(patch2semgrep_prompt)
+    logger.info("finish patch2semgrep generation")
+
+    response = invoke_llm(patch2semgrep_prompt)
+    response_store = prompt_history_dir / "response_semgrep.md"
+    response_store.write_text(response)
+    return response
+
+
+def plan2semgrep(
+    id: str,
+    iter: int,
+    pattern: str,
+    plan: str,
+    patch: str,
+    no_utility=False,
+    sample_examples=False,
+):
+    """Generate Semgrep rule from plan."""
+    logger.info("start generating plan2semgrep prompts")
+    
+    # Use semgrep examples if available
+    if sample_examples:
+        logger.warning("Sample examples for plan2semgrep")
+        # TODO: Implement sampling for semgrep examples
+        example_text = get_semgrep_example_text()
+    else:
+        example_text = get_semgrep_example_text()
+    
+    plan2semgrep_prompt = (
+        plan2semgrep_template.replace("{{input_pattern}}", pattern)
+        .replace("{{input_plan}}", plan)
+        .replace("{{input_patch}}", patch)
+        .replace("{{examples}}", example_text)
+    )
+
+    prompt_history_dir = (
+        Path(global_config.result_dir) / "semgrep_rules" / id / "prompt_history" / str(iter)
+    )
+    path2store = prompt_history_dir / "plan2semgrep.md"
+    prompt_history_dir.mkdir(parents=True, exist_ok=True)
+
+    path2store.write_text(plan2semgrep_prompt)
+    logger.info("finish plan2semgrep generation")
+
+    response = invoke_llm_semgrep(plan2semgrep_prompt)
+    response_store = prompt_history_dir / "response_semgrep.md"
+    response_store.write_text(response)
+    return response
+
+
+def repair_semgrep_syntax(id: str, repair_name: str, times: int, semgrep_rule: str, error_content: str):
+    """Repair Semgrep rule syntax errors."""
+    logger.info("start generating repair_semgrep_syntax prompts")
+    
+    prompt = (
+        repair_semgrep_template.replace("{{semgrep_rule}}", semgrep_rule)
+        .replace("{{error_messages}}", error_content)
+    )
+
+    prompt_history_dir = (
+        Path(global_config.result_dir) / "semgrep_rules" / id / "prompt_history" / repair_name
+    )
+    path2store = prompt_history_dir / f"repair_semgrep_syntax-{times}.md"
+    prompt_history_dir.mkdir(parents=True, exist_ok=True)
+
+    path2store.write_text(prompt)
+    logger.info("finish repair_semgrep_syntax generation")
+
+    response = invoke_llm(prompt)
+    if response is None:
+        logger.error("Empty response")
+        response = "SKIP"
+
+    response_store = prompt_history_dir / f"response_repair_semgrep_syntax-{times}.md"
+    response_store.write_text(response)
+    return response
+
+
+def pattern2semplan(
+    id: str,
+    iter: int,
+    pattern: str,
+    patch: str,
+    no_tp_plans=None,
+    no_fp_plans=None,
+    sample_examples=False,
+):
+    """Generate Semgrep plan based on the given pattern and patch.
+
+    Args:
+        id (str): The id of the current task.
+        iter (int): The iteration number.
+        pattern (str): The pattern of the bug.
+        patch (str): The patch of the bug.
+        no_tp_plans (list, optional): Plans that cannot detect the buggy pattern. Defaults to None.
+        no_fp_plans (list, optional): Plans that can label the non-buggy pattern correctly. Defaults to None.
+        sample_examples (bool, optional): Whether to sample examples. Defaults to False.
+    """
+    logger.info("start generating pattern2semplan prompts")
+    
+    template = pattern2semplan_template
+
+    if sample_examples:
+        logger.warning("Sample examples for pattern2semplan")
+        example_text = get_semgrep_example_text(need_pattern=True, need_plan=True, need_semgrep_rule=False)
+    else:
+        example_text = get_semgrep_example_text(need_pattern=True, need_plan=True, need_semgrep_rule=False)
+    
+    pattern2semplan_prompt = (
+        template.replace("{{input_pattern}}", pattern)
+        .replace("{{input_patch}}", patch)
+        .replace("{{examples}}", example_text)
+    )
+
+    feedback_plan_text = ""
+    if no_tp_plans:
+        no_tp_plan_text = "# Plans that cannot detect the buggy pattern\n"
+        # The last three plans if there are more than 3 failed plans
+        if len(no_tp_plans) > 3:
+            no_tp_plans = no_tp_plans[-3:]
+
+        for i, plan in enumerate(no_tp_plans):
+            no_tp_plan_text += f"## Failed Plan {i+1}\n"
+            no_tp_plan_text += plan + "\n\n"
+        feedback_plan_text += no_tp_plan_text
+    if no_fp_plans:
+        no_fp_plan_text = "# Plans that can label the non-buggy pattern correctly\n"
+
+        if len(no_fp_plans) > 3:
+            no_fp_plans = no_fp_plans[-3:]
+
+        for i, plan in enumerate(no_fp_plans):
+            no_fp_plan_text += f"## Failed Plan {i+1}\n"
+            no_fp_plan_text += plan + "\n\n"
+        feedback_plan_text += no_fp_plan_text
+
+    pattern2semplan_prompt = pattern2semplan_prompt.replace(
+        "{{failed_plan_examples}}", feedback_plan_text
+    )
+
+    prompt_history_dir = (
+        Path(global_config.result_dir) / "semgrep_rules" / id / "prompt_history" / str(iter)
+    )
+    path2store = prompt_history_dir / "pattern2semplan.md"
+    prompt_history_dir.mkdir(parents=True, exist_ok=True)
+
+    path2store.write_text(pattern2semplan_prompt)
+    logger.info("finish pattern2semplan generation")
+
+    response = invoke_llm(pattern2semplan_prompt)
+    response_store = prompt_history_dir / "response_semplan.md"
+
     response_store.write_text(response)
     return response

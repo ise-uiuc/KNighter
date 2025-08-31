@@ -182,12 +182,16 @@ class CheckerData:
         self.plan: Optional[str] = None
         self.refined_plan: Optional[str] = None  # Note: often same as plan in snippets
         self.initial_checker_code: Optional[str] = None  # Code before repair/refinement
+                                                          # For CSA: C++ checker code
+                                                          # For Semgrep: YAML rule content
 
         # Syntax Repair
         self.syntax_repair_log: List[RepairResult] = []  # List of repair attempts
         self.repaired_checker_code: Optional[
             str
         ] = None  # Code after repairChecker step
+                  # For CSA: Repaired C++ checker code
+                  # For Semgrep: Repaired YAML rule content
 
         # Evaluation results
         self.tp_score: int = -10  # True Positives, default from checker_gen.py
@@ -195,7 +199,9 @@ class CheckerData:
 
         # Data from the refinement phase (checker_refine.py)
         self.refinement_history: List[RefineResult] = []
-        self.final_checker_code: Optional[str] = None
+        self.final_checker_code: Optional[str] = None  # Final code after refinement
+                                                        # For CSA: Final C++ checker code
+                                                        # For Semgrep: Final YAML rule content
 
     def update_base_result_dir(self, base_result_dir: Path):
         """Updates the base result directory."""
@@ -246,7 +252,7 @@ class CheckerData:
 
     def to_dict(self) -> dict:
         """Converts the CheckerData instance to a JSON-serializable dictionary."""
-        return {
+        result = {
             "commit_id": self.commit_id,
             "commit_type": self.commit_type,
             "index": self.index,
@@ -266,6 +272,7 @@ class CheckerData:
             # "refinement_history": [hist.to_dict() for hist in self.refinement_history],
             # "final_checker_code": self.final_checker_code,
         }
+        return result
 
     @property
     def checker_id(self) -> str:
@@ -303,11 +310,28 @@ class CheckerData:
         (output_dir / "pattern.txt").write_text(self.pattern or "")
         (output_dir / "plan.txt").write_text(self.plan or "")
         (output_dir / "refined_plan.txt").write_text(self.refined_plan or "")
-        (output_dir / "checker-initial.cpp").write_text(self.initial_checker_code or "")
-        (output_dir / "checker-repaired.cpp").write_text(
-            self.repaired_checker_code or ""
-        )
-        (output_dir / "checker-final.cpp").write_text(self.final_checker_code or "")
+        
+        # Save initial code with appropriate extension based on content
+        if self.initial_checker_code:
+            if self.initial_checker_code.strip().startswith('rules:'):
+                (output_dir / "checker-initial.yml").write_text(self.initial_checker_code)
+            else:
+                (output_dir / "checker-initial.cpp").write_text(self.initial_checker_code)
+        
+        # Save repaired code with appropriate extension
+        if self.repaired_checker_code:
+            if self.repaired_checker_code.strip().startswith('rules:'):
+                (output_dir / "checker-repaired.yml").write_text(self.repaired_checker_code)
+            else:
+                (output_dir / "checker-repaired.cpp").write_text(self.repaired_checker_code)
+        
+        # Save final code with appropriate extension
+        if self.final_checker_code:
+            if self.final_checker_code.strip().startswith('rules:'):
+                (output_dir / "checker-final.yml").write_text(self.final_checker_code)
+            else:
+                (output_dir / "checker-final.cpp").write_text(self.final_checker_code)
+                
         (output_dir / "score.txt").write_text(
             f"TP: {self.tp_score}\nTN: {self.tn_score}"
         )
@@ -360,17 +384,27 @@ class CheckerData:
             index=index,
         )
 
-        # Load the files
+        # Load the files - try both extensions
         checker_data.patch = (dir_path / "patch.txt").read_text()
         checker_data.pattern = (dir_path / "pattern.txt").read_text()
         checker_data.plan = (dir_path / "plan.txt").read_text()
         checker_data.refined_plan = (dir_path / "refined_plan.txt").read_text()
-        checker_data.initial_checker_code = (
-            dir_path / "checker-initial.cpp"
-        ).read_text()
-        checker_data.repaired_checker_code = (
-            dir_path / "checker-repaired.cpp"
-        ).read_text()
+        
+        # Load initial code - try both extensions
+        initial_cpp = dir_path / "checker-initial.cpp"
+        initial_yml = dir_path / "checker-initial.yml"
+        if initial_yml.exists():
+            checker_data.initial_checker_code = initial_yml.read_text()
+        elif initial_cpp.exists():
+            checker_data.initial_checker_code = initial_cpp.read_text()
+        
+        # Load repaired code - try both extensions
+        repaired_cpp = dir_path / "checker-repaired.cpp"
+        repaired_yml = dir_path / "checker-repaired.yml"
+        if repaired_yml.exists():
+            checker_data.repaired_checker_code = repaired_yml.read_text()
+        elif repaired_cpp.exists():
+            checker_data.repaired_checker_code = repaired_cpp.read_text()
 
         score_file = dir_path / "score.txt"
         if score_file.exists():
@@ -378,7 +412,7 @@ class CheckerData:
             print(score_content)
             checker_data.tp_score = int(score_content[0].split(":")[-1].strip())
             checker_data.tn_score = int(score_content[1].split(":")[-1].strip())
-
+        
         return checker_data
 
 
