@@ -77,7 +77,7 @@ bool functionKnownToDeref(const CallEvent &Call,
     StringRef FnName = ID->getName();
 
     for (const auto &Entry : DerefTable) {
-      if (FnName.equals(Entry.Name)) {
+      if (FnName == Entry.Name) {
         // We found the function in our table, copy its param indices
         DerefParams.append(Entry.Params.begin(), Entry.Params.end());
         return true;
