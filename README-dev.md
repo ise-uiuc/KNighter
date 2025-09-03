@@ -67,8 +67,8 @@ gclient sync  # 10-minute timeout
 
 # Generate build configuration with custom LLVM-21
 gn gen out/x64.release --args='
-  target_cpu="x64" 
-  is_debug=false 
+  target_cpu="x64"
+  is_debug=false
   v8_static_library=true
   clang_base_path="/path/to/llvm-21/build"
   clang_use_chrome_plugins=false
@@ -88,7 +88,7 @@ gn gen out/x64.release --args='
 ```python
 # For each source file from patch:
 
-# 1. Map source to object file  
+# 1. Map source to object file
 source_file = "test/fuzzer/wasm/fuzzer-common.cc"
 obj_file = "obj/wasm_fuzzer_common/fuzzer-common.o"
 
@@ -170,7 +170,7 @@ def get_num_bugs_from_scan_build(output_dir):
    # Build LLVM-21 with plugin
    cd /scratch/chenyuan-data/knighter-dev-v8/llvm-21/build
    ninja SAGenTestPlugin
-   
+
    # Verify plugin exists
    ls -la lib/SAGenTestPlugin.so
    ```

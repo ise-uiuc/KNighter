@@ -3,8 +3,9 @@ import random
 import re
 import subprocess as sp
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from html2text import html2text
 from loguru import logger
@@ -685,6 +686,24 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         return num_bugs
 
+    def _create_unique_report_dir(self, commit_id: str, version_type: str) -> Path:
+        """Create unique report directory under result_dir for V8 analysis."""
+        # Import global_config here to avoid circular import
+        from global_config import global_config
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        result_dir = Path(global_config.result_dir)
+
+        # Create unique directory name: v8-reports/{commit_id}_{timestamp}_{version_type}
+        unique_dir_name = f"v8-reports/{commit_id}_{timestamp}_{version_type}"
+        output_dir = result_dir / unique_dir_name
+
+        # Ensure directory exists
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Created report directory: {output_dir}")
+        return output_dir
+
     def _validate_checker_v8(
         self,
         checker_code: str,
@@ -695,8 +714,19 @@ extern "C" const char clang_analyzerAPIVersionString[] =
     ):
         """
         Validate the checker against a V8 commit and patch.
-        Uses direct clang analysis bypassing scan-build entirely.
         """
+        # Remove depot_tools from PATH to prevent gclient sync from changing V8 dependencies
+        original_path = os.environ.get("PATH", "")
+        filtered_path = ":".join(
+            [p for p in original_path.split(":") if "depot_tools" not in p]
+        )
+        os.environ["PATH"] = filtered_path
+
+        logger.info(f"V8 validation: removed depot_tools from PATH")
+        logger.info(
+            f"Original PATH had {original_path.count('depot_tools')} depot_tools entries"
+        )
+
         TP, TN = 0, 0
         if not skip_build_checker:
             self.build_checker(
@@ -709,12 +739,24 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         source_files = target.get_source_files_from_patch(patch)
         logger.info(f"Source files to analyze: {source_files}")
 
-        # [DEBUG] Clear any existing debug log
+        # [DEBUG] Clear any existing debug log and create new one
         debug_log = "/tmp/v8_checker_debug.log"
         if os.path.exists(debug_log):
             os.remove(debug_log)
 
+        # Write initial debug info
+        with open(debug_log, "w") as f:
+            f.write(f"=== V8 Checker Validation Started ===\n")
+            f.write(f"Commit ID: {commit_id}\n")
+            f.write(f"Source files: {source_files}\n")
+            f.write(f"Skip build: {skip_build_checker}\n")
+            f.write("=" * 50 + "\n")
+
         num_bug_files = {}
+
+        # Create unique output directories for this validation session
+        buggy_output_dir = self._create_unique_report_dir(commit_id, "buggy")
+        fixed_output_dir = self._create_unique_report_dir(commit_id, "fixed")
 
         # Checkout buggy version
         target.checkout_commit(
@@ -729,17 +771,15 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 continue
 
             # Get object file for ninja build
-            obj_file = self._get_object_file_from_source(source_file)
+            obj_file = self._get_object_file_from_source(source_file, target)
             if not obj_file:
                 logger.warning(f"Could not determine object file for {source_file}")
                 continue
 
-            # Use separate output directory for buggy version
-            buggy_output_dir = "/tmp/test-scan-buggy"
+            # Use buggy output directory created earlier
             scan_build_cmd = self._generate_v8_analyzer_command(
                 source_file, obj_file, target, buggy_output_dir
             )
-            logger.info(f"Running scan-build analysis: {scan_build_cmd}")
 
             try:
                 if callable(scan_build_cmd):
@@ -764,8 +804,31 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             Path("tmp/scan_build_error.txt").write_text(res.stderr)
 
             logger.info(f"Buggy: return_code={res.returncode}")
+            # Append debug info about the analysis
+            with open(debug_log, "a") as f:
+                f.write(f"\n=== BUGGY VERSION - {source_file} ===\n")
+                f.write(f"Return code: {res.returncode}\n")
+                f.write(f"Stdout length: {len(res.stdout)} chars\n")
+                f.write(f"Stderr length: {len(res.stderr)} chars\n")
+                if res.stderr:
+                    f.write(f"Stderr (first 500 chars): {res.stderr[:500]}\n")
+
             # Use scan-build report parsing instead of direct output analysis
-            num_bugs = self.get_num_bugs_from_scan_build(buggy_output_dir)
+            num_bugs = self.get_num_bugs_from_scan_build(str(buggy_output_dir))
+
+            # Log HTML report details
+            with open(debug_log, "a") as f:
+                f.write(f"Output directory: {buggy_output_dir}\n")
+                f.write(f"Number of bugs found: {num_bugs}\n")
+                if os.path.exists(str(buggy_output_dir)):
+                    import glob
+
+                    html_files = glob.glob(
+                        os.path.join(str(buggy_output_dir), "*.html")
+                    )
+                    f.write(
+                        f"HTML files in output dir: {[os.path.basename(h) for h in html_files]}\n"
+                    )
             num_bug_files[source_file] = num_bugs
             if num_bugs > 0:
                 TP += 1
@@ -785,13 +848,12 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 continue
 
             # Get object file for ninja build
-            obj_file = self._get_object_file_from_source(source_file)
+            obj_file = self._get_object_file_from_source(source_file, target)
             if not obj_file:
                 logger.warning(f"Could not determine object file for {source_file}")
                 continue
 
-            # Use separate output directory for fixed version
-            fixed_output_dir = "/tmp/test-scan-fixed"
+            # Use fixed output directory created earlier
             scan_build_cmd = self._generate_v8_analyzer_command(
                 source_file, obj_file, target, fixed_output_dir
             )
@@ -816,8 +878,32 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 continue
 
             logger.info(f"Fixed: return_code={res.returncode}")
+
+            # Append debug info about the analysis
+            with open(debug_log, "a") as f:
+                f.write(f"\n=== FIXED VERSION - {source_file} ===\n")
+                f.write(f"Return code: {res.returncode}\n")
+                f.write(f"Stdout length: {len(res.stdout)} chars\n")
+                f.write(f"Stderr length: {len(res.stderr)} chars\n")
+                if res.stderr:
+                    f.write(f"Stderr (first 500 chars): {res.stderr[:500]}\n")
+
             # Use scan-build report parsing instead of direct output analysis
-            num_bugs = self.get_num_bugs_from_scan_build(fixed_output_dir)
+            num_bugs = self.get_num_bugs_from_scan_build(str(fixed_output_dir))
+
+            # Log HTML report details
+            with open(debug_log, "a") as f:
+                f.write(f"Output directory: {fixed_output_dir}\n")
+                f.write(f"Number of bugs found: {num_bugs}\n")
+                if os.path.exists(str(fixed_output_dir)):
+                    import glob
+
+                    html_files = glob.glob(
+                        os.path.join(str(fixed_output_dir), "*.html")
+                    )
+                    f.write(
+                        f"HTML files in output dir: {[os.path.basename(h) for h in html_files]}\n"
+                    )
             if num_bugs == 0 or num_bugs < num_bug_files.get(source_file, 0):
                 TN += 1
                 logger.info(
@@ -829,30 +915,81 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 )
 
         logger.info(f"V8 Validation Result: TP={TP}, TN={TN}")
+
+        # Write final summary to debug log
+        with open(debug_log, "a") as f:
+            f.write("\n" + "=" * 50 + "\n")
+            f.write("=== VALIDATION SUMMARY ===\n")
+            f.write(f"True Positives (TP): {TP}\n")
+            f.write(f"True Negatives (TN): {TN}\n")
+            f.write(f"Bug counts per file:\n")
+            for src, count in num_bug_files.items():
+                f.write(f"  {src}: {count} bugs\n")
+            f.write(f"Expected: TP=1, TN=1\n")
+            f.write(f"Success: {TP == 1 and TN == 1}\n")
+            f.write("=" * 50 + "\n")
+
         return TP, TN
 
-    def _get_object_file_from_source(self, source_file):
-        """Convert source file path to corresponding object file path."""
-        # Convert test/fuzzer/wasm/fuzzer-common.cc to obj/wasm_fuzzer_common/fuzzer-common.o
+    def _get_object_file_from_source(self, source_file, target):
+        """Convert source file path to corresponding object file path using compile_commands.json."""
+        import json
+        import shlex
+
+        # Try to find the actual object file from compile_commands.json
+        compile_commands_path = (
+            Path(target.repo.working_dir) / "out/x64.release/compile_commands.json"
+        )
+        if compile_commands_path.exists():
+            try:
+                with open(compile_commands_path) as f:
+                    commands = json.load(f)
+
+                # Normalize the source file path (V8 uses ../../ prefix)
+                normalized_source = f"../../{source_file}"
+
+                # Find the command for this source file
+                for cmd in commands:
+                    if cmd.get("file") == normalized_source:
+                        # Parse the command to find the -o flag
+                        parts = shlex.split(cmd["command"])
+                        for i, part in enumerate(parts):
+                            if part == "-o" and i + 1 < len(parts):
+                                logger.info(
+                                    f"Found object file mapping: {source_file} -> {parts[i+1]}"
+                                )
+                                return parts[i + 1]
+
+                logger.warning(
+                    f"No compile command found for {source_file}, using fallback"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error reading compile_commands.json: {e}, using fallback"
+                )
+
+        # Fallback: Use known V8 build patterns
         source_path = Path(source_file)
 
+        # Special case for test/fuzzer/wasm files
         if source_path.parts[0] == "test" and len(source_path.parts) >= 4:
-            # Handle test/fuzzer/wasm/fuzzer-common.cc -> obj/wasm_fuzzer_common/fuzzer-common.o
-            fuzzer_type = source_path.parts[2]  # "wasm"
-            filename = source_path.stem  # "fuzzer-common"
-            obj_file = f"obj/{fuzzer_type}_fuzzer_common/{filename}.o"
-            return obj_file
+            if source_path.parts[1] == "fuzzer" and source_path.parts[2] == "wasm":
+                filename = source_path.stem
+                return f"obj/wasm_fuzzer_common/{filename}.o"
 
-        # For other paths, use a generic mapping
-        relative_path = (
-            source_path.relative_to(source_path.parts[0])
-            if source_path.parts
-            else source_path
-        )
-        obj_path = Path("obj") / relative_path.with_suffix(".o")
-        return str(obj_path)
+        # For src/ files, most go to v8_base_without_compiler
+        if source_path.parts[0] == "src":
+            filename = source_path.stem
+            # Runtime, heap, builtins, etc. typically go to v8_base_without_compiler
+            return f"obj/v8_base_without_compiler/{filename}.o"
 
-    def _generate_v8_analyzer_command(self, source_file, obj_file, target, output_dir):
+        # Default fallback - just use the stem name
+        filename = source_path.stem
+        return f"obj/{filename}.o"
+
+    def _generate_v8_analyzer_command(
+        self, source_file, obj_file, target, output_dir: Path
+    ):
         """
         Generate an analyzer command for V8 source files using compile_commands.json.
         Uses the exact compilation flags from the build system.
@@ -886,7 +1023,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                     cmd_parts = shlex.split(compile_cmd)
 
                     # Create output directory
-                    os.makedirs(output_dir, exist_ok=True)
+                    output_dir.mkdir(parents=True, exist_ok=True)
 
                     # Build command using clang++ driver with --analyze (the WORKING approach!)
                     def run_build_and_analysis():
@@ -894,6 +1031,9 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                         env = os.environ.copy()
                         env["PATH"] = f"{llvm_build_dir}/bin:" + env.get("PATH", "")
 
+                        logger.info(
+                            f"Running ninja build: {['ninja', '-C', 'out/x64.release', obj_file]}"
+                        )
                         build_result = sp.run(
                             ["ninja", "-C", "out/x64.release", obj_file],
                             cwd=target.repo.working_dir,
@@ -903,6 +1043,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                         )
 
                         if build_result.returncode != 0:
+                            logger.error(f"Ninja build failed: {build_result.stderr}")
                             return build_result
 
                         # Step 2: Use clang++ driver with --analyze and EXACT same flags as compilation
@@ -990,16 +1131,14 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                                 "-Xanalyzer",
                                 "-analyzer-output=html",
                                 "-o",
-                                output_dir,  # HTML output goes to directory, not file
+                                str(output_dir.absolute()),
                                 f"../../{source_file}",  # Relative to build dir
                             ]
                         )
 
                         # Step 3: Run the analyzer from build directory (same as compilation)
                         logger.info(f"Running analyzer from: {build_dir}")
-                        logger.info(
-                            f"Analyzer command: {' '.join(analyzer_cmd[:15])}..."
-                        )
+                        logger.info(f"Analyzer command: {' '.join(analyzer_cmd)}")
 
                         analyze_result = sp.run(
                             analyzer_cmd,
@@ -1012,6 +1151,8 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                             logger.error(
                                 f"Analyzer failed: {analyze_result.stderr[:500]}"
                             )
+                        else:
+                            logger.info(f"Analyzer successful: {analyze_result.stdout}")
 
                         return analyze_result
 
@@ -1258,65 +1399,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         skip_checkout: bool = False,
         **kwargs,
     ):
-        """
-        Run the checker against a V8 commit.
-        """
-        from targets.v8 import V8
-
-        output_dir = Path(output_dir)
-        arch = kwargs.get("arch", "x64")
-        build_config = kwargs.get("build_config", "release")
-        timeout = kwargs.get("timeout", 1800)
-
-        if not skip_build_checker:
-            build_res, _ = self.build_checker(checker_code, Path("tmp"), attempt=1)
-            if build_res != 0:
-                logger.error("Build failed, skipping analysis.")
-                raise Exception("Build failed, skipping analysis.")
-
-        comd_prefix = self._generate_command(no_output=True, target_type="v8")
-        comd_prefix += "-o " + output_dir.absolute().as_posix()
-
-        if not skip_checkout:
-            target.checkout_commit(commit_id, arch=arch, build_config=build_config)
-
-        # Build command for V8 using scan-build
-        build_dir = f"out/{arch}.{build_config}"
-        comd = comd_prefix + f" ninja -C {build_dir} -j{jobs}"
-
-        # Object to analyze
-        if object_to_analyze:
-            comd += f" {object_to_analyze}"
-
-        logger.info("Running: " + comd)
-
-        scan_process = sp.Popen(
-            comd,
-            shell=True,
-            cwd=target.repo.working_dir,
-            stdout=sp.PIPE,
-            stderr=sp.PIPE,
-        )
-        output, completed = monitor_build_output(
-            scan_process, warning_limit=100, timeout=timeout
-        )
-
-        num_bugs = 0
-        if completed == "Complete":
-            return_code = scan_process.wait()
-            if return_code != 0:
-                logger.error("Fail to build V8 with checker!")
-                logger.error("Return code: " + str(return_code))
-                (output_dir / "scan_error.log").write_text(output)
-                return -999
-            if "No bugs found" not in output:
-                num_bugs = self.get_num_bugs(output)
-                logger.success(f"{num_bugs} bugs found!")
-        elif completed == "Timeout":
-            num_bugs = -1
-            logger.warning("Timeout!")
-
-        return num_bugs
+        raise NotImplementedError("Not implemented")
 
     def _generate_command(self, no_output=False, plugin_names=None, target_type=None):
         """
@@ -1331,9 +1414,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         """
         llvm_build_dir = (self.backend_path / "build").absolute()
         comd = f"PATH={llvm_build_dir}/bin:$PATH "
-
-        # GUARANTEED plugin loading - use our bulletproof wrapper
-        comd += f"{llvm_build_dir}/bin/scan-build --use-cc=clang --use-c++=/scratch/chenyuan-data/knighter-dev-v8/force-plugin-clang++ "
+        comd += f"{llvm_build_dir}/bin/scan-build "
 
         # Use appropriate arguments based on target type
         args_to_use = self._v8_args if target_type == "v8" else self._default_args

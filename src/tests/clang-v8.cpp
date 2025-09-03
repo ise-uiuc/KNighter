@@ -1,176 +1,304 @@
-//===- SAGenTestChecker.cpp --------------------------------------*- C++-*-===//
-//
-//  CSA plugin checker for V8 null dereference bug pattern.
-//  Pattern: Detect Cast<T> template calls on potentially null values.
-//
-//===----------------------------------------------------------------------===//
-
-#include "clang/AST/Decl.h"
-#include "clang/AST/Expr.h"
-#include "clang/AST/Stmt.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugReporter.h"
 #include "clang/StaticAnalyzer/Core/BugReporter/BugType.h"
+#include "clang/StaticAnalyzer/Checkers/Taint.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/Environment.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/ProgramStateTrait.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/SymExpr.h"
 #include "clang/StaticAnalyzer/Frontend/CheckerRegistry.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtVisitor.h"
+#include "llvm/Support/raw_ostream.h"
+#include "clang/StaticAnalyzer/Checkers/utility.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/Stmt.h"
+#include "clang/AST/ASTContext.h"
+#include <memory>
 #include <fstream>
 
 using namespace clang;
 using namespace ento;
+using namespace taint;
+
+// Debug logging helper
+static void debugLog(const std::string &msg) {
+  std::ofstream logFile("/tmp/v8_checker_debug.log", std::ios::app);
+  if (logFile.is_open()) {
+    logFile << "[SAGenTestChecker] " << msg << std::endl;
+    logFile.close();
+  }
+  // Also output to llvm::errs() for immediate visibility
+  llvm::errs() << "[SAGenTestChecker DEBUG] " << msg << "\n";
+}
 
 namespace {
 
-class V8CastNullChecker : public Checker<check::PreStmt<CallExpr>> {
-private:
-  mutable std::unique_ptr<BugType> BT;
+class SAGenTestChecker : public Checker<check::ASTCodeBody> {
+   mutable std::unique_ptr<BugType> BT;
+   mutable int totalFunctionsAnalyzed = 0;
+   mutable int totalForLoopsFound = 0;
+   mutable int totalBugsFound = 0;
 
-  void debugLog(const std::string& msg) const {
-    std::ofstream logFile("/tmp/v8_checker_debug.log", std::ios::app);
-    if (logFile.is_open()) {
-      logFile << msg << std::endl;
+   public:
+      SAGenTestChecker() : BT(new BugType(this, "For-loop pre-check dereference", "Memory safety")) {
+        debugLog("SAGenTestChecker initialized");
+      }
+
+      ~SAGenTestChecker() {
+        debugLog("SAGenTestChecker destroyed - Functions: " + std::to_string(totalFunctionsAnalyzed) + 
+                 ", Loops: " + std::to_string(totalForLoopsFound) + 
+                 ", Bugs: " + std::to_string(totalBugsFound));
+      }
+
+      void checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR) const;
+
+   private:
+
+      // Helpers
+      const VarDecl *getLoopPtrFromCondition(const Expr *Cond) const;
+      bool containsDerefOfVar(const Expr *E, const VarDecl *VD, const UnaryOperator *&DerefUO) const;
+      bool containsDerefOfPreIncVar(const Expr *E, const VarDecl *VD, const UnaryOperator *&DerefUO) const;
+
+      void analyzeForStmt(const ForStmt *FS, AnalysisManager &Mgr, BugReporter &BR, const std::string &funcName) const;
+      void traverseStmt(const Stmt *S, AnalysisManager &Mgr, BugReporter &BR, const std::string &funcName) const;
+};
+
+static bool isRelOrNe(BinaryOperatorKind Op) {
+  return Op == BO_LT || Op == BO_LE || Op == BO_GT || Op == BO_GE || Op == BO_NE;
+}
+
+const VarDecl *SAGenTestChecker::getLoopPtrFromCondition(const Expr *Cond) const {
+  if (!Cond) {
+    debugLog("  - Condition is null");
+    return nullptr;
+  }
+
+  const Expr *E = Cond->IgnoreParenImpCasts();
+  const auto *BO = dyn_cast<BinaryOperator>(E);
+  if (!BO) {
+    debugLog("  - Condition is not a binary operator");
+    return nullptr;
+  }
+
+  if (!isRelOrNe(BO->getOpcode())) {
+    debugLog("  - Binary operator is not relational/ne");
+    return nullptr;
+  }
+
+  auto GetPtrVar = [](const Expr *Operand) -> const VarDecl * {
+    Operand = Operand ? Operand->IgnoreParenImpCasts() : nullptr;
+    if (!Operand)
+      return nullptr;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(Operand)) {
+      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+        if (VD->getType()->isPointerType()) {
+          debugLog("    Found pointer variable: " + VD->getNameAsString());
+          return VD;
+        }
+      }
+    }
+    return nullptr;
+  };
+
+  if (const VarDecl *L = GetPtrVar(BO->getLHS()))
+    return L;
+  if (const VarDecl *R = GetPtrVar(BO->getRHS()))
+    return R;
+
+  debugLog("  - No pointer variable found in condition");
+  return nullptr;
+}
+
+bool SAGenTestChecker::containsDerefOfVar(const Expr *E, const VarDecl *VD,
+                                          const UnaryOperator *&DerefUO) const {
+  if (!E || !VD)
+    return false;
+
+  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+    if (UO->getOpcode() == UO_Deref) {
+      const Expr *Sub = UO->getSubExpr()->IgnoreParenImpCasts();
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(Sub)) {
+        if (DRE->getDecl() == VD) {
+          DerefUO = UO;
+          debugLog("    Found dereference of " + VD->getNameAsString());
+          return true;
+        }
+      }
     }
   }
 
-public:
-  V8CastNullChecker() : BT(std::make_unique<BugType>(this, "Cast on potentially null value", "V8Cast")) {
-    debugLog("[DEBUG] V8CastNullChecker initialized");
+  // Recurse into children
+  for (const Stmt *Child : E->children()) {
+    if (const auto *CE = dyn_cast_or_null<Expr>(Child)) {
+      if (containsDerefOfVar(CE, VD, DerefUO))
+        return true;
+    }
+  }
+  return false;
+}
+
+bool SAGenTestChecker::containsDerefOfPreIncVar(const Expr *E, const VarDecl *VD,
+                                                const UnaryOperator *&DerefUO) const {
+  if (!E || !VD)
+    return false;
+
+  if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+    if (UO->getOpcode() == UO_Deref) {
+      const Expr *Sub = UO->getSubExpr()->IgnoreParenCasts();
+      if (const auto *UO2 = dyn_cast<UnaryOperator>(Sub)) {
+        if (UO2->getOpcode() == UO_PreInc) {
+          const Expr *Inner = UO2->getSubExpr()->IgnoreParenCasts();
+          if (const auto *DRE = dyn_cast<DeclRefExpr>(Inner)) {
+            if (DRE->getDecl() == VD) {
+              DerefUO = UO;
+              debugLog("    Found dereference of pre-incremented " + VD->getNameAsString());
+              return true;
+            }
+          }
+        }
+      }
+    }
   }
 
-  void checkPreStmt(const CallExpr *CE, CheckerContext &C) const;
+  // Recurse into children
+  for (const Stmt *Child : E->children()) {
+    if (const auto *CE = dyn_cast_or_null<Expr>(Child)) {
+      if (containsDerefOfPreIncVar(CE, VD, DerefUO))
+        return true;
+    }
+  }
+  return false;
+}
 
-private:
-  bool isCastCall(const CallExpr *CE) const;
-  bool couldBeNull(SVal Val, CheckerContext &C) const;
-};
+void SAGenTestChecker::analyzeForStmt(const ForStmt *FS, AnalysisManager &Mgr, BugReporter &BR, 
+                                      const std::string &funcName) const {
+  if (!FS)
+    return;
 
-void V8CastNullChecker::checkPreStmt(const CallExpr *CE, CheckerContext &C) const {
-  debugLog("[DEBUG] checkPreStmt called for CallExpr");
+  totalForLoopsFound++;
+  debugLog("  Analyzing for-loop #" + std::to_string(totalForLoopsFound) + " in function: " + funcName);
 
-  // Check if this looks like a Cast call
-  if (!isCastCall(CE)) {
-    debugLog("[DEBUG] Not a Cast call, skipping");
+  const Expr *Cond = FS->getCond();
+  const VarDecl *PtrVD = getLoopPtrFromCondition(Cond);
+  if (!PtrVD) {
+    debugLog("  - No pointer variable in loop condition, skipping");
     return;
   }
 
-  debugLog("[DEBUG] Found Cast call! Analyzing arguments...");
+  debugLog("  - Found pointer variable in condition: " + PtrVD->getNameAsString());
 
-  // Check all arguments for potential null values
-  for (unsigned i = 0; i < CE->getNumArgs(); ++i) {
-    const Expr *ArgExpr = CE->getArg(i);
-    SVal ArgVal = C.getSVal(ArgExpr);
+  // Check initializer
+  const Stmt *Init = FS->getInit();
+  if (Init) {
+    debugLog("  - Checking initializer");
+    const UnaryOperator *DerefUO = nullptr;
 
-    debugLog("[DEBUG] Checking argument " + std::to_string(i));
-
-    if (couldBeNull(ArgVal, C)) {
-      debugLog("[DEBUG] Argument " + std::to_string(i) + " could be null! Reporting bug...");
-
-      // Create bug report
-      ExplodedNode *N = C.generateNonFatalErrorNode();
-      if (!N)
-        return;
-
-      auto R = std::make_unique<PathSensitiveBugReport>(*BT,
-        "Cast operation on value that may be null", N);
-      R->addRange(CE->getSourceRange());
-      C.emitReport(std::move(R));
-      return;
-    } else {
-      debugLog("[DEBUG] Argument " + std::to_string(i) + " seems safe");
+    if (const auto *DS = dyn_cast<DeclStmt>(Init)) {
+      for (const Decl *D : DS->decls()) {
+        if (const auto *VD = dyn_cast<VarDecl>(D)) {
+          const Expr *InitE = VD->getInit();
+          if (InitE && containsDerefOfVar(InitE, PtrVD, DerefUO)) {
+            totalBugsFound++;
+            debugLog("  *** BUG FOUND #" + std::to_string(totalBugsFound) + 
+                    " in initializer: dereference before bound check");
+            auto R = std::make_unique<BasicBugReport>(
+                *BT,
+                "Dereference in for-loop initializer occurs before bound check; possible out-of-bounds read.",
+                DerefUO ? PathDiagnosticLocation::createBegin(DerefUO, BR.getSourceManager(), nullptr)
+                        : PathDiagnosticLocation::createBegin(Init, BR.getSourceManager(), nullptr));
+            if (DerefUO)
+              R->addRange(DerefUO->getSourceRange());
+            BR.emitReport(std::move(R));
+          }
+        }
+      }
+    } else if (const auto *IE = dyn_cast<Expr>(Init)) {
+      if (containsDerefOfVar(IE, PtrVD, DerefUO)) {
+        totalBugsFound++;
+        debugLog("  *** BUG FOUND #" + std::to_string(totalBugsFound) + 
+                " in initializer expr: dereference before bound check");
+        auto R = std::make_unique<BasicBugReport>(
+            *BT,
+            "Dereference in for-loop initializer occurs before bound check; possible out-of-bounds read.",
+            DerefUO ? PathDiagnosticLocation::createBegin(DerefUO, BR.getSourceManager(), nullptr)
+                    : PathDiagnosticLocation::createBegin(IE, BR.getSourceManager(), nullptr));
+        if (DerefUO)
+          R->addRange(DerefUO->getSourceRange());
+        BR.emitReport(std::move(R));
+      }
     }
   }
 
-  debugLog("[DEBUG] All arguments seem safe");
+  // Check increment
+  const Expr *Inc = FS->getInc();
+  if (Inc) {
+    debugLog("  - Checking increment");
+    const UnaryOperator *DerefUO = nullptr;
+    if (containsDerefOfPreIncVar(Inc, PtrVD, DerefUO)) {
+      totalBugsFound++;
+      debugLog("  *** BUG FOUND #" + std::to_string(totalBugsFound) + 
+              " in increment: dereference of pre-incremented iterator");
+      auto R = std::make_unique<BasicBugReport>(
+          *BT,
+          "Dereference of pre-incremented iterator in for-loop increment occurs before bound check; possible out-of-bounds read.",
+          DerefUO ? PathDiagnosticLocation::createBegin(DerefUO, BR.getSourceManager(), nullptr)
+                  : PathDiagnosticLocation::createBegin(Inc, BR.getSourceManager(), nullptr));
+      if (DerefUO)
+        R->addRange(DerefUO->getSourceRange());
+      BR.emitReport(std::move(R));
+    }
+  }
 }
 
-bool V8CastNullChecker::isCastCall(const CallExpr *CE) const {
-  // Method 1: Check direct callee name
-  if (const FunctionDecl *FD = CE->getDirectCallee()) {
-    std::string name = FD->getName().str();
-    debugLog("[DEBUG] Direct callee name: " + name);
+void SAGenTestChecker::traverseStmt(const Stmt *S, AnalysisManager &Mgr, BugReporter &BR, 
+                                    const std::string &funcName) const {
+  if (!S)
+    return;
 
-    if (name.find("Cast") != std::string::npos) {
-      debugLog("[DEBUG] Found Cast via direct callee name");
-      return true;
-    }
+  if (const auto *FS = dyn_cast<ForStmt>(S))
+    analyzeForStmt(FS, Mgr, BR, funcName);
 
-    // Check qualified name for template instantiations
-    std::string qualName = FD->getQualifiedNameAsString();
-    debugLog("[DEBUG] Qualified name: " + qualName);
-
-    if (qualName.find("Cast") != std::string::npos) {
-      debugLog("[DEBUG] Found Cast via qualified name");
-      return true;
-    }
+  for (const Stmt *Child : S->children()) {
+    if (Child)
+      traverseStmt(Child, Mgr, BR, funcName);
   }
-
-  // Method 2: Check if this is a template function call expression
-  if (const auto *DTCE = dyn_cast<DependentScopeDeclRefExpr>(CE->getCallee()->IgnoreParenCasts())) {
-    if (DTCE->getDeclName().getAsString().find("Cast") != std::string::npos) {
-      debugLog("[DEBUG] Found Cast via dependent template name");
-      return true;
-    }
-  }
-
-  // Method 3: Check unresolved lookup expressions (common for templates)
-  if (const auto *ULE = dyn_cast<UnresolvedLookupExpr>(CE->getCallee()->IgnoreParenCasts())) {
-    if (ULE->getName().getAsString().find("Cast") != std::string::npos) {
-      debugLog("[DEBUG] Found Cast via unresolved lookup");
-      return true;
-    }
-  }
-
-  debugLog("[DEBUG] No Cast pattern found");
-  return false;
 }
 
-bool V8CastNullChecker::couldBeNull(SVal Val, CheckerContext &C) const {
-  debugLog("[DEBUG] Checking if value could be null");
+void SAGenTestChecker::checkASTCodeBody(const Decl *D, AnalysisManager &Mgr, BugReporter &BR) const {
+  if (!D)
+    return;
 
-  // If it's not a defined value, be conservative
-  auto DV = Val.getAs<DefinedOrUnknownSVal>();
-  if (!DV) {
-    debugLog("[DEBUG] Not a defined value - could be null");
-    return true;
+  totalFunctionsAnalyzed++;
+  
+  std::string funcName = "unknown";
+  if (const auto *FD = dyn_cast<FunctionDecl>(D)) {
+    funcName = FD->getNameAsString();
+  } else if (const auto *MD = dyn_cast<ObjCMethodDecl>(D)) {
+    funcName = MD->getNameAsString();
+  }
+  
+  debugLog("Analyzing function #" + std::to_string(totalFunctionsAnalyzed) + ": " + funcName);
+
+  const Stmt *Body = D->getBody();
+  if (!Body) {
+    debugLog("  - No body found");
+    return;
   }
 
-  ProgramStateRef State = C.getState();
-
-  // For location values, check if they can be null
-  if (isa<Loc>(*DV)) {
-    debugLog("[DEBUG] Is a location value, checking null possibility");
-
-    // Try to assume it's null
-    ProgramStateRef NullState = State->assume(*DV, false);
-    if (NullState) {
-      debugLog("[DEBUG] Value can be null");
-      return true;
-    }
-  }
-
-  // Check for zero constants
-  if (Val.isZeroConstant()) {
-    debugLog("[DEBUG] Is zero constant");
-    return true;
-  }
-
-  // Check for unknown values
-  if (Val.isUnknown()) {
-    debugLog("[DEBUG] Is unknown value");
-    return true;
-  }
-
-  debugLog("[DEBUG] Value appears non-null");
-  return false;
+  traverseStmt(Body, Mgr, BR, funcName);
 }
 
 } // end anonymous namespace
 
-// ----- Plugin registration -----
 extern "C" void clang_registerCheckers(CheckerRegistry &registry) {
-  registry.addChecker<V8CastNullChecker>(
+  debugLog("=== Registering SAGenTestChecker ===");
+  registry.addChecker<SAGenTestChecker>(
       "custom.SAGenTestChecker",
-      "Warns on Cast operations that may receive null values", "");
+      "Detect dereference in for-loop init/increment before the loop bound check",
+      "");
 }
 
 extern "C" const char clang_analyzerAPIVersionString[] =
