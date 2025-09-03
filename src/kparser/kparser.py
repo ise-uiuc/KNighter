@@ -15,11 +15,11 @@ class KParser:
     def __init__(self):
         # Load the shared library
         lib = ctypes.CDLL(str(CURR / "build/my-languages.so"))
-        
+
         # Get the language function pointer
         get_language = lib.tree_sitter_cpp
         get_language.restype = ctypes.c_void_p
-        
+
         # Create language with pointer instead of path
         cpp_language = Language(get_language(), "cpp")
         parser = Parser()
