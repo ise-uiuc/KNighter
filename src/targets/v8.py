@@ -26,17 +26,26 @@ class V8(TargetFactory):
             is_before (bool): Whether to checkout before the commit.
             arch (str): The architecture to build for.
             build_config (str): The build configuration (debug/release).
+            llvm_path (str/Path): Custom LLVM path to use (optional).
+            skip_v8_build (bool): Skip V8 build (preserve existing out/ directory).
         """
+        # Extract skip_v8_build flag from kwargs
+        skip_v8_build = kwargs.get("skip_v8_build", False)
+
         logger.info(
             f"Checking out commit {commit_id} {'before' if is_before else 'after'}"
         )
 
-        # Clean previous build artifacts
-        res = sp.run(
-            ["rm", "-rf", "out"], cwd=self.repo.working_dir, capture_output=True
-        )
-        if res.returncode != 0:
-            logger.warning(f"Failed to clean out directory: {res.stderr.decode()}")
+        if skip_v8_build:
+            logger.info("Skipping V8 build - preserving existing out/ directory")
+        else:
+            # Clean previous build artifacts
+            logger.info("Cleaning previous build artifacts")
+            res = sp.run(
+                ["rm", "-rf", "out"], cwd=self.repo.working_dir, capture_output=True
+            )
+            if res.returncode != 0:
+                logger.warning(f"Failed to clean out directory: {res.stderr.decode()}")
 
         if is_before:
             commit_id = commit_id + "^"
@@ -77,9 +86,14 @@ class V8(TargetFactory):
         # build_config = kwargs.get('build_config', 'release')
         build_dir = f"out/{arch}.release"
 
-        # Check if we should use custom LLVM
-        custom_llvm_path = Path("/scratch/chenyuan-data/knighter-dev-v8/llvm-21/build")
-        if custom_llvm_path.exists():
+        # Check if we should use custom LLVM (from kwargs or fallback to hardcoded path)
+        custom_llvm_path = kwargs.get("llvm_path")
+
+        # Convert to Path if string provided
+        if custom_llvm_path and not isinstance(custom_llvm_path, Path):
+            custom_llvm_path = Path(custom_llvm_path)
+
+        if custom_llvm_path and custom_llvm_path.exists():
             logger.info(f"Using custom LLVM from {custom_llvm_path}")
 
             gn_args = [
@@ -97,9 +111,12 @@ class V8(TargetFactory):
                 "treat_warnings_as_errors=false",
                 "use_lld=true",
                 "llvm_android_mainline=true",
-                # Use V8's bundled libc++ to avoid header conflicts with LLVM-21
             ]
         else:
+            logger.info(
+                "Using system clang (no custom LLVM path provided or path doesn't exist)"
+            )
+
             gn_args = [
                 f'target_cpu="{arch}"',
                 f"is_debug=false",
