@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import re
@@ -686,24 +687,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         return num_bugs
 
-    def _create_unique_report_dir(self, commit_id: str, version_type: str) -> Path:
-        """Create unique report directory under result_dir for V8 analysis."""
-        # Import global_config here to avoid circular import
-        from global_config import global_config
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        result_dir = Path(global_config.result_dir)
-
-        # Create unique directory name: v8-reports/{commit_id}_{timestamp}_{version_type}
-        unique_dir_name = f"v8-reports/{commit_id}_{timestamp}_{version_type}"
-        output_dir = result_dir / unique_dir_name
-
-        # Ensure directory exists
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        logger.info(f"Created report directory: {output_dir}")
-        return output_dir
-
     def _validate_checker_v8(
         self,
         checker_code: str,
@@ -714,7 +697,10 @@ extern "C" const char clang_analyzerAPIVersionString[] =
     ):
         """
         Validate the checker against a V8 commit and patch.
+        Analyzes files in both buggy and fixed versions to compute TP/TN.
         """
+        import json
+
         # Remove depot_tools from PATH to prevent gclient sync from changing V8 dependencies
         original_path = os.environ.get("PATH", "")
         filtered_path = ":".join(
@@ -723,9 +709,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         os.environ["PATH"] = filtered_path
 
         logger.info(f"V8 validation: removed depot_tools from PATH")
-        logger.info(
-            f"Original PATH had {original_path.count('depot_tools')} depot_tools entries"
-        )
 
         TP, TN = 0, 0
         if not skip_build_checker:
@@ -735,9 +718,9 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 attempt=1,
             )
 
-        # Get source files from patch instead of object files
+        # Get source files from patch
         source_files = target.get_source_files_from_patch(patch)
-        logger.info(f"Source files to analyze: {source_files}")
+        logger.info(f"Source files to analyze from patch: {source_files}")
 
         # [DEBUG] Clear any existing debug log and create new one
         debug_log = "/tmp/v8_checker_debug.log"
@@ -754,81 +737,104 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         num_bug_files = {}
 
-        # Create unique output directories for this validation session
-        buggy_output_dir = self._create_unique_report_dir(commit_id, "buggy")
-        fixed_output_dir = self._create_unique_report_dir(commit_id, "fixed")
+        # Create output directories for validation (consistent with Linux structure)
+        # Use tmp directory for validation with timestamped subdirectories
+        validation_base_dir = Path("tmp") / "v8_validation" / commit_id
+
+        # Create timestamped directories for both buggy and fixed versions
+        buggy_base_dir = validation_base_dir / "buggy"
+        fixed_base_dir = validation_base_dir / "fixed"
+        buggy_base_dir.mkdir(parents=True, exist_ok=True)
+        fixed_base_dir.mkdir(parents=True, exist_ok=True)
+
+        buggy_output_dir = self._create_timestamped_output_dir(buggy_base_dir)
+        fixed_output_dir = self._create_timestamped_output_dir(fixed_base_dir)
 
         # Checkout buggy version
+        llvm_build_dir = self.backend_path / "build"
         target.checkout_commit(
-            commit_id, is_before=True, arch="x64", build_config="release"
+            commit_id,
+            is_before=True,
+            arch="x64",
+            build_config="release",
+            llvm_path=llvm_build_dir,
         )
 
-        # Use scan-build with ninja to analyze V8 source files
+        # Build the specific object files first
+        env = os.environ.copy()
+        env["PATH"] = f"{llvm_build_dir}/bin:" + env.get("PATH", "")
+
+        # Get compile_commands.json to find exact entries for source files
+        compile_commands_path = (
+            Path(target.repo.working_dir) / "out/x64.release/compile_commands.json"
+        )
+        compile_entries = {}
+
+        if compile_commands_path.exists():
+            try:
+                with open(compile_commands_path, "r") as f:
+                    commands = json.load(f)
+
+                # Find compile entries for each source file
+                for source_file in source_files:
+                    normalized_source = f"../../{source_file}"
+                    for cmd in commands:
+                        if cmd.get("file") == normalized_source:
+                            compile_entries[source_file] = cmd
+                            break
+            except Exception as e:
+                logger.error(f"Failed to read compile_commands.json: {e}")
+
+        # Build and analyze buggy version
         for source_file in source_files:
-            full_path = os.path.join(target.repo.working_dir, source_file)
-            if not os.path.exists(full_path):
-                logger.warning(f"Source file not found: {full_path}")
+            if source_file not in compile_entries:
+                logger.warning(f"No compile command found for {source_file}")
                 continue
 
-            # Get object file for ninja build
+            # Build the object file for this source
             obj_file = self._get_object_file_from_source(source_file, target)
-            if not obj_file:
-                logger.warning(f"Could not determine object file for {source_file}")
-                continue
+            if obj_file:
+                logger.info(f"Building object file: {obj_file}")
+                build_result = sp.run(
+                    ["ninja", "-C", "out/x64.release", obj_file],
+                    cwd=target.repo.working_dir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                if build_result.returncode != 0:
+                    logger.error(
+                        f"Failed to build {obj_file}: {build_result.stderr[:500]}"
+                    )
+                    continue
 
-            # Use buggy output directory created earlier
-            scan_build_cmd = self._generate_v8_analyzer_command(
-                source_file, obj_file, target, buggy_output_dir
+            # Create file-specific output directory (validation always needs output)
+            safe_filename = source_file.replace("/", "_").replace(".", "_")
+            file_output_dir = buggy_output_dir / safe_filename
+            file_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Analyze using helper function
+            success, num_bugs, error_msg = self._analyze_v8_source_file(
+                compile_entries[source_file],
+                file_output_dir,
+                target=target,
+                timeout=900,
             )
 
-            try:
-                if callable(scan_build_cmd):
-                    # New function-based approach with separate subprocess calls
-                    res = scan_build_cmd()
-                else:
-                    # Legacy string command approach
-                    res = sp.run(
-                        scan_build_cmd,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        cwd=target.repo.working_dir,
-                        timeout=300,
-                    )
-            except sp.TimeoutExpired:
-                logger.warning(f"Timeout for file {source_file}")
+            if not success:
+                logger.warning(f"Failed to analyze {source_file}: {error_msg}")
                 continue
 
-            # FIXME: For debug
-            Path("tmp/scan_build_output.txt").write_text(res.stdout)
-            Path("tmp/scan_build_error.txt").write_text(res.stderr)
-
-            logger.info(f"Buggy: return_code={res.returncode}")
             # Append debug info about the analysis
             with open(debug_log, "a") as f:
                 f.write(f"\n=== BUGGY VERSION - {source_file} ===\n")
-                f.write(f"Return code: {res.returncode}\n")
-                f.write(f"Stdout length: {len(res.stdout)} chars\n")
-                f.write(f"Stderr length: {len(res.stderr)} chars\n")
-                if res.stderr:
-                    f.write(f"Stderr (first 500 chars): {res.stderr[:500]}\n")
-
-            # Use scan-build report parsing instead of direct output analysis
-            num_bugs = self.get_num_bugs_from_scan_build(str(buggy_output_dir))
-
-            # Log HTML report details
-            with open(debug_log, "a") as f:
-                f.write(f"Output directory: {buggy_output_dir}\n")
+                f.write(f"Analysis success: {success}\n")
                 f.write(f"Number of bugs found: {num_bugs}\n")
-                if os.path.exists(str(buggy_output_dir)):
-                    import glob
+                if error_msg:
+                    f.write(f"Error: {error_msg}\n")
+                f.write(f"Output directory: {file_output_dir}\n")
 
-                    html_files = glob.glob(
-                        os.path.join(str(buggy_output_dir), "*.html")
-                    )
-                    f.write(
-                        f"HTML files in output dir: {[os.path.basename(h) for h in html_files]}\n"
-                    )
             num_bug_files[source_file] = num_bugs
             if num_bugs > 0:
                 TP += 1
@@ -838,72 +844,84 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         # Checkout fixed version
         target.checkout_commit(
-            commit_id, is_before=False, arch="x64", build_config="release"
+            commit_id,
+            is_before=False,
+            arch="x64",
+            build_config="release",
+            llvm_path=llvm_build_dir,
         )
 
-        for source_file in source_files:
-            full_path = os.path.join(target.repo.working_dir, source_file)
-            if not os.path.exists(full_path):
-                logger.warning(f"Source file not found: {full_path}")
-                continue
-
-            # Get object file for ninja build
-            obj_file = self._get_object_file_from_source(source_file, target)
-            if not obj_file:
-                logger.warning(f"Could not determine object file for {source_file}")
-                continue
-
-            # Use fixed output directory created earlier
-            scan_build_cmd = self._generate_v8_analyzer_command(
-                source_file, obj_file, target, fixed_output_dir
-            )
-            logger.info(f"Running scan-build analysis: {scan_build_cmd}")
-
+        # Re-read compile_commands.json for fixed version
+        if compile_commands_path.exists():
             try:
-                if callable(scan_build_cmd):
-                    # New function-based approach with separate subprocess calls
-                    res = scan_build_cmd()
-                else:
-                    # Legacy string command approach
-                    res = sp.run(
-                        scan_build_cmd,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        cwd=target.repo.working_dir,
-                        timeout=300,
-                    )
-            except sp.TimeoutExpired:
-                logger.warning(f"Timeout for file {source_file}")
+                with open(compile_commands_path, "r") as f:
+                    commands = json.load(f)
+
+                # Update compile entries for fixed version
+                compile_entries = {}
+                for source_file in source_files:
+                    normalized_source = f"../../{source_file}"
+                    for cmd in commands:
+                        if cmd.get("file") == normalized_source:
+                            compile_entries[source_file] = cmd
+                            break
+            except Exception as e:
+                logger.error(
+                    f"Failed to read compile_commands.json for fixed version: {e}"
+                )
+
+        # Build and analyze fixed version
+        for source_file in source_files:
+            if source_file not in compile_entries:
+                logger.warning(f"No compile command found for {source_file}")
                 continue
 
-            logger.info(f"Fixed: return_code={res.returncode}")
+            # Build the object file for this source
+            obj_file = self._get_object_file_from_source(source_file, target)
+            if obj_file:
+                logger.info(f"Building object file: {obj_file}")
+                build_result = sp.run(
+                    ["ninja", "-C", "out/x64.release", obj_file],
+                    cwd=target.repo.working_dir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                if build_result.returncode != 0:
+                    logger.error(
+                        f"Failed to build {obj_file}: {build_result.stderr[:500]}"
+                    )
+                    continue
+
+            # Create file-specific output directory (validation always needs output)
+            safe_filename = source_file.replace("/", "_").replace(".", "_")
+            file_output_dir = fixed_output_dir / safe_filename
+            file_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Analyze using helper function
+            success, num_bugs, error_msg = self._analyze_v8_source_file(
+                compile_entries[source_file],
+                file_output_dir,
+                target=target,
+                timeout=900,
+            )
+
+            if not success:
+                logger.warning(f"Failed to analyze fixed {source_file}: {error_msg}")
+                continue
+
+            logger.info(f"Fixed: {source_file} analysis complete")
 
             # Append debug info about the analysis
             with open(debug_log, "a") as f:
                 f.write(f"\n=== FIXED VERSION - {source_file} ===\n")
-                f.write(f"Return code: {res.returncode}\n")
-                f.write(f"Stdout length: {len(res.stdout)} chars\n")
-                f.write(f"Stderr length: {len(res.stderr)} chars\n")
-                if res.stderr:
-                    f.write(f"Stderr (first 500 chars): {res.stderr[:500]}\n")
-
-            # Use scan-build report parsing instead of direct output analysis
-            num_bugs = self.get_num_bugs_from_scan_build(str(fixed_output_dir))
-
-            # Log HTML report details
-            with open(debug_log, "a") as f:
-                f.write(f"Output directory: {fixed_output_dir}\n")
+                f.write(f"Analysis success: {success}\n")
                 f.write(f"Number of bugs found: {num_bugs}\n")
-                if os.path.exists(str(fixed_output_dir)):
-                    import glob
+                if error_msg:
+                    f.write(f"Error: {error_msg}\n")
+                f.write(f"Output directory: {file_output_dir}\n")
 
-                    html_files = glob.glob(
-                        os.path.join(str(fixed_output_dir), "*.html")
-                    )
-                    f.write(
-                        f"HTML files in output dir: {[os.path.basename(h) for h in html_files]}\n"
-                    )
             if num_bugs == 0 or num_bugs < num_bug_files.get(source_file, 0):
                 TN += 1
                 logger.info(
@@ -915,6 +933,10 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 )
 
         logger.info(f"V8 Validation Result: TP={TP}, TN={TN}")
+
+        # Create softlinks for both buggy and fixed directories
+        self._create_v8_report_softlinks(buggy_output_dir, buggy_base_dir)
+        self._create_v8_report_softlinks(fixed_output_dir, fixed_base_dir)
 
         # Write final summary to debug log
         with open(debug_log, "a") as f:
@@ -1288,6 +1310,282 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         return total_bugs
 
+    def _analyze_v8_source_file(
+        self, compile_entry, output_dir, target=None, timeout=900
+    ):
+        """
+        Helper function to analyze a single V8 source file using clang++ --analyze.
+
+        Args:
+            compile_entry: Entry from compile_commands.json containing:
+                - file: source file path
+                - command: original compilation command
+                - directory: working directory for compilation
+            output_dir: Directory to save HTML analysis reports
+            target: Optional V8 target for fallback working directory
+            timeout: Analysis timeout in seconds
+
+        Returns:
+            tuple: (success: bool, num_bugs: int, error_message: str or None)
+        """
+        import shlex
+
+        source_file = compile_entry.get("file", "")
+        compile_cmd = compile_entry.get("command", "")
+        directory = compile_entry.get("directory", "")
+
+        if not source_file or not compile_cmd:
+            return False, 0, "Missing file or command in compile entry"
+
+        # Clean up source file path for logging
+        if source_file.startswith("../../"):
+            clean_source = source_file[6:]
+        else:
+            clean_source = source_file
+
+        # Build clang++ --analyze command
+        llvm_build_dir = self.backend_path / "build"
+        plugin_path = f"{llvm_build_dir}/lib/SAGenTestPlugin.so"
+
+        cmd_parts = shlex.split(compile_cmd)
+        analyzer_cmd = [f"{llvm_build_dir}/bin/clang++", "--analyze"]
+
+        # Add plugin and checker configuration
+        analyzer_cmd.extend(
+            [
+                "-Xanalyzer",
+                "-load",
+                "-Xanalyzer",
+                plugin_path,
+                "-Xanalyzer",
+                "-analyzer-checker",
+                "-Xanalyzer",
+                "custom.SAGenTestChecker",
+                "-Xanalyzer",
+                "-analyzer-disable-checker",
+                "-Xanalyzer",
+                "core",
+                "-Xanalyzer",
+                "-analyzer-disable-checker",
+                "-Xanalyzer",
+                "cplusplus",
+                "-Xanalyzer",
+                "-analyzer-disable-checker",
+                "-Xanalyzer",
+                "deadcode",
+                "-Xanalyzer",
+                "-analyzer-disable-checker",
+                "-Xanalyzer",
+                "unix",
+                "-Xanalyzer",
+                "-analyzer-disable-checker",
+                "-Xanalyzer",
+                "nullability",
+                "-Xanalyzer",
+                "-analyzer-disable-checker",
+                "-Xanalyzer",
+                "security",
+                "-Xanalyzer",
+                "-analyzer-config",
+                "-Xanalyzer",
+                "max-loop=8",
+                "-Xanalyzer",
+                "-analyzer-output=html",
+                "-o",
+                str(output_dir.absolute())
+                if hasattr(output_dir, "absolute")
+                else str(output_dir),
+            ]
+        )
+
+        # Extract compilation flags from original command (skip output and module-related flags)
+        skip_next = False
+        for part in cmd_parts[1:]:  # Skip compiler name
+            if skip_next:
+                skip_next = False
+                continue
+
+            # Skip flags we don't want
+            if part in ["-c", "-MMD", "-o", "-MF"]:
+                skip_next = True
+                continue
+            if (
+                part.endswith((".o", ".o.d"))
+                or part.startswith("-fmodule-file=")
+                or part.startswith("-fmodule-map-file=")
+                or part == "-Xclang"
+            ):
+                skip_next = True
+                continue
+            if part in [
+                "-fmodules",
+                "-fno-implicit-module-maps",
+                "-fno-implicit-modules",
+                "-fbuiltin-module-map",
+                "-DUSE_LIBCXX_MODULES",
+            ]:
+                continue
+
+            analyzer_cmd.append(part)
+
+        # Add the source file
+        analyzer_cmd.append(source_file)
+
+        # Determine working directory
+        work_dir = directory or (target.repo.working_dir if target else None)
+        if not work_dir:
+            return False, 0, "No working directory specified"
+
+        # Run analysis
+        try:
+            analyze_result = sp.run(
+                analyzer_cmd,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+
+            # Count bugs from HTML output
+            num_bugs = self.get_num_bugs_from_scan_build(str(output_dir))
+            error_msg = None
+
+            if analyze_result.returncode != 0:
+                # Non-zero return code but analysis may still have produced results
+                error_msg = analyze_result.stderr
+                escape_source = clean_source.replace("/", "_")
+                Path(f"tmp/error-{escape_source}.txt").write_text(error_msg)
+                logger.warning(
+                    f"Analysis returned non-zero code for {clean_source}: {analyze_result.returncode}"
+                )
+
+            return True, num_bugs, error_msg
+
+        except sp.TimeoutExpired:
+            num_bugs = self.get_num_bugs_from_scan_build(str(output_dir))
+            return False, num_bugs, f"Timeout analyzing {clean_source} after {timeout}s"
+        except Exception as e:
+            num_bugs = self.get_num_bugs_from_scan_build(str(output_dir))
+            return False, num_bugs, f"Error analyzing {clean_source}: {str(e)}"
+
+    def _analyze_v8_files_parallel(
+        self, source_entries_list, unique_output_dir, target, max_workers=32
+    ):
+        """
+        Analyze V8 source files in parallel.
+
+        Args:
+            source_entries_list: List of compile_commands.json entries to analyze
+            unique_output_dir: Base output directory for reports
+            target: V8 target
+            max_workers: Number of parallel workers
+
+        Returns:
+            tuple: (total_bugs, analyzed_files, failed_files)
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Thread-safe counters
+        total_bugs = 0
+        analyzed_files = 0
+        failed_files = 0
+        lock = threading.Lock()
+
+        def analyze_single_file(entry_with_index):
+            """Analyze a single source file - designed for parallel execution"""
+            i, entry = entry_with_index
+            nonlocal total_bugs, analyzed_files, failed_files
+
+            source_file = entry.get("file", "")
+            if source_file.startswith("../../"):
+                clean_source = source_file[6:]
+            else:
+                clean_source = source_file
+
+            # Create unique output directory name from full source path
+            safe_filename = clean_source.replace("/", "_").replace(".", "_")
+            file_output_dir = unique_output_dir / safe_filename
+            file_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Log progress for large batches
+            if len(source_entries_list) > 10:
+                if (i + 1) % 10 == 0 or i == 0:
+                    logger.info(
+                        f"Progress: {i + 1}/{len(source_entries_list)} files - Analyzing: {clean_source}"
+                    )
+
+            try:
+                # Use helper function to analyze the file
+                success, num_bugs, error_msg = self._analyze_v8_source_file(
+                    entry, file_output_dir, target=target, timeout=900
+                )
+
+                # Thread-safe updates
+                with lock:
+                    if success:
+                        if num_bugs > 0:
+                            logger.info(
+                                f"Found {num_bugs} bugs in {clean_source} -> {safe_filename}/"
+                            )
+                            total_bugs += num_bugs
+                        else:
+                            # Remove empty directory
+                            import shutil
+
+                            shutil.rmtree(file_output_dir, ignore_errors=True)
+                        analyzed_files += 1
+                    else:
+                        if "Timeout" in error_msg:
+                            logger.warning(
+                                f"{error_msg} (file {i+1}/{len(source_entries_list)})"
+                            )
+                        else:
+                            logger.error(error_msg)
+                        failed_files += 1
+                        # Remove directory on failure
+                        import shutil
+
+                        shutil.rmtree(file_output_dir, ignore_errors=True)
+
+            except Exception as e:
+                with lock:
+                    logger.error(f"Unexpected error analyzing {clean_source}: {e}")
+                    failed_files += 1
+                    # Remove directory on exception
+                    import shutil
+
+                    shutil.rmtree(file_output_dir, ignore_errors=True)
+
+        # Execute analysis in parallel
+        logger.info(f"Starting parallel analysis with {max_workers} workers")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            futures = []
+            for i, entry in enumerate(source_entries_list):
+                future = executor.submit(analyze_single_file, (i, entry))
+                futures.append(future)
+
+            # Wait for all tasks to complete
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                if len(source_entries_list) > 20 and completed % 20 == 0:
+                    logger.info(
+                        f"Completed {completed}/{len(source_entries_list)} files"
+                    )
+
+                try:
+                    future.result()  # This will raise any exception that occurred
+                except Exception as e:
+                    with lock:
+                        logger.error(f"Future execution error: {e}")
+                        failed_files += 1
+
+        logger.info(f"Parallel analysis completed")
+        return total_bugs, analyzed_files, failed_files
+
     def _configure_v8_clang(self, target):
         """
         Configure V8 build to use our custom clang for scan-build interception.
@@ -1397,9 +1695,543 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         output_dir: str = "tmp",
         skip_build_checker: bool = False,
         skip_checkout: bool = False,
+        skip_v8_build: bool = False,
+        parallel_analysis: bool = True,
         **kwargs,
-    ):
-        raise NotImplementedError("Not implemented")
+    ) -> int:
+        """
+        Run the checker against a V8 commit.
+
+        Pipeline:
+        1. Build the entire V8 project with ninja (unless skip_v8_build=True)
+        2. Use clang++ --analyze on all source files from compile_commands.json
+
+        Args:
+            checker_code (str): The checker code to run.
+            commit_id (str): The commit ID to run the checker against.
+            target: The V8 target to be tested.
+            object_to_analyze (str): The source file to analyze (optional).
+            jobs (int): Number of jobs to run in parallel for ninja build.
+            output_dir (str): Directory to save the output.
+            skip_build_checker (bool): Skip building the checker.
+            skip_checkout (bool): Skip checking out the commit.
+            skip_v8_build (bool): Skip building V8 (reuse existing out/ directory).
+            parallel_analysis (bool): Analyze source files in parallel.
+
+        Returns:
+            int: Number of bugs found, or negative values for errors:
+                -999: Build failed
+                -1: Timeout
+                -10: Too many bugs found
+        """
+        # Remove depot_tools from PATH to prevent interference
+        original_path = os.environ.get("PATH", "")
+        filtered_path = ":".join(
+            [p for p in original_path.split(":") if "depot_tools" not in p]
+        )
+        os.environ["PATH"] = filtered_path
+
+        logger.info(f"V8 run checker: removed depot_tools from PATH")
+
+        # Extract parameters from kwargs
+        arch = kwargs.get("arch", "x64")
+        build_config = kwargs.get("build_config", "release")
+        timeout = kwargs.get("timeout", 1800)
+        build_dir = f"out/{arch}.{build_config}"
+
+        output_dir = Path(output_dir)
+
+        # Build checker if needed
+        if not skip_build_checker:
+            build_res, stderr = self.build_checker(checker_code, Path("tmp"), attempt=1)
+            if build_res != 0:
+                logger.error(f"Build failed: {stderr}")
+                return -999
+
+        # Use the provided output_dir directly (consistent with Linux)
+        # No longer create unique timestamped directories
+
+        # Checkout commit if needed
+        if not skip_checkout:
+            llvm_build_dir = self.backend_path / "build"
+            target.checkout_commit(
+                commit_id,
+                is_before=False,
+                arch=arch,
+                build_config=build_config,
+                llvm_path=llvm_build_dir,
+                skip_v8_build=skip_v8_build,
+            )
+        else:
+            logger.info("Skipping checkout")
+
+        # Step 1: Build entire V8 with ninja (unless skip_v8_build is True)
+        llvm_build_dir = self.backend_path / "build"
+        env = os.environ.copy()
+        env["PATH"] = f"{llvm_build_dir}/bin:" + env.get("PATH", "")
+
+        if not skip_v8_build:
+            logger.info(f"Building entire V8 project with ninja -j{jobs}")
+
+            build_cmd = ["ninja", "-C", build_dir, "-k", "5"]
+            if jobs:
+                build_cmd.append(f"-j{jobs}")
+
+            logger.info(f"Running: {' '.join(build_cmd)}")
+
+            try:
+                build_result = sp.run(
+                    build_cmd,
+                    cwd=target.repo.working_dir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+
+                if build_result.returncode != 0:
+                    logger.error(f"Ninja build failed")
+                    # Log down the error msg
+                    Path("tmp/v8-build-stdout.txt").write_text(build_result.stdout)
+                    Path("tmp/v8-build-stderr.txt").write_text(build_result.stderr)
+                    # FIXME: We should not return -999 here
+                    # FIXME: Now we just keep going
+                    # return -999
+
+                logger.info("V8 build completed successfully")
+
+            except sp.TimeoutExpired:
+                logger.error(f"V8 build timeout after {timeout} seconds")
+                return -1
+            except Exception as e:
+                logger.error(f"V8 build error: {e}")
+                return -999
+        else:
+            logger.info("Skipping V8 build - using existing build artifacts")
+
+        # Step 2: Get all source files from compile_commands.json
+        compile_commands_path = (
+            Path(target.repo.working_dir) / build_dir / "compile_commands.json"
+        )
+
+        if not compile_commands_path.exists():
+            logger.error(f"compile_commands.json not found at {compile_commands_path}")
+            return -999
+
+        try:
+            with open(compile_commands_path, "r") as f:
+                compile_commands = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to read compile_commands.json: {e}")
+            return -999
+
+        # Filter source files to analyze
+        source_files_to_analyze = []
+
+        if object_to_analyze:
+            # Analyze specific file only
+            for entry in compile_commands:
+                file_path = entry.get("file", "")
+                # Normalize path
+                if file_path.startswith("../../"):
+                    file_path = file_path[6:]
+
+                if file_path == object_to_analyze or file_path.endswith(
+                    f"/{object_to_analyze}"
+                ):
+                    source_files_to_analyze.append(entry)
+                    break
+        else:
+            # Analyze all source files
+            for entry in compile_commands:
+                file_path = entry.get("file", "")
+                if file_path and file_path.endswith((".cc", ".cpp", ".c")):
+                    # Skip third-party and generated files
+                    if not any(
+                        exclude in file_path
+                        for exclude in [
+                            "third_party/",
+                            "buildtools/",
+                            "gen/",
+                            "tools/v8_gypfiles/",
+                        ]
+                    ):
+                        source_files_to_analyze.append(entry)
+
+        if not source_files_to_analyze:
+            logger.error("No source files to analyze")
+            return 0
+
+        logger.info(f"Analyzing {len(source_files_to_analyze)} V8 source files")
+
+        # Create timestamped directory (consistent with Linux scan-build behavior)
+        timestamped_output_dir = self._create_timestamped_output_dir(output_dir)
+
+        # Step 3: Run clang++ --analyze on source files (parallel or sequential)
+        if parallel_analysis:
+            # Use parallel analysis
+            from global_config import global_config
+
+            default_workers = min(global_config.jobs, len(source_files_to_analyze))
+            max_workers = kwargs.get("max_workers", default_workers)
+            logger.info(f"Using parallel analysis with {max_workers} workers")
+
+            total_bugs, analyzed_files, failed_files = self._analyze_v8_files_parallel(
+                source_files_to_analyze,
+                timestamped_output_dir,  # Use timestamped directory
+                target,
+                max_workers=max_workers,
+            )
+
+            # Handle single file timeout case for parallel analysis
+            if failed_files > 0 and len(source_files_to_analyze) == 1:
+                return -1
+
+        else:
+            # Use sequential analysis (original logic with tmp directory)
+            # Progress tracking for large batches
+            if len(source_files_to_analyze) > 10:
+                logger.info(
+                    "Large number of files detected. Progress will be logged every 10 files."
+                )
+
+            total_bugs = 0
+            analyzed_files = 0
+            failed_files = 0
+
+            for i, entry in enumerate(source_files_to_analyze):
+                source_file = entry.get("file", "")
+
+                # Clean up source file path for logging
+                if source_file.startswith("../../"):
+                    clean_source = source_file[6:]
+                else:
+                    clean_source = source_file
+
+                # Progress logging
+                if len(source_files_to_analyze) > 10:
+                    if (i + 1) % 10 == 0 or i == 0:
+                        logger.info(
+                            f"Progress: {i + 1}/{len(source_files_to_analyze)} files - Analyzing: {clean_source}"
+                        )
+                else:
+                    logger.info(f"Analyzing: {clean_source}")
+
+                # Create temp output directory first
+                temp_output_dir = timestamped_output_dir / "tmp"
+                temp_output_dir.mkdir(parents=True, exist_ok=True)
+
+                # Use helper function to analyze the file
+                success, num_bugs, error_msg = self._analyze_v8_source_file(
+                    entry, temp_output_dir, target=target, timeout=900
+                )
+
+                if success:
+                    if num_bugs > 0:
+                        # Only create permanent directory if bugs were found
+                        # Use full path with slashes replaced by underscores
+                        safe_filename = clean_source.replace("/", "_").replace(".", "_")
+                        final_output_dir = timestamped_output_dir / safe_filename
+
+                        # Move tmp directory to final location
+                        import shutil
+
+                        if final_output_dir.exists():
+                            shutil.rmtree(final_output_dir)
+                        shutil.move(str(temp_output_dir), str(final_output_dir))
+
+                        # Recreate tmp dir for next file
+                        temp_output_dir.mkdir(parents=True, exist_ok=True)
+
+                        logger.info(
+                            f"Found {num_bugs} bugs in {clean_source} -> {safe_filename}/"
+                        )
+                        total_bugs += num_bugs
+                    else:
+                        # Clean up tmp directory if no bugs found
+                        import shutil
+
+                        shutil.rmtree(temp_output_dir, ignore_errors=True)
+                        temp_output_dir.mkdir(parents=True, exist_ok=True)
+
+                    analyzed_files += 1
+                else:
+                    if "Timeout" in error_msg:
+                        logger.warning(
+                            f"{error_msg} (file {i+1}/{len(source_files_to_analyze)})"
+                        )
+                        failed_files += 1
+                        if len(source_files_to_analyze) == 1:
+                            return -1
+                    else:
+                        logger.error(error_msg)
+                        failed_files += 1
+
+            # Clean up any remaining tmp directory
+            temp_output_dir = timestamped_output_dir / "tmp"
+            if temp_output_dir.exists():
+                import shutil
+
+                shutil.rmtree(temp_output_dir, ignore_errors=True)
+
+        # Final summary
+        logger.info(f"V8 analysis completed:")
+        logger.info(
+            f"  Files analyzed: {analyzed_files}/{len(source_files_to_analyze)}"
+        )
+        logger.info(f"  Files failed: {failed_files}")
+        logger.info(f"  Total bugs found: {total_bugs}")
+
+        # Create softlinks for refinement compatibility if needed
+        self._create_v8_report_softlinks(timestamped_output_dir, output_dir)
+
+        # Handle special cases
+        if total_bugs > 300:  # Too many bugs threshold
+            logger.warning("Too many bugs found!")
+            return -10
+
+        return total_bugs
+
+    def _create_timestamped_output_dir(self, base_output_dir: Path) -> Path:
+        """
+        Create a timestamped output directory similar to scan-build's behavior.
+
+        This creates a directory with format: YYYY-MM-DD-HHMMSS-PID-N
+        consistent with Linux scan-build timestamps.
+
+        Args:
+            base_output_dir: The base output directory
+
+        Returns:
+            Path: The timestamped output directory
+        """
+        import os
+        import random
+        from datetime import datetime
+
+        # Create timestamp similar to scan-build format
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        pid = os.getpid()
+        rand_suffix = random.randint(1, 9999)
+
+        # Create directory name: YYYY-MM-DD-HHMMSS-PID-N
+        timestamped_name = f"{timestamp}-{pid}-{rand_suffix}"
+        timestamped_dir = Path(base_output_dir) / timestamped_name
+
+        # Create the directory
+        timestamped_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Created timestamped output directory: {timestamped_dir}")
+        return timestamped_dir
+
+    def _create_v8_report_softlinks(
+        self, timestamped_output_dir: Path, base_output_dir: Path
+    ) -> None:
+        """
+        Create softlinks to make V8 report structure compatible with refinement process.
+
+        Creates two levels of softlinks:
+        1. From timestamped subdirectories to base output dir (for refinement process)
+        2. From subdirectory HTML files to timestamped root (for scan-build compatibility)
+
+        Args:
+            timestamped_output_dir: The timestamped directory containing V8 report subdirectories
+            base_output_dir: The base output directory where refinement expects reports
+        """
+        try:
+            timestamped_output_dir = Path(timestamped_output_dir)
+            base_output_dir = Path(base_output_dir)
+
+            if not timestamped_output_dir.exists():
+                return
+
+            # Find all HTML files in subdirectories within timestamped dir
+            html_files_in_subdirs = list(timestamped_output_dir.glob("*/*.html"))
+
+            if not html_files_in_subdirs:
+                # No subdirectory structure, reports might already be in root
+                return
+
+            logger.info(
+                f"Creating V8 report softlinks for {len(html_files_in_subdirs)} files"
+            )
+
+            # 1. Create softlinks in the timestamped root directory (scan-build compatibility)
+            for html_file in html_files_in_subdirs:
+                subdir_name = html_file.parent.name
+                file_name = html_file.name
+
+                # Create unique link name in timestamped root
+                link_name = f"{subdir_name}_{file_name}"
+                timestamped_link_path = timestamped_output_dir / link_name
+
+                # Remove existing link if it exists
+                if timestamped_link_path.exists() or timestamped_link_path.is_symlink():
+                    timestamped_link_path.unlink()
+
+                # Create relative symlink within timestamped directory
+                relative_target = Path(subdir_name) / file_name
+                timestamped_link_path.symlink_to(relative_target)
+
+            # 2. Create softlinks from base output dir to timestamped files (refinement compatibility)
+            base_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Link all HTML files from timestamped directory to base directory
+            for html_file in timestamped_output_dir.glob("*.html"):
+                base_link_path = base_output_dir / html_file.name
+
+                # Remove existing link if it exists
+                if base_link_path.exists() or base_link_path.is_symlink():
+                    base_link_path.unlink()
+
+                # Create relative symlink from base to timestamped
+                timestamped_name = timestamped_output_dir.name
+                relative_target = Path(timestamped_name) / html_file.name
+                base_link_path.symlink_to(relative_target)
+
+            logger.info(
+                f"Created V8 softlinks: {len(html_files_in_subdirs)} in timestamped dir, mirrored to base dir"
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to create V8 report softlinks: {e}")
+            # Non-fatal error - continue without softlinks
+
+    def _discover_all_v8_source_files(self, target) -> List[str]:
+        """
+        Discover all V8 source files that can be analyzed.
+        Uses compile_commands.json to find all files that are actually compiled.
+
+        Returns:
+            List[str]: List of relative source file paths
+        """
+        import json
+
+        source_files = []
+        compile_commands_path = os.path.join(
+            target.repo.working_dir, "out/x64.release/compile_commands.json"
+        )
+
+        if os.path.exists(compile_commands_path):
+            try:
+                logger.info("Reading compile_commands.json to discover V8 source files")
+                with open(compile_commands_path, "r") as f:
+                    commands = json.load(f)
+
+                # Extract all source files from compile commands
+                for cmd in commands:
+                    file_path = cmd.get("file", "")
+                    if file_path:
+                        # V8 uses ../../ prefix in compile_commands.json
+                        if file_path.startswith("../../"):
+                            clean_path = file_path[6:]  # Remove ../../
+                        else:
+                            clean_path = file_path
+
+                        # Only include C++ source files
+                        if clean_path.endswith((".cc", ".cpp", ".c")):
+                            # Filter out third-party and build-generated files
+                            if not any(
+                                exclude in clean_path
+                                for exclude in [
+                                    "third_party/",
+                                    "buildtools/",
+                                    "build/",
+                                    "out/",
+                                    ".git/",
+                                    "gen/",
+                                    # Skip some very large or problematic directories
+                                    "tools/v8_gypfiles/",
+                                ]
+                            ):
+                                source_files.append(clean_path)
+
+                # Remove duplicates and sort
+                source_files = sorted(list(set(source_files)))
+                logger.info(
+                    f"Discovered {len(source_files)} V8 source files from compile_commands.json"
+                )
+
+                # Log some examples
+                if source_files:
+                    logger.info(f"Example files: {source_files[:5]}")
+                    if len(source_files) > 5:
+                        logger.info(f"... and {len(source_files) - 5} more files")
+
+                return source_files
+
+            except Exception as e:
+                logger.error(f"Failed to read compile_commands.json: {e}")
+
+        # Fallback: manually discover source files by walking directories
+        logger.info("Falling back to directory traversal for source file discovery")
+        return self._discover_v8_source_files_by_traversal(target)
+
+    def _discover_v8_source_files_by_traversal(self, target) -> List[str]:
+        """
+        Fallback method to discover V8 source files by walking the directory tree.
+
+        Returns:
+            List[str]: List of relative source file paths
+        """
+        source_files = []
+        repo_root = Path(target.repo.working_dir)
+
+        # Define directories to search and exclude patterns
+        search_dirs = ["src", "test", "samples"]
+        exclude_patterns = [
+            "third_party",
+            "buildtools",
+            "build",
+            "out",
+            ".git",
+            "gen",
+            "node_modules",
+            "__pycache__",
+        ]
+
+        logger.info(f"Searching for V8 source files in: {search_dirs}")
+
+        for search_dir in search_dirs:
+            search_path = repo_root / search_dir
+            if not search_path.exists():
+                continue
+
+            for file_path in search_path.rglob("*.cc"):
+                # Convert to relative path
+                relative_path = file_path.relative_to(repo_root)
+                relative_str = str(relative_path)
+
+                # Skip excluded patterns
+                if any(pattern in relative_str for pattern in exclude_patterns):
+                    continue
+
+                source_files.append(relative_str)
+
+            # Also include .cpp and .c files
+            for ext in ["*.cpp", "*.c"]:
+                for file_path in search_path.rglob(ext):
+                    relative_path = file_path.relative_to(repo_root)
+                    relative_str = str(relative_path)
+
+                    if any(pattern in relative_str for pattern in exclude_patterns):
+                        continue
+
+                    source_files.append(relative_str)
+
+        # Remove duplicates and sort
+        source_files = sorted(list(set(source_files)))
+        logger.info(f"Discovered {len(source_files)} V8 source files by traversal")
+
+        # Limit the number of files to avoid overwhelming analysis
+        max_files = 1000  # Reasonable limit for analysis
+        if len(source_files) > max_files:
+            logger.warning(
+                f"Too many files ({len(source_files)}), limiting to first {max_files}"
+            )
+            source_files = source_files[:max_files]
+
+        return source_files
 
     def _generate_command(self, no_output=False, plugin_names=None, target_type=None):
         """
@@ -1526,7 +2358,16 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         report_tmp_dir = Path(output_dir)
         report_tmp_dir.mkdir(parents=True, exist_ok=True)
 
+        # Check if this is V8-style subdirectory structure or traditional flat structure
         report_html_list = list(report_dir.glob("*.html"))
+
+        # If no HTML files directly in report_dir, check subdirectories (V8 structure)
+        if not report_html_list:
+            # Look for HTML files in subdirectories (e.g., src_objects_objects_cc/)
+            report_html_list = list(report_dir.glob("*/*.html"))
+            if report_html_list:
+                logger.info(f"Found V8-style report structure with subdirectories")
+
         num_reports = len(report_html_list)
         if num_reports < stop_num:
             logger.warning(f"< {stop_num} reports!")
