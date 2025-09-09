@@ -114,7 +114,7 @@ class GlobalConfig:
     @property
     def scan_commit(self) -> Optional[str]:
         """Get the scan commit."""
-        return self.get("scan_commit", "HEAD")
+        return self.get("scan_commit", "main")
 
     @property
     def max_fp_reports_for_refinement(self) -> int:

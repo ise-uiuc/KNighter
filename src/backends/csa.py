@@ -2,9 +2,9 @@ import json
 import os
 import random
 import re
+import shlex
 import subprocess as sp
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -687,6 +687,42 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         return num_bugs
 
+    def _get_compile_entries_for_v8_sources(
+        self, compile_commands_path: Path, source_files: List[str]
+    ) -> dict:
+        """
+        Extract compile entries for specific source files from compile_commands.json.
+
+        Args:
+            compile_commands_path: Path to compile_commands.json
+            source_files: List of source files to find entries for
+
+        Returns:
+            dict: Mapping of source file to compile command entry
+        """
+        compile_entries = {}
+
+        if not compile_commands_path.exists():
+            logger.error(f"compile_commands.json not found at {compile_commands_path}")
+            return compile_entries
+
+        try:
+            with open(compile_commands_path, "r") as f:
+                commands = json.load(f)
+
+            # Find compile entries for each source file
+            for source_file in source_files:
+                normalized_source = f"../../{source_file}"
+                for cmd in commands:
+                    if cmd.get("file") == normalized_source:
+                        compile_entries[source_file] = cmd
+                        break
+
+        except Exception as e:
+            logger.error(f"Failed to read compile_commands.json: {e}")
+
+        return compile_entries
+
     def _validate_checker_v8(
         self,
         checker_code: str,
@@ -699,8 +735,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         Validate the checker against a V8 commit and patch.
         Analyzes files in both buggy and fixed versions to compute TP/TN.
         """
-        import json
-
         # Remove depot_tools from PATH to prevent gclient sync from changing V8 dependencies
         original_path = os.environ.get("PATH", "")
         filtered_path = ":".join(
@@ -768,22 +802,11 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         compile_commands_path = (
             Path(target.repo.working_dir) / "out/x64.release/compile_commands.json"
         )
-        compile_entries = {}
 
-        if compile_commands_path.exists():
-            try:
-                with open(compile_commands_path, "r") as f:
-                    commands = json.load(f)
-
-                # Find compile entries for each source file
-                for source_file in source_files:
-                    normalized_source = f"../../{source_file}"
-                    for cmd in commands:
-                        if cmd.get("file") == normalized_source:
-                            compile_entries[source_file] = cmd
-                            break
-            except Exception as e:
-                logger.error(f"Failed to read compile_commands.json: {e}")
+        # Use helper function to get compile entries
+        compile_entries = self._get_compile_entries_for_v8_sources(
+            compile_commands_path, source_files
+        )
 
         # Build and analyze buggy version
         for source_file in source_files:
@@ -851,24 +874,10 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             llvm_path=llvm_build_dir,
         )
 
-        # Re-read compile_commands.json for fixed version
-        if compile_commands_path.exists():
-            try:
-                with open(compile_commands_path, "r") as f:
-                    commands = json.load(f)
-
-                # Update compile entries for fixed version
-                compile_entries = {}
-                for source_file in source_files:
-                    normalized_source = f"../../{source_file}"
-                    for cmd in commands:
-                        if cmd.get("file") == normalized_source:
-                            compile_entries[source_file] = cmd
-                            break
-            except Exception as e:
-                logger.error(
-                    f"Failed to read compile_commands.json for fixed version: {e}"
-                )
+        # Re-read compile_commands.json for fixed version (may have changed after checkout)
+        compile_entries = self._get_compile_entries_for_v8_sources(
+            compile_commands_path, source_files
+        )
 
         # Build and analyze fixed version
         for source_file in source_files:
@@ -955,9 +964,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
     def _get_object_file_from_source(self, source_file, target):
         """Convert source file path to corresponding object file path using compile_commands.json."""
-        import json
-        import shlex
-
         # Try to find the actual object file from compile_commands.json
         compile_commands_path = (
             Path(target.repo.working_dir) / "out/x64.release/compile_commands.json"
@@ -1754,6 +1760,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         # Checkout commit if needed
         if not skip_checkout:
             llvm_build_dir = self.backend_path / "build"
+            print(commit_id)
             target.checkout_commit(
                 commit_id,
                 is_before=False,
@@ -1794,7 +1801,8 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                     # Log down the error msg
                     Path("tmp/v8-build-stdout.txt").write_text(build_result.stdout)
                     Path("tmp/v8-build-stderr.txt").write_text(build_result.stderr)
-                    # FIXME: We should not return -999 here
+
+                    # FIXME: There are some issues when building v8 testcases
                     # FIXME: Now we just keep going
                     # return -999
 
