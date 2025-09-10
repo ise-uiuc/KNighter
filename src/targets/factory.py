@@ -99,6 +99,9 @@ class TargetFactory(ABC):
         # Add buggy code section
         sections.append("## Buggy Code\n")
         for file_path, func_name, func_code in func_code_set:
+            # Skip if func_name is None (parsing failure)
+            if func_name is None:
+                continue
             if func_name.startswith("WHOLE_FILE_"):
                 # Handle whole file fallback case
                 file_name = func_name.replace("WHOLE_FILE_", "")

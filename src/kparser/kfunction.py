@@ -42,6 +42,8 @@ class KernelFunction:
             for c in decl.children:
                 if c.type == "identifier":
                     return c.text.decode("utf-8")
+            # If no identifier found, return empty string
+            return ""
         elif "pointer_declarator" in types:
             return self.__find_name(children[types.index("pointer_declarator")])
         else:
