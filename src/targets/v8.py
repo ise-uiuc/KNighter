@@ -1,5 +1,6 @@
 import re
 import subprocess as sp
+from datetime import datetime
 from pathlib import Path
 from shutil import which
 from typing import List
@@ -26,26 +27,55 @@ class V8(TargetFactory):
             is_before (bool): Whether to checkout before the commit.
             arch (str): The architecture to build for.
             build_config (str): The build configuration (debug/release).
+            llvm_path (str/Path): Custom LLVM path to use (optional).
+            skip_v8_build (bool): Skip V8 build (preserve existing out/ directory).
         """
+        # Extract skip_v8_build flag from kwargs
+        skip_v8_build = kwargs.get("skip_v8_build", False)
+
         logger.info(
             f"Checking out commit {commit_id} {'before' if is_before else 'after'}"
         )
 
-        # Clean previous build artifacts
-        res = sp.run(
-            ["rm", "-rf", "out"], cwd=self.repo.working_dir, capture_output=True
-        )
-        if res.returncode != 0:
-            logger.warning(f"Failed to clean out directory: {res.stderr.decode()}")
+        if skip_v8_build:
+            logger.info("Skipping V8 build - preserving existing out/ directory")
+        else:
+            # Clean previous build artifacts
+            logger.info("Cleaning previous build artifacts")
+            res = sp.run(
+                ["rm", "-rf", "out"], cwd=self.repo.working_dir, capture_output=True
+            )
+            if res.returncode != 0:
+                logger.warning(f"Failed to clean out directory: {res.stderr.decode()}")
 
         if is_before:
             commit_id = commit_id + "^"
+
+        # Reset any uncommitted changes from previous runs
+        try:
+            self.repo.git.reset("--hard")
+            self.repo.git.clean("-fd")
+        except Exception as e:
+            logger.warning(f"Failed to clean repository state: {e}")
 
         self.repo.git.checkout(commit_id)
 
         # Try to sync dependencies with gclient only if available and configured
         repo_dir = Path(self.repo.working_dir)
         gclient_exe = which("gclient")
+
+        # If gclient not in PATH, try common locations
+        if not gclient_exe:
+            potential_paths = [
+                Path.home() / "depot_tools" / "gclient",
+                Path("/usr/local/bin/gclient"),
+                Path("/opt/depot_tools/gclient"),
+            ]
+            for path in potential_paths:
+                if path.exists():
+                    gclient_exe = str(path)
+                    break
+
         has_gclient_config = (repo_dir / ".gclient").exists() or (
             repo_dir.parent / ".gclient"
         ).exists()
@@ -77,9 +107,14 @@ class V8(TargetFactory):
         # build_config = kwargs.get('build_config', 'release')
         build_dir = f"out/{arch}.release"
 
-        # Check if we should use custom LLVM
-        custom_llvm_path = Path("/scratch/chenyuan-data/knighter-dev-v8/llvm-21/build")
-        if custom_llvm_path.exists():
+        # Check if we should use custom LLVM (from kwargs or fallback to hardcoded path)
+        custom_llvm_path = kwargs.get("llvm_path")
+
+        # Convert to Path if string provided
+        if custom_llvm_path and not isinstance(custom_llvm_path, Path):
+            custom_llvm_path = Path(custom_llvm_path)
+
+        if custom_llvm_path and custom_llvm_path.exists():
             logger.info(f"Using custom LLVM from {custom_llvm_path}")
 
             gn_args = [
@@ -97,9 +132,12 @@ class V8(TargetFactory):
                 "treat_warnings_as_errors=false",
                 "use_lld=true",
                 "llvm_android_mainline=true",
-                # Use V8's bundled libc++ to avoid header conflicts with LLVM-21
             ]
         else:
+            logger.info(
+                "Using system clang (no custom LLVM path provided or path doesn't exist)"
+            )
+
             gn_args = [
                 f'target_cpu="{arch}"',
                 f"is_debug=false",
@@ -116,6 +154,9 @@ class V8(TargetFactory):
             raise RuntimeError(
                 "GN executable not found. Install depot_tools or ensure 'gn' is on PATH (or at buildtools/linux64/gn)."
             )
+
+        # Apply version-specific patches before generating build files
+        self._apply_version_patches()
 
         logger.info(
             f"Generating build files for {arch.upper()} with arguments: {' '.join(gn_args)}"
@@ -137,6 +178,73 @@ class V8(TargetFactory):
             logger.error(f"Failed to generate build files: {res.stderr}")
             logger.error(res.stdout)
             raise RuntimeError(f"Failed to generate build files: {res.stderr}")
+
+    def _apply_version_patches(self):
+        """
+        Apply version-specific patches to handle build system incompatibilities.
+        This method is called after checking out a commit to fix known issues.
+        """
+        # Fix exec_script_whitelist -> exec_script_allowlist change
+        self._fix_exec_script_naming()
+
+    def _fix_exec_script_naming(self):
+        """
+        Fix the exec_script_whitelist -> exec_script_allowlist naming change.
+        This change occurred in V8 around April 2025 (commit 51d69ed8f8d).
+        """
+        gn_file = Path(self.repo.working_dir) / ".gn"
+        if not gn_file.exists():
+            return
+
+        try:
+            content = gn_file.read_text()
+
+            # Check if we need to patch (has old naming)
+            if "exec_script_whitelist" in content:
+                # First check if build_dotfile_settings has the new naming
+                dotfile_settings = (
+                    Path(self.repo.working_dir) / "build" / "dotfile_settings.gni"
+                )
+                if dotfile_settings.exists():
+                    settings_content = dotfile_settings.read_text()
+                    if (
+                        "exec_script_allowlist" in settings_content
+                        and "exec_script_whitelist" not in settings_content
+                    ):
+                        # The build system uses new naming but .gn uses old - need to patch
+                        logger.info(
+                            "Patching .gn file: exec_script_whitelist -> exec_script_allowlist"
+                        )
+                        patched_content = content.replace(
+                            "exec_script_whitelist", "exec_script_allowlist"
+                        )
+                        gn_file.write_text(patched_content)
+                        logger.info("Successfully patched .gn file for compatibility")
+
+            # Handle the reverse case (old build system, new .gn file)
+            elif "exec_script_allowlist" in content:
+                dotfile_settings = (
+                    Path(self.repo.working_dir) / "build" / "dotfile_settings.gni"
+                )
+                if dotfile_settings.exists():
+                    settings_content = dotfile_settings.read_text()
+                    if (
+                        "exec_script_whitelist" in settings_content
+                        and "exec_script_allowlist" not in settings_content
+                    ):
+                        # The build system uses old naming but .gn uses new - need to patch
+                        logger.info(
+                            "Patching .gn file: exec_script_allowlist -> exec_script_whitelist"
+                        )
+                        patched_content = content.replace(
+                            "exec_script_allowlist", "exec_script_whitelist"
+                        )
+                        gn_file.write_text(patched_content)
+                        logger.info("Successfully patched .gn file for compatibility")
+
+        except Exception as e:
+            logger.warning(f"Failed to apply exec_script patch: {e}")
+            # Non-fatal - let the build fail with proper error message if needed
 
     @staticmethod
     def get_object_name(file_name: str) -> str:
