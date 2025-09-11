@@ -1,10 +1,15 @@
+import glob
 import json
 import os
 import random
 import re
 import shlex
+import shutil
 import subprocess as sp
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -183,8 +188,6 @@ class ClangBackend(AnalysisBackendFactory):
     def _generate_unique_checker_name(self, checker_id: str) -> str:
         """Generate a unique checker name from checker_id."""
         # Remove the KN- prefix and clean up the name
-        import re
-
         name = checker_id.replace("KN-", "").replace("-", "_")
         # Ensure it's a valid C++ identifier
         name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
@@ -211,9 +214,6 @@ class ClangBackend(AnalysisBackendFactory):
 
     def _create_group_plugin_directories(self, checker_data_list: List):
         """Create plugin directories for all checkers in the group."""
-        import shutil
-        import subprocess as sp
-
         plugin_dir = self.backend_path / "clang/lib/Analysis/plugins"
         if not plugin_dir.exists():
             logger.error(f"Plugin directory {plugin_dir} does not exist")
@@ -1033,8 +1033,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         if os.path.exists(compile_commands_path):
             try:
-                import json
-
                 with open(compile_commands_path, "r") as f:
                     compile_commands = json.load(f)
 
@@ -1045,9 +1043,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                         break
 
                 if compile_cmd:
-                    import shlex
-                    import subprocess as sp
-
                     cmd_parts = shlex.split(compile_cmd)
 
                     # Create output directory
@@ -1261,8 +1256,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         if not os.path.exists(scan_build_output_dir):
             return 0
 
-        import glob
-
         # First try HTML files (new format for cross-file diagnostics)
         html_files = glob.glob(
             os.path.join(scan_build_output_dir, "**/*.html"), recursive=True
@@ -1272,49 +1265,9 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             # Exclude index.html and scanview.html which are summaries
             bug_reports = [f for f in html_files if "report-" in os.path.basename(f)]
             return len(bug_reports)
-
-        # Fallback to plist files (legacy format)
-        plist_files = glob.glob(os.path.join(scan_build_output_dir, "*.plist"))
-
-        if not plist_files:
+        else:
+            logger.warning(f"No HTML files found in {scan_build_output_dir}")
             return 0
-
-        total_bugs = 0
-
-        try:
-            import xml.etree.ElementTree as ET
-
-            for plist_file in plist_files:
-                with open(plist_file, "r") as f:
-                    content = f.read()
-
-                # Parse plist XML to count diagnostics
-                try:
-                    root = ET.fromstring(content)
-
-                    # Look for diagnostics array in the plist
-                    for dict_elem in root.findall(".//dict"):
-                        for key in dict_elem.findall("key"):
-                            if key.text == "diagnostics":
-                                # Next element should be the array of diagnostics
-                                next_elem = key.getnext()
-                                if next_elem is not None and next_elem.tag == "array":
-                                    # Count child dict elements (each represents a bug)
-                                    bugs_in_file = len(next_elem.findall("dict"))
-                                    total_bugs += bugs_in_file
-                                    break
-
-                except ET.ParseError as e:
-                    # If plist parsing fails, try to count by looking for checker names
-                    if "custom.SAGenTestChecker" in content:
-                        # Basic fallback: count occurrences of our checker name
-                        total_bugs += content.count("custom.SAGenTestChecker")
-
-        except Exception as e:
-            # Fallback: if we can't parse plist files, at least count that files exist
-            total_bugs = len(plist_files)
-
-        return total_bugs
 
     def _analyze_v8_source_file(
         self, compile_entry, output_dir, target=None, timeout=900
@@ -1334,8 +1287,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         Returns:
             tuple: (success: bool, num_bugs: int, error_message: str or None)
         """
-        import shlex
-
         source_file = compile_entry.get("file", "")
         compile_cmd = compile_entry.get("command", "")
         directory = compile_entry.get("directory", "")
@@ -1489,8 +1440,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         Returns:
             tuple: (total_bugs, analyzed_files, failed_files)
         """
-        import threading
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         # Thread-safe counters
         total_bugs = 0
@@ -1537,8 +1486,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                             total_bugs += num_bugs
                         else:
                             # Remove empty directory
-                            import shutil
-
                             shutil.rmtree(file_output_dir, ignore_errors=True)
                         analyzed_files += 1
                     else:
@@ -1550,8 +1497,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                             logger.error(error_msg)
                         failed_files += 1
                         # Remove directory on failure
-                        import shutil
-
                         shutil.rmtree(file_output_dir, ignore_errors=True)
 
             except Exception as e:
@@ -1559,8 +1504,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                     logger.error(f"Unexpected error analyzing {clean_source}: {e}")
                     failed_files += 1
                     # Remove directory on exception
-                    import shutil
-
                     shutil.rmtree(file_output_dir, ignore_errors=True)
 
         # Execute analysis in parallel
@@ -1596,7 +1539,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         """
         Configure V8 build to use our custom clang for scan-build interception.
         """
-        import subprocess as sp
 
         # Find GN executable (similar to v8.py logic)
         gn_exe = None
@@ -1612,8 +1554,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         if not gn_exe:
             # Try to find gn in PATH
-            import shutil
-
             gn_exe = shutil.which("gn")
 
         if not gn_exe:
@@ -1632,8 +1572,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         )
         clang_version = "21"  # default
         if clang_version_result.returncode == 0:
-            import re
-
             version_match = re.search(
                 r"clang version (\d+)", clang_version_result.stdout
             )
@@ -1877,9 +1815,10 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         # Step 3: Run clang++ --analyze on source files (parallel or sequential)
         if parallel_analysis:
-            # Use parallel analysis
+            # Import here to avoid circular import
             from global_config import global_config
 
+            # Use parallel analysis
             default_workers = min(global_config.jobs, len(source_files_to_analyze))
             max_workers = kwargs.get("max_workers", default_workers)
             logger.info(f"Using parallel analysis with {max_workers} workers")
@@ -1942,7 +1881,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                         final_output_dir = timestamped_output_dir / safe_filename
 
                         # Move tmp directory to final location
-                        import shutil
 
                         if final_output_dir.exists():
                             shutil.rmtree(final_output_dir)
@@ -1957,7 +1895,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                         total_bugs += num_bugs
                     else:
                         # Clean up tmp directory if no bugs found
-                        import shutil
 
                         shutil.rmtree(temp_output_dir, ignore_errors=True)
                         temp_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1978,7 +1915,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             # Clean up any remaining tmp directory
             temp_output_dir = timestamped_output_dir / "tmp"
             if temp_output_dir.exists():
-                import shutil
 
                 shutil.rmtree(temp_output_dir, ignore_errors=True)
 
@@ -2013,10 +1949,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         Returns:
             Path: The timestamped output directory
         """
-        import os
-        import random
-        from datetime import datetime
-
         # Create timestamp similar to scan-build format
         timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         pid = os.getpid()
@@ -2113,8 +2045,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         Returns:
             List[str]: List of relative source file paths
         """
-        import json
-
         source_files = []
         compile_commands_path = os.path.join(
             target.repo.working_dir, "out/x64.release/compile_commands.json"
@@ -2441,8 +2371,6 @@ extern "C" const char clang_analyzerAPIVersionString[] =
     @staticmethod
     def _generate_unique_checker_name_static(checker_id: str) -> str:
         """Static version of _generate_unique_checker_name for use in attribution."""
-        import re
-
         name = checker_id.replace("KN-", "").replace("-", "_")
         name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
         if name and not name[0].isalpha():
