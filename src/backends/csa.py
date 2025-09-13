@@ -2193,6 +2193,8 @@ extern "C" const char clang_analyzerAPIVersionString[] =
             if no_output and arg_name == "-o":
                 continue
             comd += f"{arg_name} {arg_value} "
+
+        comd += f"--use-cc={llvm_build_dir}/bin/clang "
         return comd
 
     def _generate_command_group(

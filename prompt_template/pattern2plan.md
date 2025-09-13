@@ -1,7 +1,7 @@
 # Instruction
 
 Please organize a elaborate plan to help to write a CSA
-checker to detect thhe **bug pattern**.
+checker to detect the **bug pattern**.
 
 You will be provided with a **bug pattern** description and the corresponding patch to help you undestand this bug pattern.
 
