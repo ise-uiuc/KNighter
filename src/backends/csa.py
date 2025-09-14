@@ -2171,7 +2171,7 @@ extern "C" const char clang_analyzerAPIVersionString[] =
 
         return source_files
 
-    def _generate_command(self, no_output=False, plugin_names=None, target_type=None):
+    def _generate_command(self, no_output=False, plugin_names=None):
         """
         Generate the command to run the analysis.
 
@@ -2184,17 +2184,22 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         """
         llvm_build_dir = (self.backend_path / "build").absolute()
         comd = f"PATH={llvm_build_dir}/bin:$PATH "
-        comd += f"{llvm_build_dir}/bin/scan-build "
+        comd += f"{llvm_build_dir}/bin/scan-build --use-cc=clang "
+        if plugin_names:
+            for plugin_name in plugin_names:
+                comd += f"-load-plugin {llvm_build_dir}/lib/{plugin_name}Plugin.so "
+                comd += f"-enable-checker custom.{plugin_name}Checker "
+        else:
+            comd += f"-load-plugin {llvm_build_dir}/lib/SAGenTestPlugin.so "
+            comd += "-enable-checker custom.SAGenTestChecker "
 
         # Use appropriate arguments based on target type
-        args_to_use = self._v8_args if target_type == "v8" else self._default_args
-
+        args_to_use = self._default_args
         for arg_name, arg_value in args_to_use:
             if no_output and arg_name == "-o":
                 continue
             comd += f"{arg_name} {arg_value} "
 
-        comd += f"--use-cc={llvm_build_dir}/bin/clang "
         return comd
 
     def _generate_command_group(
