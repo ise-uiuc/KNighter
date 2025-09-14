@@ -46,10 +46,16 @@ class GlobalConfig:
         # Init the target and backend
         # FIXME: This should be extended to support other targets and backends
         target_type = self.get("target_type", "linux")
+
+        if "v8_dir" in self._config:
+            self._config["v8"] = V8(self.get("v8_dir"))
+        if "linux_dir" in self._config:
+            self._config["linux"] = Linux(self.get("linux_dir"))
+
         if target_type == "v8":
-            self._config["target"] = V8(self.get("v8_dir"))
+            self._config["target"] = self._config["v8"]
         else:
-            self._config["target"] = Linux(self.get("linux_dir"))
+            self._config["target"] = self._config["linux"]
         self._config["backend"] = ClangBackend(self.get("LLVM_dir"))
 
     def _init_logger(self):
