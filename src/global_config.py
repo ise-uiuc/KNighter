@@ -10,6 +10,7 @@ from backends.factory import AnalysisBackendFactory
 from targets.factory import TargetFactory
 from targets.linux import Linux
 from targets.v8 import V8
+from targets.firefox import Firefox
 
 logger = loguru.logger
 
@@ -49,11 +50,15 @@ class GlobalConfig:
 
         if "v8_dir" in self._config:
             self._config["v8"] = V8(self.get("v8_dir"))
+        if "firefox_dir" in self._config:
+            self._config["firefox"] = Firefox(self.get("firefox_dir"))
         if "linux_dir" in self._config:
             self._config["linux"] = Linux(self.get("linux_dir"))
 
         if target_type == "v8":
             self._config["target"] = self._config["v8"]
+        elif target_type == "firefox":
+            self._config["target"] = self._config["firefox"]
         else:
             self._config["target"] = self._config["linux"]
         self._config["backend"] = ClangBackend(self.get("LLVM_dir"))

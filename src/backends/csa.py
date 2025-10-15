@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import time
 import shlex
 import shutil
 import subprocess as sp
@@ -2457,75 +2458,339 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         return num_bugs
 
     def _analyze_firefox_files_with_scan_build(
-        self, target, source_files: list[str], checker_name: str = "SAGenTest"
+        self, target, source_files: list[str], checker_name: str = "SAGenTestChecker"
     ) -> list:
         """
-        Analyze Firefox source files using scan-build with custom SAGEN checker.
-        Disables all built-in checkers and enables only the custom checker.
-
-        Args:
-            target: Firefox target instance
-            source_files: List of source files to analyze
-            checker_name: Name of the custom checker to enable
-
-        Returns:
-            list: List of detected bugs/issues
+        Firefox-safe analysis with per-commit & per-run results.
+        - Force local LLVM toolchain (disable bootstrap to avoid artifact downloads).
+        - Create per-commit objdir and per-run results dir under tmp/.
+        - Persist ALL logs under tmp/firefox_scan_results/<commit>/<run-id>/_logs (never delete).
+        - Probe CSA plugin + checker before running scan-build.
+        - Gate incremental builds on a FULL BUILD completion check.
+        If full build is not complete, run a full `./mach build` first.
+        - Filter build targets against objdir ONLY after full build is complete.
+        - Pick & install a rustup toolchain based on the commit date, and set repo-local override.
         """
+        import os, shlex, subprocess as sp, json, time, datetime, shutil, types
+        from pathlib import Path
+
         logger.info(f"Analyzing {len(source_files)} Firefox files with scan-build")
 
+        repo_dir = Path(target.repo.working_dir)
         llvm_build_dir = (self.backend_path / "build").absolute()
-        results_dir = Path("tmp/firefox_scan_results")
+        analyzer_clang = llvm_build_dir / "bin" / "clang"
+        analyzer_clangxx = llvm_build_dir / "bin" / "clang++"
+        scan_build = llvm_build_dir / "bin" / "scan-build"
+        plugin_so = llvm_build_dir / "lib" / "SAGenTestPlugin.so"
+
+        # Resolve commit for naming
+        rev = sp.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo_dir, capture_output=True, text=True)
+        commit_short = (rev.stdout or "unknown").strip() or "unknown"
+        objdir_name = f"obj-scan-{commit_short}"
+        topobjdir = repo_dir / objdir_name
+
+        # Per-run results dir
+        run_id = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S-%f")
+        results_root = repo_dir / "tmp" / "firefox_scan_results"
+        results_dir = results_root / commit_short / run_id
         results_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = results_dir / "_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Temporary logger sink
+        cmd_log = log_dir / "cmd-run.log"
+        sink_id = logger.add(str(cmd_log), level="DEBUG", retention="30 days")
+        logger.debug(f"[init] temp cmd logger -> {cmd_log}")
+
+        def _log_env(e: dict) -> str:
+            keys = ["MOZCONFIG", "MOZ_AUTOMATION", "CI", "CC", "CXX", "NODEJS"]
+            return ", ".join(f"{k}={e.get(k, '')}" for k in keys)
+
+        def _write_file(path: Path, content: str):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content or "")
+
+        def run_cmd(cmd, *, name: str, cwd: Path, env: dict | None = None,
+                    timeout: int | None = None, check: bool = False):
+            t0 = time.time()
+            cmd_str = " ".join(shlex.quote(str(x)) for x in cmd)
+            logger.debug(f"[CMD:{name}] cwd={cwd} env=({_log_env(env or {})})")
+            logger.debug(f"[CMD:{name}] $ {cmd_str}")
+            _write_file(log_dir / f"{name}.cmd.txt", cmd_str + "\n")
+
+            res = sp.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+            dt = time.time() - t0
+            logger.debug(f"[CMD:{name}] rc={res.returncode} took={dt:.2f}s")
+
+            _write_file(log_dir / f"{name}.stdout.log", res.stdout or "")
+            _write_file(log_dir / f"{name}.stderr.log", res.stderr or "")
+
+            if res.stdout:
+                logger.debug(f"[CMD:{name}] STDOUT:\n{res.stdout}")
+            if res.stderr:
+                logger.debug(f"[CMD:{name}] STDERR:\n{res.stderr}")
+
+            if check and res.returncode != 0:
+                raise RuntimeError(f"{name} failed (rc={res.returncode})")
+            return res
+
+        def run_cmd_stream(cmd, *, name: str, cwd: Path, env: dict | None = None, timeout: int | None = None):
+            cmd_str = " ".join(shlex.quote(str(x)) for x in cmd)
+            logger.debug(f"[CMD:{name}] cwd={cwd} env=({_log_env(env or {})})")
+            logger.debug(f"[CMD:{name}] $ {cmd_str}")
+            _write_file(log_dir / f"{name}.cmd.txt", cmd_str + "\n")
+
+            t0 = time.time()
+            proc = sp.Popen(
+                cmd, cwd=cwd, env=env, text=True, bufsize=1,
+                stdout=sp.PIPE, stderr=sp.STDOUT
+            )
+            out_path = log_dir / f"{name}.stdout.log"
+            with open(out_path, "w", encoding="utf-8", buffering=1) as fout:
+                for line in proc.stdout:
+                    fout.write(line)
+                    logger.debug(f"[{name}] {line.rstrip()}")
+
+            try:
+                rc = proc.wait(timeout=timeout)
+            except sp.TimeoutExpired:
+                proc.kill()
+                rc = -9
+                logger.warning(f"[CMD:{name}] timeout after {timeout}s; killed.")
+            dt = time.time() - t0
+            logger.debug(f"[CMD:{name}] rc={rc} took={dt:.2f}s")
+            return types.SimpleNamespace(returncode=rc, stdout="", stderr=f"(streamed to {out_path})")
+
+        def _detect_checker_fullname() -> tuple[bool, str]:
+            cmd = [
+                str(analyzer_clang), "-fsyntax-only", "-x", "c", "-",
+                "-Xclang", "-load", "-Xclang", str(plugin_so),
+                "-Xclang", "-analyzer-checker-help",
+            ]
+            r = run_cmd(cmd, name="probe_checker", cwd=repo_dir, env=os.environ.copy(), timeout=60)
+            expected = f"custom.{checker_name}"
+            if r.returncode != 0 or not r.stdout:
+                logger.warning("[probe] CSA plugin may not have loaded; running without plugin.")
+                return (False, "")
+            ok = any(expected in ln for ln in r.stdout.splitlines())
+            if not ok:
+                candidates = [ln.strip() for ln in r.stdout.splitlines() if checker_name in ln]
+                if candidates:
+                    logger.warning(f"[probe] '{expected}' not found; candidates: {candidates[:3]}")
+                else:
+                    logger.warning(f"[probe] '{expected}' not found in analyzer-checker-help.")
+            return (ok, expected if ok else "")
+
+        def _pick_rust_for_date(iso_date: str) -> str:
+            try:
+                if iso_date.endswith("Z"):
+                    iso_date = iso_date.replace("Z", "+00:00")
+                d = datetime.datetime.fromisoformat(iso_date).date()
+            except Exception:
+                d = datetime.date.today()
+            if d >= datetime.date(2024, 10, 1):
+                return "1.88.0"
+            if d >= datetime.date(2024, 1, 1):
+                return "1.82.0"
+            if d >= datetime.date(2023, 1, 1):
+                return "1.66.1"
+            if d >= datetime.date(2022, 1, 1):
+                return "1.63.0"
+            return "1.56.1"
+
+        def _ensure_rust_override(repo: Path, toolchain: str):
+            rustup = shutil.which("rustup")
+            if not rustup:
+                logger.warning("[rust] rustup not found; cannot set override automatically.")
+                return
+            run_cmd([rustup, "toolchain", "install", toolchain],
+                    name="rustup_toolchain_install", cwd=repo, env=os.environ.copy(), timeout=1800)
+            run_cmd([rustup, "override", "set", toolchain],
+                    name="rustup_override_set", cwd=repo, env=os.environ.copy(), timeout=300)
+            ver = run_cmd(["rustc", "--version"], name="rustc_version_after_override",
+                        cwd=repo, env=os.environ.copy(), timeout=60)
+            logger.info(f"[rust] using: {(ver.stdout or ver.stderr or '').strip()} (override={toolchain})")
+
+        # NEW: full-build completeness check (heuristic but robust)
+        def _is_full_build_complete(objdir: Path) -> bool:
+            """
+            Heuristics for a 'full build complete' state:
+            - configure finished: <objdir>/config.status
+            - export/headers available: <objdir>/dist/include/js-config.h
+            - linked artifacts present: one of {libxul, firefox/js shell} in <objdir>/dist/bin
+            """
+            if not (objdir / "config.status").exists():
+                return False
+            if not (objdir / "dist" / "include" / "js-config.h").exists():
+                return False
+            bin_dir = objdir / "dist" / "bin"
+            if not bin_dir.exists():
+                return False
+            markers = ["libxul.so", "libxul.dylib", "xul.dll", "firefox", "firefox.exe", "js", "js.exe"]
+            return any((bin_dir / m).exists() for m in markers)
 
         bugs_found = []
-
         try:
-            # Build scan-build command with disabled built-in checkers and custom checker
-            # Use -Xanalyzer to pass arguments to clang's static analyzer
-            cmd = [
-                f"{llvm_build_dir}/bin/scan-build",
-                "--use-cc=clang",
-                "--use-c++=clang++",
-                "-load-plugin", f"{llvm_build_dir}/lib/SAGenTestPlugin.so",
-                "-enable-checker", f"custom.{checker_name}",
+            # --- commit date -> rustc toolchain (install & override if possible)
+            cdate = sp.run(["git", "show", "-s", "--format=%cI", "HEAD"],
+                        cwd=repo_dir, capture_output=True, text=True)
+            commit_iso = (cdate.stdout or "").strip()
+            _write_file(log_dir / "commit_date.txt", commit_iso + "\n")
+            toolchain = _pick_rust_for_date(commit_iso or "")
+            _write_file(log_dir / "rust_toolchain.picked.txt", toolchain + "\n")
+            _ensure_rust_override(repo_dir, toolchain)
+
+            # mozconfig
+            mozconfig_path = repo_dir / "mozconfig"
+            desired_mozconfig = "\n".join([
+                f"mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/{objdir_name}",
+                "ac_add_options --without-wasm-sandboxed-libraries",
+                "ac_add_options --disable-bootstrap",
+            ]) + "\n"
+
+            need_reconfigure = False
+            if (not mozconfig_path.exists()) or (mozconfig_path.read_text() != desired_mozconfig):
+                _write_file(mozconfig_path, desired_mozconfig)
+                need_reconfigure = True
+                logger.info(f"{'Created' if not mozconfig_path.exists() else 'Updated'} mozconfig for {commit_short}")
+            _write_file(log_dir / "mozconfig.snapshot", desired_mozconfig)
+
+            # environment
+            env = os.environ.copy()
+            env["MOZCONFIG"] = str(mozconfig_path)
+            env.pop("MOZ_AUTOMATION", None)
+            env.pop("CI", None)
+            env["CC"] = str(analyzer_clang)
+            env["CXX"] = str(analyzer_clangxx)
+            env.setdefault("PYTHONUNBUFFERED", "1")
+
+            # venv + (optional) clobber on reconfigure
+            run_cmd(["./mach", "create-virtualenvs"], name="mach_create_venvs", cwd=repo_dir, env=env, timeout=900)
+            if need_reconfigure:
+                run_cmd(["./mach", "clobber"], name="mach_clobber", cwd=repo_dir, env=env, timeout=1800)
+
+            cfg = run_cmd(["./mach", "-v", "configure"], name="mach_configure", cwd=repo_dir, env=env, timeout=2400)
+            if cfg.returncode != 0:
+                logger.warning("mach configure returned non-zero; see logs for details.")
+
+            # Tool versions
+            versions = {}
+            env_json = run_cmd(["./mach", "environment", "--format", "json"],
+                            name="mach_environment", cwd=repo_dir, env=env, timeout=300)
+            try:
+                if env_json.stdout:
+                    data = json.loads(env_json.stdout)
+                    substs = data.get("substs", {})
+                    versions["build_CC"] = substs.get("CC")
+                    versions["build_CXX"] = substs.get("CXX")
+                    versions["build_PYTHON3"] = substs.get("PYTHON3") or substs.get("PYTHON")
+                    # Also record topobjdir for sanity
+                    _write_file(log_dir / "topobjdir.txt", (data.get("topobjdir") or "") + "\n")
+            except Exception as e:
+                logger.debug(f"[versions] parse env failed: {e}")
+
+            pyv = run_cmd(["./mach", "python", "-c", "import sys;print(sys.version)"],
+                        name="mach_python_version", cwd=repo_dir, env=env, timeout=120)
+            versions["build_python_version"] = (pyv.stdout or "").strip()
+
+            cav = run_cmd([str(analyzer_clang), "--version"],
+                        name="analyzer_clang_version", cwd=repo_dir, env=env, timeout=60)
+            versions["analyzer_clang_version"] = (cav.stdout or cav.stderr or "").strip()
+            _write_file(log_dir / "tool_versions.json", json.dumps(versions, indent=2))
+
+            # --- probe plugin/checker
+            plugin_ok, full_checker = _detect_checker_fullname()
+
+            # --- FULL BUILD GATE: if full build is NOT complete, run a full build first
+            full_ready_before = _is_full_build_complete(topobjdir)
+            _write_file(log_dir / "full_build_ready.before.txt", str(full_ready_before) + "\n")
+
+            # Compose base scan-build command (plugin optional)
+            base_cmd = [
+                str(scan_build),
+                f"--use-cc={analyzer_clang}",
+                f"--use-c++={analyzer_clangxx}",
                 "-o", str(results_dir),
-                "./mach", "build"
             ]
-
-            # Add specific object files to force rebuilding if provided and not too many
-            if len(source_files) < 5:
-                # Convert source files to object files to force mach to rebuild
-                object_files = [Firefox.get_object_name(f) for f in source_files]
-                # Remove existing object files to force recompilation
-                obj_dir = Path(target.repo.working_dir) / "obj-x86_64-pc-linux-gnu"
-                for obj_file in object_files:
-                    full_obj_path = obj_dir / obj_file
-                    if full_obj_path.exists():
-                        full_obj_path.unlink()
-                        logger.info(f"Removed existing object file: {full_obj_path}")
-                cmd.extend(object_files)
-
-            logger.info(f"Running scan-build command: {' '.join(cmd)}")
-
-            result = sp.run(
-                cmd,
-                cwd=target.repo.working_dir,
-                capture_output=True,
-                text=True,
-                timeout=1800  # 30 minutes timeout
-            )
-
-            # Parse results from scan-build output
-            if result.returncode == 0 or "scan-build:" in result.stderr:
-                bugs_found = self._parse_scan_build_results(results_dir)
-                logger.info(f"Scan-build analysis completed, found {len(bugs_found)} issues")
+            if plugin_ok:
+                base_cmd += ["-load-plugin", str(plugin_so), "-enable-checker", full_checker]
             else:
-                logger.warning(f"Scan-build analysis had errors: {result.stderr}")
-                bugs_found = []
+                logger.warning("[scan-build] running WITHOUT custom plugin.")
+
+            if not full_ready_before:
+                logger.info("[build] Full build is NOT complete -> running full `./mach build` under scan-build")
+                cmd_full = base_cmd + ["./mach", "build", "-j8"]
+                result = run_cmd_stream(cmd_full, name="scan_build_full", cwd=repo_dir, env=env, timeout=7200)
+                _write_file(log_dir / "scan-build-full.stdout.log", result.stdout or "")
+                _write_file(log_dir / "scan-build-full.stderr.log", result.stderr or "")
+
+            # Re-check after potential full build
+            full_ready_after = _is_full_build_complete(topobjdir)
+            _write_file(log_dir / "full_build_ready.after.txt", str(full_ready_after) + "\n")
+
+            # --- If full build is complete, allow incremental per-directory build; otherwise we already did full build.
+            build_args: list[str] = []
+            if full_ready_after:
+                # Derive candidate per-dir targets from source files
+                def _rel_parent(p: str) -> str:
+                    try:
+                        rel = str(Path(p).parent)
+                        relpath = str(Path(rel).resolve().relative_to(repo_dir.resolve()))
+                    except Exception:
+                        relpath = str(Path(p).parent)
+                    return relpath
+
+                raw_targets = sorted({_rel_parent(f) for f in source_files if f})
+                raw_targets = [
+                    t for t in raw_targets
+                    if t and (repo_dir / t).exists() and t.strip().lower() != "windows"
+                ]
+
+                # Keep only those present in objdir (active for this configuration)
+                for t in raw_targets:
+                    if (topobjdir / t).exists():
+                        build_args.append(t)
+                    else:
+                        logger.debug(f"[targets] drop '{topobjdir}/{t}' (inactive or platform-mismatch)")
+
+            if full_ready_after and build_args:
+                logger.info(f"[build] Full build complete -> running INCREMENTAL build for targets: {build_args}")
+                cmd_inc = base_cmd + ["./mach", "build", "-j8", *build_args]
+                result = run_cmd_stream(cmd_inc, name="scan_build_incremental", cwd=repo_dir, env=env, timeout=3600)
+                _write_file(log_dir / "scan-build-incremental.stdout.log", result.stdout or "")
+                _write_file(log_dir / "scan-build-incremental.stderr.log", result.stderr or "")
+            else:
+                if full_ready_after:
+                    logger.info("[build] Full build complete but no valid incremental targets; skipping incremental pass.")
+                # else: full build already executed above
+
+            # Parse reports
+            bugs_found = self._parse_scan_build_results(results_dir) if results_dir.exists() else []
+            logger.info(f"Scan-build done, issues={len(bugs_found)}")
+
+            summary = {
+                "commit": commit_short,
+                "run_id": run_id,
+                "objdir": objdir_name,
+                "full_build_ready_before": full_ready_before,
+                "full_build_ready_after": full_ready_after,
+                "incremental_targets": build_args or [],
+                "checker": full_checker if plugin_ok else "<none>",
+                "issues": len(bugs_found),
+                "results_dir": str(results_dir),
+                "log_dir": str(log_dir),
+            }
+            _write_file(results_dir / "_run_summary.json", json.dumps(summary, indent=2))
 
         except Exception as e:
             logger.error(f"Error during scan-build analysis: {e}")
             bugs_found = []
+        finally:
+            try:
+                logger.remove(sink_id)
+            except Exception:
+                pass
+            logger.debug("[cleanup] removed temp cmd logger sink (files persist)")
 
         return bugs_found
 
