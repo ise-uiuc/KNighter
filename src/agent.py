@@ -8,13 +8,40 @@ from global_config import global_config
 from model import invoke_llm
 from tools import error_formatting, grab_error_message
 
-prompt_template_dir = Path(__file__).parent.parent / "prompt_template"
-example_dir = prompt_template_dir / "examples"
+PROMPT_ROOT = Path(__file__).parent.parent / "prompt_template"
+PROMPT_FIREFOX_ROOT = PROMPT_ROOT / "firefox"
+
+def _detect_target_name() -> str:
+    t = getattr(global_config, "target", None)
+    if t:
+        name = getattr(t, "name", None)
+        if isinstance(name, str) and name:
+            return name.lower()
+    return str(global_config.get("target_type", "linux")).lower()
+
+def _load_with_fallback(relpath: str) -> str:
+    """Use firefox if exists."""
+    if _detect_target_name() == "firefox":
+        p_fx = FIREFOX_ROOT / relpath
+        if p_fx.exists():
+            return p_fx.read_text()
+    return (PROMPT_ROOT / relpath).read_text()
+
+def _load_examples() -> str:
+    if _detect_target_name() == "firefox":
+        p_fx = FIREFOX_ROOT / "examples"
+        if p_fx.exists():
+            return p_fx
+    return PROMPT_ROOT / "examples"
+
+prompt_template_dir = PROMPT_ROOT
+
+example_dir = _load_examples()
 default_checker_examples = []
 
-UTILITY_FUNCTION = (prompt_template_dir / "knowledge" / "utility.md").read_text()
-SUGGESTIONS = (prompt_template_dir / "knowledge" / "suggestions.md").read_text()
-TEMPLATE = (prompt_template_dir / "knowledge" / "template.md").read_text()
+UTILITY_FUNCTION = _load_with_fallback("knowledge/utility.md")
+SUGGESTIONS      = _load_with_fallback("knowledge/suggestions.md")
+TEMPLATE         = _load_with_fallback("knowledge/template.md")
 
 
 class Example(BaseModel):
@@ -65,13 +92,13 @@ def get_example_text(
     return example_text
 
 
-patch2checker_template = (prompt_template_dir / "patch2checker.md").read_text()
-patch2pattern_template = (
+patch2checker_template = _load_with_fallback("patch2checker.md")
+patch2checker_template = (
     patch2checker_template.replace("{{utility_functions}}", UTILITY_FUNCTION)
     .replace("{{suggestions}}", SUGGESTIONS)
     .replace("{{checker_template}}", TEMPLATE)
 )
-patch2checker_template = patch2pattern_template.replace(
+patch2checker_template = patch2checker_template.replace(
     "{{examples}}",
     get_example_text(
         default_checker_examples,
@@ -83,7 +110,7 @@ patch2checker_template = patch2pattern_template.replace(
 )
 
 """Patch to Pattern"""
-patch2pattern_template = (prompt_template_dir / "patch2pattern.md").read_text()
+patch2pattern_template = _load_with_fallback("patch2pattern.md")
 patch2pattern_template = patch2pattern_template.replace(
     "{{examples}}",
     get_example_text(
@@ -95,9 +122,7 @@ patch2pattern_template = patch2pattern_template.replace(
     ),
 )
 
-patch2pattern_general_template = (
-    prompt_template_dir / "patch2pattern-general.md"
-).read_text()
+patch2pattern_general_template = _load_with_fallback("patch2pattern-general.md")
 patch2pattern_general_template = patch2pattern_general_template.replace(
     "{{examples}}",
     get_example_text(
@@ -110,32 +135,28 @@ patch2pattern_general_template = patch2pattern_general_template.replace(
 )
 
 """Pattern to Plan"""
-pattern2plan_template = (prompt_template_dir / "pattern2plan.md").read_text()
+pattern2plan_template = _load_with_fallback("pattern2plan.md")
 pattern2plan_template = pattern2plan_template.replace(
     "{{utility_functions}}", UTILITY_FUNCTION
 )
 
 """Pattern to Plan without utility functions"""
-pattern2plan_template_no_utility = (
-    prompt_template_dir / "pattern2plan-no-utility.md"
-).read_text()
+pattern2plan_template_no_utility = _load_with_fallback("pattern2plan-no-utility.md")
 
 """Plan to Checker"""
-plan2checker_template = (prompt_template_dir / "plan2checker.md").read_text()
+plan2checker_template = _load_with_fallback("plan2checker.md")
 plan2checker_template = (
     plan2checker_template.replace("{{utility_functions}}", UTILITY_FUNCTION)
     .replace("{{suggestions}}", SUGGESTIONS)
     .replace("{{checker_template}}", TEMPLATE)
 )
 
-plan2checker_template_no_utility = (
-    prompt_template_dir / "plan2checker-no-utility.md"
-).read_text()
+plan2checker_template_no_utility = _load_with_fallback("plan2checker-no-utility.md")
 plan2checker_template_no_utility = plan2checker_template_no_utility.replace(
     "{{suggestions}}", SUGGESTIONS
 ).replace("{{checker_template}}", TEMPLATE)
 
-label_commit_template = (prompt_template_dir / "label_commit.md").read_text()
+label_commit_template = _load_with_fallback("label_commit.md")
 
 
 def label_commit(id: str, iter: int, commit_id, patch: str):
