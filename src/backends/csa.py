@@ -2471,7 +2471,14 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         - Filter build targets against objdir ONLY after full build is complete.
         - Pick & install a rustup toolchain based on the commit date, and set repo-local override.
         """
-        import os, shlex, subprocess as sp, json, time, datetime, shutil, types
+        import os
+        import shlex
+        import subprocess as sp
+        import json
+        import time
+        import datetime
+        import shutil
+        import types
         from pathlib import Path
 
         logger.info(f"Analyzing {len(source_files)} Firefox files with scan-build")
