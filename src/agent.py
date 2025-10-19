@@ -15,7 +15,7 @@ def _detect_target_name() -> str:
     t = getattr(global_config, "target", None)
     if t:
         name = getattr(t, "name", None)
-        if isintance(name, str) and name:
+        if isinstance(name, str) and name:
             return name.lower()
     return str(global_config.get("target_type", "linux")).lower()
 
