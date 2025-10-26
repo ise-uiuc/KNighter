@@ -84,7 +84,7 @@ def scan_batch_checkers(checker_dict, arch="x86"):
     comd_prefix += f"-o {output_dir_str} "
     olddefcmd = comd_prefix + f"make LLVM=1 ARCH={arch} olddefconfig"
 
-    global_config.target().checkout_commit(
+    global_config.target.checkout_commit(
         commit, is_before=False, olddefcmd=olddefcmd, arch=arch
     )
 
