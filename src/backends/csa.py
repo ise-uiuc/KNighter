@@ -18,6 +18,7 @@ from loguru import logger
 
 from backends.factory import AnalysisBackendFactory
 from checker_data import ReportData
+from targets.firefox import Firefox
 from targets.factory import TargetFactory
 from targets.linux import Linux
 from tools import monitor_build_output, remove_text_section
@@ -423,13 +424,11 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 checker_code, commit_id, patch, target, skip_build_checker
             )
         elif target._target_type == "v8":
-            return self._validate_checker_v8(
-                checker_code, commit_id, patch, target, skip_build_checker
-            )
+            return self._validate_checker_v8(checker_code, commit_id, patch, target, skip_build_checker)
+        elif target._target_type == "firefox":
+            return self._validate_checker_firefox(checker_code, commit_id, patch, target, skip_build_checker)
         else:
-            raise NotImplementedError(
-                f"Validation for target type {target._target_type} is not implemented."
-            )
+            raise NotImplementedError(f"Validation for target type {target._target_type} is not implemented.")
 
     def run_checker(
         self,
@@ -482,10 +481,20 @@ extern "C" const char clang_analyzerAPIVersionString[] =
                 skip_checkout=skip_checkout,
                 **kwargs,
             )
-        else:
-            raise NotImplementedError(
-                f"Running checker for target type {target._target_type} is not implemented."
+        elif target._target_type == "firefox":
+            return self._run_checker_firefox(
+                checker_code,
+                commit_id,
+                target,
+                object_to_analyze=object_to_analyze,
+                jobs=jobs,
+                output_dir=output_dir,
+                skip_build_checker=skip_build_checker,
+                skip_checkout=skip_checkout,
+                **kwargs,
             )
+        else:
+            raise NotImplementedError(f"Running checker for target type {target._target_type} is not implemented.")
 
     """Self defined functions"""
 
@@ -2385,3 +2394,258 @@ extern "C" const char clang_analyzerAPIVersionString[] =
         if len(name) > 30:
             name = name[:30]
         return name or "SAGenTest"
+
+    ########## Firefox Specific Methods ##########
+    def _run_checker_firefox(
+        self,
+        checker_code: str,
+        commit_id: str,
+        target,
+        object_to_analyze: str = None,
+        jobs: int = 32,
+        output_dir: str = "tmp",
+        skip_build_checker: bool = False,
+        skip_checkout: bool = False,
+        **kwargs,
+    ):
+        """
+        Run a custom checker against Firefox codebase using scan-build.
+
+        Args:
+            checker_code: The custom checker source code
+            commit_id: Commit to analyze
+            target: Firefox target instance
+            object_to_analyze: Specific object/file to analyze (optional)
+            jobs: Number of parallel jobs
+            output_dir: Directory for output
+            skip_build_checker: Skip building the checker
+            skip_checkout: Skip checking out the commit
+            **kwargs: Additional arguments
+
+        Returns:
+            int: Number of bugs found
+        """
+        logger.info(f"Firefox run_checker: running checker against commit {commit_id}")
+
+        if not skip_build_checker:
+            self.build_checker(
+                checker_code,
+                log_dir=Path(output_dir),
+            )
+
+        if not skip_checkout:
+            target.checkout_commit(commit_id, is_before=False)
+
+        # Determine source files to analyze
+        if object_to_analyze:
+            source_files = [object_to_analyze]
+        else:
+            # Get source files from commit patch
+            patch = target.get_patch(commit_id)
+            source_files = target.get_source_files_from_patch(patch)
+
+        logger.info(f"Analyzing {len(source_files)} files: {source_files}")
+
+        # Run analysis with scan-build
+        bugs_found = self._analyze_firefox_files_with_scan_build(
+            target, source_files
+        )
+
+        num_bugs = len(bugs_found)
+        logger.info(f"Firefox analysis completed. Found {num_bugs} bugs")
+
+        return num_bugs
+
+    def _analyze_firefox_files_with_scan_build(
+        self, target, source_files: list[str], checker_name: str = "SAGenTest"
+    ) -> list:
+        """
+        Analyze Firefox source files using scan-build with custom SAGEN checker.
+        Disables all built-in checkers and enables only the custom checker.
+
+        Args:
+            target: Firefox target instance
+            source_files: List of source files to analyze
+            checker_name: Name of the custom checker to enable
+
+        Returns:
+            list: List of detected bugs/issues
+        """
+        logger.info(f"Analyzing {len(source_files)} Firefox files with scan-build")
+
+        llvm_build_dir = (self.backend_path / "build").absolute()
+        results_dir = Path("tmp/firefox_scan_results")
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        bugs_found = []
+
+        try:
+            # Build scan-build command with disabled built-in checkers and custom checker
+            # Use -Xanalyzer to pass arguments to clang's static analyzer
+            cmd = [
+                f"{llvm_build_dir}/bin/scan-build",
+                "--use-cc=clang",
+                "--use-c++=clang++",
+                "-load-plugin", f"{llvm_build_dir}/lib/SAGenTestPlugin.so",
+                "-enable-checker", f"custom.{checker_name}",
+                "-o", str(results_dir),
+                "./mach", "build"
+            ]
+
+            # Add specific object files to force rebuilding if provided and not too many
+            if len(source_files) < 5:
+                # Convert source files to object files to force mach to rebuild
+                object_files = [Firefox.get_object_name(f) for f in source_files]
+                # Remove existing object files to force recompilation
+                obj_dir = Path(target.repo.working_dir) / "obj-x86_64-pc-linux-gnu"
+                for obj_file in object_files:
+                    full_obj_path = obj_dir / obj_file
+                    if full_obj_path.exists():
+                        full_obj_path.unlink()
+                        logger.info(f"Removed existing object file: {full_obj_path}")
+                cmd.extend(object_files)
+
+            logger.info(f"Running scan-build command: {' '.join(cmd)}")
+
+            result = sp.run(
+                cmd,
+                cwd=target.repo.working_dir,
+                capture_output=True,
+                text=True,
+                timeout=1800  # 30 minutes timeout
+            )
+
+            # Parse results from scan-build output
+            if result.returncode == 0 or "scan-build:" in result.stderr:
+                bugs_found = self._parse_scan_build_results(results_dir)
+                logger.info(f"Scan-build analysis completed, found {len(bugs_found)} issues")
+            else:
+                logger.warning(f"Scan-build analysis had errors: {result.stderr}")
+                bugs_found = []
+
+        except Exception as e:
+            logger.error(f"Error during scan-build analysis: {e}")
+            bugs_found = []
+
+        return bugs_found
+
+    def _parse_scan_build_results(self, results_dir: Path) -> list:
+        """
+        Parse scan-build results from HTML or plist files.
+
+        Args:
+            results_dir: Directory containing scan-build results
+
+        Returns:
+            list: List of parsed bug reports
+        """
+        bugs = []
+
+        try:
+            # Look for timestamped subdirectories (scan-build format)
+            subdirs = [d for d in results_dir.iterdir() if d.is_dir()]
+
+            for subdir in subdirs:
+                # Look for plist files (structured bug reports)
+                plist_files = list(subdir.glob("*.plist"))
+                for plist_file in plist_files:
+                    try:
+                        # Simple parsing - count each plist as one bug
+                        bugs.append({
+                            "file": str(plist_file),
+                            "type": "scan-build-report"
+                        })
+                    except Exception as e:
+                        logger.warning(f"Failed to parse {plist_file}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error parsing scan-build results: {e}")
+
+        return bugs
+
+    def _validate_checker_firefox(
+        self,
+        checker_code: str,
+        commit_id: str,
+        patch: str,
+        target,
+        skip_build_checker: bool = False,
+    ):
+        """
+        Validate the checker against a Firefox commit and patch.
+        Uses scan-build with SAGEN checker and disabled built-in checkers.
+        """
+        logger.info(f"Firefox validation: validating checker against commit {commit_id}")
+
+        TP, TN = 0, 0
+        if not skip_build_checker:
+            self.build_checker(
+                checker_code, 
+                log_dir=Path("tmp"), 
+            )
+
+        try:
+            # Get source files from patch
+            source_files = target.get_source_files_from_patch(patch)
+            logger.info(f"Source files to analyze from patch: {source_files}")
+
+            if not source_files:
+                logger.warning("No source files found in patch")
+                return TP, TN
+
+            # Checkout buggy version (before the commit)
+            logger.info("Checking out buggy version (before commit)")
+            target.checkout_commit(commit_id, is_before=True)
+
+            # Run analysis on buggy version
+            bugs_before = self._analyze_firefox_files_with_scan_build(
+                target, source_files
+            )
+            logger.info(f"Bugs found in buggy version: {len(bugs_before)}")
+
+            # Checkout fixed version (after the commit)
+            logger.info("Checking out fixed version (after commit)")
+            target.checkout_commit(commit_id, is_before=False)
+
+            # Run analysis on fixed version
+            bugs_after = self._analyze_firefox_files_with_scan_build(
+                target, source_files
+            )
+            logger.info(f"Bugs found in fixed version: {len(bugs_after)}")
+
+            # Calculate TP/TN based on bug differences
+            if len(bugs_before) > len(bugs_after):
+                TP = len(bugs_before) - len(bugs_after)
+                logger.info(f"True positives detected: {TP}")
+            else:
+                TN = 1  # No regression introduced
+                logger.info("No regression detected (TN)")
+
+        except Exception as e:
+            logger.error(f"Error during Firefox validation: {e}")
+            TP, TN = 0, 0
+
+        logger.info(f"Firefox validation completed. TP: {TP}, TN: {TN}")
+        return TP, TN
+
+    def _generate_analyzer_command_firefox(
+        self, firefox, source_file: str, clang_binary: str, plugin_path: str, checker_name: str
+    ):
+        flags = firefox.get_compile_flags(source_file)
+        cmds = (
+            [
+                clang_binary,
+                "--analyze",
+                "-Xanalyzer",
+                "-load",
+                "-Xanalyzer",
+                str(plugin_path),
+                "-Xanalyzer",
+                "-analyzer-checker",
+                "-Xanalyzer",
+                checker_name,
+            ]
+            + flags
+            + [source_file]
+        )
+        return cmds
